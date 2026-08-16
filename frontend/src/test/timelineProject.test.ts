@@ -477,6 +477,50 @@ describe("统一 timeline domain", () => {
     expect(state.run_selected_segment_ids).toEqual([first, second, third]);
   });
 
+  it("在片段 02 前插空段时分配新的默认编号且保留已有名称", () => {
+    let state = createTimelineEditorState();
+    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    expect(state.project.segments.map((segment) => segment.title)).toEqual(["片段 01", "片段 02"]);
+
+    state = timelineEditorReducer(state, { type: "segment/insert", position: "before" });
+
+    expect(state.project.segments.map((segment) => segment.title)).toEqual([
+      "片段 01",
+      "片段 03",
+      "片段 02",
+    ]);
+  });
+
+  it("乱序默认名称的前后插均按现有最大编号递增", () => {
+    const state = createTimelineEditorState();
+    const segments = [1, 7, 3, 4].map((number) => createTimelineSegment("fl2va", number));
+    const initial = {
+      ...state,
+      project: { ...state.project, segments },
+      selected_segment_ids: [segments[3].id],
+      selection_anchor_id: segments[3].id,
+      run_selected_segment_ids: segments.map((segment) => segment.id),
+    };
+
+    const before = timelineEditorReducer(initial, { type: "segment/insert", position: "before" });
+    const after = timelineEditorReducer(initial, { type: "segment/insert", position: "after" });
+
+    expect(before.project.segments.map((segment) => segment.title)).toEqual([
+      "片段 01",
+      "片段 07",
+      "片段 03",
+      "片段 08",
+      "片段 04",
+    ]);
+    expect(after.project.segments.map((segment) => segment.title)).toEqual([
+      "片段 01",
+      "片段 07",
+      "片段 03",
+      "片段 04",
+      "片段 08",
+    ]);
+  });
+
   it("参考素材槽删除后不重排，新素材填最低空槽", () => {
     let segment = createTimelineSegment("ref2va", 1);
     segment = assignAssetToSegment(segment, image) as typeof segment;
