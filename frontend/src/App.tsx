@@ -39,8 +39,8 @@ import {
 import { randomSafeSeed } from "./domain/modes";
 import { persistUiTheme, readUiTheme } from "./domain/theme";
 import {
-  loadTimelineRunSelectionPreference,
-  saveTimelineRunSelectionPreference,
+  loadTimelineSegmentSelectionPreference,
+  saveTimelineSegmentSelectionPreference,
 } from "./domain/workspacePreferences";
 import {
   autoFitSourceAudioTiming,
@@ -381,11 +381,9 @@ function clearPendingRuntimeSettings(): void {
 function createInitialTimelineState() {
   const state = createTimelineEditorState();
   const layout = loadAssetLayoutPreference();
-  state.selected_segment_ids = [state.project.segments[0].id];
+  state.selected_segment_ids = state.project.segments.map((segment) => segment.id);
+  state.active_segment_id = state.project.segments[0]?.id ?? null;
   state.selection_anchor_id = state.project.segments[0].id;
-  state.run_selected_segment_ids = state.project.segments
-    .filter((segment) => segment.enabled)
-    .map((segment) => segment.id);
   state.asset_grid_size = layout.size;
   return state;
 }
@@ -600,8 +598,9 @@ export default function App() {
   const storageAuthorityControllerRef = useRef<AbortController | null>(null);
   const storageRecoveryInProgress = useRef(false);
   const databaseIdentityStaleRef = useRef(false);
-  const runSelectionGeneration = useRef(0);
-  const restoredRunSelectionKey = useRef<string | null>(null);
+  const segmentSelectionGeneration = useRef(0);
+  const restoredSegmentSelectionKey = useRef<string | null>(null);
+  const projectSwitchGeneration = useRef(0);
   const timelinePersistedRevision = useRef(0);
   const timelineWriteGeneration = useRef(0);
   const timelineSaveRequest = useRef<Promise<TimelineProject | null> | null>(null);
@@ -719,8 +718,14 @@ export default function App() {
       ? reduced
       : { ...reduced, project: sourceAudioFit.project };
     const projectChanged = next.project !== current.project;
-    const runSelectionChanged = next.run_selected_segment_ids.length !== current.run_selected_segment_ids.length ||
-      next.run_selected_segment_ids.some((id, index) => id !== current.run_selected_segment_ids[index]);
+    const selectionChanged = next.selected_segment_ids.length !== current.selected_segment_ids.length ||
+      next.selected_segment_ids.some((id, index) => id !== current.selected_segment_ids[index]);
+    const segmentTopologyChanged = next.project.segments.length !== current.project.segments.length ||
+      next.project.segments.some((segment, index) => segment.id !== current.project.segments[index]?.id);
+    const currentRunnable = runnableTimelineSegmentIds(current);
+    const nextRunnable = runnableTimelineSegmentIds(next);
+    const executableSelectionChanged = nextRunnable.length !== currentRunnable.length ||
+      nextRunnable.some((id, index) => id !== currentRunnable[index]);
     if (databaseIdentityStaleRef.current && projectChanged) {
       setToast("本页数据库身份已过期；请刷新整个页面后继续");
       return;
@@ -761,17 +766,24 @@ export default function App() {
       taskListRequest.current += 1;
       dispatch({ type: "tasks/invalidate-current-snapshots" });
     }
-    if (runSelectionChanged) {
-      runSelectionGeneration.current += 1;
+    if (executableSelectionChanged) {
+      segmentSelectionGeneration.current += 1;
       setCompileReport(null);
     }
     const activeDatabase = activeDatabaseRef.current;
-    if (activeDatabase && (projectChanged || runSelectionChanged)) {
-      saveTimelineRunSelectionPreference(
+    const selectionPreferenceScope = activeDatabase
+      ? `${activeDatabase.active_database_identity}:${activeProjectIdRef.current}`
+      : null;
+    if (
+      activeDatabase &&
+      restoredSegmentSelectionKey.current === selectionPreferenceScope &&
+      (segmentTopologyChanged || selectionChanged)
+    ) {
+      saveTimelineSegmentSelectionPreference(
         activeDatabase,
+        activeProjectIdRef.current,
         next.project.segments.map((segment) => segment.id),
-        next.project.segments.filter((segment) => segment.enabled).map((segment) => segment.id),
-        next.run_selected_segment_ids,
+        next.selected_segment_ids,
       );
     }
     rawTimelineDispatch(action);
@@ -1603,11 +1615,9 @@ export default function App() {
       timelineHadLocal.current = true;
       if (timelineRevision.current !== revision) return null;
 
-      timelineRef.current = {
-        ...timelineRef.current,
-        project: confirmed,
-      };
-      rawTimelineDispatch({ type: "project/replace", project: confirmed });
+      const replaceAction: TimelineAction = { type: "project/replace", project: confirmed };
+      timelineRef.current = timelineEditorReducer(timelineRef.current, replaceAction);
+      rawTimelineDispatch(replaceAction);
       clearLocalTimeline();
       setTimelineDirty(false);
       setTimelinePausedError(null);
@@ -1829,9 +1839,35 @@ export default function App() {
     // task history empty until the next polling interval.
     void loadTasks(controller.signal, true);
     void loadAssets(controller.signal);
+    const installHydratedProject = (
+      project: TimelineProject,
+      database: { active_database_path: string; active_database_identity: string },
+      projectId: string,
+    ) => {
+      const segmentIds = project.segments.map((segment) => segment.id);
+      const restoredSelection = loadTimelineSegmentSelectionPreference(
+        database,
+        projectId,
+        segmentIds,
+      );
+      const replaceAction: TimelineAction = { type: "project/replace", project };
+      const restoreSelectionAction: TimelineAction = {
+        type: "segment/set-selection",
+        ids: restoredSelection ?? segmentIds,
+      };
+      timelineRef.current = timelineEditorReducer(
+        timelineEditorReducer(timelineRef.current, replaceAction),
+        restoreSelectionAction,
+      );
+      rawTimelineDispatch(replaceAction);
+      rawTimelineDispatch(restoreSelectionAction);
+      restoredSegmentSelectionKey.current =
+        `${database.active_database_identity}:${projectId}`;
+    };
     const hydrateTimeline = async (): Promise<void> => {
       if (controller.signal.aborted || timelineHydrationReady.current) return;
       try {
+        const hydratingProjectId = activeProjectIdRef.current;
         const storage = await directorApi.getStorage(controller.signal);
         if (controller.signal.aborted) return;
         const candidateDatabase = {
@@ -1839,10 +1875,10 @@ export default function App() {
           active_database_identity: storage.active_database_identity,
         };
         const persistedRuntimeSettings = loadPendingRuntimeSettings(candidateDatabase);
-        const pending = loadLocalTimeline(candidateDatabase, activeProjectIdRef.current);
+        const pending = loadLocalTimeline(candidateDatabase, hydratingProjectId);
         let serverProject: TimelineProject | null = null;
         if (!pending) {
-          const value = await fetchTimelineForProject(activeProjectIdRef.current, controller.signal);
+          const value = await fetchTimelineForProject(hydratingProjectId, controller.signal);
           if (controller.signal.aborted) return;
           serverProject = normalizeTimelineProject(value);
           if (!serverProject) throw new Error("服务器返回的时间线结构无效");
@@ -1880,8 +1916,7 @@ export default function App() {
         if (pending) {
           timelineRevision.current = 1;
           timelineHadLocal.current = true;
-          timelineRef.current = { ...timelineRef.current, project: pending };
-          rawTimelineDispatch({ type: "project/replace", project: pending });
+          installHydratedProject(pending, candidateDatabase, hydratingProjectId);
           setTimelineDirty(true);
           timelineHydrationReady.current = true;
           setTimelineHydrationStatus("ready");
@@ -1897,8 +1932,7 @@ export default function App() {
           return;
         }
         const project = serverProject as TimelineProject;
-        timelineRef.current = { ...timelineRef.current, project };
-        rawTimelineDispatch({ type: "project/replace", project });
+        installHydratedProject(project, candidateDatabase, hydratingProjectId);
         setTimelineDirty(false);
         timelineHydrationReady.current = true;
         setTimelineHydrationStatus("ready");
@@ -1952,22 +1986,29 @@ export default function App() {
     const activeDatabase = activeDatabaseRef.current;
     if (!activeDatabase) return;
     const projectSegmentIds = timeline.project.segments.map((segment) => segment.id);
-    const enabledSegmentIds = timeline.project.segments
-      .filter((segment) => segment.enabled)
-      .map((segment) => segment.id);
-    const restoreKey = `${activeDatabase.active_database_identity}:${projectSegmentIds.join("\u001f")}`;
-    if (restoredRunSelectionKey.current === restoreKey) return;
-    restoredRunSelectionKey.current = restoreKey;
-    const restored = loadTimelineRunSelectionPreference(
+    const restoreKey = `${activeDatabase.active_database_identity}:${activeProjectId}`;
+    if (restoredSegmentSelectionKey.current === restoreKey) return;
+    restoredSegmentSelectionKey.current = restoreKey;
+    const restored = loadTimelineSegmentSelectionPreference(
       activeDatabase,
+      activeProjectId,
       projectSegmentIds,
-      enabledSegmentIds,
     );
     if (restored === null) return;
-    const action: TimelineAction = { type: "segment/set-run-selection", ids: restored };
-    timelineRef.current = timelineEditorReducer(timelineRef.current, action);
+    const action: TimelineAction = { type: "segment/set-selection", ids: restored };
+    const currentRunnable = runnableTimelineSegmentIds(timelineRef.current);
+    const next = timelineEditorReducer(timelineRef.current, action);
+    const nextRunnable = runnableTimelineSegmentIds(next);
+    if (
+      currentRunnable.length !== nextRunnable.length ||
+      currentRunnable.some((id, index) => id !== nextRunnable[index])
+    ) {
+      segmentSelectionGeneration.current += 1;
+      setCompileReport(null);
+    }
+    timelineRef.current = next;
     rawTimelineDispatch(action);
-  }, [timeline.project.segments, timelineHydrationStatus]);
+  }, [activeProjectId, timeline.project.segments, timelineHydrationStatus]);
   useEffect(() => {
     if (
       timelineSyncRequired ||
@@ -2142,7 +2183,9 @@ export default function App() {
       const authoritative = normalizeTimelineProject(await fetchTimelineForProject(activeProjectIdRef.current));
       if (!authoritative) throw new Error("服务器返回的时间线结构无效");
       if (timelineWriteGeneration.current !== generation) return;
-      rawTimelineDispatch({ type: "project/replace", project: authoritative });
+      const replaceAction: TimelineAction = { type: "project/replace", project: authoritative };
+      timelineRef.current = timelineEditorReducer(timelineRef.current, replaceAction);
+      rawTimelineDispatch(replaceAction);
       timelinePersistedRevision.current = timelineRevision.current;
       setTimelineAuthorityRequired(false);
       setTimelineDirty(false);
@@ -2191,15 +2234,25 @@ export default function App() {
     if (assetDeleteLock.current || assetDeleteIntent.current) { setToast("正在原子解除素材引用，请稍候"); return; }
     if (timelineSyncRequired) { setToast("服务器时间线正在自动恢复同步，暂不能生成"); return; }
     const executionGeneration = runtimeSettingsGeneration.current;
+    const clickedSegmentSelectionGeneration = segmentSelectionGeneration.current;
+    const clickedProjectId = activeProjectIdRef.current;
     const executionSettings = structuredClone(authoritativeSettingsRef.current);
     let expectedTimelineRevision = timelineRevision.current;
     const clickedSegmentIds = [...segmentIds];
+    // Starting a run is also a project-authority boundary. Cancel any target
+    // project load that began while this project was still idle so its late
+    // response cannot replace the project being submitted.
+    projectSwitchGeneration.current += 1;
     runtimeExecutionIntent.current += 1;
     setSubmitting(true);
     try {
       let config = await flushTimelineAutosave();
-      if (timelineRevision.current !== expectedTimelineRevision) {
-        throw new Error("时间线在生成确认期间发生变化，请重新生成");
+      if (
+        activeProjectIdRef.current !== clickedProjectId ||
+        timelineRevision.current !== expectedTimelineRevision ||
+        segmentSelectionGeneration.current !== clickedSegmentSelectionGeneration
+      ) {
+        throw new Error("项目、时间线或分段选择在生成确认期间发生变化，请重新生成");
       }
       let validationErrors = [
         ...validateTimelineProject(config, clickedSegmentIds),
@@ -2217,11 +2270,15 @@ export default function App() {
       ];
       if (validationErrors.length) throw new Error(validationErrors[0]);
       if (
+        activeProjectIdRef.current !== clickedProjectId ||
         timelineRevision.current !== expectedTimelineRevision ||
+        segmentSelectionGeneration.current !== clickedSegmentSelectionGeneration
+      ) throw new Error("项目、时间线或分段选择在生成确认期间发生变化，请重新生成");
+      if (
         runtimeSettingsGeneration.current !== executionGeneration ||
         !sameRuntimeSettings(authoritativeSettingsRef.current, executionSettings)
       ) throw new Error("运行设置权威状态已变化，请重新生成");
-      const task = await submitTimelineForProject(activeProjectIdRef.current, {
+      const task = await submitTimelineForProject(clickedProjectId, {
         config: structuredClone(config),
         segment_ids: clickedSegmentIds,
       });
@@ -2310,7 +2367,8 @@ export default function App() {
     if (assetUploadLock.current) { setToast("正在上传并绑定本地素材，完成前不能预检"); return; }
     if (assetDeleteLock.current || assetDeleteIntent.current) { setToast("正在原子解除素材引用，请稍候"); return; }
     if (timelineSyncRequired) { setToast("服务器时间线正在自动恢复权威状态"); return; }
-    const clickedRunSelectionGeneration = runSelectionGeneration.current;
+    const clickedSegmentSelectionGeneration = segmentSelectionGeneration.current;
+    const clickedProjectId = activeProjectIdRef.current;
     const clickedSegmentIds = [...segmentIds];
     let config = normalizeTimelineProject(structuredClone(timelineRef.current.project));
     if (!config) { setToast("时间线结构无效，请检查项目字段"); return; }
@@ -2321,6 +2379,8 @@ export default function App() {
     if (validationErrors.length) { setToast(validationErrors[0]); return; }
     const executionGeneration = runtimeSettingsGeneration.current;
     const executionSettings = structuredClone(authoritativeSettingsRef.current);
+    // A pending project GET must not land while preflight owns this project.
+    projectSwitchGeneration.current += 1;
     runtimeExecutionIntent.current += 1;
     setCompiling(true);
     try {
@@ -2333,16 +2393,17 @@ export default function App() {
         ...runtimeTimelineValidation(config, capabilities, state.settings, clickedSegmentIds),
       ];
       if (validationErrors.length) { setToast(validationErrors[0]); return; }
-      const report = await compileTimelineForProject(activeProjectIdRef.current, { config: structuredClone(config), segment_ids: clickedSegmentIds });
+      const report = await compileTimelineForProject(clickedProjectId, { config: structuredClone(config), segment_ids: clickedSegmentIds });
       if (
+        activeProjectIdRef.current !== clickedProjectId ||
         timelineRevision.current !== clickedTimelineRevision ||
-        runSelectionGeneration.current !== clickedRunSelectionGeneration ||
+        segmentSelectionGeneration.current !== clickedSegmentSelectionGeneration ||
         runtimeSettingsGeneration.current !== executionGeneration ||
         !sameRuntimeSettings(authoritativeSettingsRef.current, executionSettings) ||
         runtimeSettingsDesired.current !== null ||
         runtimeSettingsSyncRequiredRef.current
       ) {
-        setToast("时间线、分段选择或运行设置已变化，请重新预检");
+        setToast("项目、时间线、分段选择或运行设置已变化，请重新预检");
         return;
       }
       setCompileReport(report);
@@ -2557,6 +2618,10 @@ export default function App() {
     }
   };
   const loadTaskProject = async (id: string) => {
+    if (runtimeExecutionIntent.current > 0) {
+      setToast("生成或预检正在确认当前项目；完成前不能另存历史项目");
+      return;
+    }
     if (timelineSyncRequiredRef.current || assetDeleteLock.current || assetDeleteIntent.current || assetUploadLock.current) {
       setToast("当前时间线或素材状态尚未稳定，暂不能另存历史项目");
       return;
@@ -2571,10 +2636,9 @@ export default function App() {
         document: snapshot.project,
       });
       setProjects((current) => [...current, created]);
-      await switchProject(created.id);
+      if (!await switchProject(created.id)) return;
       if (snapshot.segment_ids !== null && snapshot.segment_ids.length > 0) {
         dispatchTimeline({ type: "segment/set-selection", ids: snapshot.segment_ids });
-        dispatchTimeline({ type: "segment/set-run-selection", ids: snapshot.segment_ids });
       }
       dispatch({ type: "tasks/panel", open: false });
       setToast(`已把任务来源项目另存为新项目“${created.title}”；生成前仍会重新校验素材与当前环境`);
@@ -2738,8 +2802,9 @@ export default function App() {
         try {
           const authoritative = normalizeTimelineProject(await fetchTimelineForProject(activeProjectIdRef.current));
           if (!authoritative) throw new Error("服务器时间线响应无效");
-          timelineRef.current = { ...timelineRef.current, project: authoritative };
-          rawTimelineDispatch({ type: "project/replace", project: authoritative });
+          const replaceAction: TimelineAction = { type: "project/replace", project: authoritative };
+          timelineRef.current = timelineEditorReducer(timelineRef.current, replaceAction);
+          rawTimelineDispatch(replaceAction);
           timelinePersistedRevision.current = timelineRevision.current;
           setTimelineAuthorityRequired(false);
           setTimelineDirty(false);
@@ -2924,6 +2989,11 @@ export default function App() {
     : null;
   const selectedEnabledIds = runnableTimelineSegmentIds(timeline);
   const inactiveSelectionAssetReferences = inactiveAssetReferences(new Set(selectedEnabledIds));
+  const emptySelectionErrors = selectedEnabledIds.length > 0
+    ? []
+    : timeline.selected_segment_ids.length > 0
+      ? ["所选片段均已停用；请启用至少一个所选片段后再生成"]
+      : ["请至少选择一个要生成的片段"];
   const selectionTimelineErrors = [
     ...(!timelineHydrated ? [databaseIdentityStale ? "本页数据库身份已过期，请刷新整个页面" : "正在从服务器恢复时间线"] : []),
     ...(storageRestartRequired ? ["数据库切换正在等待重启"] : []),
@@ -2934,11 +3004,14 @@ export default function App() {
     ...(rayLightRecoveryPending ? ["正在核对 RayLight 重启恢复结果"] : []),
     ...(timelineSyncRequired ? ["素材级联已提交，但服务器时间线尚未完成权威回读"] : []),
     ...(timelinePausedMessage ? [timelinePausedMessage] : []),
-    ...validateTimelineProject(timeline.project, selectedEnabledIds),
+    ...emptySelectionErrors,
+    ...(selectedEnabledIds.length ? validateTimelineProject(timeline.project, selectedEnabledIds) : []),
     ...(inactiveSelectionAssetReferences.length
       ? [`当前 ComfyUI 素材库不包含所选片段的引用素材：${[...new Set(inactiveSelectionAssetReferences)].join("、")}`]
       : []),
-    ...runtimeTimelineValidation(timeline.project, capabilities, state.settings, selectedEnabledIds),
+    ...(selectedEnabledIds.length
+      ? runtimeTimelineValidation(timeline.project, capabilities, state.settings, selectedEnabledIds)
+      : []),
   ];
   const timelineRunActionsReady = workspaceCapabilities.connection === "online" &&
     selectionTimelineErrors.length === 0 && selectedEnabledIds.length > 0;
@@ -2970,14 +3043,23 @@ export default function App() {
     ));
   };
 
-  const switchProject = async (targetId: string) => {
-    if (targetId === activeProjectIdRef.current) return;
+  const switchProject = async (targetId: string): Promise<boolean> => {
+    // Even choosing the already-active project is meaningful: it cancels an
+    // unresolved switch whose response has not taken authority yet.
+    const switchGeneration = ++projectSwitchGeneration.current;
+    if (targetId === activeProjectIdRef.current) return true;
+    if (runtimeExecutionIntent.current > 0) {
+      setToast("生成或预检正在确认当前项目；完成前不能切换项目");
+      return false;
+    }
     if (timelineHydrationReady.current) {
       try {
         await flushTimelineAutosave();
+        if (projectSwitchGeneration.current !== switchGeneration) return false;
       } catch (reason) {
+        if (projectSwitchGeneration.current !== switchGeneration) return false;
         setToast(`切换前同步当前项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
-        return;
+        return false;
       }
     }
     const database = activeDatabaseRef.current;
@@ -2987,23 +3069,62 @@ export default function App() {
     if (!targetProject) {
       try {
         targetProject = normalizeTimelineProject(await fetchTimelineForProject(targetId));
+        if (projectSwitchGeneration.current !== switchGeneration) return false;
       } catch (reason) {
+        if (projectSwitchGeneration.current !== switchGeneration) return false;
         setToast(`加载目标项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
-        return;
+        return false;
       }
     }
-    if (!targetProject) { setToast("目标项目时间线结构无效"); return; }
-    const nextState = timelineEditorReducer(timelineRef.current, {
+    if (projectSwitchGeneration.current !== switchGeneration) return false;
+    if (!targetProject) { setToast("目标项目时间线结构无效"); return false; }
+    // The target request may have been pending long enough for another edit
+    // to occur in the current project. Drain again immediately before the
+    // synchronous authority hand-off so that edit cannot be discarded.
+    if (timelineHydrationReady.current) {
+      try {
+        await flushTimelineAutosave();
+        if (
+          projectSwitchGeneration.current !== switchGeneration ||
+          runtimeExecutionIntent.current > 0
+        ) return false;
+      } catch (reason) {
+        if (projectSwitchGeneration.current !== switchGeneration) return false;
+        setToast(`切换前同步当前项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
+        return false;
+      }
+    }
+    const targetSegmentIds = targetProject.segments.map((segment) => segment.id);
+    const targetSelectionScope = database
+      ? `${database.active_database_identity}:${targetId}`
+      : null;
+    const restoredSelection = database
+      ? loadTimelineSegmentSelectionPreference(database, targetId, targetSegmentIds)
+      : null;
+    const replaceAction: TimelineAction = {
       type: "project/replace",
       project: targetProject,
-    });
+    };
+    const restoreSelectionAction: TimelineAction = {
+      type: "segment/set-selection",
+      ids: restoredSelection ?? targetSegmentIds,
+    };
+    const nextState = timelineEditorReducer(
+      timelineEditorReducer(timelineRef.current, replaceAction),
+      restoreSelectionAction,
+    );
     timelineRef.current = nextState;
-    rawTimelineDispatch({ type: "project/replace", project: targetProject });
+    segmentSelectionGeneration.current += 1;
+    rawTimelineDispatch(replaceAction);
+    // A different project starts with its own default selection even when an
+    // imported/cloned timeline happens to reuse segment IDs. Its project-
+    // scoped browser preference, if any, is restored in the same transition.
+    rawTimelineDispatch(restoreSelectionAction);
     timelineRevision.current = 0;
     timelinePersistedRevision.current = 0;
     timelineHadLocal.current = false;
     timelineWriteGeneration.current += 1;
-    restoredRunSelectionKey.current = null;
+    restoredSegmentSelectionKey.current = targetSelectionScope;
     timelineHydrationReady.current = true;
     setTimelineHydrationStatus("ready");
     setTimelineDirty(false);
@@ -3017,6 +3138,7 @@ export default function App() {
     taskListRequest.current += 1;
     void loadTasks(undefined, true);
     setToast(`已切换到项目“${targetProject.title}”`);
+    return true;
   };
 
   const createProject = async (title?: string) => {
@@ -3039,13 +3161,18 @@ export default function App() {
 
   const deleteProject = async (projectId: string) => {
     if (projectId === DEFAULT_PROJECT_ID) return;
+    if (runtimeExecutionIntent.current > 0) {
+      setToast("生成或预检正在确认当前项目；完成前不能删除项目");
+      return;
+    }
     try {
+      if (
+        activeProjectIdRef.current === projectId &&
+        !await switchProject(DEFAULT_PROJECT_ID)
+      ) return;
       const response = await directorApi.deleteProject(projectId);
       setProjects((current) => current.filter((project) => project.id !== projectId));
       setToast(`已删除项目；${response.orphaned_jobs} 个历史任务已归档为旧任务`);
-      if (activeProjectIdRef.current === projectId) {
-        await switchProject(DEFAULT_PROJECT_ID);
-      }
     } catch (reason) {
       setToast(`删除项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
     }
@@ -3169,11 +3296,11 @@ export default function App() {
                 className="topbar__project-switcher"
                 aria-label="切换项目"
                 value={activeProjectId}
-                disabled={!timelineHydrated}
+                disabled={!timelineHydrated || submitting || compiling}
                 onChange={(event) => {
                   const value = event.target.value;
                   if (value === "__new__") void createProject();
-                  else if (value !== activeProjectId) void switchProject(value);
+                  else void switchProject(value);
                 }}
               >
                 {projects.map((project) => (
@@ -3189,6 +3316,7 @@ export default function App() {
                   type="button"
                   className="topbar__project-delete"
                   aria-label={`删除项目 ${timeline.project.title}`}
+                  disabled={submitting || compiling}
                   onClick={() => {
                     if (window.confirm(`确认删除项目“${timeline.project.title}”？已生成的任务会保留为旧任务。`)) {
                       void deleteProject(activeProjectId);

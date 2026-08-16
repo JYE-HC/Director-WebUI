@@ -2,8 +2,8 @@ import type { RV2VShotDetectionRequest } from "../api/types";
 
 export const TIMELINE_WORKSPACE_PREFERENCES_KEY =
   "director-web:v1:timeline-workspace-preferences";
-const TIMELINE_RUN_SELECTION_KEY_PREFIX =
-  "director-web:v1:timeline-run-selection";
+const TIMELINE_SEGMENT_SELECTION_KEY_PREFIX =
+  "director-web:v2:timeline-segment-selection";
 
 export interface TimelineWorkspacePreferences {
   version: 1;
@@ -128,50 +128,54 @@ function validDatabase(database: TimelinePreferenceDatabase): boolean {
     /^[0-9a-f]{64}$/.test(database.active_database_identity);
 }
 
-function runSelectionKey(database: TimelinePreferenceDatabase): string {
-  return `${TIMELINE_RUN_SELECTION_KEY_PREFIX}:${database.active_database_identity}`;
+function segmentSelectionKey(
+  database: TimelinePreferenceDatabase,
+  projectId: string,
+): string {
+  return `${TIMELINE_SEGMENT_SELECTION_KEY_PREFIX}:${database.active_database_identity}:${projectId}`;
 }
 
-export function saveTimelineRunSelectionPreference(
+export function saveTimelineSegmentSelectionPreference(
   database: TimelinePreferenceDatabase,
+  projectId: string,
   projectSegmentIds: readonly string[],
-  enabledSegmentIds: readonly string[],
   selectedSegmentIds: readonly string[],
 ): void {
-  if (!validDatabase(database)) return;
+  if (!validDatabase(database) || !projectId) return;
   const projectIds = [...projectSegmentIds];
-  const enabledIds = projectIds.filter((id) => enabledSegmentIds.includes(id));
-  const selectedIds = enabledIds.filter((id) => selectedSegmentIds.includes(id));
-  const mode = enabledIds.length === selectedIds.length ? "all" : "explicit";
+  const selectedIds = projectIds.filter((id) => selectedSegmentIds.includes(id));
+  const mode = projectIds.length === selectedIds.length ? "all" : "explicit";
   try {
-    window.localStorage.setItem(runSelectionKey(database), JSON.stringify({
-      version: 1,
+    window.localStorage.setItem(segmentSelectionKey(database, projectId), JSON.stringify({
+      version: 2,
       active_database_path: database.active_database_path,
       active_database_identity: database.active_database_identity,
+      active_project_id: projectId,
       mode,
       project_segment_ids: projectIds,
       selected_segment_ids: selectedIds,
     }));
   } catch {
-    // The current in-memory run set remains usable without browser storage.
+    // The current in-memory selection remains usable without browser storage.
   }
 }
 
-export function loadTimelineRunSelectionPreference(
+export function loadTimelineSegmentSelectionPreference(
   database: TimelinePreferenceDatabase,
+  projectId: string,
   projectSegmentIds: readonly string[],
-  enabledSegmentIds: readonly string[],
 ): string[] | null {
-  if (!validDatabase(database)) return null;
+  if (!validDatabase(database) || !projectId) return null;
   try {
-    const raw = window.localStorage.getItem(runSelectionKey(database));
+    const raw = window.localStorage.getItem(segmentSelectionKey(database, projectId));
     if (!raw) return null;
     const value: unknown = JSON.parse(raw);
     if (
       !isRecord(value) ||
-      value.version !== 1 ||
+      value.version !== 2 ||
       value.active_database_path !== database.active_database_path ||
       value.active_database_identity !== database.active_database_identity ||
+      value.active_project_id !== projectId ||
       (value.mode !== "all" && value.mode !== "explicit") ||
       !Array.isArray(value.project_segment_ids) ||
       !Array.isArray(value.selected_segment_ids) ||
@@ -182,10 +186,9 @@ export function loadTimelineRunSelectionPreference(
     if (!(value.project_segment_ids as string[]).some((id) => currentProjectIds.has(id))) {
       return null;
     }
-    const enabled = new Set(enabledSegmentIds);
-    if (value.mode === "all") return projectSegmentIds.filter((id) => enabled.has(id));
+    if (value.mode === "all") return [...projectSegmentIds];
     const selected = new Set(value.selected_segment_ids as string[]);
-    return projectSegmentIds.filter((id) => enabled.has(id) && selected.has(id));
+    return projectSegmentIds.filter((id) => selected.has(id));
   } catch {
     return null;
   }

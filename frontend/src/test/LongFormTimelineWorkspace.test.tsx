@@ -468,7 +468,7 @@ describe("统一时间线关键交互", () => {
     state.selected_asset_ids = state.assets.map((asset) => asset.id);
     render(<Harness initial={state} />);
 
-    const inspector = screen.getByRole("region", { name: "选中片段编辑器" });
+    const inspector = screen.getByRole("region", { name: "当前片段编辑器" });
     const dataTransfer = {
       types: ["application/x-director-assets", "application/x-director-asset"],
       getData: vi.fn((type: string) => type === "application/x-director-assets"
@@ -501,7 +501,7 @@ describe("统一时间线关键交互", () => {
       const state = createTimelineEditorState();
       state.assets = [image];
       render(<Harness initial={state} />);
-      const inspector = screen.getByRole("region", { name: "选中片段编辑器" });
+      const inspector = screen.getByRole("region", { name: "当前片段编辑器" });
       const dataTransfer = {
         types: ["application/x-director-asset"],
         getData: vi.fn((type: string) => type === "application/x-director-asset" ? image.id : ""),
@@ -544,7 +544,7 @@ describe("统一时间线关键交互", () => {
       authority_stale: false,
     });
     render(<Harness initial={state} onUploadFiles={onUploadFiles} />);
-    const inspector = screen.getByRole("region", { name: "选中片段编辑器" });
+    const inspector = screen.getByRole("region", { name: "当前片段编辑器" });
     const files = [
       new File(["v"], "源.mp4", { type: "video/mp4" }),
       new File(["i"], "角色.png", { type: "image/png" }),
@@ -655,7 +655,7 @@ describe("统一时间线关键交互", () => {
     expect(dataTransfer.dropEffect).toBe("none");
     expect(fireEvent.drop(reference, { dataTransfer })).toBe(false);
 
-    const inspector = screen.getByRole("region", { name: "选中片段编辑器" });
+    const inspector = screen.getByRole("region", { name: "当前片段编辑器" });
     dataTransfer.dropEffect = "copy";
     expect(fireEvent.dragOver(inspector, { dataTransfer })).toBe(false);
     expect(dataTransfer.dropEffect).toBe("none");
@@ -667,7 +667,6 @@ describe("统一时间线关键交互", () => {
     const user = userEvent.setup();
     const state = createTimelineEditorState();
     state.project.segments.push(createTimelineSegment("fl2va", 2));
-    state.run_selected_segment_ids = state.project.segments.map((segment) => segment.id);
     const supportedCapabilities: CapabilityReport = {
       ...capabilities,
       native_timeline: {
@@ -712,6 +711,7 @@ describe("统一时间线关键交互", () => {
     second.continuity.enabled = true;
     state.project.segments.push(second);
     state.selected_segment_ids = [second.id];
+    state.active_segment_id = second.id;
     state.selection_anchor_id = second.id;
     render(<Harness initial={state} />);
 
@@ -734,6 +734,7 @@ describe("统一时间线关键交互", () => {
     third.continuity = { enabled: false, overlap_frames: 5 };
     state.project.segments.push(second, third);
     state.selected_segment_ids = [second.id];
+    state.active_segment_id = second.id;
     state.selection_anchor_id = second.id;
     const supportedCapabilities: CapabilityReport = {
       ...capabilities,
@@ -743,12 +744,12 @@ describe("统一时间线关键交互", () => {
 
     expect(screen.getByRole("checkbox", { name: "启用当前片段连续性" })).toBeChecked();
     expect(screen.getByLabelText("当前片段接续尾帧数")).toHaveValue("39");
-    await user.click(screen.getByRole("button", { name: /^运行片段 3：/ }));
+    await user.click(screen.getByRole("button", { name: /^聚焦并选择片段 3：/ }));
     expect(screen.getByRole("checkbox", { name: "启用当前片段连续性" })).not.toBeChecked();
     expect(screen.getByLabelText("当前片段接续尾帧数")).toHaveValue("5");
     await user.click(screen.getByRole("checkbox", { name: "启用当前片段连续性" }));
     await user.selectOptions(screen.getByLabelText("当前片段接续尾帧数"), "56");
-    await user.click(screen.getByRole("button", { name: /^运行片段 2：/ }));
+    await user.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
     expect(screen.getByRole("checkbox", { name: "启用当前片段连续性" })).toBeChecked();
     expect(screen.getByLabelText("当前片段接续尾帧数")).toHaveValue("39");
     expect(readState().project.segments.map((segment) => segment.continuity)).toEqual([
@@ -766,6 +767,7 @@ describe("统一时间线关键交互", () => {
     };
     state.project.segments.push(second);
     state.selected_segment_ids = [second.id];
+    state.active_segment_id = second.id;
     state.selection_anchor_id = second.id;
     state.assets = [image];
     const supportedCapabilities: CapabilityReport = {
@@ -808,8 +810,8 @@ describe("统一时间线关键交互", () => {
     second.continuity = { enabled: true, overlap_frames: 22 };
     state.project.segments.push(second);
     state.selected_segment_ids = [second.id];
+    state.active_segment_id = second.id;
     state.selection_anchor_id = second.id;
-    state.run_selected_segment_ids = [second.id];
     const supportedCapabilities: CapabilityReport = {
       ...capabilities,
       native_timeline: {
@@ -827,10 +829,10 @@ describe("统一时间线关键交互", () => {
     const missing = screen.getByText("复用前驱成片");
     expect(missing).toHaveClass("is-history");
     expect(missing).toHaveAttribute("title", expect.stringContaining("复用直接前驱第 1 段"));
-    const successorClip = screen.getByRole("button", { name: /^运行片段 2：/ });
+    const successorClip = screen.getByRole("button", { name: /^聚焦并选择片段 2：/ });
     expect(successorClip).toHaveAccessibleDescription(/复用直接前驱第 1 段/);
 
-    fireEvent.click(screen.getByRole("button", { name: /^运行片段 1：/ }), { ctrlKey: true });
+    fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ }), { ctrlKey: true });
     expect(screen.getByText("接续 1 段")).toBeInTheDocument();
     expect(screen.getByText("接续")).toHaveAttribute("title", expect.stringContaining("最后 22 帧"));
     expect(successorClip).toHaveAccessibleDescription(/最后 22 帧接续生成/);
@@ -842,7 +844,6 @@ describe("统一时间线关键交互", () => {
     const second = { ...createTimelineSegment("fl2va", 2), prompt: "第二段" };
     second.continuity.enabled = true;
     state.project.segments.push(second);
-    state.run_selected_segment_ids = [state.project.segments[0].id];
     render(<Harness initial={state} workspaceCapabilities={{
       ...capabilities,
       native_timeline: { supported: true, modes: ["fl2va", "ref2va"], continuity: true },
@@ -853,7 +854,7 @@ describe("统一时间线关键交互", () => {
     expect(eligible).toHaveClass("is-eligible");
     expect(eligible).not.toHaveClass("is-active");
     expect(screen.queryByText("接续")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^运行片段 2：/ })).toHaveAccessibleDescription(
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ })).toHaveAccessibleDescription(
       /同时选择第 1 段与第 2 段后，可使用前段最后 22 帧接续生成/,
     );
   });
@@ -872,9 +873,9 @@ describe("统一时间线关键交互", () => {
       continuity: { enabled: true, overlap_frames: 22 as const },
     };
     state.project.segments = [first, second];
-    state.selected_segment_ids = [second.id];
+    state.selected_segment_ids = [first.id, second.id];
+    state.active_segment_id = second.id;
     state.selection_anchor_id = second.id;
-    state.run_selected_segment_ids = [first.id, second.id];
     render(<Harness initial={state} workspaceCapabilities={{
       ...capabilities,
       native_timeline: { supported: true, modes: ["fl2va", "ref2va"], continuity: true },
@@ -892,7 +893,9 @@ describe("统一时间线关键交互", () => {
     const anchored = { ...createTimelineSegment("fl2va", 2), prompt: "锚点段", first_image: image, continuity: { enabled: true, overlap_frames: 22 as const } };
     const ref = { ...createTimelineSegment("ref2va", 3), prompt: "参考段", source_video: video, continuity: { enabled: true, overlap_frames: 22 as const } };
     state.project.segments = [first, anchored, ref];
-    state.run_selected_segment_ids = [first.id, anchored.id, ref.id];
+    state.selected_segment_ids = [first.id, anchored.id, ref.id];
+    state.active_segment_id = first.id;
+    state.selection_anchor_id = first.id;
     render(<Harness initial={state} workspaceCapabilities={{
       ...capabilities,
       native_timeline: { supported: true, modes: ["fl2va", "ref2va"], continuity: true },
@@ -942,6 +945,39 @@ describe("统一时间线关键交互", () => {
       asset: video,
       anchorId: state.project.segments[0].id,
       position: "before",
+    });
+  });
+
+  it("视频落在轨道空白处时以当前检查器焦点作为插入锚点", () => {
+    const state = createTimelineEditorState();
+    const first = state.project.segments[0];
+    const second = createTimelineSegment("fl2va", 2);
+    const third = createTimelineSegment("fl2va", 3);
+    state.project.segments = [first, second, third];
+    state.selected_segment_ids = [first.id, second.id, third.id];
+    state.active_segment_id = second.id;
+    state.selection_anchor_id = second.id;
+    state.assets = [video];
+    const onDispatch = vi.fn();
+    render(<LongFormTimelineWorkspace {...commonProps(state)} onDispatch={onDispatch} />);
+    const track = document.querySelector<HTMLElement>(".director-timeline__track");
+    expect(track).not.toBeNull();
+    const dataTransfer = {
+      types: ["application/x-director-asset", "application/x-director-asset-video"],
+      getData: vi.fn((type: string) => type === "application/x-director-asset" ? video.id : ""),
+      setData: vi.fn(),
+      dropEffect: "copy",
+      effectAllowed: "copyMove",
+      files: [],
+    };
+
+    fireEvent.drop(track!, { dataTransfer });
+
+    expect(onDispatch).toHaveBeenCalledWith({
+      type: "segment/insert-video",
+      asset: video,
+      anchorId: second.id,
+      position: "after",
     });
   });
 
@@ -1192,7 +1228,7 @@ describe("统一时间线关键交互", () => {
 
     await user.type(screen.getByLabelText("片段提示词"), "#角");
     expect(screen.getByRole("listbox", { name: "当前片段已引入的参考素材" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /^运行片段 2：/ }));
+    await user.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
     await waitFor(() => expect(screen.queryByRole("listbox", { name: "当前片段已引入的参考素材" })).not.toBeInTheDocument());
     expect(screen.getByLabelText("片段提示词")).toHaveValue("");
   });
@@ -1300,7 +1336,7 @@ describe("统一时间线关键交互", () => {
     vi.spyOn(directorApi, "detectRV2VShots").mockImplementation(() => new Promise((resolve) => { resolveDetection = resolve; }));
     render(<Harness initial={state} />);
     await user.click(screen.getByRole("button", { name: "智能分割" }));
-    fireEvent.click(screen.getByRole("button", { name: /^运行片段 2：/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
     expect(screen.getByRole("button", { name: "智能分割" })).toBeDisabled();
     resolveDetection({ cut_frames: [5 * 24], shot_count: 2, warnings: [] });
     await Promise.resolve();
@@ -1541,7 +1577,9 @@ describe("统一时间线关键交互", () => {
     state = {
       ...state,
       project: { ...state.project, segments: [first, second] },
-      run_selected_segment_ids: [first.id, second.id],
+      selected_segment_ids: [first.id, second.id],
+      active_segment_id: first.id,
+      selection_anchor_id: first.id,
     };
     render(<Harness initial={state} />);
 
@@ -1734,13 +1772,12 @@ describe("统一时间线关键交互", () => {
   it("片段编辑控制带按视觉顺序组织，并始终呈现项目入点", () => {
     render(<Harness initial={createTimelineEditorState()} />);
 
-    const inspector = screen.getByRole("region", { name: "选中片段编辑器" });
+    const inspector = screen.getByRole("region", { name: "当前片段编辑器" });
     const controlbar = inspector.querySelector(".segment-inspector__controlbar");
     expect(controlbar).not.toBeNull();
     expect(Array.from(controlbar?.children ?? []).map((element) => element.className)).toEqual([
       "segment-inspector__title",
       "field field--inline segment-inspector__name",
-      "toggle segment-inspector__participation",
       "segment-inspector__divider",
       "segment-inspector__continuity",
       "field field--inline segment-inspector__mode",
@@ -1835,7 +1872,7 @@ describe("统一时间线关键交互", () => {
         });
       });
       expect(sourceDuration).toHaveValue(39 / 24);
-      expect(screen.getByRole("region", { name: "选中片段编辑器" })).toHaveTextContent(
+      expect(screen.getByRole("region", { name: "当前片段编辑器" })).toHaveTextContent(
         "请求 1.00s → 实际 1.6250s · 39f",
       );
     }
@@ -1872,13 +1909,15 @@ describe("统一时间线关键交互", () => {
     expect(screen.getByLabelText("生成时长（秒）")).toBeEnabled();
   });
 
-  it("把标题、项目摘要、运行选择和缩放收在同一时间线 header", () => {
+  it("把全选和禁用所选放在标题旁，并移除标题说明文字", () => {
     render(<Harness initial={createTimelineEditorState()} />);
 
     const title = screen.getByText("长视频编排");
     const titleRow = title.closest(".director-timeline__title");
     expect(titleRow).not.toBeNull();
-    expect(titleRow).toContainElement(screen.getByText(/点击片段选择运行 · Ctrl\/⌘ 多选/));
+    expect(titleRow).toContainElement(screen.getByRole("checkbox", { name: "全选" }));
+    expect(titleRow).toContainElement(screen.getByRole("button", { name: /^禁用所选/ }));
+    expect(titleRow).not.toHaveTextContent(/点击片段选择运行|Ctrl\/⌘ 多选/);
     const timelineHeader = title.closest(".director-timeline")?.querySelector(":scope > header");
     const summary = screen.getByLabelText("项目摘要");
     expect(timelineHeader).toContainElement(summary);
@@ -1888,76 +1927,145 @@ describe("统一时间线关键交互", () => {
     expect(timelineHeader).toContainElement(screen.getByRole("checkbox", { name: "全选" }));
     expect(timelineHeader).toContainElement(screen.getByLabelText("时间线缩放"));
     const actions = timelineHeader?.querySelector(".director-timeline__actions");
-    expect(actions).toContainElement(screen.getByRole("checkbox", { name: "全选" }));
+    expect(actions).not.toContainElement(screen.getByRole("checkbox", { name: "全选" }));
+    expect(actions).not.toContainElement(screen.getByRole("button", { name: /^禁用所选/ }));
     expect(actions).toContainElement(screen.getByLabelText("时间线缩放"));
     expect(actions).not.toContainElement(summary);
     expect(document.querySelector(".timeline-commandbar .director-timeline__summary")).toBeNull();
-    expect(document.querySelector(".timeline-commandbar .timeline-run-filter")).toBeNull();
   });
 
-  it("整块片段表达运行集合，全选只切换运行而不扩大编辑选择", async () => {
+  it("全选覆盖停用片段，禁用所选后仍保持单一选择", async () => {
     const user = userEvent.setup();
     let state = createTimelineEditorState();
     state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    const [first, second] = state.project.segments;
+    state = timelineEditorReducer(state, {
+      type: "segment/set-enabled",
+      ids: [second.id],
+      enabled: false,
+    });
     render(<Harness initial={state} />);
 
-    expect(screen.queryByRole("checkbox", { name: "选择运行" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "选择运行" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "清空" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("checkbox", { name: /^运行片段/ })).not.toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "全选" })).toBeChecked();
-    const firstClip = screen.getByRole("button", { name: /^运行片段 1：/ });
-    const secondClip = screen.getByRole("button", { name: /^运行片段 2：/ });
-    const firstEnabled = screen.getByRole("checkbox", { name: "片段 1 参与时间线" });
-    expect(firstClip).not.toContainElement(firstEnabled);
-    expect(firstClip.closest(".timeline-clip")).toContainElement(firstEnabled);
+    const firstClip = screen.getByRole("button", { name: /^聚焦并选择片段 1：/ });
     expect(firstClip).toHaveAttribute("aria-pressed", "true");
-    expect(secondClip).toHaveAttribute("aria-pressed", "true");
-    expect(document.querySelectorAll(".timeline-clip.is-run-selected")).toHaveLength(2);
+    expect(screen.getByRole("checkbox", { name: `多选片段 1：${first.title}` })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: `多选停用片段 2：${second.title}` })).toBeChecked();
     expect(document.querySelectorAll(".timeline-clip.is-selected")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /^禁用所选/ })).toHaveAccessibleName("禁用所选，1 个已启用片段");
 
-    expect(screen.queryByRole("button", { name: "预检执行计划" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "生成任务 2" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^禁用所选/ }));
+    expect(readState().selected_segment_ids).toEqual([first.id, second.id]);
+    expect(readState().project.segments.every((segment) => !segment.enabled)).toBe(true);
+    expect(screen.getByRole("checkbox", { name: "全选" })).toBeChecked();
+    expect(screen.getByRole("button", { name: /^禁用所选/ })).toBeDisabled();
+    expect(document.querySelectorAll(".director-timeline__disabled article.is-selected")).toHaveLength(2);
 
     await user.click(screen.getByRole("checkbox", { name: "全选" }));
     expect(screen.getByRole("checkbox", { name: "全选" })).not.toBeChecked();
-    expect(firstClip).toHaveAttribute("aria-pressed", "false");
-    expect(secondClip).toHaveAttribute("aria-pressed", "false");
-    expect(document.querySelectorAll(".timeline-clip.is-run-selected")).toHaveLength(0);
-    expect(document.querySelectorAll(".timeline-clip.is-selected")).toHaveLength(1);
+    expect(readState()).toMatchObject({
+      selected_segment_ids: [],
+      active_segment_id: null,
+      selection_anchor_id: null,
+    });
+    expect(screen.getByRole("region", { name: "当前片段编辑器" })).toHaveTextContent("未选择片段");
+
+    await user.click(screen.getByRole("checkbox", { name: "全选" }));
+    expect(readState().selected_segment_ids).toEqual([first.id, second.id]);
+    expect(screen.getByRole("checkbox", { name: "全选" })).toBeChecked();
   });
 
-  it("片段整块复用普通、Ctrl 和 Shift 手势同步编辑与运行选择", () => {
+  it("右上角复选框累加多选时保留当前检查器焦点", () => {
     const state = createTimelineEditorState();
     const first = state.project.segments[0];
     const second = createTimelineSegment("fl2va", 2);
     const third = createTimelineSegment("ref2va", 3);
     state.project.segments = [first, second, third];
-    state.run_selected_segment_ids = [first.id, second.id, third.id];
     render(<Harness initial={state} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /^运行片段 2：/ }));
-    expect(readState().selected_segment_ids).toEqual([second.id]);
-    expect(readState().run_selected_segment_ids).toEqual([second.id]);
+    fireEvent.click(screen.getByRole("checkbox", { name: `多选片段 2：${second.title}` }));
+    fireEvent.click(screen.getByRole("checkbox", { name: `多选片段 3：${third.title}` }));
 
-    fireEvent.click(screen.getByRole("button", { name: /^运行片段 1：/ }), { ctrlKey: true });
-    expect(readState().selected_segment_ids).toEqual([second.id, first.id]);
-    expect(readState().run_selected_segment_ids).toEqual([first.id, second.id]);
-
-    fireEvent.click(screen.getByRole("button", { name: /^运行片段 3：/ }), { shiftKey: true });
-    expect(readState().selected_segment_ids).toEqual([first.id, second.id, third.id]);
-    expect(readState().run_selected_segment_ids).toEqual([first.id, second.id, third.id]);
+    expect(readState()).toMatchObject({
+      selected_segment_ids: [first.id, second.id, third.id],
+      active_segment_id: first.id,
+    });
+    expect(within(screen.getByRole("region", { name: "当前片段编辑器" }))
+      .getByLabelText("片段名称")).toHaveValue(first.title);
+    const batchInspector = screen.getByRole("region", { name: "批量片段编辑" });
+    expect(batchInspector).toHaveTextContent("已选择 3 个片段");
+    expect(batchInspector).toHaveTextContent("专属素材字段会重新初始化");
   });
 
-  it("拖动片段结束后的浏览器 click 不会误改运行选择", () => {
+  it("片段整块复用普通、Ctrl 和 Shift 手势更新同一选择", () => {
+    const state = createTimelineEditorState();
+    const first = state.project.segments[0];
+    const second = createTimelineSegment("fl2va", 2);
+    const third = createTimelineSegment("ref2va", 3);
+    state.project.segments = [first, second, third];
+    render(<Harness initial={state} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
+    expect(readState().selected_segment_ids).toEqual([second.id]);
+    expect(readState().active_segment_id).toBe(second.id);
+
+    fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ }), { ctrlKey: true });
+    expect(readState().selected_segment_ids).toEqual([second.id, first.id]);
+    expect(readState().active_segment_id).toBe(first.id);
+
+    fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 3：/ }), { shiftKey: true });
+    expect(readState().selected_segment_ids).toEqual([first.id, second.id, third.id]);
+    expect(readState().active_segment_id).toBe(third.id);
+  });
+
+  it("Shift 范围停留在目标可见轨，不会顺带选中另一轨片段", () => {
+    const state = createTimelineEditorState();
+    const first = state.project.segments[0];
+    const disabledSecond = { ...createTimelineSegment("fl2va", 2), enabled: false };
+    const third = createTimelineSegment("ref2va", 3);
+    const disabledFourth = { ...createTimelineSegment("ref2va", 4), enabled: false };
+    state.project.segments = [first, disabledSecond, third, disabledFourth];
+    state.selected_segment_ids = [first.id];
+    state.active_segment_id = first.id;
+    state.selection_anchor_id = first.id;
+    render(<Harness initial={state} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 3：/ }), {
+      shiftKey: true,
+    });
+
+    expect(readState()).toMatchObject({
+      selected_segment_ids: [first.id, third.id],
+      active_segment_id: third.id,
+      selection_anchor_id: first.id,
+    });
+    expect(screen.getByRole("checkbox", {
+      name: `多选停用片段 2：${disabledSecond.title}`,
+    })).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: /^选择停用片段 2：/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^选择停用片段 4：/ }), {
+      shiftKey: true,
+    });
+    expect(readState()).toMatchObject({
+      selected_segment_ids: [disabledSecond.id, disabledFourth.id],
+      active_segment_id: disabledFourth.id,
+      selection_anchor_id: disabledSecond.id,
+    });
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 3：/ }))
+      .toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /^禁用所选/ })).toBeDisabled();
+  });
+
+  it("拖动片段结束后的浏览器 click 不会误改单一选择", () => {
     const state = createTimelineEditorState();
     const first = state.project.segments[0];
     const second = createTimelineSegment("fl2va", 2);
     state.project.segments = [first, second];
-    state.run_selected_segment_ids = [first.id, second.id];
+    state.selected_segment_ids = [first.id, second.id];
     render(<Harness initial={state} />);
 
-    const firstClip = screen.getByRole("button", { name: /^运行片段 1：/ });
+    const firstClip = screen.getByRole("button", { name: /^聚焦并选择片段 1：/ });
     const dataTransfer = {
       effectAllowed: "none",
       dropEffect: "none",
@@ -1969,14 +2077,12 @@ describe("统一时间线关键交互", () => {
     fireEvent.dragEnd(firstClip, { dataTransfer });
     fireEvent.click(firstClip);
 
-    expect(readState().selected_segment_ids).toEqual([first.id]);
-    expect(readState().run_selected_segment_ids).toEqual([first.id, second.id]);
+    expect(readState().selected_segment_ids).toEqual([first.id, second.id]);
   });
 
-  it("停用轨用独立键盘按钮选择编辑，且不清空当前运行集合", () => {
+  it("停用轨可选择和多选，重新启用后仍保持选择", () => {
     let state = createTimelineEditorState();
     state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
-    const first = state.project.segments[0];
     const second = state.project.segments[1];
     state = timelineEditorReducer(state, {
       type: "segment/set-enabled",
@@ -1985,15 +2091,39 @@ describe("统一时间线关键交互", () => {
     });
     render(<Harness initial={state} />);
 
-    const editDisabled = screen.getByRole("button", {
-      name: new RegExp(`^编辑停用片段 2：${second.title}`),
+    const selectDisabled = screen.getByRole("button", {
+      name: new RegExp(`^选择停用片段 2：${second.title}`),
     });
-    const enable = screen.getByRole("button", { name: "启用" });
-    expect(editDisabled).not.toContainElement(enable);
-    expect(editDisabled.closest("article")).toContainElement(enable);
+    const selectCheckbox = screen.getByRole("checkbox", { name: `多选停用片段 2：${second.title}` });
+    const enable = screen.getByRole("button", { name: `启用片段 2：${second.title}` });
+    expect(selectDisabled).not.toContainElement(enable);
+    expect(selectDisabled.closest("article")).toContainElement(enable);
+    expect(selectCheckbox).toBeChecked();
 
-    fireEvent.click(editDisabled);
+    fireEvent.click(selectDisabled);
     expect(readState().selected_segment_ids).toEqual([second.id]);
-    expect(readState().run_selected_segment_ids).toEqual([first.id]);
+    expect(readState().active_segment_id).toBe(second.id);
+
+    fireEvent.click(enable);
+    expect(readState().project.segments.find((segment) => segment.id === second.id)?.enabled).toBe(true);
+    expect(readState().selected_segment_ids).toEqual([second.id]);
+  });
+
+  it("按钮和键盘删除多个片段时共用带数量的确认", async () => {
+    const user = userEvent.setup();
+    let state = createTimelineEditorState();
+    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    render(<Harness initial={state} />);
+
+    await user.click(screen.getByRole("button", { name: "删除所选" }));
+    expect(confirm).toHaveBeenNthCalledWith(1, expect.stringContaining("2 个片段"));
+    expect(readState().project.segments).toHaveLength(2);
+
+    const timeline = screen.getByRole("region", { name: "主时间线" });
+    timeline.focus();
+    fireEvent.keyDown(timeline, { key: "Delete" });
+    expect(confirm).toHaveBeenNthCalledWith(2, expect.stringContaining("2 个片段"));
+    expect(readState().project.segments).toHaveLength(1);
   });
 });

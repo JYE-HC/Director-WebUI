@@ -11,7 +11,7 @@
 - 顶栏「项目名」就是这份文档里的 `title` 字段（`project/patch` 只改这一个字段）。
 - 前端自动保存 WAL 只有一个槽位（`director-web:v4:timeline-wal`），按「活动数据库身份」绑定一份待写时间线。
 
-因此「新建一个长视频」只能覆盖这份单例，当前编辑内容随之丢弃。要支持多项目，需要在时间线文档之上引入「项目」实体，并让所有引用它的旁路（任务、素材级联删除、历史 take 账本、运行选择偏好、崩溃恢复 WAL）都按项目正确隔离。
+因此「新建一个长视频」只能覆盖这份单例，当前编辑内容随之丢弃。要支持多项目，需要在时间线文档之上引入「项目」实体，并让所有引用它的旁路（任务、素材级联删除、历史 take 账本、分段选择偏好、崩溃恢复 WAL）都按项目正确隔离。
 
 ## 2. 核心设计决策
 
@@ -61,14 +61,15 @@
 
 ## 5. 前端状态与 WAL
 
-- directorState 增加 projects: ProjectSummary[] 与 activeProjectId: string | null；时间线状态仍是 TimelineEditorState（project + 选择 + 播放头 + 运行集合）。
-- **运行集合偏好**（workspacePreferences）已按「数据库身份 + 全部分段 ID」键控，分段 ID 项目内唯一，多项目后天然隔离，无需改键；切项目时照常按目标项目分段恢复。
+- directorState 增加 projects: ProjectSummary[] 与 activeProjectId: string | null；时间线状态仍是 TimelineEditorState（project + 单一分段选择 + 当前检查器焦点 + 播放头）。实际可执行集合由 `selected ∩ enabled` 派生。
+- **分段选择偏好**（workspacePreferences）使用 v2 envelope，按「数据库身份 + project ID」键控，并保存启用和停用段组成的完整选择；切项目时先恢复目标项目自己的偏好，无记录才默认全选，不能因两个项目复用相同 segment ID 而继承来源项目子集。
 - **崩溃恢复 WAL 改为按项目分槽**：升级到 v5，键 director-web:v5:timeline-wal:<projectId>。保留 v4 单槽的隔离/迁移动线（旧键只归档不重放），复用现有 owner_id/quarantine 机制防跨标签页错清。
 - **切项目流程**（关键，必须 fail-closed）：
   1. 若当前项目有未确认 WAL，先 force-flush（await 服务器确认 + 清槽）再切；
-  2. 置 timelineHydrationStatus 为加载态，hydrateTimeline 读取目标项目槽位 WAL 或 GET /api/projects/{id}/timeline；
-  3. 恢复运行集合、播放头归零、清空预检报告与历史 take 的 current-snapshot 展示。
-  切换期间旧页面保持 inert，沿用现有「数据库身份变更 → 写冻结」的防护。
+  2. 用 latest-wins 世代读取目标项目槽位 WAL 或 GET /api/projects/{id}/timeline；选择当前项目、发起更新的切换、开始生成或预检都必须使旧请求失效；
+  3. 目标读取期间当前项目仍可编辑，因此权威交接前必须再次 force-flush，并复查切换世代与运行 intent；
+  4. 在同一同步交接中恢复单一分段选择、播放头归零、清空预检报告与历史 take 的 current-snapshot 展示。
+  任一步同步失败或请求已过期都保持当前项目不变，不能让迟到响应取得权威。
 
 ## 6. UI：项目切换器（顶栏）
 
@@ -97,7 +98,7 @@
 | current_project / current_snapshot | 与单例时间线比 | 与「活动项目」比（server 收 project_id 或 client 用 project_id 判断） |
 | 历史「加载任务来源项目」 | 覆盖单例 | 改为「另存为新项目」或询问覆盖 |
 | 前端 WAL | 单槽 v4 | 按项目分槽 v5 |
-| 运行集合偏好 | 已按分段 ID 隔离 | 无需改键 |
+| 分段选择偏好 | v2 按数据库身份 + project ID 隔离 | 切项目同步恢复，停用段也保留 |
 | default_timeline_draft 固定分段 ID | timeline-segment-1 | 每次生成全新 ID |
 
 ## 9. 分阶段实施
@@ -125,4 +126,4 @@
 - 项目标题 = 时间线文档 `title` 字段（单一权威），`projects.title` 列作为列表冗余并在保存/重命名时同步。
 - 顶栏项目切换器用原生 `<select>`（切换 + 新建），删除用独立按钮，重命名复用原顶栏标题就地编辑。
 - 任务抽屉「当前项目」仍按严格 timeline 相等（现有契约），列表端点新增 `project_id` 查询参数使比较按活动项目作用域。
-- 历史「加载任务来源项目」已改为「另存为新项目」：通过 `POST /api/projects/import` 原子创建新项目并切换，保留来源片段的稳定 ID 与显式运行集合，不再覆盖当前编辑中的项目。
+- 历史「加载任务来源项目」已改为「另存为新项目」：通过 `POST /api/projects/import` 原子创建新项目并切换，保留来源片段的稳定 ID 与显式分段选择，并立即写入新项目自己的选择偏好，不再覆盖当前编辑中的项目。

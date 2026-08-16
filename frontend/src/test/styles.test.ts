@@ -35,6 +35,43 @@ describe("数字输入框", () => {
   });
 });
 
+describe("时间线单一分段选择视觉", () => {
+  it("只保留实线变色选中态，并给卡片复选框足够命中区", () => {
+    const selectedRules = [...styles.matchAll(/\.timeline-clip\.is-selected\{([^}]*)\}/g)]
+      .map((match) => match[1]).join(";");
+    const selectionControlRules = [...styles.matchAll(/\.timeline-clip__selection\{([^}]*)\}/g)]
+      .map((match) => match[1]).join(";");
+    const disabledControlRules = [...styles.matchAll(/\.director-timeline__disabled-checkbox\{([^}]*)\}/g)]
+      .map((match) => match[1]).join(";");
+
+    expect(styles).not.toMatch(/is-run-selected|\.timeline-clip\.is-selected::before/);
+    expect(selectedRules).toMatch(/border-color\s*:\s*var\(--clip-color\)/);
+    expect(selectedRules).toMatch(/background\s*:\s*color-mix/);
+    expect(selectionControlRules).toMatch(/width\s*:\s*24px/);
+    expect(selectionControlRules).toMatch(/height\s*:\s*24px/);
+    expect(disabledControlRules).toMatch(/width\s*:\s*24px/);
+    expect(disabledControlRules).toMatch(/height\s*:\s*24px/);
+  });
+
+  it("浅色主题保留停用段选中色和禁用按钮可读 hover", () => {
+    const disabledSelectedRules = [...styles.matchAll(
+      /:root\[data-theme="light"\] \.director-timeline__disabled article\.is-selected\{([^}]*)\}/g,
+    )].map((match) => match[1]).join(";");
+    const disableHoverRule = styles.match(
+      /:root\[data-theme="light"\] \.timeline-disable-selected:hover:not\(:disabled\)\{([^}]*)\}/,
+    )?.[1];
+    const disabledSelectRule = styles.match(
+      /:root\[data-theme="light"\] \.director-timeline__disabled article \.director-timeline__disabled-select\{([^}]*)\}/,
+    )?.[1];
+
+    expect(disabledSelectedRules).toMatch(/background\s*:\s*color-mix/);
+    expect(disabledSelectedRules).toMatch(/box-shadow\s*:/);
+    expect(disableHoverRule).toMatch(/color\s*:\s*#873f3b/);
+    expect(disabledSelectRule).toMatch(/background\s*:\s*transparent/);
+    expect(disabledSelectRule).toMatch(/color\s*:\s*inherit/);
+  });
+});
+
 describe("源视频卡响应式布局", () => {
   it("侧边栏挤压工作区时仍保持素材和设置并排", () => {
     const sourceLayoutRule = styles.match(/\.segment-reference-grid__source-layout\{([^}]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\)[^}]*)\}/)?.[1];
