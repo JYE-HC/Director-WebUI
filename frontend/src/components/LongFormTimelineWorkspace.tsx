@@ -845,7 +845,7 @@ function SegmentInspector({
   const continuityHelp = !nativeContinuitySupported
     ? "当前原生分段子图不支持这个片段的连续性"
     : !segment.enabled
-      ? "片段参与时间线后才可读取前段尾帧"
+      ? "片段重新启用后才可读取前段尾帧"
       : !continuityBoundary
         ? "当前是第一个启用片段，没有可读取的前段"
         : continuityBoundary.kind === "explicit-first-image"
@@ -974,7 +974,7 @@ function SegmentInspector({
   return (
     <section
       className={`segment-inspector segment-inspector--${segment.mode}`}
-      aria-label="选中片段编辑器"
+      aria-label="当前片段编辑器"
       aria-busy={uploadingFiles}
       onDragOver={(event) => {
         if (hasSystemFileDrag(event)) {
@@ -1003,7 +1003,6 @@ function SegmentInspector({
       <header className="segment-inspector__controlbar">
         <h2 className="segment-inspector__title">片段编辑</h2>
         <Field label="片段名称" className="field--inline segment-inspector__name"><input maxLength={256} value={segment.title} onChange={(event) => updateBase({ title: event.target.value })} /></Field>
-        <label className="toggle segment-inspector__participation"><input type="checkbox" checked={segment.enabled} onChange={(event) => updateBase({ enabled: event.target.checked })} /><span />参与时间线</label>
         <span className="segment-inspector__divider" aria-hidden="true" />
         <div className="segment-inspector__continuity" role="group" aria-label="当前片段连续性" aria-describedby={continuityHelpId} title={continuityHelp}>
           <label className="toggle"><input aria-label="启用当前片段连续性" type="checkbox" disabled={!segment.continuity.enabled && !continuityCanEnable} checked={segment.continuity.enabled} onChange={(event) => replace({ ...segment, continuity: { ...segment.continuity, enabled: event.target.checked } } as TimelineSegment)} /><span />连续性</label>
@@ -1211,7 +1210,7 @@ export function LongFormTimelineWorkspace({
   const timelineScrubbingRef = useRef(false);
   const suppressSegmentClickRef = useRef<string | null>(null);
   const appendVideoInputRef = useRef<HTMLInputElement>(null);
-  const runAllCheckboxRef = useRef<HTMLInputElement>(null);
+  const selectAllCheckboxRef = useRef<HTMLInputElement>(null);
   const latestStateRef = useRef(state);
   latestStateRef.current = state;
   useEffect(() => {
@@ -1307,8 +1306,7 @@ export function LongFormTimelineWorkspace({
     : null;
   const selectedSegments = state.project.segments.filter((segment) => state.selected_segment_ids.includes(segment.id));
   const runnableSelection = runnableTimelineSegmentIds(state);
-  const enabledSegmentIds = state.project.segments.filter((segment) => segment.enabled).map((segment) => segment.id);
-  const runSelected = new Set(state.run_selected_segment_ids);
+  const runnableSelected = new Set(runnableSelection);
   const continuityBoundaries = timelineContinuityBoundaries(state.project);
   const continuityBoundaryByTarget = new Map(
     continuityBoundaries.map((boundary) => [boundary.segment.id, boundary]),
@@ -1340,11 +1338,12 @@ export function LongFormTimelineWorkspace({
   const activeContinuityBoundaryCount = continuityBoundaries.filter((boundary) =>
     boundary.kind === "eligible" &&
     boundary.segment.continuity.enabled &&
-    runSelected.has(boundary.predecessor.id) &&
-    runSelected.has(boundary.segment.id),
+    runnableSelected.has(boundary.predecessor.id) &&
+    runnableSelected.has(boundary.segment.id),
   ).length;
-  const effectiveRunSelectedCount = runnableSelection.length;
-  const activeSegment = selectedSegments.length === 1 ? selectedSegments[0] : null;
+  const activeSegment = state.active_segment_id
+    ? state.project.segments.find((segment) => segment.id === state.active_segment_id) ?? null
+    : null;
   const total = timelineDuration(state.project);
   const projectFps = Number.isFinite(state.project.render.fps) && state.project.render.fps > 0
     ? state.project.render.fps
@@ -1693,10 +1692,10 @@ export function LongFormTimelineWorkspace({
     state.project.render.fps]);
 
   useEffect(() => {
-    if (!runAllCheckboxRef.current) return;
-    runAllCheckboxRef.current.indeterminate =
-      effectiveRunSelectedCount > 0 && effectiveRunSelectedCount < enabledSegmentIds.length;
-  }, [effectiveRunSelectedCount, enabledSegmentIds.length]);
+    if (!selectAllCheckboxRef.current) return;
+    selectAllCheckboxRef.current.indeterminate =
+      selectedSegments.length > 0 && selectedSegments.length < state.project.segments.length;
+  }, [selectedSegments.length, state.project.segments.length]);
 
   useEffect(() => {
     setLivePreviewToken(0);
@@ -1794,6 +1793,16 @@ export function LongFormTimelineWorkspace({
     }
   }, [comparisonActive, originalPreviewIdentity, playbackRestartToken, previewIdentity, playing]);
 
+  const deleteSelectedSegments = () => {
+    const count = state.selected_segment_ids.length;
+    if (!count) return;
+    if (
+      count > 1 &&
+      !window.confirm(`确定删除所选的 ${count} 个片段吗？此操作会同时移除它们的时间线配置。`)
+    ) return;
+    onDispatch({ type: "segment/delete-selected" });
+  };
+
   const handleTimelineKey = (event: ReactKeyboardEvent) => {
     if (event.nativeEvent.isComposing || interactiveTimelineTarget(event.target)) return;
     const command = event.ctrlKey || event.metaKey;
@@ -1810,7 +1819,7 @@ export function LongFormTimelineWorkspace({
     if (command || event.altKey) return;
     if (event.key === "Delete" || event.key === "Backspace") {
       event.preventDefault();
-      onDispatch({ type: "segment/delete-selected" });
+      deleteSelectedSegments();
       return;
     }
     if (event.key === " ") {
@@ -1891,7 +1900,7 @@ export function LongFormTimelineWorkspace({
       return;
     }
     const firstVideo = assets.find((asset) => asset.kind === "video");
-    if (firstVideo) onDispatch({ type: "segment/insert-video", asset: firstVideo, anchorId: state.selected_segment_ids.at(-1) ?? null, position: "after" });
+    if (firstVideo) onDispatch({ type: "segment/insert-video", asset: firstVideo, anchorId: state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null, position: "after" });
     assetDropTargetRef.current = null;
     setAssetDropTarget(null);
   };
@@ -2139,33 +2148,48 @@ export function LongFormTimelineWorkspace({
           <button type="button" disabled={capabilities.connection !== "online" || detectingShots || activeSegment?.mode !== "ref2va" || !activeSegment.source_video || state.project.segments.length >= 128} onClick={() => void detectActiveSegmentShots()}>{detectingShots ? "检测中…" : "智能分割"}</button>
           <button type="button" disabled={!canMergeSelectedSegments(state)} onClick={() => onDispatch({ type: "segment/merge-selected" })}>合并所选</button>
           <button type="button" disabled={!state.selected_segment_ids.length || state.project.segments.length >= 128} onClick={() => onDispatch({ type: "segment/duplicate-selected" })}>复制片段</button>
-          <button type="button" className="is-danger" disabled={!state.selected_segment_ids.length} onClick={() => onDispatch({ type: "segment/delete-selected" })}>删除所选</button>
+          <button type="button" className="is-danger" disabled={!state.selected_segment_ids.length} onClick={deleteSelectedSegments}>删除所选</button>
         </div>
       </section>
 
       <section className="director-timeline" tabIndex={0} onKeyDown={handleTimelineKey} aria-label="主时间线">
         <header>
-          <div className="director-timeline__title"><strong>长视频编排</strong><small>点击片段选择运行 · Ctrl/⌘ 多选 · Shift 连选 · 拖动重排 · S 在播放头拆分</small></div>
+          <div className="director-timeline__title">
+            <strong>长视频编排</strong>
+            <div className="director-timeline__selection-controls" role="group" aria-label="分段选择与启用状态">
+              <label className="timeline-selection-filter"><input
+                ref={selectAllCheckboxRef}
+                type="checkbox"
+                checked={state.project.segments.length > 0 && selectedSegments.length === state.project.segments.length}
+                onChange={(event) => onDispatch({
+                  type: "segment/set-selection",
+                  ids: event.target.checked ? state.project.segments.map((segment) => segment.id) : [],
+                })}
+              /><span>全选</span></label>
+              <button
+                type="button"
+                className="timeline-disable-selected"
+                aria-label={`禁用所选，${runnableSelection.length} 个已启用片段`}
+                disabled={!runnableSelection.length}
+                onClick={() => onDispatch({ type: "segment/set-enabled", ids: runnableSelection, enabled: false })}
+              >禁用所选</button>
+            </div>
+          </div>
           <div className="director-timeline__summary" role="group" aria-label="项目摘要">
             <span className="director-timeline__metric"><b>{state.project.segments.length}</b><small>段</small></span>
             <span className="director-timeline__metric is-time"><b>{formatClock(total)}</b><small>总时长</small></span>
             <span className="director-timeline__metric"><b>{state.project.render.width}×{state.project.render.height}</b><small>{state.project.render.fps}fps</small></span>
             <em>{state.project.export_mode === "all" ? "组装完整视频" : "输出独立片段"}</em>
+            {configuredContinuityCount > 0 && <em className={`timeline-run-continuity ${blockingContinuityIssueCount ? "is-blocked" : ""}`} role="status" aria-live="polite">
+              {continuityRunIssues.length
+                ? continuityBlockedStatus
+                : activeContinuityBoundaryCount > 0
+                  ? `接续 ${activeContinuityBoundaryCount} 段`
+                  : "当前选择没有已启用的接续边界"}
+            </em>}
             {timelineToolNotice && <em role="status">{timelineToolNotice}</em>}
           </div>
           <div className="director-timeline__actions">
-            <div className="director-timeline__run-controls" role="group" aria-label="运行分段选择">
-              {configuredContinuityCount > 0 && <span className={`timeline-run-continuity ${blockingContinuityIssueCount ? "is-blocked" : ""}`} role="status" aria-live="polite">
-                {continuityRunIssues.length
-                  ? continuityBlockedStatus
-                  : activeContinuityBoundaryCount > 0
-                    ? `接续 ${activeContinuityBoundaryCount} 段`
-                    : "当前选择没有已启用的接续边界"}
-              </span>}
-              <label className="timeline-run-filter"><input ref={runAllCheckboxRef} type="checkbox" checked={enabledSegmentIds.length > 0 && effectiveRunSelectedCount === enabledSegmentIds.length} onChange={(event) => {
-                onDispatch({ type: "segment/set-run-selection", ids: event.target.checked ? enabledSegmentIds : [] });
-              }} /><span>全选</span></label>
-            </div>
             <div className="timeline-zoom-controls" role="group" aria-label="时间线缩放">
               <button type="button" aria-label="缩小时间线" disabled={timelineZoom <= TIMELINE_ZOOM_MIN} onClick={() => updateTimelineZoom(timelineZoom - 12)}>−</button>
               <input aria-label="时间线缩放比例" type="range" min={TIMELINE_ZOOM_MIN} max={TIMELINE_ZOOM_MAX} step="1" value={clampTimelineZoom(timelineZoom)} onChange={(event) => updateTimelineZoom(Number(event.target.value))} />
@@ -2220,7 +2244,7 @@ export function LongFormTimelineWorkspace({
               ? continuityBoundaryByTarget.get(segment.id) ?? null
               : null;
             const continuityIssue = continuityIssueByTarget.get(segment.id) ?? null;
-            const continuitySelected = runSelected.has(segment.id);
+            const continuitySelected = runnableSelected.has(segment.id);
             const continuityStatus = continuityBoundary
               ? continuityBoundary.kind === "explicit-first-image"
                 ? {
@@ -2246,7 +2270,7 @@ export function LongFormTimelineWorkspace({
                             short: "采样超限",
                             description: continuityIssue.message,
                           }
-                        : continuitySelected && runSelected.has(continuityBoundary.predecessor.id)
+                        : continuitySelected && runnableSelected.has(continuityBoundary.predecessor.id)
                           ? {
                               tone: "active",
                               short: "接续",
@@ -2264,7 +2288,7 @@ export function LongFormTimelineWorkspace({
             return (
               <article
                 key={segment.id}
-                className={`timeline-clip timeline-clip--${meta.accent} ${runSelected.has(segment.id) ? "is-run-selected" : ""} ${selected ? "is-selected" : ""} ${assetDropTarget?.id === segment.id ? `is-drop-${assetDropTarget.zone}` : ""}`}
+                className={`timeline-clip timeline-clip--${meta.accent} ${selected ? "is-selected" : ""} ${assetDropTarget?.id === segment.id ? `is-drop-${assetDropTarget.zone}` : ""}`}
                 style={{ left: `${start * timelineZoom}px`, width: `${Math.max(0, end - start) * timelineZoom}px` }}
                 data-start-seconds={start}
                 data-duration-seconds={Math.max(0, end - start)}
@@ -2337,9 +2361,9 @@ export function LongFormTimelineWorkspace({
                   type="button"
                   className="timeline-clip__select-surface"
                   draggable
-                  aria-label={`运行片段 ${index + 1}：${segment.title}`}
+                  aria-label={`聚焦并选择片段 ${index + 1}：${segment.title}`}
                   aria-describedby={continuityDescriptionId}
-                  aria-pressed={runSelected.has(segment.id)}
+                  aria-pressed={selected}
                   onClick={(event) => {
                     if (suppressSegmentClickRef.current === segment.id) {
                       suppressSegmentClickRef.current = null;
@@ -2369,12 +2393,12 @@ export function LongFormTimelineWorkspace({
                     <span className={`timeline-clip__continuity is-${continuityStatus.tone}`} title={continuityStatus.description}>{continuityStatus.short}</span>
                     <span id={continuityDescriptionId} className="sr-only">{continuityStatus.description}</span>
                   </>}
-                  <label className="timeline-clip__enabled" title="参与时间线"><input
+                  <label className="timeline-clip__selection" title={selected ? "移出多选" : "加入多选"}><input
                     type="checkbox"
-                    aria-label={`片段 ${index + 1} 参与时间线`}
-                    checked={segment.enabled}
+                    aria-label={`多选片段 ${index + 1}：${segment.title}`}
+                    checked={selected}
                     onClick={(event) => event.stopPropagation()}
-                    onChange={(event) => onDispatch({ type: "segment/set-enabled", ids: [segment.id], enabled: event.target.checked })}
+                    onChange={() => onDispatch({ type: "segment/toggle-selection", id: segment.id })}
                   /></label>
                 </header>
                 {assetDropTarget?.id === segment.id && <div className="timeline-clip__drop-hint" aria-live="polite">{assetDropTarget.zone === "before" ? "在此片段前新建 Ref2VA" : assetDropTarget.zone === "after" ? "在此片段后新建 Ref2VA" : "绑定当前片段素材"}</div>}
@@ -2402,14 +2426,30 @@ export function LongFormTimelineWorkspace({
             <button
               type="button"
               className="director-timeline__disabled-select"
-              aria-label={`编辑停用片段 ${index + 1}：${segment.title}`}
+              aria-label={`选择停用片段 ${index + 1}：${segment.title}`}
               aria-pressed={state.selected_segment_ids.includes(segment.id)}
               onClick={(event) => onDispatch({ type: "segment/select", id: segment.id, additive: event.ctrlKey || event.metaKey, range: event.shiftKey })}
             ><strong>{segment.title}</strong><small>{TIMELINE_MODE_META[segment.mode].shortLabel}</small></button>
-            <button type="button" onClick={() => onDispatch({ type: "segment/set-enabled", ids: [segment.id], enabled: true })}>启用</button>
+            <label className="director-timeline__disabled-checkbox" title={state.selected_segment_ids.includes(segment.id) ? "移出多选" : "加入多选"}><input
+              type="checkbox"
+              aria-label={`多选停用片段 ${index + 1}：${segment.title}`}
+              checked={state.selected_segment_ids.includes(segment.id)}
+              onClick={(event) => event.stopPropagation()}
+              onChange={() => onDispatch({ type: "segment/toggle-selection", id: segment.id })}
+            /></label>
+            <button
+              type="button"
+              aria-label={`启用片段 ${index + 1}：${segment.title}`}
+              onClick={() => onDispatch({ type: "segment/set-enabled", ids: [segment.id], enabled: true })}
+            >启用</button>
           </article>)}</div>
         </section>}
       </section>
+
+      {selectedSegments.length > 1 && <section className="segment-inspector segment-inspector--multi" aria-label="批量片段编辑">
+        <div><h2>已选择 {selectedSegments.length} 个片段</h2><p>检查器继续显示当前片段；批量切换模型族只保留名称、提示词、时长与启用状态，专属素材字段会重新初始化。</p></div>
+        <Field label="应用生成模式到所选"><select defaultValue="" onChange={(event) => { if (event.target.value) onDispatch({ type: "segment/set-mode", ids: state.selected_segment_ids, mode: event.target.value as TimelineGenerationMode }); event.currentTarget.value = ""; }}><option value="">选择模式…</option>{TIMELINE_MODE_ORDER.map((mode) => <option key={mode} value={mode}>{segmentModeLabel(mode)}</option>)}</select></Field>
+      </section>}
 
       {activeSegment ? <SegmentInspector
         state={state}
@@ -2422,9 +2462,8 @@ export function LongFormTimelineWorkspace({
         dropNotice={assetDropNotice}
         uploadingFiles={uploadingFiles}
       /> : (
-        <section className="segment-inspector segment-inspector--multi" aria-label="批量片段编辑">
-          <div><h2>已选择 {selectedSegments.length} 个片段</h2><p>可批量切换 FL2VA / Ref2VA。切换模型族只保留名称、提示词、时长与启用状态，专属素材字段会重新初始化。</p></div>
-          <Field label="应用生成模式到所选"><select defaultValue="" onChange={(event) => { if (event.target.value) onDispatch({ type: "segment/set-mode", ids: state.selected_segment_ids, mode: event.target.value as TimelineGenerationMode }); event.currentTarget.value = ""; }}><option value="">选择模式…</option>{TIMELINE_MODE_ORDER.map((mode) => <option key={mode} value={mode}>{segmentModeLabel(mode)}</option>)}</select></Field>
+        <section className="segment-inspector segment-inspector--empty" aria-label="当前片段编辑器">
+          <div><h2>未选择片段</h2><p>选择一个片段后可在这里编辑其生成配置。</p></div>
         </section>
       )}
     </main>

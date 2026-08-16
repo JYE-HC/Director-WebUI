@@ -20,6 +20,7 @@ import { MODE_ORDER, type AssetReference } from "../domain/modes";
 import {
   createTimelineProject,
   createTimelineSegment,
+  DEFAULT_PROJECT_ID,
   LEGACY_TIMELINE_STORAGE_KEY,
   QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY,
   QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY,
@@ -29,8 +30,8 @@ import {
   UNBOUND_TIMELINE_WAL_STORAGE_KEY,
 } from "../domain/timelineProject";
 import {
-  loadTimelineRunSelectionPreference,
-  saveTimelineRunSelectionPreference,
+  loadTimelineSegmentSelectionPreference,
+  saveTimelineSegmentSelectionPreference,
 } from "../domain/workspacePreferences";
 
 const ACTIVE_DATABASE_PATH = "/srv/director/data/director.sqlite3";
@@ -827,7 +828,10 @@ describe("统一长视频时间线应用", () => {
 
   it("快速连续编辑只同步最终快照，纯选择不触发时间线写入", async () => {
     const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments.push(createTimelineSegment("fl2va", 2));
     mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
     const update = vi.mocked(directorApi.updateTimeline);
 
     render(<App />);
@@ -838,11 +842,13 @@ describe("统一长视频时间线应用", () => {
 
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
-      segments: [expect.objectContaining({ prompt: "快速连续输入" })],
+      segments: expect.arrayContaining([expect.objectContaining({ prompt: "快速连续输入" })]),
     }));
     await waitFor(() => expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull());
 
-    await user.click(screen.getByRole("button", { name: /^运行片段 1：/ }));
+    await user.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ }))
+      .toHaveAttribute("aria-pressed", "false");
     await new Promise((resolve) => window.setTimeout(resolve, 250));
     expect(update).toHaveBeenCalledTimes(1);
   });
@@ -1177,7 +1183,7 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "全局设置" })).toHaveFocus());
   });
 
-  it("预检与生成主操作只渲染在顶栏右侧，并跟随运行片段数量", async () => {
+  it("预检与生成主操作只渲染在顶栏右侧，并跟随可执行选择数量", async () => {
     const user = userEvent.setup();
     mockCommonRequests();
 
@@ -1213,15 +1219,15 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
   });
 
-  it("按当前数据库恢复 timeline 运行集合，并在刷新后保留明确取消全选", async () => {
+  it("按当前数据库和项目恢复统一选择，并在刷新后保留明确取消全选", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     const second = createTimelineSegment("fl2va", 2);
     project.segments = [project.segments[0], second];
     const segmentIds = project.segments.map((segment) => segment.id);
-    saveTimelineRunSelectionPreference(
+    saveTimelineSegmentSelectionPreference(
       ACTIVE_DATABASE,
-      segmentIds,
+      DEFAULT_PROJECT_ID,
       segmentIds,
       [second.id],
     );
@@ -1230,28 +1236,26 @@ describe("统一长视频时间线应用", () => {
 
     const firstView = render(<App />);
     await waitUntilReady();
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: `运行片段 1：${project.segments[0].title}` }))
-        .toHaveAttribute("aria-pressed", "false");
-      expect(screen.getByRole("button", { name: `运行片段 2：${second.title}` }))
-        .toHaveAttribute("aria-pressed", "true");
-    });
+    expect(screen.getByRole("button", { name: `聚焦并选择片段 1：${project.segments[0].title}` }))
+      .toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: `聚焦并选择片段 2：${second.title}` }))
+      .toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "生成任务 1" })).toBeInTheDocument();
     expect(directorApi.updateTimeline).not.toHaveBeenCalled();
 
     const selectAll = screen.getByRole("checkbox", { name: "全选" });
     await user.click(selectAll);
-    await waitFor(() => expect(loadTimelineRunSelectionPreference(
+    await waitFor(() => expect(loadTimelineSegmentSelectionPreference(
       ACTIVE_DATABASE,
-      segmentIds,
+      DEFAULT_PROJECT_ID,
       segmentIds,
     )).toEqual(segmentIds));
     expect(screen.getByRole("button", { name: "生成任务 2" })).toBeInTheDocument();
 
     await user.click(selectAll);
-    await waitFor(() => expect(loadTimelineRunSelectionPreference(
+    await waitFor(() => expect(loadTimelineSegmentSelectionPreference(
       ACTIVE_DATABASE,
-      segmentIds,
+      DEFAULT_PROJECT_ID,
       segmentIds,
     )).toEqual([]));
     expect(screen.getByRole("button", { name: "生成任务 0" })).toBeDisabled();
@@ -1261,12 +1265,265 @@ describe("统一长视频时间线应用", () => {
     render(<App />);
     await waitUntilReady();
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: `运行片段 1：${project.segments[0].title}` }))
+      expect(screen.getByRole("button", { name: `聚焦并选择片段 1：${project.segments[0].title}` }))
         .toHaveAttribute("aria-pressed", "false");
-      expect(screen.getByRole("button", { name: `运行片段 2：${second.title}` }))
+      expect(screen.getByRole("button", { name: `聚焦并选择片段 2：${second.title}` }))
         .toHaveAttribute("aria-pressed", "false");
     });
     expect(screen.getByRole("button", { name: "生成任务 0" })).toBeDisabled();
+  });
+
+  it("切换到复用相同 segment ID 的项目时不继承上一项目的子集选择", async () => {
+    const user = userEvent.setup();
+    const projectA = createTimelineProject();
+    const second = createTimelineSegment("fl2va", 2);
+    projectA.title = "项目 A";
+    projectA.segments = [projectA.segments[0], second];
+    const projectB = structuredClone(projectA);
+    projectB.title = "项目 B";
+    projectB.segments = projectB.segments.map((segment, index) => ({
+      ...segment,
+      title: `B 片段 ${index + 1}`,
+    }));
+    const segmentIds = projectA.segments.map((segment) => segment.id);
+    saveTimelineSegmentSelectionPreference(
+      ACTIVE_DATABASE,
+      DEFAULT_PROJECT_ID,
+      segmentIds,
+      [second.id],
+    );
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      projects: [
+        {
+          id: DEFAULT_PROJECT_ID,
+          title: projectA.title,
+          created_at: "2026-08-12T00:00:00Z",
+          updated_at: "2026-08-12T00:00:00Z",
+          segment_count: 2,
+        },
+        {
+          id: "project-b",
+          title: projectB.title,
+          created_at: "2026-08-12T00:00:00Z",
+          updated_at: "2026-08-12T00:00:00Z",
+          segment_count: 2,
+        },
+      ],
+    });
+    vi.spyOn(directorApi, "getProjectTimeline").mockResolvedValue(projectB);
+
+    render(<App />);
+    await waitUntilReady();
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: /^聚焦并选择片段 1：/,
+    })).toHaveAttribute("aria-pressed", "false"));
+
+    await user.selectOptions(
+      await screen.findByRole("combobox", { name: "切换项目" }),
+      "project-b",
+    );
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: "全选" })).toBeChecked());
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：B 片段 1/ }))
+      .toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 2：B 片段 2/ }))
+      .toHaveAttribute("aria-pressed", "true");
+    expect(loadTimelineSegmentSelectionPreference(
+      ACTIVE_DATABASE,
+      "project-b",
+      segmentIds,
+    )).toBeNull();
+  });
+
+  it("快速切换项目时迟到的旧项目响应不能覆盖最新目标", async () => {
+    const projectA = createTimelineProject();
+    projectA.title = "项目 A";
+    const projectB = structuredClone(projectA);
+    projectB.title = "项目 B";
+    const projectC = structuredClone(projectA);
+    projectC.title = "项目 C";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      projects: [
+        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-c", title: projectC.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+      ],
+    });
+    let resolveProjectB!: (project: typeof projectB) => void;
+    const getProjectTimeline = vi.spyOn(directorApi, "getProjectTimeline")
+      .mockImplementation((projectId) => projectId === "project-b"
+        ? new Promise((resolve) => { resolveProjectB = resolve; })
+        : Promise.resolve(projectC));
+
+    render(<App />);
+    await waitUntilReady();
+    const switcher = await screen.findByRole("combobox", { name: "切换项目" });
+    fireEvent.change(switcher, { target: { value: "project-b" } });
+    await waitFor(() => expect(getProjectTimeline).toHaveBeenCalledWith("project-b", undefined));
+    fireEvent.change(switcher, { target: { value: "project-c" } });
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "重命名项目，当前名称：项目 C",
+    })).toBeInTheDocument());
+
+    await act(async () => resolveProjectB(projectB));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(screen.getByRole("button", { name: "重命名项目，当前名称：项目 C" }))
+      .toBeInTheDocument();
+  });
+
+  it("目标项目仍在加载时改回当前项目会取消迟到的切换", async () => {
+    const projectA = createTimelineProject();
+    projectA.title = "项目 A";
+    const projectB = structuredClone(projectA);
+    projectB.title = "项目 B";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      projects: [
+        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+      ],
+    });
+    let resolveProjectB!: (project: typeof projectB) => void;
+    const getProjectTimeline = vi.spyOn(directorApi, "getProjectTimeline")
+      .mockImplementation(() => new Promise((resolve) => { resolveProjectB = resolve; }));
+
+    render(<App />);
+    await waitUntilReady();
+    const switcher = await screen.findByRole("combobox", { name: "切换项目" });
+    fireEvent.change(switcher, { target: { value: "project-b" } });
+    await waitFor(() => expect(getProjectTimeline).toHaveBeenCalledWith("project-b", undefined));
+    fireEvent.change(switcher, { target: { value: DEFAULT_PROJECT_ID } });
+
+    await act(async () => resolveProjectB(projectB));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(switcher).toHaveValue(DEFAULT_PROJECT_ID);
+    expect(screen.getByRole("button", { name: "重命名项目，当前名称：项目 A" }))
+      .toBeInTheDocument();
+  });
+
+  it("目标项目加载期间的新编辑会在切换交接前同步", async () => {
+    const projectA = createTimelineProject();
+    projectA.title = "项目 A";
+    projectA.segments[0].prompt = "原提示词";
+    const projectB = structuredClone(projectA);
+    projectB.title = "项目 B";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      projects: [
+        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+      ],
+    });
+    let resolveProjectB!: (project: typeof projectB) => void;
+    vi.spyOn(directorApi, "getProjectTimeline")
+      .mockImplementation(() => new Promise((resolve) => { resolveProjectB = resolve; }));
+    const updateTimeline = vi.mocked(directorApi.updateTimeline);
+
+    render(<App />);
+    await waitUntilReady();
+    fireEvent.change(await screen.findByRole("combobox", { name: "切换项目" }), {
+      target: { value: "project-b" },
+    });
+    await waitFor(() => expect(directorApi.getProjectTimeline)
+      .toHaveBeenCalledWith("project-b", undefined));
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "加载等待期间的新提示词" },
+    });
+
+    await act(async () => resolveProjectB(projectB));
+    await waitFor(() => expect(updateTimeline).toHaveBeenCalledWith(expect.objectContaining({
+      title: "项目 A",
+      segments: expect.arrayContaining([
+        expect.objectContaining({ prompt: "加载等待期间的新提示词" }),
+      ]),
+    })));
+    expect(screen.getByRole("button", { name: "重命名项目，当前名称：项目 B" }))
+      .toBeInTheDocument();
+  });
+
+  it("只选择停用片段时明确阻止预检和生成，重新启用后自动恢复", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "启用片段";
+    const disabled = {
+      ...createTimelineSegment("fl2va", 2),
+      prompt: "停用片段",
+      enabled: false,
+    };
+    project.segments.push(disabled);
+    const segmentIds = project.segments.map((segment) => segment.id);
+    saveTimelineSegmentSelectionPreference(
+      ACTIVE_DATABASE,
+      DEFAULT_PROJECT_ID,
+      segmentIds,
+      [disabled.id],
+    );
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    const compile = vi.spyOn(directorApi, "compileTimeline");
+    const submit = vi.spyOn(directorApi, "createTimelineTask");
+
+    render(<App />);
+    await waitUntilReady();
+    await waitFor(() => expect(screen.getByRole("checkbox", {
+      name: `多选停用片段 2：${disabled.title}`,
+    })).toBeChecked());
+
+    expect(screen.getByRole("checkbox", { name: "全选" })).toBePartiallyChecked();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "所选片段均已停用；请启用至少一个所选片段后再生成",
+    );
+    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "生成任务 0" })).toBeDisabled();
+    expect(compile).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: `启用片段 2：${disabled.title}` }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "生成任务 1" })).toBeEnabled());
+    expect(screen.getByRole("checkbox", {
+      name: `多选片段 2：${disabled.title}`,
+    })).toBeChecked();
+  });
+
+  it("全选包含停用片段，但预检和生成 payload 只提交已启用交集", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    const first = { ...project.segments[0], prompt: "运行片段" };
+    const disabled = {
+      ...createTimelineSegment("ref2va", 2),
+      enabled: false,
+    };
+    project.segments = [first, disabled];
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    const compile = vi.spyOn(directorApi, "compileTimeline").mockRejectedValue(
+      new Error("仅检查请求边界"),
+    );
+    const submit = vi.spyOn(directorApi, "createTimelineTask").mockResolvedValue(queuedTimelineTask);
+
+    render(<App />);
+    await waitUntilReady();
+    expect(screen.getByRole("checkbox", { name: "全选" })).toBeChecked();
+    expect(screen.getByRole("checkbox", {
+      name: `多选停用片段 2：${disabled.title}`,
+    })).toBeChecked();
+    expect(screen.getByRole("button", { name: "生成任务 1" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "预检执行计划" }));
+    await waitFor(() => expect(compile).toHaveBeenCalledWith({
+      config: expect.objectContaining({ segments: expect.any(Array) }),
+      segment_ids: [first.id],
+    }));
+    await user.click(screen.getByRole("button", { name: "生成任务 1" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({
+      config: expect.objectContaining({ segments: expect.any(Array) }),
+      segment_ids: [first.id],
+    }));
   });
 
   it.each([320, 560])("%dpx 顶栏使用长短双标签且保持完整可访问名", async (width) => {
@@ -1446,10 +1703,10 @@ describe("统一长视频时间线应用", () => {
     expect(preflight).toBeEnabled();
     expect(generateAll).toBeEnabled();
 
-    await user.click(screen.getByRole("button", { name: /^运行片段 2：/ }));
+    await user.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
 
-    expect(screen.getByRole("button", { name: /^运行片段 1：/ })).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByRole("button", { name: /^运行片段 2：/ })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ })).toHaveAttribute("aria-pressed", "true");
     expect(preflight).toBeEnabled();
     const generateSelected = screen.getByRole("button", { name: "生成任务 1" });
     expect(generateSelected).toBeEnabled();
@@ -1466,7 +1723,7 @@ describe("统一长视频时间线应用", () => {
       config: expect.objectContaining({ segments: expect.any(Array) }),
       segment_ids: [second.id],
     }));
-    expect(screen.getByRole("button", { name: /^运行片段 1：/ })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ })).toHaveAttribute("aria-pressed", "false");
   });
 
   it("段间接续尾帧不足或内部采样超过 512 帧时在顶栏前直接阻断", async () => {
@@ -1605,7 +1862,37 @@ describe("统一长视频时间线应用", () => {
     fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "点击后的新版本" } });
     await user.click(screen.getByRole("button", { name: "删除所选" }));
     await act(async () => resolveUpdate(project));
-    await waitFor(() => expect(screen.getByText(/时间线在生成确认期间发生变化/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(
+      /时间线或分段选择在生成确认期间发生变化/,
+    )).toBeInTheDocument());
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("生成等待 exact revision 时若只改变分段选择也不提交旧集合", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    const first = { ...project.segments[0], prompt: "第一段" };
+    const second = { ...createTimelineSegment("fl2va", 2), prompt: "第二段" };
+    project.segments = [first, second];
+    saveLocalTimeline(project);
+    mockCommonRequests();
+    let resolveUpdate!: (value: typeof project) => void;
+    vi.mocked(directorApi.updateTimeline).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveUpdate = resolve; }),
+    );
+    const submit = vi.spyOn(directorApi, "createTimelineTask").mockResolvedValue(queuedTimelineTask);
+
+    render(<App />);
+    await waitUntilReady();
+    await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "生成任务 2" }));
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
+    await act(async () => resolveUpdate(project));
+
+    await waitFor(() => expect(screen.getByText(
+      /时间线或分段选择在生成确认期间发生变化/,
+    )).toBeInTheDocument());
     expect(submit).not.toHaveBeenCalled();
   });
 
@@ -1731,6 +2018,7 @@ describe("统一长视频时间线应用", () => {
       await user.click(screen.getByRole("button", { name: "预检执行计划" }));
       await waitFor(() => expect(directorApi.compileTimeline).toHaveBeenCalledTimes(1));
     }
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "移出素材库" }));
     expect(remove).not.toHaveBeenCalled();
     expect(cascade).not.toHaveBeenCalled();
@@ -1813,7 +2101,7 @@ describe("统一长视频时间线应用", () => {
       segment_ids: [first.id, second.id],
     }));
 
-    await user.click(screen.getByRole("button", { name: /^运行片段 2：/ }));
+    await user.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
     await act(async () => resolveCompile({
       execution_strategy: "native_segment_graph_v1",
       model_families: ["fl2va"],
@@ -3466,7 +3754,7 @@ describe("统一长视频时间线应用", () => {
     expect(directorApi.listTasks).toHaveBeenCalledTimes(readsBeforeUnmount);
   });
 
-  it("把历史来源项目另存为新项目并恢复显式运行集合", async () => {
+  it("把历史来源项目另存为新项目并持久化显式统一选择", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     const first = { ...project.segments[0], prompt: "历史第一段" };
@@ -3500,9 +3788,14 @@ describe("统一长视频时间线应用", () => {
     await user.click(await screen.findByRole("button", { name: "任务 job-term 的更多操作" }));
     await user.click(screen.getByRole("menuitem", { name: "另存为新项目" }));
 
-    await waitFor(() => expect(screen.getByRole("button", { name: /^运行片段 1：/ })).toHaveAttribute("aria-pressed", "false"));
-    expect(screen.getByRole("button", { name: /^运行片段 2：/ })).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() => expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ })).toHaveAttribute("aria-pressed", "false"));
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "生成任务 1" })).toBeEnabled();
+    await waitFor(() => expect(loadTimelineSegmentSelectionPreference(
+      ACTIVE_DATABASE,
+      imported.id,
+      project.segments.map((segment) => segment.id),
+    )).toEqual([second.id]));
 
     await user.click(screen.getByRole("button", { name: "预检执行计划" }));
     await waitFor(() => expect(compile).toHaveBeenCalledWith(

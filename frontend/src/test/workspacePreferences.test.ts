@@ -1,7 +1,7 @@
 import {
-  loadTimelineRunSelectionPreference,
+  loadTimelineSegmentSelectionPreference,
   loadTimelineWorkspacePreferences,
-  saveTimelineRunSelectionPreference,
+  saveTimelineSegmentSelectionPreference,
   saveTimelineWorkspacePreferences,
   TIMELINE_WORKSPACE_PREFERENCES_KEY,
 } from "../domain/workspacePreferences";
@@ -10,6 +10,7 @@ const DATABASE = {
   active_database_path: "/srv/director/data/director.sqlite3",
   active_database_identity: "a".repeat(64),
 };
+const PROJECT_ID = "project-a";
 
 beforeEach(() => localStorage.clear());
 
@@ -93,36 +94,57 @@ describe("时间线工作区浏览器偏好", () => {
     });
   });
 
-  it("按数据库身份恢复运行集合，并区分全选、子集和明确空集合", () => {
+  it("按数据库与项目恢复统一选择，并保留停用片段、全选意图和明确空集合", () => {
     const project = ["first", "second", "disabled"];
-    const enabled = ["first", "second"];
 
-    saveTimelineRunSelectionPreference(DATABASE, project, enabled, ["second"]);
-    expect(loadTimelineRunSelectionPreference(DATABASE, project, enabled)).toEqual(["second"]);
-    expect(loadTimelineRunSelectionPreference(
+    saveTimelineSegmentSelectionPreference(
       DATABASE,
-      [...project, "new"],
-      ["first", "second", "new"],
-    )).toEqual(["second"]);
-
-    saveTimelineRunSelectionPreference(DATABASE, project, enabled, enabled);
-    expect(loadTimelineRunSelectionPreference(
+      PROJECT_ID,
+      project,
+      ["second", "disabled"],
+    );
+    expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project))
+      .toEqual(["second", "disabled"]);
+    expect(loadTimelineSegmentSelectionPreference(
       DATABASE,
+      PROJECT_ID,
       [...project, "new"],
-      ["first", "second", "new"],
-    )).toEqual(["first", "second", "new"]);
+    )).toEqual(["second", "disabled"]);
 
-    saveTimelineRunSelectionPreference(DATABASE, project, enabled, []);
-    expect(loadTimelineRunSelectionPreference(DATABASE, project, enabled)).toEqual([]);
-    expect(loadTimelineRunSelectionPreference(DATABASE, ["replacement"], ["replacement"]))
+    saveTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project, project);
+    expect(loadTimelineSegmentSelectionPreference(
+      DATABASE,
+      PROJECT_ID,
+      [...project, "new"],
+    )).toEqual(["first", "second", "disabled", "new"]);
+
+    saveTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project, []);
+    expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project)).toEqual([]);
+    expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, ["replacement"]))
       .toBeNull();
-    expect(loadTimelineRunSelectionPreference({
+    expect(loadTimelineSegmentSelectionPreference({
       ...DATABASE,
       active_database_path: "/srv/director/other.sqlite3",
-    }, project, enabled)).toBeNull();
-    expect(loadTimelineRunSelectionPreference({
+    }, PROJECT_ID, project)).toBeNull();
+    expect(loadTimelineSegmentSelectionPreference({
       ...DATABASE,
       active_database_identity: "b".repeat(64),
-    }, project, enabled)).toBeNull();
+    }, PROJECT_ID, project)).toBeNull();
+    expect(loadTimelineSegmentSelectionPreference(DATABASE, "project-b", project)).toBeNull();
+  });
+
+  it("隔离旧运行选择 key 与损坏的 v2 envelope", () => {
+    const project = ["first", "disabled"];
+    localStorage.setItem(
+      `director-web:v1:timeline-run-selection:${DATABASE.active_database_identity}`,
+      JSON.stringify({ version: 1, selected_segment_ids: ["first"] }),
+    );
+    expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project)).toBeNull();
+
+    localStorage.setItem(
+      `director-web:v2:timeline-segment-selection:${DATABASE.active_database_identity}:${PROJECT_ID}`,
+      JSON.stringify({ version: 1 }),
+    );
+    expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project)).toBeNull();
   });
 });

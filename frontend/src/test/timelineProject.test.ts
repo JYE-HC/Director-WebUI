@@ -501,14 +501,73 @@ describe("统一 timeline domain", () => {
     state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
     const third = state.project.segments[2].id;
     state = timelineEditorReducer(state, { type: "segment/select", id: first });
-    expect(state.run_selected_segment_ids).toEqual([first]);
+    expect(runnableTimelineSegmentIds(state)).toEqual([first]);
+    expect(state.active_segment_id).toBe(first);
     state = timelineEditorReducer(state, { type: "segment/select", id: third, range: true });
     expect(state.selected_segment_ids).toEqual([first, second, third]);
-    expect(state.run_selected_segment_ids).toEqual([first, second, third]);
+    expect(state.active_segment_id).toBe(third);
+    expect(runnableTimelineSegmentIds(state)).toEqual([first, second, third]);
     state = timelineEditorReducer(state, { type: "segment/move", draggedId: third, targetId: first });
     expect(state.project.segments.map((segment) => segment.id)).toEqual([third, first, second]);
     expect(state.selected_segment_ids).toEqual([first, second, third]);
-    expect(state.run_selected_segment_ids).toEqual([first, second, third]);
+    expect(runnableTimelineSegmentIds(state)).toEqual([third, first, second]);
+  });
+
+  it("Shift 范围只覆盖目标所在轨道，不会隐式选中另一轨的片段", () => {
+    const first = createTimelineSegment("fl2va", 1);
+    const disabledSecond = { ...createTimelineSegment("fl2va", 2), enabled: false };
+    const third = createTimelineSegment("ref2va", 3);
+    const disabledFourth = { ...createTimelineSegment("ref2va", 4), enabled: false };
+    let state = createTimelineEditorState();
+    state.project.segments = [first, disabledSecond, third, disabledFourth];
+    state.selected_segment_ids = [first.id];
+    state.active_segment_id = first.id;
+    state.selection_anchor_id = first.id;
+
+    state = timelineEditorReducer(state, { type: "segment/select", id: third.id, range: true });
+    expect(state.selected_segment_ids).toEqual([first.id, third.id]);
+    expect(state.selected_segment_ids).not.toContain(disabledSecond.id);
+    expect(state.active_segment_id).toBe(third.id);
+    expect(state.selection_anchor_id).toBe(first.id);
+    expect(runnableTimelineSegmentIds(state)).toEqual([first.id, third.id]);
+
+    state = timelineEditorReducer(state, {
+      type: "segment/toggle-selection",
+      id: disabledSecond.id,
+    });
+    state = timelineEditorReducer(state, {
+      type: "segment/select",
+      id: third.id,
+      additive: true,
+      range: true,
+    });
+    expect(state.selected_segment_ids).toEqual([first.id, third.id, disabledSecond.id]);
+    expect(runnableTimelineSegmentIds(state)).toEqual([first.id, third.id]);
+
+    state = timelineEditorReducer(state, { type: "segment/select", id: disabledSecond.id });
+    state = timelineEditorReducer(state, {
+      type: "segment/select",
+      id: disabledFourth.id,
+      range: true,
+    });
+    expect(state.selected_segment_ids).toEqual([disabledSecond.id, disabledFourth.id]);
+    expect(state.selected_segment_ids).not.toContain(third.id);
+    expect(runnableTimelineSegmentIds(state)).toEqual([]);
+
+    state = timelineEditorReducer(state, { type: "segment/select", id: third.id, range: true });
+    expect(state.selected_segment_ids).toEqual([third.id]);
+    expect(state.selection_anchor_id).toBe(third.id);
+
+    state = timelineEditorReducer(state, {
+      type: "segment/select",
+      id: disabledSecond.id,
+      additive: true,
+      range: true,
+    });
+    expect(state.selected_segment_ids).toEqual([third.id, disabledSecond.id]);
+    expect(state.active_segment_id).toBe(disabledSecond.id);
+    expect(state.selection_anchor_id).toBe(disabledSecond.id);
+    expect(runnableTimelineSegmentIds(state)).toEqual([third.id]);
   });
 
   it("在片段 02 前插空段时分配新的默认编号且保留已有名称", () => {
@@ -532,8 +591,8 @@ describe("统一 timeline domain", () => {
       ...state,
       project: { ...state.project, segments },
       selected_segment_ids: [segments[3].id],
+      active_segment_id: segments[3].id,
       selection_anchor_id: segments[3].id,
-      run_selected_segment_ids: segments.map((segment) => segment.id),
     };
 
     const before = timelineEditorReducer(initial, { type: "segment/insert", position: "before" });
@@ -770,6 +829,8 @@ describe("统一 timeline domain", () => {
     expect(left).toMatchObject({ mode: "ref2va", duration_seconds: 2, source_start_seconds: 2, source_duration_seconds: 3 });
     expect(right).toMatchObject({ mode: "ref2va", duration_seconds: 6, source_start_seconds: 5, source_duration_seconds: 9 });
     expect(right.id).not.toBe(left.id);
+    expect(state.selected_segment_ids).toEqual([left.id, right.id]);
+    expect(state.active_segment_id).toBe(right.id);
   });
 
   it("智能分镜按全源 cut frame 原子拆分 V2V/RV2V，并拒绝过期结果", () => {
@@ -794,6 +855,7 @@ describe("统一 timeline domain", () => {
     ]);
     expect(split.project.segments[1].id).not.toBe(source.id);
     expect(split.selected_segment_ids).toEqual(split.project.segments.map((segment) => segment.id));
+    expect(split.active_segment_id).toBe(split.project.segments[0].id);
 
     const stale = splitTimelineSourceSegmentAtCuts(state, source.id, [5 * 24], 24, {
       ...expected,
@@ -825,6 +887,7 @@ describe("统一 timeline domain", () => {
       segment.mode === "ref2va" && segment.reference_images[0]?.id === image.id,
     )).toBe(true);
     expect(split.selected_segment_ids).toEqual(split.project.segments.map((segment) => segment.id));
+    expect(split.active_segment_id).toBe(split.project.segments[0].id);
 
     const oddFrameSource = {
       ...source,
@@ -854,24 +917,31 @@ describe("统一 timeline domain", () => {
       ids: project.segments.map((segment) => segment.id),
     });
     expect(state.selected_segment_ids).toEqual(project.segments.map((segment) => segment.id));
+    expect(state.active_segment_id).toBe(project.segments[0].id);
     state = timelineEditorReducer(state, { type: "segment/set-selection", ids: [] });
     expect(state.selected_segment_ids).toEqual([]);
+    expect(state.active_segment_id).toBeNull();
+    expect(state.selection_anchor_id).toBeNull();
+
+    state = timelineEditorReducer(state, { type: "project/replace", project: structuredClone(project) });
+    expect(state.selected_segment_ids).toEqual([]);
+    expect(state.active_segment_id).toBeNull();
     expect(state.selection_anchor_id).toBeNull();
   });
 
-  it("片段点击原子同步编辑选择和运行范围，启停仍按运行意图裁剪", () => {
+  it("用单一选择派生启用运行集合，禁用和重新启用不丢失选择", () => {
     let state = createTimelineEditorState();
     const first = state.project.segments[0].id;
     state = timelineEditorReducer(state, { type: "segment/insert", position: "after", mode: "ref2va" });
     const second = state.project.segments[1].id;
+    expect(state.selected_segment_ids).toEqual([first, second]);
     expect(runnableTimelineSegmentIds(state)).toEqual([first, second]);
 
     state = timelineEditorReducer(state, { type: "segment/select", id: first });
     expect(state.selected_segment_ids).toEqual([first]);
-    expect(state.run_selected_segment_ids).toEqual([first]);
     state = timelineEditorReducer(state, { type: "segment/select", id: second, additive: true });
     expect(state.selected_segment_ids).toEqual([first, second]);
-    expect(state.run_selected_segment_ids).toEqual([first, second]);
+    expect(state.active_segment_id).toBe(second);
 
     state = timelineEditorReducer(state, {
       type: "segment/set-enabled",
@@ -879,26 +949,33 @@ describe("统一 timeline domain", () => {
       enabled: false,
     });
     expect(runnableTimelineSegmentIds(state)).toEqual([first]);
-    expect(state.run_selected_segment_ids).toEqual([first]);
+    expect(state.selected_segment_ids).toEqual([first, second]);
+    expect(state.active_segment_id).toBe(second);
     expect(state.project.segments[1].enabled).toBe(false);
 
-    state = timelineEditorReducer(state, { type: "segment/select", id: second });
-    expect(state.selected_segment_ids).toEqual([second]);
-    expect(state.run_selected_segment_ids).toEqual([first]);
-
-    state = timelineEditorReducer(state, { type: "segment/set-selection", ids: [first, second] });
-    state = timelineEditorReducer(state, { type: "segment/set-run-selection", ids: [] });
+    state = timelineEditorReducer(state, {
+      type: "segment/set-enabled",
+      ids: [second],
+      enabled: true,
+    });
     expect(state.selected_segment_ids).toEqual([first, second]);
-    expect(state.run_selected_segment_ids).toEqual([]);
+    expect(runnableTimelineSegmentIds(state)).toEqual([first, second]);
+
+    state = timelineEditorReducer(state, { type: "segment/toggle-selection", id: first });
+    expect(state.selected_segment_ids).toEqual([second]);
+    expect(state.active_segment_id).toBe(second);
+    state = timelineEditorReducer(state, { type: "segment/toggle-selection", id: second });
+    expect(state.selected_segment_ids).toEqual([]);
+    expect(state.active_segment_id).toBeNull();
 
     let fallback = createTimelineEditorState();
     fallback = timelineEditorReducer(fallback, { type: "segment/delete-selected" });
     expect(runnableTimelineSegmentIds(fallback)).toEqual([fallback.project.segments[0].id]);
   });
 
-  it("无共享 ID 的项目替换保持单一编辑焦点，同时默认运行全部启用段", () => {
+  it("无共享 ID 的项目替换默认选择全部片段，并只运行其中启用段", () => {
     const first = createTimelineSegment("fl2va", 1);
-    const second = createTimelineSegment("ref2va", 2);
+    const second = { ...createTimelineSegment("ref2va", 2), enabled: false };
     const replacement = { ...createTimelineProject(), segments: [first, second] };
 
     const state = timelineEditorReducer(createTimelineEditorState(), {
@@ -906,21 +983,20 @@ describe("统一 timeline domain", () => {
       project: replacement,
     });
 
-    expect(state.selected_segment_ids).toEqual([first.id]);
-    expect(state.run_selected_segment_ids).toEqual([first.id, second.id]);
+    expect(state.selected_segment_ids).toEqual([first.id, second.id]);
+    expect(state.active_segment_id).toBe(first.id);
+    expect(runnableTimelineSegmentIds(state)).toEqual([first.id]);
   });
 
-  it("复制片段逐一继承各自源片段的运行勾选", () => {
+  it("复制片段后只选择副本并把第一个副本设为活动片段", () => {
     let state = createTimelineEditorState();
     state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
-    const [first, second] = state.project.segments.map((segment) => segment.id);
-    state = timelineEditorReducer(state, { type: "segment/set-run-selection", ids: [second] });
-    state = timelineEditorReducer(state, { type: "segment/set-selection", ids: [first, second] });
     state = timelineEditorReducer(state, { type: "segment/duplicate-selected" });
 
     const copiedIds = state.selected_segment_ids;
     expect(copiedIds).toHaveLength(2);
-    expect(runnableTimelineSegmentIds(state)).toEqual([second, copiedIds[1]]);
+    expect(state.active_segment_id).toBe(copiedIds[0]);
+    expect(runnableTimelineSegmentIds(state)).toEqual(copiedIds);
   });
 
   it("将绝对播放头定位到稳定片段，并按比例映射 V2V 源时间", () => {
@@ -1086,11 +1162,19 @@ describe("统一 timeline domain", () => {
     let state = createTimelineEditorState();
     const first = { ...createTimelineSegment("ref2va", 1), prompt: "重绘", source_video: video, source_start_seconds: 0, source_duration_seconds: 4, duration_seconds: 4 };
     const second = { ...createTimelineSegment("ref2va", 2), prompt: "重绘", source_video: video, source_start_seconds: 4, source_duration_seconds: 4, duration_seconds: 4 };
-    state = { ...state, project: { ...state.project, segments: [first, second] }, selected_segment_ids: [first.id, second.id], selection_anchor_id: first.id, run_selected_segment_ids: [second.id] };
+    state = {
+      ...state,
+      project: { ...state.project, segments: [first, second] },
+      selected_segment_ids: [first.id, second.id],
+      active_segment_id: first.id,
+      selection_anchor_id: first.id,
+    };
     expect(canMergeSelectedSegments(state)).toBe(true);
     state = timelineEditorReducer(state, { type: "segment/merge-selected" });
     expect(state.project.segments).toHaveLength(1);
     expect(state.project.segments[0]).toMatchObject({ duration_seconds: 8, source_duration_seconds: 8 });
+    expect(state.selected_segment_ids).toEqual([first.id]);
+    expect(state.active_segment_id).toBe(first.id);
     expect(runnableTimelineSegmentIds(state)).toEqual([first.id]);
 
     const incompatible = createTimelineEditorState();
@@ -1098,6 +1182,18 @@ describe("统一 timeline domain", () => {
     const b = { ...createTimelineSegment("fl2va", 2), first_image: { ...image, id: "different-image" } };
     const flState = { ...incompatible, project: { ...incompatible.project, segments: [a, b] }, selected_segment_ids: [a.id, b.id] };
     expect(canMergeSelectedSegments(flState)).toBe(false);
+
+    const mixedEnabledState = {
+      ...incompatible,
+      project: {
+        ...incompatible.project,
+        segments: [first, { ...second, enabled: false }],
+      },
+      selected_segment_ids: [first.id, second.id],
+      active_segment_id: first.id,
+      selection_anchor_id: first.id,
+    };
+    expect(canMergeSelectedSegments(mixedEnabledState)).toBe(false);
   });
 
   it("normalizer 按模式白名单剥离 UI 和其他模式字段", () => {

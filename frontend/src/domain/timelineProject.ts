@@ -225,11 +225,11 @@ export interface TimelineContinuityRunIssue {
 export interface TimelineEditorState {
   project: TimelineProject;
   assets: AssetReference[];
-  /** Editing focus/selection. Direct clip gestures mirror enabled IDs into the run set. */
+  /** The single user-visible segment selection used by editing and execution. */
   selected_segment_ids: string[];
+  /** The selected segment shown in the inspector; this is focus, not a second selection. */
+  active_segment_id: string | null;
   selection_anchor_id: string | null;
-  /** Browser-persisted run set, intentionally kept outside server project data. */
-  run_selected_segment_ids: string[];
   selected_asset_ids: string[];
   asset_grid_size: AssetGridSize;
   playhead_seconds: number;
@@ -466,8 +466,8 @@ export function createTimelineEditorState(): TimelineEditorState {
     project,
     assets: [],
     selected_segment_ids: [project.segments[0].id],
+    active_segment_id: project.segments[0].id,
     selection_anchor_id: project.segments[0].id,
-    run_selected_segment_ids: [project.segments[0].id],
     selected_asset_ids: [],
     asset_grid_size: "medium",
     playhead_seconds: 0,
@@ -593,11 +593,17 @@ export function selectTimelineSegment(
 ): TimelineEditorState {
   const index = timelineIndexById(state.project, id);
   if (index < 0) return state;
+  const target = state.project.segments[index];
   if (options.range && state.selection_anchor_id) {
-    const anchor = timelineIndexById(state.project, state.selection_anchor_id);
-    if (anchor >= 0) {
-      const [start, end] = anchor < index ? [anchor, index] : [index, anchor];
-      const range = state.project.segments
+    // Enabled and disabled clips are rendered in separate rails. Compute a
+    // Shift range from the target rail's visible order so a disabled segment
+    // hidden between two main-track clips is never selected implicitly.
+    const rail = state.project.segments.filter((segment) => segment.enabled === target.enabled);
+    const anchor = rail.findIndex((segment) => segment.id === state.selection_anchor_id);
+    const railIndex = rail.findIndex((segment) => segment.id === id);
+    if (anchor >= 0 && railIndex >= 0) {
+      const [start, end] = anchor < railIndex ? [anchor, railIndex] : [railIndex, anchor];
+      const range = rail
         .slice(start, end + 1)
         .map((segment) => segment.id);
       return {
@@ -605,6 +611,7 @@ export function selectTimelineSegment(
         selected_segment_ids: options.additive
           ? [...new Set([...state.selected_segment_ids, ...range])]
           : range,
+        active_segment_id: id,
       };
     }
   }
@@ -613,29 +620,51 @@ export function selectTimelineSegment(
     const selected = exists
       ? state.selected_segment_ids.filter((candidate) => candidate !== id)
       : [...state.selected_segment_ids, id];
+    const active = exists
+      ? state.active_segment_id === id
+        ? selected.at(-1) ?? null
+        : state.active_segment_id
+      : id;
     return {
       ...state,
-      selected_segment_ids: selected.length ? selected : [id],
-      selection_anchor_id: id,
+      selected_segment_ids: selected,
+      active_segment_id: active,
+      selection_anchor_id: exists ? active : id,
     };
   }
-  return { ...state, selected_segment_ids: [id], selection_anchor_id: id };
+  return {
+    ...state,
+    selected_segment_ids: [id],
+    active_segment_id: id,
+    selection_anchor_id: id,
+  };
+}
+
+/** Toggle membership from the explicit clip checkbox without moving edit focus. */
+export function toggleTimelineSegmentSelection(
+  state: TimelineEditorState,
+  id: string,
+): TimelineEditorState {
+  if (timelineIndexById(state.project, id) < 0) return state;
+  const exists = state.selected_segment_ids.includes(id);
+  const selected = exists
+    ? state.selected_segment_ids.filter((candidate) => candidate !== id)
+    : [...state.selected_segment_ids, id];
+  const active = exists && state.active_segment_id === id
+    ? selected.at(-1) ?? null
+    : state.active_segment_id ?? id;
+  return {
+    ...state,
+    selected_segment_ids: selected,
+    active_segment_id: active,
+    selection_anchor_id: state.selection_anchor_id === id
+      ? active
+      : state.selection_anchor_id ?? active,
+  };
 }
 
 function touchProject(project: TimelineProject, segments: TimelineSegment[]): TimelineProject {
   return { ...project, segments };
-}
-
-function enabledTimelineSegmentIds(project: TimelineProject): string[] {
-  return project.segments
-    .filter((segment) => segment.enabled)
-    .map((segment) => segment.id);
-}
-
-/** Whether the current explicit run set represents every enabled segment. */
-function runSelectionCoversAllEnabled(state: TimelineEditorState): boolean {
-  const selected = new Set(state.run_selected_segment_ids);
-  return enabledTimelineSegmentIds(state.project).every((id) => selected.has(id));
 }
 
 export function insertTimelineSegment(
@@ -644,8 +673,7 @@ export function insertTimelineSegment(
   mode: TimelineGenerationMode = "fl2va",
 ): TimelineEditorState {
   if (state.project.segments.length >= 128) return state;
-  const selectedAllForRun = runSelectionCoversAllEnabled(state);
-  const selectedId = state.selected_segment_ids.at(-1);
+  const selectedId = state.active_segment_id ?? state.selected_segment_ids.at(-1);
   const selectedIndex = selectedId
     ? timelineIndexById(state.project, selectedId)
     : state.project.segments.length - 1;
@@ -655,14 +683,13 @@ export function insertTimelineSegment(
   const segment = createTimelineSegment(mode, nextDefaultTimelineSegmentNumber(state.project));
   const segments = [...state.project.segments];
   segments.splice(insertionIndex, 0, segment);
+  const selected = new Set([...state.selected_segment_ids, segment.id]);
   return {
     ...state,
     project: touchProject(state.project, segments),
-    selected_segment_ids: [segment.id],
+    selected_segment_ids: segments.filter((item) => selected.has(item.id)).map((item) => item.id),
+    active_segment_id: segment.id,
     selection_anchor_id: segment.id,
-    run_selected_segment_ids: selectedAllForRun
-      ? [...state.run_selected_segment_ids, segment.id]
-      : state.run_selected_segment_ids,
   };
 }
 
@@ -674,7 +701,7 @@ export function insertTimelineVideoAsset(
   return insertTimelineVideoAssetAtAnchor(
     state,
     asset,
-    state.selected_segment_ids.at(-1) ?? null,
+    state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null,
     position,
   );
 }
@@ -687,7 +714,6 @@ export function insertTimelineVideoAssetAtAnchor(
   position: "before" | "after" = "after",
 ): TimelineEditorState {
   if (asset.kind !== "video" || state.project.segments.length >= 128) return state;
-  const selectedAllForRun = runSelectionCoversAllEnabled(state);
   const anchorIndex = anchorId ? timelineIndexById(state.project, anchorId) : -1;
   const fallbackIndex = state.selected_segment_ids.at(-1)
     ? timelineIndexById(state.project, state.selected_segment_ids.at(-1) as string)
@@ -714,14 +740,13 @@ export function insertTimelineVideoAssetAtAnchor(
   };
   const segments = [...state.project.segments];
   segments.splice(insertionIndex, 0, segment);
+  const selected = new Set([...state.selected_segment_ids, segment.id]);
   return {
     ...state,
     project: touchProject(state.project, segments),
-    selected_segment_ids: [segment.id],
+    selected_segment_ids: segments.filter((item) => selected.has(item.id)).map((item) => item.id),
+    active_segment_id: segment.id,
     selection_anchor_id: segment.id,
-    run_selected_segment_ids: selectedAllForRun
-      ? [...state.run_selected_segment_ids, segment.id]
-      : state.run_selected_segment_ids,
   };
 }
 
@@ -742,7 +767,6 @@ export function moveTimelineSegment(
 export function deleteSelectedSegments(state: TimelineEditorState): TimelineEditorState {
   const selected = new Set(state.selected_segment_ids);
   if (!selected.size) return state;
-  const selectedAllForRun = runSelectionCoversAllEnabled(state);
   let segments = state.project.segments.filter((segment) => !selected.has(segment.id));
   const createdFallback = segments.length === 0;
   if (createdFallback) segments = [createTimelineSegment("fl2va", 1)];
@@ -754,10 +778,8 @@ export function deleteSelectedSegments(state: TimelineEditorState): TimelineEdit
     ...state,
     project: touchProject(state.project, segments),
     selected_segment_ids: [first.id],
+    active_segment_id: first.id,
     selection_anchor_id: first.id,
-    run_selected_segment_ids: createdFallback && selectedAllForRun
-      ? [first.id]
-      : state.run_selected_segment_ids.filter((id) => !selected.has(id)),
   });
 }
 
@@ -778,9 +800,11 @@ function mergeCompatible(
 ): boolean {
   if (!selected.length) return false;
   const mode = selected[0].mode;
+  const enabled = selected[0].enabled;
   const duration = selected.reduce((total, segment) => total + segment.duration_seconds, 0);
   if (
     selected.some((segment) => segment.mode !== mode) ||
+    selected.some((segment) => segment.enabled !== enabled) ||
     !Number.isFinite(duration) ||
     duration <= 0 ||
     duration > 120 ||
@@ -839,7 +863,6 @@ export function mergeSelectedSegments(state: TimelineEditorState): TimelineEdito
   const selected = selectedContiguousSegments(state);
   if (!selected) return state;
   const selectedIds = new Set(selected.map((segment) => segment.id));
-  const selectedForRun = selected.some((segment) => state.run_selected_segment_ids.includes(segment.id));
   const first = selected[0];
   const merged = {
     ...first,
@@ -867,18 +890,14 @@ export function mergeSelectedSegments(state: TimelineEditorState): TimelineEdito
     ...state,
     project: touchProject(state.project, segments),
     selected_segment_ids: [merged.id],
+    active_segment_id: merged.id,
     selection_anchor_id: merged.id,
-    run_selected_segment_ids: segments
-      .map((segment) => segment.id)
-      .filter((id) => id === merged.id
-        ? selectedForRun
-        : state.run_selected_segment_ids.includes(id)),
   });
 }
 
 export function canSplitSelectedSegment(state: TimelineEditorState): boolean {
-  if (state.project.segments.length >= 128 || state.selected_segment_ids.length !== 1) return false;
-  const id = state.selected_segment_ids[0];
+  if (state.project.segments.length >= 128 || !state.active_segment_id) return false;
+  const id = state.active_segment_id;
   const segment = state.project.segments.find((candidate) => candidate.id === id);
   if (!segment?.enabled) return false;
   const position = timelineSegmentAt(state.project, state.playhead_seconds);
@@ -894,7 +913,7 @@ export function canSplitSelectedSegment(state: TimelineEditorState): boolean {
 
 export function splitSelectedSegment(state: TimelineEditorState): TimelineEditorState {
   if (!canSplitSelectedSegment(state)) return state;
-  const id = state.selected_segment_ids[0];
+  const id = state.active_segment_id as string;
   const index = timelineIndexById(state.project, id);
   const source = state.project.segments[index];
   const position = timelineSegmentAt(state.project, state.playhead_seconds);
@@ -920,11 +939,9 @@ export function splitSelectedSegment(state: TimelineEditorState): TimelineEditor
   return clampTimelinePlayhead({
     ...state,
     project: touchProject(state.project, segments),
-    selected_segment_ids: [right.id],
+    selected_segment_ids: [left.id, right.id],
+    active_segment_id: right.id,
     selection_anchor_id: right.id,
-    run_selected_segment_ids: state.run_selected_segment_ids.includes(source.id)
-      ? state.run_selected_segment_ids.flatMap((id) => id === source.id ? [left.id, right.id] : [id])
-      : state.run_selected_segment_ids,
   });
 }
 
@@ -991,11 +1008,8 @@ export function splitTimelineSourceSegmentAtCuts(
     ...state,
     project: touchProject(state.project, segments),
     selected_segment_ids: replacements.map((segment) => segment.id),
+    active_segment_id: replacements[0].id,
     selection_anchor_id: replacements[0].id,
-    run_selected_segment_ids: state.run_selected_segment_ids.includes(source.id)
-      ? state.run_selected_segment_ids.flatMap((id) =>
-          id === source.id ? replacements.map((segment) => segment.id) : [id])
-      : state.run_selected_segment_ids,
   });
 }
 
@@ -1067,16 +1081,8 @@ export function duplicateSelectedSegments(state: TimelineEditorState): TimelineE
     ...state,
     project: touchProject(state.project, segments),
     selected_segment_ids: copies.map((segment) => segment.id),
+    active_segment_id: copies[0].id,
     selection_anchor_id: copies[0].id,
-    // A duplicate inherits the source segment's execution checkbox. This is
-    // independent from whether the rest of the timeline happens to be fully
-    // selected for execution.
-    run_selected_segment_ids: [
-      ...state.run_selected_segment_ids,
-      ...copies
-        .filter((_, index) => state.run_selected_segment_ids.includes(sources[index].id))
-        .map((segment) => segment.id),
-    ],
   };
 }
 
@@ -1216,8 +1222,8 @@ export type TimelineAction =
   | { type: "project/replace"; project: TimelineProject }
   | { type: "project/patch"; patch: Partial<Pick<TimelineProject, "title" | "render" | "sampling" | "export_mode">> }
   | { type: "segment/select"; id: string; additive?: boolean; range?: boolean }
+  | { type: "segment/toggle-selection"; id: string }
   | { type: "segment/set-selection"; ids: string[] }
-  | { type: "segment/set-run-selection"; ids: string[] }
   | { type: "segment/set-enabled"; ids: string[]; enabled: boolean }
   | { type: "segment/insert"; position: "before" | "after"; mode?: TimelineGenerationMode }
   | { type: "segment/insert-video"; position?: "before" | "after"; anchorId?: string | null; asset: AssetReference }
@@ -1252,24 +1258,24 @@ export function timelineEditorReducer(
 ): TimelineEditorState {
   switch (action.type) {
     case "project/replace": {
-      const first = action.project.segments[0];
       const ids = new Set(action.project.segments.map((segment) => segment.id));
-      const selected = state.selected_segment_ids.filter((id) => ids.has(id));
-      const selectedAllForRun = runSelectionCoversAllEnabled(state);
       const sharesSegmentIdentity = state.project.segments.some((segment) => ids.has(segment.id));
-      const runSelected = selectedAllForRun || !sharesSegmentIdentity
-        ? enabledTimelineSegmentIds(action.project)
-        : action.project.segments
-            .filter((segment) => segment.enabled && state.run_selected_segment_ids.includes(segment.id))
-            .map((segment) => segment.id);
+      const selectedAll = state.project.segments.length > 0 &&
+        state.project.segments.every((segment) => state.selected_segment_ids.includes(segment.id));
+      const selected = selectedAll || !sharesSegmentIdentity
+        ? action.project.segments.map((segment) => segment.id)
+        : state.selected_segment_ids.filter((id) => ids.has(id));
+      const active = state.active_segment_id && selected.includes(state.active_segment_id)
+        ? state.active_segment_id
+        : selected[0] ?? null;
       return clampTimelinePlayhead({
         ...state,
         project: action.project,
-        selected_segment_ids: selected.length ? selected : first ? [first.id] : [],
-        selection_anchor_id: state.selection_anchor_id && ids.has(state.selection_anchor_id)
+        selected_segment_ids: selected,
+        active_segment_id: active,
+        selection_anchor_id: state.selection_anchor_id && selected.includes(state.selection_anchor_id)
           ? state.selection_anchor_id
-          : selected[0] ?? first?.id ?? null,
-        run_selected_segment_ids: runSelected,
+          : active,
       });
     }
     case "project/patch":
@@ -1283,32 +1289,13 @@ export function timelineEditorReducer(
     case "segment/select": {
       const target = state.project.segments.find((segment) => segment.id === action.id);
       if (!target) return state;
-      // Disabled clips remain editor-selectable, but cannot participate in a
-      // run. Selecting one from the disabled rail must not erase the current
-      // runnable set.
-      if (!target.enabled) {
-        const selected = selectTimelineSegment(state, action.id, action);
-        return selected.selected_asset_ids.length
-          ? { ...selected, selected_asset_ids: [] }
-          : selected;
-      }
-      // Direct gestures operate on the prominently displayed run set. This
-      // also reconciles a temporary edit/run divergence caused by header or
-      // structural commands (for example: edit focus A, run selection B,
-      // Ctrl-click A should add A to B rather than accidentally clear B).
-      const selected = selectTimelineSegment({
-        ...state,
-        selected_segment_ids: state.project.segments
-          .filter((segment) => segment.enabled && state.run_selected_segment_ids.includes(segment.id))
-          .map((segment) => segment.id),
-      }, action.id, action);
-      const next = {
-        ...selected,
-        run_selected_segment_ids: selected.project.segments
-          .filter((segment) =>
-            segment.enabled && selected.selected_segment_ids.includes(segment.id))
-          .map((segment) => segment.id),
-      };
+      const next = selectTimelineSegment(state, action.id, action);
+      return next.selected_asset_ids.length
+        ? { ...next, selected_asset_ids: [] }
+        : next;
+    }
+    case "segment/toggle-selection": {
+      const next = toggleTimelineSegmentSelection(state, action.id);
       return next.selected_asset_ids.length
         ? { ...next, selected_asset_ids: [] }
         : next;
@@ -1318,25 +1305,21 @@ export function timelineEditorReducer(
       const selected = state.project.segments
         .map((segment) => segment.id)
         .filter((id) => requested.has(id));
+      const active = state.active_segment_id && selected.includes(state.active_segment_id)
+        ? state.active_segment_id
+        : selected[0] ?? null;
       return {
         ...state,
         selected_segment_ids: selected,
-        selection_anchor_id: selected.at(-1) ?? null,
+        active_segment_id: active,
+        selection_anchor_id: state.selection_anchor_id && selected.includes(state.selection_anchor_id)
+          ? state.selection_anchor_id
+          : active,
         selected_asset_ids: selected.length ? [] : state.selected_asset_ids,
-      };
-    }
-    case "segment/set-run-selection": {
-      const requested = new Set(action.ids);
-      return {
-        ...state,
-        run_selected_segment_ids: state.project.segments
-          .filter((segment) => segment.enabled && requested.has(segment.id))
-          .map((segment) => segment.id),
       };
     }
     case "segment/set-enabled": {
       const ids = new Set(action.ids);
-      const selectedAllForRun = runSelectionCoversAllEnabled(state);
       const project = touchProject(
         state.project,
         state.project.segments.map((segment) =>
@@ -1345,10 +1328,6 @@ export function timelineEditorReducer(
       return clampTimelinePlayhead({
         ...state,
         project,
-        run_selected_segment_ids: action.enabled && selectedAllForRun
-          ? enabledTimelineSegmentIds(project)
-          : state.run_selected_segment_ids.filter((id) =>
-              !ids.has(id) && project.segments.some((segment) => segment.enabled && segment.id === id)),
       });
     }
     case "segment/insert":
@@ -1357,7 +1336,7 @@ export function timelineEditorReducer(
       return insertTimelineVideoAssetAtAnchor(
         state,
         action.asset,
-        action.anchorId ?? state.selected_segment_ids.at(-1) ?? null,
+        action.anchorId ?? state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null,
         action.position,
       );
     case "segment/move":
@@ -1386,9 +1365,13 @@ export function timelineEditorReducer(
       const updated = updateTimelineSegment(state, action.id, (segment) =>
         assignAssetToSegment(segment, action.asset, action.target));
       if (!action.select || updated === state) return updated;
+      const selected = new Set([...updated.selected_segment_ids, action.id]);
       return {
         ...updated,
-        selected_segment_ids: [action.id],
+        selected_segment_ids: updated.project.segments
+          .filter((segment) => selected.has(segment.id))
+          .map((segment) => segment.id),
+        active_segment_id: action.id,
         selection_anchor_id: action.id,
         selected_asset_ids: [],
       };
@@ -1404,9 +1387,13 @@ export function timelineEditorReducer(
         return result.segment;
       });
       if (!action.select || !bound) return updated;
+      const selected = new Set([...updated.selected_segment_ids, action.id]);
       return {
         ...updated,
-        selected_segment_ids: [action.id],
+        selected_segment_ids: updated.project.segments
+          .filter((segment) => selected.has(segment.id))
+          .map((segment) => segment.id),
+        active_segment_id: action.id,
         selection_anchor_id: action.id,
         selected_asset_ids: [],
       };
@@ -1505,9 +1492,9 @@ export function timelineDuration(project: TimelineProject): number {
   );
 }
 
-/** Resolves the exact ephemeral run set without conflating it with edit focus. */
+/** Resolves the executable subset of the single user-visible selection. */
 export function runnableTimelineSegmentIds(state: TimelineEditorState): string[] {
-  const selected = new Set(state.run_selected_segment_ids);
+  const selected = new Set(state.selected_segment_ids);
   return state.project.segments
     .filter((segment) => segment.enabled && selected.has(segment.id))
     .map((segment) => segment.id);
