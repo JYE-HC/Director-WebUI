@@ -12,11 +12,13 @@ import { LongFormTimelineWorkspace } from "../components/LongFormTimelineWorkspa
 import type { AssetReference } from "../domain/modes";
 import {
   alignedTimelineSegmentDuration,
+  autoFitSourceAudioTiming,
   createTimelineEditorState,
   createTimelineSegment,
   EMPTY_SIX_SECTION_PROMPT,
   sourcePreviewTime,
   timelineEditorReducer,
+  type TimelineAction,
   type TimelineEditorState,
 } from "../domain/timelineProject";
 import { loadTimelineWorkspacePreferences } from "../domain/workspacePreferences";
@@ -74,18 +76,36 @@ function commonProps(state: TimelineEditorState) {
   };
 }
 
+function timelineEditorReducerWithSourceAudioFit(
+  state: TimelineEditorState,
+  action: TimelineAction,
+): TimelineEditorState {
+  const reduced = timelineEditorReducer(state, action);
+  const fitted = autoFitSourceAudioTiming(reduced.project);
+  return fitted.project === reduced.project
+    ? reduced
+    : { ...reduced, project: fitted.project };
+}
+
 function Harness({
   initial,
   workspaceCapabilities = capabilities,
   onUploadFiles,
+  segmentCandidates = {},
+  fitSourceAudio = false,
 }: {
   initial: TimelineEditorState;
   workspaceCapabilities?: CapabilityReport;
   onUploadFiles?: ComponentProps<typeof LongFormTimelineWorkspace>["onUploadFiles"];
+  segmentCandidates?: ComponentProps<typeof LongFormTimelineWorkspace>["segmentCandidates"];
+  fitSourceAudio?: boolean;
 }) {
-  const [state, dispatch] = useReducer(timelineEditorReducer, initial);
+  const [state, dispatch] = useReducer(
+    fitSourceAudio ? timelineEditorReducerWithSourceAudioFit : timelineEditorReducer,
+    initial,
+  );
   return <>
-    <LongFormTimelineWorkspace {...commonProps(state)} capabilities={workspaceCapabilities} onDispatch={dispatch} onUploadFiles={onUploadFiles} />
+    <LongFormTimelineWorkspace {...commonProps(state)} capabilities={workspaceCapabilities} segmentCandidates={segmentCandidates} onDispatch={dispatch} onUploadFiles={onUploadFiles} />
     <pre data-testid="timeline-state">{JSON.stringify(state)}</pre>
   </>;
 }
@@ -1444,6 +1464,68 @@ describe("统一时间线关键交互", () => {
     expect(original.parentElement).toBe(screen.getByLabelText("原视频对比画布 864×480"));
   });
 
+  it("原视频对比循环回到开头后会重新播放候选与裁剪源", async () => {
+    const user = userEvent.setup();
+    const state = createTimelineEditorState();
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      id: state.project.segments[0].id,
+      prompt: "循环对比镜头",
+      source_video: video,
+      source_start_seconds: 6,
+      source_duration_seconds: 8,
+      duration_seconds: 4,
+    };
+    state.project = { ...state.project, segments: [source] };
+    state.playhead_seconds = 2;
+    render(<Harness
+      initial={state}
+      segmentCandidates={{
+        [source.id]: {
+          job_id: "loop-candidate-job",
+          job_updated_at: "2026-08-16T00:00:00Z",
+          result: {
+            segment_id: source.id,
+            child_id: "loop-candidate-child",
+            output_url: "/api/jobs/loop-candidate-job/segment-output",
+            output_file: "output/director/loop.mp4",
+            current_snapshot: true,
+          },
+        },
+      }}
+    />);
+
+    await user.click(screen.getByRole("button", { name: "原视频对比" }));
+    await user.click(screen.getByRole("checkbox", { name: "循环" }));
+    const candidate = screen.getByLabelText(`片段 ${source.id} 的最新生成候选`) as HTMLVideoElement;
+    const original = screen.getByLabelText(`原视频 ${video.name}`) as HTMLVideoElement;
+    const candidatePlay = vi.fn().mockResolvedValue(undefined);
+    const originalPlay = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(candidate, "play", { configurable: true, value: candidatePlay });
+    Object.defineProperty(original, "play", { configurable: true, value: originalPlay });
+    fireEvent.loadedMetadata(candidate);
+    fireEvent.loadedMetadata(original);
+
+    await user.click(screen.getByRole("button", { name: "播放" }));
+    await waitFor(() => {
+      expect(candidatePlay).toHaveBeenCalledTimes(1);
+      expect(originalPlay).toHaveBeenCalledTimes(1);
+    });
+
+    candidate.currentTime = source.duration_seconds;
+    original.currentTime = source.source_start_seconds + source.source_duration_seconds;
+    fireEvent.ended(candidate);
+
+    await waitFor(() => {
+      expect(readState().playhead_seconds).toBe(0);
+      expect(candidate.currentTime).toBeCloseTo(0);
+      expect(original.currentTime).toBeCloseTo(sourcePreviewTime(source, 0, 24));
+      expect(candidatePlay).toHaveBeenCalledTimes(2);
+      expect(originalPlay).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByRole("button", { name: "暂停" })).toBeEnabled();
+  });
+
   it("混合时间线对比经过 FL2VA 时保持双栏占位，进入 Ref2VA 后恢复原视频", async () => {
     const user = userEvent.setup();
     let state = createTimelineEditorState();
@@ -1725,6 +1807,38 @@ describe("统一时间线关键交互", () => {
       duration_seconds: 2,
       source_duration_seconds: 4,
     });
+  });
+
+  it("保留源音频时反复回车提交 1 秒都稳定计算为 39 帧", async () => {
+    const user = userEvent.setup();
+    const state = createTimelineEditorState();
+    state.project.segments = [{
+      ...createTimelineSegment("ref2va", 1),
+      id: state.project.segments[0].id,
+      audio_mode: "source",
+      duration_seconds: 1,
+      source_video: video,
+      source_start_seconds: 0,
+      source_duration_seconds: 39 / 24,
+    }];
+    render(<Harness initial={state} fitSourceAudio />);
+
+    const sourceDuration = screen.getByLabelText("源截取时长（秒）");
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await user.click(sourceDuration);
+      await user.clear(sourceDuration);
+      await user.type(sourceDuration, "1{Enter}");
+      await waitFor(() => {
+        expect(readState().project.segments[0]).toMatchObject({
+          duration_seconds: 1,
+          source_duration_seconds: 39 / 24,
+        });
+      });
+      expect(sourceDuration).toHaveValue(39 / 24);
+      expect(screen.getByRole("region", { name: "选中片段编辑器" })).toHaveTextContent(
+        "请求 1.00s → 实际 1.6250s · 39f",
+      );
+    }
   });
 
   it("保留源音频时显示素材总量与 H3 自动裁剪结果", () => {

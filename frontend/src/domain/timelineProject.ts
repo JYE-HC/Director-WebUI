@@ -379,7 +379,7 @@ function segmentBase<M extends TimelineGenerationMode>(
   return {
     id: createSegmentId(),
     mode,
-    title: `片段 ${String(index).padStart(2, "0")}`,
+    title: defaultTimelineSegmentTitle(index),
     prompt: "",
     duration_seconds: 5,
     enabled: true,
@@ -387,6 +387,28 @@ function segmentBase<M extends TimelineGenerationMode>(
     ref_image_size: "match",
     audio_mode: "generate",
   };
+}
+
+function defaultTimelineSegmentTitle(index: number): string {
+  return `片段 ${String(index).padStart(2, "0")}`;
+}
+
+function nextDefaultTimelineSegmentNumber(project: TimelineProject): number {
+  let highest = 0;
+  project.segments.forEach((segment) => {
+    const match = /^片段 (\d+)$/.exec(segment.title);
+    if (!match) return;
+    const value = Number(match[1]);
+    if (Number.isSafeInteger(value) && value > highest) highest = value;
+  });
+  if (highest < Number.MAX_SAFE_INTEGER) return highest + 1;
+
+  // A manually entered MAX_SAFE_INTEGER title must not make the allocator
+  // produce an imprecise number. At 128 segments this fallback is bounded.
+  const titles = new Set(project.segments.map((segment) => segment.title));
+  let fallback = 1;
+  while (titles.has(defaultTimelineSegmentTitle(fallback))) fallback += 1;
+  return fallback;
 }
 
 export function createTimelineSegment(
@@ -630,7 +652,7 @@ export function insertTimelineSegment(
   const insertionIndex = selectedIndex < 0
     ? state.project.segments.length
     : selectedIndex + (position === "after" ? 1 : 0);
-  const segment = createTimelineSegment(mode, insertionIndex + 1);
+  const segment = createTimelineSegment(mode, nextDefaultTimelineSegmentNumber(state.project));
   const segments = [...state.project.segments];
   segments.splice(insertionIndex, 0, segment);
   return {
@@ -679,9 +701,12 @@ export function insertTimelineVideoAssetAtAnchor(
   // compile validation remains the boundary that requires the user to split a
   // long source into native H3-sized generation segments.
   const duration = Math.max(0.01, asset.metadata?.duration ?? 5);
+  const nextDefaultIndex = nextDefaultTimelineSegmentNumber(state.project);
   const segment: Ref2VASegment = {
-    ...createTimelineSegment("ref2va", insertionIndex + 1),
-    title: asset.name.replace(/\.[^.]+$/, "") || `片段 ${String(insertionIndex + 1).padStart(2, "0")}`,
+    ...createTimelineSegment("ref2va", nextDefaultIndex),
+    title: asset.name.replace(/\.[^.]+$/, "") || defaultTimelineSegmentTitle(
+      nextDefaultIndex,
+    ),
     duration_seconds: duration,
     source_video: asset,
     source_start_seconds: 0,
@@ -2063,11 +2088,12 @@ export function reorderSegmentReference(
 }
 
 /**
- * Updates a source-backed Ref2VA range while preserving its existing
- * source-to-output playback ratio. The inspector locks the direct output
- * duration control once a source is bound, so range edits and replacement
- * clamps must keep the compiled request duration reachable through the source
- * controls instead of leaving a stale hidden value behind.
+ * Updates a source-backed Ref2VA range. Generated-audio segments preserve the
+ * existing source-to-output playback ratio. With source audio, an explicit
+ * source-duration edit instead establishes the same requested output duration;
+ * the project-level H3 fitter can then make the source/output frame counts
+ * equal without feeding its previous automatic adjustment back into the next
+ * edit as a new playback ratio.
  */
 export function updateRef2VASourceRange(
   segment: Ref2VASegment,
@@ -2092,7 +2118,9 @@ export function updateRef2VASourceRange(
       Number.isFinite(segment.duration_seconds) && segment.duration_seconds > 0
     ? segment.duration_seconds / previousSourceDuration
     : 1;
-  const nextDuration = nextSourceDuration * ratio;
+  const nextDuration = segment.audio_mode === "source"
+    ? nextSourceDuration
+    : nextSourceDuration * ratio;
   if (!Number.isFinite(nextDuration) || nextDuration <= 0) return segment;
   return {
     ...segment,

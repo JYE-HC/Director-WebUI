@@ -1188,6 +1188,7 @@ export function LongFormTimelineWorkspace({
   const [loop, setLoop] = useState(initialPreferences.loop);
   const [volume, setVolume] = useState(initialPreferences.volume);
   const [playing, setPlaying] = useState(false);
+  const [playbackRestartToken, setPlaybackRestartToken] = useState(0);
   const [showLiveMonitor, setShowLiveMonitor] = useState(initialPreferences.showLiveMonitor);
   const [compareOriginal, setCompareOriginal] = useState(initialPreferences.compareOriginal);
   const [programMediaStatus, setProgramMediaStatus] = useState<"idle" | "loading" | "ready" | "seeking" | "error">("idle");
@@ -1499,6 +1500,7 @@ export function LongFormTimelineWorkspace({
     }
     if (loop && total > 0) {
       setProgramPlayhead(0);
+      setPlaybackRestartToken((token) => token + 1);
       return;
     }
     setProgramPlayhead(total);
@@ -1726,7 +1728,11 @@ export function LongFormTimelineWorkspace({
         next = mapping.segmentStart + Math.min(mapping.segmentDuration, Math.max(0, mediaLocal));
       }
       if (next >= total) {
-        if (loop) { playheadRef.current = 0; onDispatch({ type: "playhead/set", seconds: 0 }); }
+        if (loop) {
+          playheadRef.current = 0;
+          onDispatch({ type: "playhead/set", seconds: 0 });
+          setPlaybackRestartToken((token) => token + 1);
+        }
         else { playheadRef.current = total; onDispatch({ type: "playhead/set", seconds: total }); setPlaying(false); return; }
       } else if (Math.abs(next - playheadRef.current) > 1e-4) {
         playheadRef.current = next;
@@ -1755,6 +1761,18 @@ export function LongFormTimelineWorkspace({
   }, [previewIdentity, volume]);
 
   useEffect(() => {
+    const video = programVideoRef.current;
+    if (!video || mappedProgramTime === null) return;
+    synchronizeProgramVideo(video, playing ? 0.35 : 0.02);
+  }, [mappedProgramTime, playing, previewIdentity, sourcePlaybackRate]);
+
+  useEffect(() => {
+    const video = originalVideoRef.current;
+    if (!comparisonActive || !video || mappedOriginalTime === null) return;
+    synchronizeOriginalVideo(video, playing ? 0.35 : 0.02);
+  }, [comparisonActive, mappedOriginalTime, originalPlaybackRate, originalPreviewIdentity, playing]);
+
+  useEffect(() => {
     const programVideo = programVideoRef.current;
     const originalVideo = comparisonActive ? originalVideoRef.current : null;
     if (!playing) {
@@ -1774,19 +1792,7 @@ export function LongFormTimelineWorkspace({
         if (!programVideo) setPlaying(false);
       });
     }
-  }, [comparisonActive, originalPreviewIdentity, previewIdentity, playing]);
-
-  useEffect(() => {
-    const video = programVideoRef.current;
-    if (!video || mappedProgramTime === null) return;
-    synchronizeProgramVideo(video, playing ? 0.35 : 0.02);
-  }, [mappedProgramTime, playing, previewIdentity, sourcePlaybackRate]);
-
-  useEffect(() => {
-    const video = originalVideoRef.current;
-    if (!comparisonActive || !video || mappedOriginalTime === null) return;
-    synchronizeOriginalVideo(video, playing ? 0.35 : 0.02);
-  }, [comparisonActive, mappedOriginalTime, originalPlaybackRate, originalPreviewIdentity, playing]);
+  }, [comparisonActive, originalPreviewIdentity, playbackRestartToken, previewIdentity, playing]);
 
   const handleTimelineKey = (event: ReactKeyboardEvent) => {
     if (event.nativeEvent.isComposing || interactiveTimelineTarget(event.target)) return;

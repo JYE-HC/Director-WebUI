@@ -61,8 +61,16 @@ export function DeferredNumberInput({
     if (lower !== undefined) next = Math.max(lower, next);
     if (upper !== undefined) next = Math.min(upper, next);
 
-    setDraft(String(next));
-    if (!Object.is(next, value)) onValueCommit(next);
+    if (Object.is(next, value)) {
+      setDraft(String(next));
+      return;
+    }
+    onValueCommit(next);
+    // The parent may normalize the committed value, including back to the
+    // same authoritative value it already had. Return to that authority until
+    // the controlled prop reports what was accepted; otherwise an unchanged
+    // externalText dependency cannot clear the now-stale local draft.
+    setDraft(externalText);
   };
 
   return <input

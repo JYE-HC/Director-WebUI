@@ -287,6 +287,40 @@ describe("统一 timeline domain", () => {
     }
   });
 
+  it("保留源音频时重复输入同一源时长不会继承上次自动适配比例", () => {
+    const project = createTimelineProject();
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      audio_mode: "source" as const,
+      source_video: video,
+      source_start_seconds: 0,
+      source_duration_seconds: 39 / 24,
+      duration_seconds: 1,
+    };
+
+    const editAndFit = (segment: typeof source) => {
+      const edited = updateRef2VASourceRange(segment, {
+        source_start_seconds: 0,
+        source_duration_seconds: 1,
+      });
+      return autoFitSourceAudioTiming({ ...project, segments: [edited] })
+        .project.segments[0] as typeof source;
+    };
+
+    const first = editAndFit(source);
+    const second = editAndFit(first);
+    expect(first).toMatchObject({
+      duration_seconds: 1,
+      source_duration_seconds: 39 / 24,
+    });
+    expect(second).toMatchObject({
+      duration_seconds: 1,
+      source_duration_seconds: 39 / 24,
+    });
+    expect(alignedTimelineSegmentDuration(first, 24) * 24).toBe(39);
+    expect(alignedTimelineSegmentDuration(second, 24) * 24).toBe(39);
+  });
+
   it("源片按自身区间等距显示关键帧，分割出的长片段也显示多帧", () => {
     const full = {
       ...createTimelineSegment("ref2va", 1),
@@ -475,6 +509,50 @@ describe("统一 timeline domain", () => {
     expect(state.project.segments.map((segment) => segment.id)).toEqual([third, first, second]);
     expect(state.selected_segment_ids).toEqual([first, second, third]);
     expect(state.run_selected_segment_ids).toEqual([first, second, third]);
+  });
+
+  it("在片段 02 前插空段时分配新的默认编号且保留已有名称", () => {
+    let state = createTimelineEditorState();
+    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    expect(state.project.segments.map((segment) => segment.title)).toEqual(["片段 01", "片段 02"]);
+
+    state = timelineEditorReducer(state, { type: "segment/insert", position: "before" });
+
+    expect(state.project.segments.map((segment) => segment.title)).toEqual([
+      "片段 01",
+      "片段 03",
+      "片段 02",
+    ]);
+  });
+
+  it("乱序默认名称的前后插均按现有最大编号递增", () => {
+    const state = createTimelineEditorState();
+    const segments = [1, 7, 3, 4].map((number) => createTimelineSegment("fl2va", number));
+    const initial = {
+      ...state,
+      project: { ...state.project, segments },
+      selected_segment_ids: [segments[3].id],
+      selection_anchor_id: segments[3].id,
+      run_selected_segment_ids: segments.map((segment) => segment.id),
+    };
+
+    const before = timelineEditorReducer(initial, { type: "segment/insert", position: "before" });
+    const after = timelineEditorReducer(initial, { type: "segment/insert", position: "after" });
+
+    expect(before.project.segments.map((segment) => segment.title)).toEqual([
+      "片段 01",
+      "片段 07",
+      "片段 03",
+      "片段 08",
+      "片段 04",
+    ]);
+    expect(after.project.segments.map((segment) => segment.title)).toEqual([
+      "片段 01",
+      "片段 07",
+      "片段 03",
+      "片段 04",
+      "片段 08",
+    ]);
   });
 
   it("参考素材槽删除后不重排，新素材填最低空槽", () => {
