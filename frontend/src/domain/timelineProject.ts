@@ -2088,11 +2088,12 @@ export function reorderSegmentReference(
 }
 
 /**
- * Updates a source-backed Ref2VA range while preserving its existing
- * source-to-output playback ratio. The inspector locks the direct output
- * duration control once a source is bound, so range edits and replacement
- * clamps must keep the compiled request duration reachable through the source
- * controls instead of leaving a stale hidden value behind.
+ * Updates a source-backed Ref2VA range. Generated-audio segments preserve the
+ * existing source-to-output playback ratio. With source audio, an explicit
+ * source-duration edit instead establishes the same requested output duration;
+ * the project-level H3 fitter can then make the source/output frame counts
+ * equal without feeding its previous automatic adjustment back into the next
+ * edit as a new playback ratio.
  */
 export function updateRef2VASourceRange(
   segment: Ref2VASegment,
@@ -2117,7 +2118,9 @@ export function updateRef2VASourceRange(
       Number.isFinite(segment.duration_seconds) && segment.duration_seconds > 0
     ? segment.duration_seconds / previousSourceDuration
     : 1;
-  const nextDuration = nextSourceDuration * ratio;
+  const nextDuration = segment.audio_mode === "source"
+    ? nextSourceDuration
+    : nextSourceDuration * ratio;
   if (!Number.isFinite(nextDuration) || nextDuration <= 0) return segment;
   return {
     ...segment,

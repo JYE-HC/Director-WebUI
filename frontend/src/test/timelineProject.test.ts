@@ -287,6 +287,40 @@ describe("统一 timeline domain", () => {
     }
   });
 
+  it("保留源音频时重复输入同一源时长不会继承上次自动适配比例", () => {
+    const project = createTimelineProject();
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      audio_mode: "source" as const,
+      source_video: video,
+      source_start_seconds: 0,
+      source_duration_seconds: 39 / 24,
+      duration_seconds: 1,
+    };
+
+    const editAndFit = (segment: typeof source) => {
+      const edited = updateRef2VASourceRange(segment, {
+        source_start_seconds: 0,
+        source_duration_seconds: 1,
+      });
+      return autoFitSourceAudioTiming({ ...project, segments: [edited] })
+        .project.segments[0] as typeof source;
+    };
+
+    const first = editAndFit(source);
+    const second = editAndFit(first);
+    expect(first).toMatchObject({
+      duration_seconds: 1,
+      source_duration_seconds: 39 / 24,
+    });
+    expect(second).toMatchObject({
+      duration_seconds: 1,
+      source_duration_seconds: 39 / 24,
+    });
+    expect(alignedTimelineSegmentDuration(first, 24) * 24).toBe(39);
+    expect(alignedTimelineSegmentDuration(second, 24) * 24).toBe(39);
+  });
+
   it("源片按自身区间等距显示关键帧，分割出的长片段也显示多帧", () => {
     const full = {
       ...createTimelineSegment("ref2va", 1),

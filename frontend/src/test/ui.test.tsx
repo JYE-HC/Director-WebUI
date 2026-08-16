@@ -106,7 +106,27 @@ describe("延迟提交数字输入框", () => {
     await user.clear(input);
     await user.type(input, "31");
     await user.keyboard("{Enter}");
+    expect(onCommit).toHaveBeenCalledOnce();
     expect(onCommit).toHaveBeenCalledWith(31);
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("父级将提交值纠正回原权威值时不会残留本地草稿", async () => {
+    const user = userEvent.setup();
+    const onCommit = vi.fn();
+    render(<DeferredNumberInput
+      aria-label="源截取时长"
+      min={0.01}
+      value={39 / 24}
+      onValueCommit={onCommit}
+    />);
+    const input = screen.getByLabelText("源截取时长");
+
+    await user.clear(input);
+    await user.type(input, "1{Enter}");
+
+    expect(onCommit).toHaveBeenCalledOnce();
+    expect(onCommit).toHaveBeenCalledWith(1);
+    expect(input).toHaveValue(39 / 24);
   });
 });
