@@ -46,6 +46,40 @@ const STORAGE_SOURCE_LABEL: Record<StorageConfiguration["source"], string> = {
   default: "默认路径",
 };
 
+const HIDDEN_PATH_VALUE = "••••••••••••••••";
+
+function VisibilityToggle({
+  label,
+  visible,
+  onToggle,
+}: {
+  label: string;
+  visible: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="visibility-toggle"
+      aria-label={label}
+      aria-pressed={visible}
+      title={visible ? "隐藏内容" : "显示内容"}
+      onClick={onToggle}
+    >
+      {visible ? (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" />
+          <circle cx="12" cy="12" r="2.75" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 3l18 18M10.6 6.1A10.6 10.6 0 0 1 12 6c6 0 9.5 6 9.5 6a16.6 16.6 0 0 1-2.7 3.4M14.1 14.1A3 3 0 0 1 9.9 9.9M6.2 7.2C3.8 9 2.5 12 2.5 12s3.5 6 9.5 6c1.2 0 2.3-.2 3.3-.6" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 function safeStorageError(reason: unknown, fallback: string): string {
   return reason instanceof ApiError ? reason.message : fallback;
 }
@@ -189,6 +223,9 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   const [residencyNotice, setResidencyNotice] = useState<string | null>(null);
   const [storageConfiguration, setStorageConfiguration] = useState<StorageConfiguration | null>(null);
   const [storageTarget, setStorageTarget] = useState("");
+  const [comfyUrlVisible, setComfyUrlVisible] = useState(false);
+  const [currentDatabaseVisible, setCurrentDatabaseVisible] = useState(false);
+  const [storageTargetVisible, setStorageTargetVisible] = useState(false);
   const [storageLoading, setStorageLoading] = useState(true);
   const [storageOperation, setStorageOperation] = useState<"save" | "migrate" | null>(null);
   const [storageMessage, setStorageMessage] = useState<{
@@ -764,7 +801,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
       <div className="settings-layout">
         <div className="settings-main">
           <Panel eyebrow="连接" title="ComfyUI" description="浏览器仅连接导演台后端，由后端代理 ComfyUI。">
-            <div ref={connectionStatusRef} className="connection-card" tabIndex={-1}><StatusDot state={connectionProbe ? connectionProbe.result === null ? "checking" : connectionProbe.result.ok ? "online" : "offline" : awaitingCurrentEndpoint ? "checking" : capabilities.connection} /><div><strong>{connectionProbe ? connectionProbe.result === null ? "正在测试当前地址" : connectionProbe.result.ok ? "当前填写地址可连接" : "当前填写地址连接失败" : awaitingCurrentEndpoint ? "等待当前地址确认" : capabilities.connection === "offline" ? "ComfyUI 离线" : !runtimeConfigured ? "ComfyUI 尚未配置" : capabilities.connection === "online" ? "ComfyUI 在线" : "等待检测"}</strong><small>{connectionProbe ? connectionProbe.result === null ? connectionProbe.url : connectionProbe.result.latency_ms === undefined ? connectionProbe.result.message : `${connectionProbe.result.message} · 响应 ${connectionProbe.result.latency_ms} ms` : awaitingCurrentEndpoint ? working.comfy_url : capabilities.connection === "offline" ? capabilities.message || "无法读取运行环境" : !runtimeConfigured ? "填写有效地址后自动启用运行资源" : capabilities.latency_ms === undefined ? "尚未读取延迟" : `响应 ${capabilities.latency_ms} ms`}</small></div><button type="button" className="button button--ghost" onClick={() => void test()} disabled={testing || effectiveRuntimeEditingDisabled}>{testing ? <><Spinner />测试中…</> : "测试连接"}</button></div>
+            <div ref={connectionStatusRef} className="connection-card" tabIndex={-1}><StatusDot state={connectionProbe ? connectionProbe.result === null ? "checking" : connectionProbe.result.ok ? "online" : "offline" : awaitingCurrentEndpoint ? "checking" : capabilities.connection} /><div><strong>{connectionProbe ? connectionProbe.result === null ? "正在测试连接" : connectionProbe.result.ok ? "当前填写地址可连接" : "当前填写地址连接失败" : awaitingCurrentEndpoint ? "等待当前地址确认" : capabilities.connection === "offline" ? "ComfyUI 离线" : !runtimeConfigured ? "ComfyUI 尚未配置" : capabilities.connection === "online" ? "ComfyUI 在线" : "等待检测"}</strong><small>{connectionProbe ? connectionProbe.result === null ? "正在等待 ComfyUI 响应" : connectionProbe.result.latency_ms === undefined ? connectionProbe.result.message : `${connectionProbe.result.message} · 响应 ${connectionProbe.result.latency_ms} ms` : awaitingCurrentEndpoint ? working.comfy_url : capabilities.connection === "offline" ? capabilities.message || "无法读取运行环境" : !runtimeConfigured ? "填写有效地址后自动启用运行资源" : capabilities.latency_ms === undefined ? "尚未读取延迟" : `响应 ${capabilities.latency_ms} ms`}</small></div><button type="button" className="button button--ghost" onClick={() => void test()} disabled={testing || effectiveRuntimeEditingDisabled}>{testing ? <><Spinner />测试中…</> : "测试连接"}</button></div>
             {currentRayLightRuntimeStatus?.recovery_required && <div className="raylight-recovery-alert" role="alert" aria-labelledby="raylight-recovery-title" aria-describedby="raylight-recovery-description">
               <strong id="raylight-recovery-title">旧 RayLight 运行状态引用了当前不可见 GPU</strong>
               <div id="raylight-recovery-description" className="raylight-recovery-alert__details">
@@ -786,35 +823,55 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                 {rayLightRecoveryPending ? <><Spinner />恢复中…</> : "确认 ComfyUI 已重启并恢复 RayLight"}
               </button>
             </div>}
-            <div className="field-grid field-grid--two"><Field label="ComfyUI 地址"><input type="url" required disabled={effectiveRuntimeEditingDisabled} value={working.comfy_url} placeholder="http://comfyui-host:8188" onChange={(event) => change({ ...working, comfy_url: event.target.value })} /></Field><Field label="客户端 ID"><input required disabled={effectiveRuntimeEditingDisabled} maxLength={128} pattern="[A-Za-z0-9._:-]+" value={working.client_id} onChange={(event) => change({ ...working, client_id: event.target.value })} /></Field></div>
+            <div className="field-grid field-grid--two">
+              <div className="field">
+                <label className="field__label" htmlFor="comfy-url">ComfyUI 地址</label>
+                <div className="sensitive-value">
+                  <input id="comfy-url" type={comfyUrlVisible ? "url" : "password"} required disabled={effectiveRuntimeEditingDisabled} autoComplete="off" value={working.comfy_url} placeholder="http://comfyui-host:8188" onChange={(event) => change({ ...working, comfy_url: event.target.value })} />
+                  <VisibilityToggle label="ComfyUI 地址显示状态" visible={comfyUrlVisible} onToggle={() => setComfyUrlVisible((current) => !current)} />
+                </div>
+              </div>
+              <Field label="客户端 ID"><input required disabled={effectiveRuntimeEditingDisabled} maxLength={128} pattern="[A-Za-z0-9._:-]+" value={working.client_id} onChange={(event) => change({ ...working, client_id: event.target.value })} /></Field>
+            </div>
           </Panel>
           <Panel eyebrow="数据" title="数据存储" description="数据库路径独立于 ComfyUI 运行设置；路径保存或迁移后都不会热切换当前进程。" action={storageLoading ? <Spinner label="读取数据存储配置" /> : undefined}>
             {storageConfiguration && <div className="storage-current" aria-label="当前数据库存储配置">
-              <div className="storage-current__path"><span>当前数据库</span><code title={storageConfiguration.active_database_path}>{storageConfiguration.active_database_path}</code></div>
+              <div className="storage-current__path">
+                <span>当前数据库</span>
+                <div className="sensitive-value sensitive-value--code">
+                  <code title={currentDatabaseVisible ? storageConfiguration.active_database_path : undefined}>{currentDatabaseVisible ? storageConfiguration.active_database_path : HIDDEN_PATH_VALUE}</code>
+                  <VisibilityToggle label="当前数据库路径显示状态" visible={currentDatabaseVisible} onToggle={() => setCurrentDatabaseVisible((current) => !current)} />
+                </div>
+              </div>
               <div><span>配置来源</span><strong>{STORAGE_SOURCE_LABEL[storageConfiguration.source]}</strong></div>
-              {storageConfiguration.configured_database_path !== storageConfiguration.active_database_path && <div className="storage-current__path"><span>重启后路径</span><code title={storageConfiguration.configured_database_path}>{storageConfiguration.configured_database_path}</code></div>}
+              {storageConfiguration.configured_database_path !== storageConfiguration.active_database_path && <div className="storage-current__path"><span>重启后路径</span><code title={currentDatabaseVisible ? storageConfiguration.configured_database_path : undefined}>{currentDatabaseVisible ? storageConfiguration.configured_database_path : HIDDEN_PATH_VALUE}</code></div>}
               <div><span>切换状态</span><strong>{storageConfiguration.restart_required ? "等待重启" : "当前已生效"}</strong></div>
             </div>}
             {!storageConfiguration && !storageLoading && <div className="notice notice--error" role="alert">无法确认当前数据库，存储操作保持禁用。</div>}
-            <Field label="数据库目标路径" hint="只接受绝对路径或以 ~/ 开头的路径。推荐迁移当前数据库，避免重启后进入空库。">
-              <input
-                type="text"
-                aria-label="数据库目标路径"
-                disabled={storageOperationsDisabled || storageOperation !== null}
-                spellCheck={false}
-                autoComplete="off"
-                value={storageTarget}
-                placeholder="/path/to/director.sqlite3 或 ~/director.sqlite3"
-                aria-invalid={storageTargetEdited.current && Boolean(storagePathError) || undefined}
-                aria-describedby={storageTargetEdited.current && storagePathError ? "database-path-error" : undefined}
-                onChange={(event) => {
-                  storageTargetEdited.current = true;
-                  setStorageTarget(event.target.value);
-                  setStorageMessage(null);
-                }}
-              />
+            <div className="field">
+              <label className="field__label" htmlFor="database-target-path">数据库目标路径</label>
+              <div className="sensitive-value">
+                <input
+                  id="database-target-path"
+                  type={storageTargetVisible ? "text" : "password"}
+                  disabled={storageOperationsDisabled || storageOperation !== null}
+                  spellCheck={false}
+                  autoComplete="off"
+                  value={storageTarget}
+                  placeholder="/path/to/director.sqlite3 或 ~/director.sqlite3"
+                  aria-invalid={storageTargetEdited.current && Boolean(storagePathError) || undefined}
+                  aria-describedby={storageTargetEdited.current && storagePathError ? "database-path-error database-path-hint" : "database-path-hint"}
+                  onChange={(event) => {
+                    storageTargetEdited.current = true;
+                    setStorageTarget(event.target.value);
+                    setStorageMessage(null);
+                  }}
+                />
+                <VisibilityToggle label="数据库目标路径显示状态" visible={storageTargetVisible} onToggle={() => setStorageTargetVisible((current) => !current)} />
+              </div>
               {storageTargetEdited.current && storagePathError && <small id="database-path-error" className="inline-error">{storagePathError}</small>}
-            </Field>
+              <small id="database-path-hint">只接受绝对路径或以 ~/ 开头的路径。推荐迁移当前数据库，避免重启后进入空库。</small>
+            </div>
             <div className="storage-actions" role="group" aria-label="数据库存储操作">
               <button type="button" className="button button--ghost" disabled={storageOperationsDisabled || storageLoading || storageOperation !== null || !storageConfiguration || Boolean(storagePathError)} onClick={() => void saveStoragePath()}>{storageOperation === "save" ? <><Spinner />保存中…</> : cancellingPendingStorageSwitch ? "取消切换并继续使用当前库" : "保存路径（重启后切换）"}</button>
               <button type="button" className="button button--primary" disabled={storageOperationsDisabled || storageLoading || storageOperation !== null || !storageConfiguration || Boolean(storagePathError)} onClick={() => void migrateStorage()}>{storageOperation === "migrate" ? <><Spinner />迁移中…</> : "迁移当前数据库并切换"}</button>

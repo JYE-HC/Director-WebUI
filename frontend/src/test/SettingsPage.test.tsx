@@ -147,6 +147,49 @@ describe("共享设置表单", () => {
     expect(within(modePanel).getByText("Ref2VA")).toBeInTheDocument();
   });
 
+  it("三个敏感设置默认隐藏，并可独立显示且不改动字段值", async () => {
+    const user = userEvent.setup();
+    vi.mocked(directorApi.getStorage).mockResolvedValue(STORAGE_CONFIGURATION);
+    render(
+      <SettingsPage
+        settings={CONFIGURED_SETTINGS}
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[]}
+        models={MODEL_INVENTORY}
+        loadingModels={false}
+        onSaved={confirmConfiguredSettings}
+      />,
+    );
+
+    const comfyUrl = screen.getByLabelText("ComfyUI 地址");
+    const comfyVisibility = screen.getByRole("button", { name: "ComfyUI 地址显示状态" });
+    expect(comfyUrl).toHaveAttribute("type", "password");
+    expect(comfyUrl).toHaveValue(CONFIGURED_SETTINGS.comfy_url);
+    expect(comfyVisibility).toHaveAttribute("aria-pressed", "false");
+    await user.click(comfyVisibility);
+    expect(comfyUrl).toHaveAttribute("type", "url");
+    expect(comfyUrl).toHaveValue(CONFIGURED_SETTINGS.comfy_url);
+    expect(comfyVisibility).toHaveAttribute("aria-pressed", "true");
+
+    const currentStorage = await screen.findByLabelText("当前数据库存储配置");
+    const currentVisibility = screen.getByRole("button", { name: "当前数据库路径显示状态" });
+    expect(currentStorage).not.toHaveTextContent(STORAGE_CONFIGURATION.active_database_path);
+    expect(currentVisibility).toHaveAttribute("aria-pressed", "false");
+    await user.click(currentVisibility);
+    expect(currentStorage).toHaveTextContent(STORAGE_CONFIGURATION.active_database_path);
+    expect(currentVisibility).toHaveAttribute("aria-pressed", "true");
+
+    const storageTarget = screen.getByLabelText("数据库目标路径");
+    const targetVisibility = screen.getByRole("button", { name: "数据库目标路径显示状态" });
+    expect(storageTarget).toHaveAttribute("type", "password");
+    expect(storageTarget).toHaveValue(STORAGE_CONFIGURATION.configured_database_path);
+    expect(targetVisibility).toHaveAttribute("aria-pressed", "false");
+    await user.click(targetVisibility);
+    expect(storageTarget).toHaveAttribute("type", "text");
+    expect(storageTarget).toHaveValue(STORAGE_CONFIGURATION.configured_database_path);
+    expect(targetVisibility).toHaveAttribute("aria-pressed", "true");
+  });
+
   it("模型族就绪只读取两族原生时间线能力，不把旧六配方当成可选模式", () => {
     render(
       <SettingsPage
@@ -224,6 +267,8 @@ describe("共享设置表单", () => {
     );
 
     const currentStorage = await screen.findByLabelText("当前数据库存储配置");
+    expect(currentStorage).not.toHaveTextContent(STORAGE_CONFIGURATION.active_database_path);
+    await user.click(screen.getByRole("button", { name: "当前数据库路径显示状态" }));
     expect(currentStorage).toHaveTextContent(STORAGE_CONFIGURATION.active_database_path);
     expect(currentStorage).toHaveTextContent("启动参数");
     const path = screen.getByLabelText("数据库目标路径");
@@ -290,6 +335,7 @@ describe("共享设置表单", () => {
   });
 
   it("legacy 存储来源默认采用后端提供的项目推荐迁移路径", async () => {
+    const user = userEvent.setup();
     vi.mocked(directorApi.getStorage).mockResolvedValue({
       ...STORAGE_CONFIGURATION,
       source: "legacy",
@@ -308,6 +354,7 @@ describe("共享设置表单", () => {
     expect(await screen.findByLabelText("数据库目标路径")).toHaveValue(
       STORAGE_CONFIGURATION.recommended_database_path,
     );
+    await user.click(screen.getByRole("button", { name: "当前数据库路径显示状态" }));
     expect(screen.getByLabelText("当前数据库存储配置")).toHaveTextContent(
       STORAGE_CONFIGURATION.active_database_path,
     );
@@ -377,7 +424,10 @@ describe("共享设置表单", () => {
     await user.click(screen.getByRole("button", { name: "测试连接" }));
 
     expect(probe).toHaveBeenCalledWith("http://probe-comfy.test:8188");
-    expect(screen.getByText("正在测试当前地址")).toBeInTheDocument();
+    const connectionCard = screen.getByText("正在测试连接").closest(".connection-card");
+    expect(connectionCard).not.toBeNull();
+    expect(connectionCard).toHaveTextContent("正在等待 ComfyUI 响应");
+    expect(connectionCard).not.toHaveTextContent("http://probe-comfy.test:8188");
     expect(screen.getByRole("button", { name: /测试中/ })).toBeDisabled();
     expect(onSaved).toHaveBeenLastCalledWith(
       expect.objectContaining({ comfy_url: "http://probe-comfy.test:8188" }),
