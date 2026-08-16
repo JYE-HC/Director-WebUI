@@ -1464,6 +1464,68 @@ describe("统一时间线关键交互", () => {
     expect(original.parentElement).toBe(screen.getByLabelText("原视频对比画布 864×480"));
   });
 
+  it("原视频对比循环回到开头后会重新播放候选与裁剪源", async () => {
+    const user = userEvent.setup();
+    const state = createTimelineEditorState();
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      id: state.project.segments[0].id,
+      prompt: "循环对比镜头",
+      source_video: video,
+      source_start_seconds: 6,
+      source_duration_seconds: 8,
+      duration_seconds: 4,
+    };
+    state.project = { ...state.project, segments: [source] };
+    state.playhead_seconds = 2;
+    render(<Harness
+      initial={state}
+      segmentCandidates={{
+        [source.id]: {
+          job_id: "loop-candidate-job",
+          job_updated_at: "2026-08-16T00:00:00Z",
+          result: {
+            segment_id: source.id,
+            child_id: "loop-candidate-child",
+            output_url: "/api/jobs/loop-candidate-job/segment-output",
+            output_file: "output/director/loop.mp4",
+            current_snapshot: true,
+          },
+        },
+      }}
+    />);
+
+    await user.click(screen.getByRole("button", { name: "原视频对比" }));
+    await user.click(screen.getByRole("checkbox", { name: "循环" }));
+    const candidate = screen.getByLabelText(`片段 ${source.id} 的最新生成候选`) as HTMLVideoElement;
+    const original = screen.getByLabelText(`原视频 ${video.name}`) as HTMLVideoElement;
+    const candidatePlay = vi.fn().mockResolvedValue(undefined);
+    const originalPlay = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(candidate, "play", { configurable: true, value: candidatePlay });
+    Object.defineProperty(original, "play", { configurable: true, value: originalPlay });
+    fireEvent.loadedMetadata(candidate);
+    fireEvent.loadedMetadata(original);
+
+    await user.click(screen.getByRole("button", { name: "播放" }));
+    await waitFor(() => {
+      expect(candidatePlay).toHaveBeenCalledTimes(1);
+      expect(originalPlay).toHaveBeenCalledTimes(1);
+    });
+
+    candidate.currentTime = source.duration_seconds;
+    original.currentTime = source.source_start_seconds + source.source_duration_seconds;
+    fireEvent.ended(candidate);
+
+    await waitFor(() => {
+      expect(readState().playhead_seconds).toBe(0);
+      expect(candidate.currentTime).toBeCloseTo(0);
+      expect(original.currentTime).toBeCloseTo(sourcePreviewTime(source, 0, 24));
+      expect(candidatePlay).toHaveBeenCalledTimes(2);
+      expect(originalPlay).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByRole("button", { name: "暂停" })).toBeEnabled();
+  });
+
   it("混合时间线对比经过 FL2VA 时保持双栏占位，进入 Ref2VA 后恢复原视频", async () => {
     const user = userEvent.setup();
     let state = createTimelineEditorState();
