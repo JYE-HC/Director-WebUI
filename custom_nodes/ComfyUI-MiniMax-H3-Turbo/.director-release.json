@@ -1,0 +1,6 @@
+{
+  "name": "ComfyUI-MiniMax-H3-Turbo",
+  "director_release": "0.1.0-rc1",
+  "upstream_commit": "55fee864dd7b2976b1c4ce3c3d5f7968f181409f",
+  "modified_for_director": false
+}

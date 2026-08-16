@@ -1,0 +1,314 @@
+from comfy import model_base
+
+
+class CFGParallelInjectRegistry:
+    """Registry for registering and applying CFG context parallelism injections."""
+
+    _REGISTRY = {}
+    _DIRECT_REGISTRY = {}
+
+    @classmethod
+    def register(cls, model_class):
+        """Register a model class and its CFG injection handler.
+
+        Most specific (child) models must be registered before base classes.
+        Example:
+            @CFGParallelInjectRegistry.register(model_base.Chroma)
+            def _inject_chroma(model): ...
+        """
+
+        def decorator(inject_func):
+            cls._REGISTRY[model_class] = inject_func
+            return inject_func
+
+        return decorator
+
+    @classmethod
+    def inject(cls, model_patcher):
+        base_model = model_patcher.model
+        for registered_cls, inject_func in cls._REGISTRY.items():
+            if isinstance(base_model, registered_cls):
+                print(f"[CFG] Initializing CFG Parallel for {registered_cls.__name__}")
+                return inject_func()
+        raise ValueError(f"Model: {type(base_model).__name__} is not yet supported for CFG Parallelism")
+
+    @classmethod
+    def register_direct(cls, model_class):
+        def decorator(inject_func):
+            cls._DIRECT_REGISTRY[model_class] = inject_func
+            return inject_func
+
+        return decorator
+
+    @classmethod
+    def has_direct_handler(cls, model_patcher):
+        return any(isinstance(model_patcher.model, registered_cls) for registered_cls in cls._DIRECT_REGISTRY)
+
+    @classmethod
+    def inject_direct(cls, model_patcher, *args):
+        base_model = model_patcher.model
+        for registered_cls, inject_func in cls._DIRECT_REGISTRY.items():
+            if isinstance(base_model, registered_cls):
+                print(f"[CFG] Initializing CFG Parallel for {registered_cls.__name__}")
+                return inject_func(model_patcher, base_model, *args)
+
+
+if hasattr(model_base, "LingBotVideo"):
+
+    @CFGParallelInjectRegistry.register_direct(model_base.LingBotVideo)
+    def _inject_lingbot_video(model_patcher, base_model, *args):
+        from ..diffusion_models.lingbot_video.xdit_cfg_parallel import patch_cfg_forward
+
+        patch_cfg_forward(base_model.diffusion_model)
+
+
+if hasattr(model_base, "WAN22_WanDancer"):
+
+    @CFGParallelInjectRegistry.register(model_base.WAN22_WanDancer)
+    def _inject_wan22_wandancer():
+        from ..diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward_wrapper_wandancer
+
+        return cfg_parallel_forward_wrapper_wandancer
+
+
+if hasattr(model_base, "WAN21"):
+
+    @CFGParallelInjectRegistry.register(model_base.WAN21)
+    def _inject_wan21():
+        from ..diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "QwenImage"):
+
+    @CFGParallelInjectRegistry.register(model_base.QwenImage)
+    def _inject_qwen():
+        from ..diffusion_models.qwen_image.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "MiniMaxH3"):
+
+    @CFGParallelInjectRegistry.register(model_base.MiniMaxH3)
+    def _inject_minimax_h3():
+        from ..diffusion_models.minimax.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "JoyImage"):
+
+    @CFGParallelInjectRegistry.register(model_base.JoyImage)
+    def _inject_joyimage():
+        from ..diffusion_models.joyimage.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Lens"):
+
+    @CFGParallelInjectRegistry.register(model_base.Lens)
+    def _inject_lens():
+        from ..diffusion_models.lens.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "PiD"):
+
+    @CFGParallelInjectRegistry.register(model_base.PiD)
+    def _inject_pid():
+        from ..diffusion_models.pixeldit.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "PixelDiTT2I"):
+
+    @CFGParallelInjectRegistry.register(model_base.PixelDiTT2I)
+    def _inject_pixeldit():
+        from ..diffusion_models.pixeldit.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Chroma"):
+
+    @CFGParallelInjectRegistry.register(model_base.ChromaRadiance)
+    @CFGParallelInjectRegistry.register(model_base.Chroma)
+    def _inject_chroma():
+        from ..diffusion_models.chroma.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Flux"):
+
+    @CFGParallelInjectRegistry.register(model_base.Flux)
+    def _inject_flux():
+        from ..diffusion_models.flux.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Hunyuan3Dv2"):
+
+    @CFGParallelInjectRegistry.register(model_base.Hunyuan3Dv2)
+    def _inject_hunyuan_3dv2():
+        from ..diffusion_models.hunyuan3d.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Hunyuan3Dv2_1"):
+
+    @CFGParallelInjectRegistry.register(model_base.Hunyuan3Dv2_1)
+    def _inject_hunyuan_3dv2_1():
+        from ..diffusion_models.hunyuan3d.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "HunyuanVideo"):
+
+    @CFGParallelInjectRegistry.register(model_base.HunyuanVideo)
+    def _inject_hunyuan():
+        from ..diffusion_models.hunyuan_video.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "AuraFlow"):
+
+    @CFGParallelInjectRegistry.register(model_base.AuraFlow)
+    def _inject_aura_flow():
+        from ..diffusion_models.aura.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "CosmosVideo"):
+
+    @CFGParallelInjectRegistry.register(model_base.CosmosVideo)
+    def _inject_cosmos():
+        from ..diffusion_models.cosmos.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "CosmosPredict2"):
+
+    @CFGParallelInjectRegistry.register(model_base.CosmosPredict2)
+    def _inject_cosmos_predict2():
+        from ..diffusion_models.cosmos.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Anima"):
+
+    @CFGParallelInjectRegistry.register(model_base.Anima)
+    def _inject_anima():
+        from ..diffusion_models.anima.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "HiDream"):
+
+    @CFGParallelInjectRegistry.register(model_base.HiDream)
+    def _inject_hidream():
+        from ..diffusion_models.hidream.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "HiDreamO1"):
+
+    @CFGParallelInjectRegistry.register(model_base.HiDreamO1)
+    def _inject_hidream_o1():
+        from ..diffusion_models.hidream_o1.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "LTXV"):
+
+    @CFGParallelInjectRegistry.register(model_base.LTXV)
+    def _inject_ltxv():
+        from ..diffusion_models.lightricks.xdit_cfg_parallel import cfg_parallel_forward_wrapper_ltx
+
+        return cfg_parallel_forward_wrapper_ltx
+
+
+if hasattr(model_base, "LTXAV"):
+
+    @CFGParallelInjectRegistry.register(model_base.LTXAV)
+    def _inject_ltxav():
+        from ..diffusion_models.lightricks.xdit_cfg_parallel import cfg_parallel_forward_wrapper_ltxav
+
+        return cfg_parallel_forward_wrapper_ltxav
+
+
+if hasattr(model_base, "Lumina2"):
+
+    @CFGParallelInjectRegistry.register(model_base.Lumina2)
+    def _inject_lumina():
+        from ..diffusion_models.lumina.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Boogu"):
+
+    @CFGParallelInjectRegistry.register(model_base.Boogu)
+    def _inject_boogu():
+        from ..diffusion_models.boogu.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Omnigen2"):
+
+    @CFGParallelInjectRegistry.register(model_base.Omnigen2)
+    def _inject_omnigen2():
+        from ..diffusion_models.omnigen.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Krea2"):
+
+    @CFGParallelInjectRegistry.register(model_base.Krea2)
+    def _inject_krea2():
+        from ..diffusion_models.krea2.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Kandinsky5"):
+
+    @CFGParallelInjectRegistry.register(model_base.Kandinsky5)
+    def _inject_kandinsky5():
+        from ..diffusion_models.kandinsky5.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "ErnieImage"):
+
+    @CFGParallelInjectRegistry.register(model_base.ErnieImage)
+    def _inject_ernie_image():
+        from ..diffusion_models.ernie.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+# This will cause error for all non specified models above, since all of that will be funneled into this
+@CFGParallelInjectRegistry.register(model_base.BaseModel)
+def _inject_unet():
+    from ..diffusion_models.modules.diffusionmodules.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+    return cfg_parallel_forward_wrapper

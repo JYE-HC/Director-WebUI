@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+.uv-cache/
+
+# Runtime data
+data/
+uploads/
+*.sqlite3
+*.db
+.data/
+.dsh/
+*.log
+
+# Frontend
+node_modules/
+dist/
+coverage/
+.vite/
+
+# Local settings
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+
+# Maintainer-only files (not part of release snapshots)
+AGENTS.md
+踩坑*.md

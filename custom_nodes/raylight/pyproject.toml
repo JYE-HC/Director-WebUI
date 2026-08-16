@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=70.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raylight"
+version = "1.8.0"
+description = "Enable tensor split multi gpu capability in Comfy UI"
+authors = [
+  {name = "Micko Lesmana", email = "mickolesmana@gmail.com"}
+]
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = []
+dependencies = [
+"ray>=2.48.0", "xfuser>=0.4.4"
+]
+
+
+
+[project.optional-dependencies]
+dev = [
+    "bump-my-version",
+    "coverage",  # testing
+    "mypy",  # linting
+    "pre-commit", # runs linting on commit
+    "pytest",  # testing
+    "ruff",  # linting
+]
+
+[project.urls]
+bugs = "https://github.com/komikndr/raylight/issues"
+homepage = "https://github.com/komikndr/raylight"
+Repository = "https://github.com/komikndr/raylight"
+
+
+[tool.comfy]
+PublisherId = "komikndr"
+DisplayName = "raylight"
+repository = "https://github.com/komikndr/raylight"
+Icon = "https://github.com/komikndr/raylight/blob/main/icon.png?raw=true"
+
+
+[tool.setuptools.package-data]
+"*" = ["*.*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = [
+    "tests",
+]
+
+[tool.pyright]
+#typeCheckingMode = "strict"
+reportMissingImports = false
+
+[tool.mypy]
+files = "."
+
+# Use strict defaults
+strict = true
+warn_unreachable = true
+warn_no_return = true
+
+[[tool.mypy.overrides]]
+# Don't require test functions to include types
+module = "tests.*"
+allow_untyped_defs = true
+disable_error_code = "attr-defined"
+
+[tool.ruff]
+# extend-exclude = ["static", "ci/templates"]
+line-length = 140
+src = ["src", "tests"]
+target-version = "py39"
+
+# Add rules to ban exec/eval
+[tool.ruff.lint]
+select = [
+    "S102",  # exec-builtin
+    "S307",  # eval-used
+    "W293",
+    "F",  # The "F" series in Ruff stands for "Pyflakes" rules, which catch various Python syntax errors and undefined names.
+    # See all rules here: https://docs.astral.sh/ruff/rules/#pyflakes-f
+]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "double"

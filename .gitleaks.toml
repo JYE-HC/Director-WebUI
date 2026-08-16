@@ -1,0 +1,23 @@
+title = "Director Web release secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Exact synthetic credentials used by the diagnostic redaction regression test"
+condition = "AND"
+regexTarget = "line"
+paths = ['''^backend/tests/test_job_management\.py$''']
+regexes = [
+  '''token=private-token Authorization: Bearer private-bearer request to''',
+  '''https://alice:private-password@comfy\.test failed''',
+  '''access_token=private-access refreshToken=private-refresh''',
+  '''client_secret=private-client-secret apiKey=private-api-key''',
+  '''Bearer private-json-bearer''',
+  '''Basic private-quoted-basic''',
+  '''password = \\"private password with spaces\\"''',
+]
+
+[[allowlists]]
+description = "The scanner configuration contains the exact synthetic fixture regexes"
+paths = ['''^\.gitleaks\.toml$''']

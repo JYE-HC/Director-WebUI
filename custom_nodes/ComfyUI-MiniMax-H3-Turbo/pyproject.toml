@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-minimax-h3-turbo"
+description = "4-step turbo sampler + LoRA loader for MiniMax-H3 joint video + audio generation."
+version = "1.2.3"
+license = { text = "Apache-2.0" }
+dependencies = []
+requires-python = ">=3.10"
+
+[project.urls]
+Repository = "https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo"
+
+[tool.comfy]
+PublisherId = "larryvrh"
+DisplayName = "ComfyUI-MiniMax-H3-Turbo"
+Icon = ""
