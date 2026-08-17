@@ -254,6 +254,18 @@ def start_director(args: argparse.Namespace) -> int:
     backend_port = str(args.backend_port or env("DIRECTOR_PORT", "8787"))
     frontend_host = args.frontend_host or env("DIRECTOR_FRONTEND_HOST", "127.0.0.1")
     frontend_port = str(args.frontend_port or env("DIRECTOR_FRONTEND_PORT", "4173"))
+    try:
+        backend_port_number = int(backend_port)
+        frontend_port_number = int(frontend_port)
+    except ValueError:
+        print(f"invalid Director port: backend={backend_port} frontend={frontend_port}", file=sys.stderr)
+        return 1
+    if not port_is_available(backend_host, backend_port_number):
+        print(f"backend port is already in use: {backend_host}:{backend_port}", file=sys.stderr)
+        return 1
+    if not port_is_available(frontend_host, frontend_port_number):
+        print(f"frontend port is already in use: {frontend_host}:{frontend_port}", file=sys.stderr)
+        return 1
     api_origin = f"http://127.0.0.1:{backend_port}"
 
     print(f"starting backend on {backend_host}:{backend_port}")
