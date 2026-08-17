@@ -29,6 +29,8 @@ START_AFTER_INSTALL=false
 START_COMFYUI_AFTER_INSTALL=false
 REQUIRE_COMFY_ONLINE=false
 DIRECTOR_SKIP_RELOCATION=false
+CONFIRM_COMFYUI_STOPPED=false
+REPLACE_NODES=()
 COMFYUI_ROOT_OPTION=""
 WINDOWS_COMFYUI_ROOT_OPTION=""
 COMFYUI_PYTHON_OPTION=""
@@ -72,6 +74,8 @@ usage() {
       --start                   安装成功后启动 Director
       --start-comfyui           安装成功后启动本地 ComfyUI
       --require-online           ComfyUI 在线检查失败则安装失败
+      --replace-node NAME       备份并替换已有不同内容的 bundled 节点（可重复；仅 raylight / ComfyUI-MiniMax-H3-Turbo）
+      --confirm-comfyui-stopped 确认替换节点前已停止 ComfyUI
       --skip-relocation         WSL2 下即使项目在 /mnt/c 也不自动迁移
   -h, --help                    显示帮助
 EOF
@@ -117,6 +121,14 @@ parse_args() {
       --start) START_AFTER_INSTALL=true; shift ;;
       --start-comfyui) START_COMFYUI_AFTER_INSTALL=true; shift ;;
       --require-online) REQUIRE_COMFY_ONLINE=true; shift ;;
+      --replace-node)
+        (($# >= 2)) || die "缺少 --replace-node 参数"
+        case "$2" in
+          raylight|ComfyUI-MiniMax-H3-Turbo) REPLACE_NODES+=("$2") ;;
+          *) die "不能替换未知节点：$2（只能是 raylight 或 ComfyUI-MiniMax-H3-Turbo）" 64 ;;
+        esac
+        shift 2 ;;
+      --confirm-comfyui-stopped) CONFIRM_COMFYUI_STOPPED=true; shift ;;
       --skip-relocation) DIRECTOR_SKIP_RELOCATION=true; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "未知选项：$1" 64 ;;

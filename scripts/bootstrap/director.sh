@@ -9,6 +9,11 @@ install_director_local() {
   local args=(--comfyui-root "$COMFYUI_ROOT" --node-bin-dir "$NODE_BIN_DIR")
   [[ -n "${COMFYUI_PYTHON_OPTION:-}" ]] && args+=(--comfy-python "$COMFYUI_PYTHON_OPTION")
   [[ "$ASSUME_YES" == true ]] && args+=(-y)
+  if ((${#REPLACE_NODES[@]})); then
+    local node
+    for node in "${REPLACE_NODES[@]}"; do args+=(--replace-node "$node"); done
+  fi
+  [[ "${CONFIRM_COMFYUI_STOPPED:-false}" == true ]] && args+=(--confirm-comfyui-stopped)
   info "调用现有 install.sh 安装 Director、前端依赖与 bundled custom nodes"
   (cd "$SCRIPT_DIR" && ./install.sh install "${args[@]}")
 }
@@ -41,6 +46,9 @@ step_install_director() {
   }
   install_director_local || {
     error "Director/custom nodes 安装失败；修复 ComfyUI 或节点冲突后可用 --resume 重试"
+    error "若上方提示节点“已有内容不同”且确认替换：先 ./bootstrap.sh stop-comfyui，再执行"
+    error "  ./bootstrap.sh --only install_director --replace-node <节点名> --confirm-comfyui-stopped"
+    error "（旧目录自动备份到 ComfyUI 的 .director-backups/，不会被删除）"
     return 1
   }
   ok "Director 与 custom nodes 安装完成"
