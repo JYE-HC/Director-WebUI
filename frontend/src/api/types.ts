@@ -631,6 +631,16 @@ export const DEFAULT_SETTINGS: RuntimeSettings = {
   },
 };
 
+/**
+ * Mirrors the backend's `Database.canonical_comfy_origin` (trailing slashes
+ * stripped). Asset list/trash responses carry this canonical origin while
+ * runtime settings keep the user-entered URL verbatim, so every comparison
+ * between the two must normalize first.
+ */
+export function canonicalComfyOrigin(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
 export function isConfiguredComfyUrl(value: string): boolean {
   if (!value.trim()) return false;
   try {

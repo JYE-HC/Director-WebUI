@@ -114,45 +114,64 @@ Standard 提交会失败封闭，不能把“旧账本无法描述”误当成�
 
 ## 安装与启动
 
-这是 Linux 本地部署的首个 alpha 发布候选。推荐 Python 3.12、Node.js 22.13+、`uv`、
-Git、ffmpeg/ffprobe，以及包含所需官方 H3 节点的 ComfyUI。精确兼容基线和依赖来源见
+这是 Linux 本地部署的首个 alpha 发布候选。精确兼容基线和依赖来源见
 [发布说明](RELEASE.md)。模型权重、LoRA 和用户素材不随本仓库分发。
 
-先运行只读检查，再安装：
+推荐使用仓库根目录的一键引导脚本，依次完成平台检测、系统依赖、uv、Node.js、ffmpeg、
+ComfyUI 准备、Director 安装与验证。先运行只读检查，再安装：
 
 ```bash
-./install.sh check --comfyui-root /path/to/ComfyUI
-./install.sh install --comfyui-root /path/to/ComfyUI
-./install.sh verify --comfyui-root /path/to/ComfyUI
+./bootstrap.sh check     # 只读环境检查，不写入任何文件
+./bootstrap.sh install   # 交互式安装；加 -y 使用推荐默认值
+./bootstrap.sh verify    # 只验证已安装内容
 ```
 
-安装器会校验本发布包、ComfyUI Git 能力、Python/CUDA/Ray 环境、Node、ffmpeg 和 custom node
-冲突；它不会执行 `git pull`、切换 ComfyUI commit、修补 ComfyUI 核心、下载模型或自动重启
-ComfyUI。与实测 ComfyUI commit 相同或属于它的后继版本均可安装；本地改动只提示统计信息，
-不会展示文件名，也不会阻止安装。若已有同名但内容不同的节点，安装会停止；只有在 ComfyUI 已停止时，
-才可显式使用 `--replace-node raylight --replace-node ComfyUI-MiniMax-H3-Turbo
+安装按固定步骤队列执行：检测平台、检查项目文件系统位置、选择 ComfyUI 安装方式、安装系统
+依赖、uv、Node.js、ffmpeg、准备 ComfyUI、安装 ComfyUI 依赖、安装 Director 与 custom
+nodes、离线验证、可选在线验证、生成启动配置、可选启动服务。`--dry-run` 只打印检测结果与
+安装计划；`--resume`/`--from`/`--only`/`--skip` 控制断点续装与步骤裁剪；`--no-sudo`
+禁止安装系统包，uv/node/ffmpeg 尽量装入项目 `.tools/`；已有兼容 Node.js 时可用
+`--node-bin-dir PATH` 直接复用。
+
+ComfyUI 有三种接入方式：自动 clone（默认，`--comfyui-ref latest|tested|<tag/sha>`）、复用
+已有安装（`--comfyui-root PATH`，可用 `--comfy-python PATH` 指定解释器）、跳过本地安装直连
+远程实例（`--skip-comfyui --comfyui-url URL`）。WSL2 下项目位于 /mnt/c 时会自动迁移到
+WSL 原生文件系统（`--skip-relocation` 关闭），并可用 `--windows-comfyui-root` 复用
+Windows 侧 ComfyUI 的模型目录。
+
+本地 ComfyUI 模式下，Director 前后端与 bundled custom nodes 的安装及离线验证由发布包内的
+`install.sh` 完成。安装器会校验本发布包、ComfyUI Git 能力、Python/CUDA/Ray 环境、Node、ffmpeg
+和 custom node 冲突；它不会执行 `git pull`、切换 ComfyUI commit、修补 ComfyUI 核心、下载模型
+或自动重启 ComfyUI。与实测 ComfyUI commit 相同或属于它的后继版本均可安装；本地改动只提示
+统计信息，不会展示文件名，也不会阻止安装。若已有同名但内容不同的节点，安装会停止；只有在
+ComfyUI 已停止时，才可显式使用 `--replace-node raylight --replace-node ComfyUI-MiniMax-H3-Turbo
 --confirm-comfyui-stopped`。旧目录会保存在 ComfyUI 根下的 `.director-backups/`，不会被删除。
 
 标准单卡链只使用 ComfyUI core/官方 extras。两张及以上 GPU 才会使用仓库内的 Director 定制
 RayLight；`ComfyUI-MiniMax-H3-Turbo` 只在选择旧版专用 Turbo LoRA 时使用。不要安装旧
 `MiniMaxH3Director` 大节点，Director 不依赖并明确拒绝它。
 
-安装结束后先重启 ComfyUI，再启动 Director：
+安装与服务管理共用同一入口：
 
 ```bash
-./director.sh start
-./director.sh status
+./bootstrap.sh start|stop|restart|status|logs             # Director，委托 director.sh
+./bootstrap.sh start-comfyui|stop-comfyui|status-comfyui|logs-comfyui
+./bootstrap.sh reset    # 只清空 .director-install 安装状态，不删除 ComfyUI、数据库或模型
 ```
 
-`director.sh` 使用用户级临时 systemd unit，默认只监听 `127.0.0.1`，日志写入 `data/`。
-Node 不在 PATH 时可设置 `DIRECTOR_NODE_BIN_DIR=/path/to/node/bin`。首次启动后在“系统设置”填写
-ComfyUI URL。数据库默认位于 `.data/database/director.sqlite3`，升级时不会自动删除或覆盖旧库。
-
-监听地址和端口可以在 `start`/`restart` 时覆盖：
+监听地址和端口可在安装或 `start`/`restart` 时用 `--listen-host`、`--backend-port`
+（默认 8787）、`--frontend-port`（默认 4173）覆盖；`--start`/`--start-comfyui` 让安装
+成功后直接拉起对应服务。例如让前后端监听所有 IPv4 网卡：
 
 ```bash
-./director.sh restart --host 0.0.0.0 --backend-port 8788 --frontend-port 4174
+./bootstrap.sh restart --host 0.0.0.0 --backend-port 8788 --frontend-port 4174
 ```
+
+`director.sh` 使用用户级临时 systemd unit 管理前后端进程，默认只监听 `127.0.0.1`，日志写入
+`data/director-backend.log` 和 `data/director-frontend.log`，可用 `./bootstrap.sh logs backend`
+或 `./bootstrap.sh logs frontend` 跟踪。`0.0.0.0` 仅用于监听，浏览器访问时应使用服务器实际 IP。
+首次启动后在“系统设置”填写 ComfyUI URL。数据库默认位于 `.data/database/director.sqlite3`，
+升级时不会自动删除或覆盖旧库。
 
 本版没有登录鉴权，不要直接暴露到公网。跨机器访问前应在反向代理层增加 TLS、身份认证与来源限制。
 
