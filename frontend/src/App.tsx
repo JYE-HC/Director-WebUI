@@ -3,6 +3,7 @@ import { ApiError, DATABASE_IDENTITY_STALE_EVENT, directorApi, taskEventsUrl } f
 import {
   EMPTY_CAPABILITIES,
   EMPTY_MODELS,
+  canonicalComfyOrigin,
   isConfiguredComfyUrl,
   rayLightResidencyPolicyAfterBindingChange,
   resolveExecutionBackend,
@@ -289,6 +290,15 @@ function collectTimelineRecoveryBranches(
       });
       if (!divergentJournals.has(journal)) continue;
     }
+    // A clean journal records head === confirmed base: everything that session
+    // knew was already synced at confirm time. When the server has since moved
+    // on, the branch classifies as "conflict" yet carries no unsynced content
+    // to recover. Listing it would re-surface the recovery gate on every
+    // refresh forever, so keep its bytes as silent evidence only.
+    if (
+      journal.status === "conflict" &&
+      timelineProjectsEqual(journal.project, journal.confirmedDocument)
+    ) continue;
     const project = journalRecoveryProject(journal);
     pending.push({
       id: timelineRecoveryBranchId(null, journal),
@@ -1889,12 +1899,13 @@ export default function App() {
           }
         : null
     );
+    const scopeComfyOrigin = scope ? canonicalComfyOrigin(scope.comfyOrigin) : null;
     const scopeStillCurrent = () => Boolean(
       scope &&
       runtimeSettingsAuthorityReadyRef.current &&
       activeDatabaseRef.current?.active_database_path === scope.database.active_database_path &&
       activeDatabaseRef.current?.active_database_identity === scope.database.active_database_identity &&
-      authoritativeSettingsRef.current.comfy_url === scope.comfyOrigin
+      canonicalComfyOrigin(authoritativeSettingsRef.current.comfy_url) === scopeComfyOrigin
     );
     if (!scopeStillCurrent()) {
       if (failClosed) {
@@ -1911,7 +1922,7 @@ export default function App() {
         assetListRequest.current !== requestId ||
         !scopeStillCurrent() ||
         response.active_database_identity !== scope!.database.active_database_identity ||
-        response.comfy_origin !== scope!.comfyOrigin
+        response.comfy_origin !== scopeComfyOrigin
       ) {
         if (failClosed && assetListRequest.current === requestId) {
           dispatchTimelineUi({ type: "assets/replace", assets: [] });
@@ -1944,14 +1955,14 @@ export default function App() {
   const loadAssetTrash = useCallback(async (): Promise<boolean> => {
     const requestId = ++assetTrashListRequest.current;
     const databaseIdentity = activeDatabaseRef.current?.active_database_identity ?? null;
-    const comfyOrigin = authoritativeSettingsRef.current.comfy_url;
+    const comfyOrigin = canonicalComfyOrigin(authoritativeSettingsRef.current.comfy_url);
     setAssetTrashLoading(true);
     try {
       const response = await directorApi.listAssetTrash();
       if (
         requestId !== assetTrashListRequest.current ||
         activeDatabaseRef.current?.active_database_identity !== databaseIdentity ||
-        authoritativeSettingsRef.current.comfy_url !== comfyOrigin ||
+        canonicalComfyOrigin(authoritativeSettingsRef.current.comfy_url) !== comfyOrigin ||
         response.active_database_identity !== databaseIdentity ||
         response.comfy_origin !== comfyOrigin
       ) return false;
@@ -1996,9 +2007,9 @@ export default function App() {
         activeDatabase.active_database_identity !== expectedDatabase.active_database_identity ||
         authoritativeSettingsRef.current.comfy_url !== expectedComfyOrigin ||
         assetResponse.active_database_identity !== expectedDatabase.active_database_identity ||
-        assetResponse.comfy_origin !== expectedComfyOrigin ||
+        assetResponse.comfy_origin !== canonicalComfyOrigin(expectedComfyOrigin) ||
         trashResponse.active_database_identity !== expectedDatabase.active_database_identity ||
-        trashResponse.comfy_origin !== expectedComfyOrigin
+        trashResponse.comfy_origin !== canonicalComfyOrigin(expectedComfyOrigin)
       ) return "unknown";
 
       const preference = loadAssetLayoutPreference();

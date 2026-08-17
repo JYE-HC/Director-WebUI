@@ -497,6 +497,20 @@ describe("统一长视频时间线应用", () => {
     expect(screen.queryByText(foreignAsset.name)).not.toBeInTheDocument();
   });
 
+  it("设置 URL 带尾斜杠时素材列表仍按 canonical origin 匹配并显示", async () => {
+    const slashedSettings = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy.test:8188/" };
+    mockCommonRequests(slashedSettings);
+    vi.mocked(directorApi.listAssets).mockResolvedValue(
+      appAssetList([imageAsset], "http://comfy.test:8188"),
+    );
+
+    render(<App />);
+    await waitUntilReady();
+
+    await waitFor(() => expect(directorApi.listAssets).toHaveBeenCalled());
+    expect(await screen.findByText(imageAsset.name)).toBeInTheDocument();
+  });
+
   it("旧 v2 长期镜像只隔离保留，不参与启动恢复或反写服务器", async () => {
     const staleMirror = createTimelineProject();
     staleMirror.title = "旧浏览器镜像";
@@ -769,6 +783,51 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByRole("button", { name: "保留本地版本" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "采用服务器版本" })).toBeInTheDocument();
     expect(update).not.toHaveBeenCalled();
+  });
+
+  it("基线已过期的干净 journal 不列为恢复分支，只保留取证 bytes 且零 PUT", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const base = createTimelineProject();
+    base.segments[0].prompt = "clean 基线前";
+    const confirmed = structuredClone(base);
+    confirmed.title = "过期干净分支";
+    confirmed.segments[0].prompt = "clean head 内容";
+    const remote = structuredClone(base);
+    remote.segments[0].prompt = "服务器新内容";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before: base,
+      after: confirmed,
+      now: 21,
+    });
+    const journalScope = {
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: "foreign-clean-stale-owner",
+    };
+    await saveTimelineHistoryJournal(journalScope, {
+      document: confirmed,
+      revision: 9,
+    }, history);
+    const journalToken = await readTimelineHistoryJournalVersionToken(journalScope);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: remote,
+      revision: 10,
+    });
+    const update = vi.mocked(directorApi.updateTimelineAuthority);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("服务器新内容");
+    expect(screen.queryByText(/可恢复的本地分支/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "恢复所选分支" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/服务器时间线存在修订冲突/)).not.toBeInTheDocument();
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
+    expect(update).not.toHaveBeenCalled();
+    expect(await readTimelineHistoryJournalVersionToken(journalScope)).toEqual(journalToken);
   });
 
   it("多个 foreign 分支全部可键盘选择，逐项确认丢弃只删除所选 owner", async () => {
