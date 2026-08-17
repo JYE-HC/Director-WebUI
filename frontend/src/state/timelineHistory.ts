@@ -232,10 +232,16 @@ function cloneTimelineHistoryContext(
     selected_segment_ids: [...context.selected_segment_ids],
     active_segment_id: context.active_segment_id,
     selection_anchor_id: context.selection_anchor_id,
-    // A text replay restores its caret only. It must never revive a stale
-    // structural selection even if a caller forgot to set the explicit flag.
+    // A standalone text replay restores its caret only. Only a synthesized
+    // multi-entry jump may explicitly combine it with structural selection.
     ...(textEditing
-      ? { restore_segment_selection: false, text_editing: textEditing }
+      ? {
+          // Ordinary text entries explicitly opt out of restoring structural
+          // selection. A multi-entry jump may intentionally combine the last
+          // effective structural context with the last text caret context.
+          restore_segment_selection: context.restore_segment_selection === true,
+          text_editing: textEditing,
+        }
       : context.restore_segment_selection === undefined
         ? {}
         : { restore_segment_selection: context.restore_segment_selection }),
@@ -701,6 +707,34 @@ export function timelineHistoryEntries(
   return orderedEntries(history);
 }
 
+function replayContextAcrossEntries(
+  entries: readonly TimelineHistoryEntry[],
+  currentCursor: number,
+  targetCursor: number,
+): TimelineHistoryContext | undefined {
+  const movingBackward = targetCursor < currentCursor;
+  const crossedEntries = movingBackward
+    ? entries.slice(targetCursor, currentCursor).reverse()
+    : entries.slice(currentCursor, targetCursor);
+  let structuralContext: TimelineHistoryContext | undefined;
+  let textContext: TimelineHistoryContext | undefined;
+  for (const entry of crossedEntries) {
+    const context = movingBackward ? entry.beforeContext : entry.afterContext;
+    if (!context) continue;
+    if (context.restore_segment_selection !== false) structuralContext = context;
+    if (context.text_editing) textContext = context;
+  }
+  if (!structuralContext) return textContext;
+  if (!textContext?.text_editing) return structuralContext;
+  return {
+    selected_segment_ids: [...structuralContext.selected_segment_ids],
+    active_segment_id: structuralContext.active_segment_id,
+    selection_anchor_id: structuralContext.selection_anchor_id,
+    restore_segment_selection: true,
+    text_editing: cloneTimelineTextEditingContext(textContext.text_editing),
+  };
+}
+
 /** Jumps to any retained cursor with one reconstructed snapshot and no intermediate revisions. */
 export function jumpTimelineHistory(
   history: TimelineHistoryState,
@@ -715,7 +749,7 @@ export function jumpTimelineHistory(
   const project = projectAtRelativeCursor(history, targetCursor);
   const movingBackward = targetCursor < currentCursor;
   const entry = movingBackward ? entries[targetCursor] : entries[targetCursor - 1];
-  const context = movingBackward ? entry.beforeContext : entry.afterContext;
+  const context = replayContextAcrossEntries(entries, currentCursor, targetCursor);
   return {
     history: {
       ...history,

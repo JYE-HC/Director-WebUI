@@ -2022,6 +2022,28 @@ describe("统一长视频时间线应用", () => {
     expect(prompt).toHaveValue("光标移动前");
   });
 
+  it("提示词选区变化会结束上一段输入合并", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "选择前";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+
+    render(<App />);
+    await waitUntilReady();
+
+    const prompt = screen.getByLabelText("片段提示词") as HTMLTextAreaElement;
+    fireEvent.change(prompt, { target: { value: "选择前的输入" } });
+    prompt.setSelectionRange(0, "选择前的输入".length);
+    fireEvent.select(prompt);
+    fireEvent.change(prompt, { target: { value: "替换选区" } });
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(prompt).toHaveValue("选择前的输入");
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(prompt).toHaveValue("选择前");
+  });
+
   it("输入法组合输入超过普通合并窗口仍作为一次文本编辑撤销", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();

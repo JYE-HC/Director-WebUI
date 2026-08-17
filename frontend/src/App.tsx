@@ -1647,6 +1647,7 @@ export default function App() {
     };
     document.addEventListener("focusin", sealHistoryInputSession);
     document.addEventListener("pointerdown", sealTimelineTextBoundary);
+    document.addEventListener("select", sealTimelineTextBoundary);
     document.addEventListener("keydown", sealTimelineTextNavigation);
     document.addEventListener("beforeinput", sealNonIncrementalInput);
     document.addEventListener("compositionstart", beginComposition);
@@ -1654,6 +1655,7 @@ export default function App() {
     return () => {
       document.removeEventListener("focusin", sealHistoryInputSession);
       document.removeEventListener("pointerdown", sealTimelineTextBoundary);
+      document.removeEventListener("select", sealTimelineTextBoundary);
       document.removeEventListener("keydown", sealTimelineTextNavigation);
       document.removeEventListener("beforeinput", sealNonIncrementalInput);
       document.removeEventListener("compositionstart", beginComposition);

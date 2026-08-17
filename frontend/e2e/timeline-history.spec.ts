@@ -104,6 +104,22 @@ test("caret navigation seals one typing transaction", async ({ page }) => {
   await expect(prompt).toHaveValue(INITIAL_PROMPT);
 });
 
+test("selecting all seals the previous typing transaction", async ({ page }) => {
+  const prompt = await openPrompt(page);
+
+  await prompt.focus();
+  await prompt.press("End");
+  await page.keyboard.insertText(" first");
+  await prompt.press("Control+a");
+  await page.keyboard.insertText("replacement");
+  await expect(prompt).toHaveValue("replacement");
+
+  await prompt.press("Control+z");
+  await expect(prompt).toHaveValue(`${INITIAL_PROMPT} first`);
+  await prompt.press("Control+z");
+  await expect(prompt).toHaveValue(INITIAL_PROMPT);
+});
+
 test("a selected range replacement round-trips through project history", async ({ page }) => {
   const prompt = await openPrompt(page);
 

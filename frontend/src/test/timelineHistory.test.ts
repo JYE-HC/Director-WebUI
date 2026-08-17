@@ -435,6 +435,75 @@ describe("timeline history", () => {
     expect(() => jumpTimelineHistory(history, 46)).toThrow(RangeError);
   });
 
+  it("preserves the final structural and text contexts across multi-entry jumps", () => {
+    const initial = createTimelineProject();
+    const initialSegmentId = initial.segments[0].id;
+    const inserted = structuredClone(initial);
+    const insertedSegment = createTimelineSegment("fl2va", 2);
+    inserted.segments.push(insertedSegment);
+    const renamed = titled(inserted, "跨步历史");
+    const configured = { ...renamed, export_mode: "segments" as const };
+    const beforeText = {
+      field_key: "project:title",
+      start: initial.title.length,
+      end: initial.title.length,
+      direction: "none" as const,
+    };
+    const afterText = {
+      field_key: "project:title",
+      start: renamed.title.length,
+      end: renamed.title.length,
+      direction: "none" as const,
+    };
+
+    let history = recordTimelineHistory(createTimelineHistory(), {
+      label: "插入片段",
+      before: initial,
+      after: inserted,
+      beforeContext: context([initialSegmentId], initialSegmentId, initialSegmentId, {
+        restore_segment_selection: true,
+      }),
+      afterContext: context([insertedSegment.id], insertedSegment.id, insertedSegment.id, {
+        restore_segment_selection: true,
+      }),
+    });
+    history = recordTimelineHistory(history, {
+      label: "重命名项目",
+      before: inserted,
+      after: renamed,
+      beforeContext: context([insertedSegment.id], insertedSegment.id, insertedSegment.id, {
+        restore_segment_selection: false,
+        text_editing: beforeText,
+      }),
+      afterContext: context([insertedSegment.id], insertedSegment.id, insertedSegment.id, {
+        restore_segment_selection: false,
+        text_editing: afterText,
+      }),
+    });
+    history = recordTimelineHistory(history, {
+      label: "修改导出方式",
+      before: renamed,
+      after: configured,
+    });
+
+    const fullHistory = history;
+    for (let index = 0; index < 3; index += 1) {
+      history = undoTimelineHistory(history)!.history;
+    }
+    expect(jumpTimelineHistory(history, 3)?.snapshot.context).toEqual(context(
+      [insertedSegment.id],
+      insertedSegment.id,
+      insertedSegment.id,
+      { restore_segment_selection: true, text_editing: afterText },
+    ));
+    expect(jumpTimelineHistory(fullHistory, 0)?.snapshot.context).toEqual(context(
+      [initialSegmentId],
+      initialSegmentId,
+      initialSegmentId,
+      { restore_segment_selection: true, text_editing: beforeText },
+    ));
+  });
+
   it("safely rebases canonical ACKs at the current head and preserves undo/redo", () => {
     const initial = createTimelineProject();
     const client = titled(initial, "客户端标题");
