@@ -249,10 +249,10 @@ run_install() {
     info "启动 Director：./bootstrap.sh start"
   fi
   if [[ "$IS_WSL" == true ]]; then
-    info "Windows 浏览器访问：http://localhost:${DIRECTOR_FRONTEND_PORT:-4173}"
-    info "WSL 内访问：http://127.0.0.1:${DIRECTOR_FRONTEND_PORT:-4173}"
+    info "浏览器输入 http://localhost:${DIRECTOR_FRONTEND_PORT:-4173} 访问 Director-WebUI（Windows 侧）"
+    info "WSL 内则输入 http://127.0.0.1:${DIRECTOR_FRONTEND_PORT:-4173}"
   else
-    info "浏览器访问：http://127.0.0.1:${DIRECTOR_FRONTEND_PORT:-4173}"
+    info "浏览器输入 http://127.0.0.1:${DIRECTOR_FRONTEND_PORT:-4173} 访问 Director-WebUI"
   fi
 }
 

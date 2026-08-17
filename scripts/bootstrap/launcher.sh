@@ -154,9 +154,9 @@ start_director_if_requested() {
     fi
   fi
   if [[ "$IS_WSL" == true ]]; then
-    info "Windows 浏览器建议访问：http://localhost:${DIRECTOR_FRONTEND_PORT:-4173}"
+    info "浏览器输入 http://localhost:${DIRECTOR_FRONTEND_PORT:-4173} 访问 Director-WebUI（Windows 侧）"
   else
-    info "浏览器访问：http://127.0.0.1:${DIRECTOR_FRONTEND_PORT:-4173}"
+    info "浏览器输入 http://127.0.0.1:${DIRECTOR_FRONTEND_PORT:-4173} 访问 Director-WebUI"
   fi
   return 0
 }
