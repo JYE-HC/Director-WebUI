@@ -3167,6 +3167,7 @@ describe("统一长视频时间线应用", () => {
     render(<App />);
     await waitUntilReady();
     const switcher = await screen.findByRole("combobox", { name: "切换项目" });
+    await screen.findByRole("option", { name: projectB.title });
     fireEvent.change(switcher, { target: { value: "project-b" } });
     await waitFor(() => expect(getProjectTimeline).toHaveBeenCalledWith("project-b", undefined));
     fireEvent.change(switcher, { target: { value: "project-c" } });
@@ -3201,6 +3202,7 @@ describe("统一长视频时间线应用", () => {
     render(<App />);
     await waitUntilReady();
     const switcher = await screen.findByRole("combobox", { name: "切换项目" });
+    await screen.findByRole("option", { name: projectB.title });
     fireEvent.change(switcher, { target: { value: "project-b" } });
     await waitFor(() => expect(getProjectTimeline).toHaveBeenCalledWith("project-b", undefined));
     fireEvent.change(switcher, { target: { value: DEFAULT_PROJECT_ID } });
@@ -3242,9 +3244,9 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
-    fireEvent.change(await screen.findByRole("combobox", { name: "切换项目" }), {
-      target: { value: "project-b" },
-    });
+    const switcher = await screen.findByRole("combobox", { name: "切换项目" });
+    await screen.findByRole("option", { name: projectB.title });
+    fireEvent.change(switcher, { target: { value: "project-b" } });
     await waitFor(() => expect(directorApi.getProjectTimeline)
       .toHaveBeenCalledWith("project-b", undefined));
     fireEvent.change(screen.getByLabelText("片段提示词"), {
@@ -3328,6 +3330,7 @@ describe("统一长视频时间线应用", () => {
     });
 
     const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    await screen.findByRole("option", { name: projectB.title });
     fireEvent.change(switcher, { target: { value: "project-b" } });
     await waitFor(() => expect(directorApi.getProjectTimeline)
       .toHaveBeenCalledWith("project-b", undefined));
@@ -5160,6 +5163,7 @@ describe("统一长视频时间线应用", () => {
     render(<App />);
     await waitUntilReady();
     const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    await screen.findByRole("option", { name: staleProjectB.title });
     fireEvent.change(switcher, { target: { value: "project-b" } });
     await waitFor(() => expect(directorApi.getProjectTimeline)
       .toHaveBeenCalledWith("project-b", undefined));
@@ -6275,6 +6279,7 @@ describe("统一长视频时间线应用", () => {
     render(<App />);
     await waitUntilReady();
     const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    await screen.findByRole("option", { name: staleProjectB.title });
     fireEvent.change(switcher, { target: { value: "project-b" } });
     await waitFor(() => expect(directorApi.getProjectTimeline)
       .toHaveBeenCalledWith("project-b", undefined));
@@ -6352,6 +6357,7 @@ describe("统一长视频时间线应用", () => {
     render(<App />);
     await waitUntilReady();
     const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    await screen.findByRole("option", { name: staleProjectB.title });
     fireEvent.change(switcher, { target: { value: "project-b" } });
     await waitFor(() => expect(directorApi.getProjectTimeline)
       .toHaveBeenCalledWith("project-b", undefined));
