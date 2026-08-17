@@ -10,8 +10,8 @@ maintainer's previous commit identity are not published.
 | Component | Requirement | Tested baseline |
 | --- | --- | --- |
 | Platform | Linux; user systemd for `director.sh` | Linux + systemd 249 |
-| Python | 3.10+; 3.13+ not yet in CI | 3.12.13 |
-| Node.js | `^20.19`, `^22.13`, or `>=24` | 25.2.1 |
+| Python | 3.12+; 3.13+ not yet in CI | 3.12.13 |
+| Node.js | `^22.13` or `>=24` | 25.2.1 |
 | ComfyUI | tested commit or an official Git descendant | `8f37cf8c833a8f2d3c62e2adbccebfd165623481` |
 | Ray | 2.48.0+ | 2.56.1 |
 | xFuser | 0.4.4+ | 0.4.5 |
