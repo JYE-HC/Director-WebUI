@@ -381,6 +381,14 @@ def stop_comfyui(args: argparse.Namespace) -> int:
     return 0 if stop_process("comfyui") else 1
 
 
+def restart_comfyui(args: argparse.Namespace) -> int:
+    code = stop_comfyui(args)
+    if code != 0:
+        return code
+    time.sleep(0.3)
+    return start_comfyui(args)
+
+
 def status_comfyui(args: argparse.Namespace) -> int:
     del args
     return status("comfyui")
@@ -423,6 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("start-comfyui").set_defaults(func=start_comfyui)
     sub.add_parser("stop-comfyui").set_defaults(func=stop_comfyui)
+    sub.add_parser("restart-comfyui").set_defaults(func=restart_comfyui)
     sub.add_parser("status-comfyui").set_defaults(func=status_comfyui)
     sub.add_parser("logs-comfyui").set_defaults(func=logs_comfyui)
     return parser

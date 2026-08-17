@@ -151,13 +151,19 @@ ComfyUI 已停止时，才可显式使用 `--replace-node raylight --replace-nod
 RayLight；`ComfyUI-MiniMax-H3-Turbo` 只在选择旧版专用 Turbo LoRA 时使用。不要安装旧
 `MiniMaxH3Director` 大节点，Director 不依赖并明确拒绝它。
 
-安装与服务管理共用同一入口：
+安装与服务管理共用同一入口。`start`/`stop`/`restart`/`status`/`logs` 同时管理 Director 与本地
+ComfyUI（远程 ComfyUI 模式下只管理 Director）；带 `-director` 或 `-comfyui` 后缀的命令只管理
+对应一方：
 
 ```bash
-./bootstrap.sh start|stop|restart|status|logs             # Director，委托 director.sh
-./bootstrap.sh start-comfyui|stop-comfyui|status-comfyui|logs-comfyui
+./bootstrap.sh start|stop|restart|status|logs   # Director + 本地 ComfyUI
+./bootstrap.sh start-director|stop-director|restart-director|status-director|logs-director
+./bootstrap.sh start-comfyui|stop-comfyui|restart-comfyui|status-comfyui|logs-comfyui
 ./bootstrap.sh reset    # 只清空 .director-install 安装状态，不删除 ComfyUI、数据库或模型
 ```
+
+`logs` 不带参数时同时跟踪 backend/frontend/comfyui 三份日志，也可用
+`logs backend|frontend|comfyui` 只看一份。
 
 监听地址和端口可在安装或 `start`/`restart` 时用 `--listen-host`、`--backend-port`
 （默认 8787）、`--frontend-port`（默认 4173）覆盖；`--start`/`--start-comfyui` 让安装
