@@ -257,7 +257,7 @@ check_node_collisions() {
             safety=1
           fi
         else
-          fail "$name：已有内容不同；默认不覆盖。需要时显式传入 --replace-node $name"
+          fail "$name：已有内容不同；默认不覆盖。确认替换请执行：./install.sh install --comfyui-root \"$COMFYUI_ROOT\" --replace-node $name --confirm-comfyui-stopped（经 bootstrap 安装则用 ./bootstrap.sh --only install_director --replace-node $name --confirm-comfyui-stopped；旧目录会备份保留，不会被删除）"
           safety=1
         fi
         ;;
