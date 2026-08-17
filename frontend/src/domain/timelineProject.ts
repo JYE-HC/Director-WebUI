@@ -184,6 +184,27 @@ export type TimelineSegment = FL2VASegment | Ref2VASegment;
 
 export type SourceVideoSegment = Ref2VASegment;
 
+/** User-selected fields copied by both segment configuration actions. */
+export interface TimelineSegmentCopyOptions {
+  mode: boolean;
+  duration: boolean;
+  continuity: boolean;
+  audioMode: boolean;
+  refImageSize: boolean;
+  prompt: boolean;
+  promptReferences: boolean;
+}
+
+export const DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS: TimelineSegmentCopyOptions = {
+  mode: true,
+  duration: true,
+  continuity: true,
+  audioMode: true,
+  refImageSize: true,
+  prompt: false,
+  promptReferences: false,
+};
+
 export interface TimelineProject {
   version: 4;
   title: string;
@@ -594,10 +615,12 @@ export function selectTimelineSegment(
   const index = timelineIndexById(state.project, id);
   if (index < 0) return state;
   const target = state.project.segments[index];
-  if (options.range && state.selection_anchor_id) {
+  if (options.range) {
     // Enabled and disabled clips are rendered in separate rails. Compute a
     // Shift range from the target rail's visible order so a disabled segment
-    // hidden between two main-track clips is never selected implicitly.
+    // hidden between two main-track clips is never selected implicitly. The
+    // active clip is the edit/copy source, so a range gesture keeps it selected
+    // instead of silently reversing the copy direction.
     const rail = state.project.segments.filter((segment) => segment.enabled === target.enabled);
     const anchor = rail.findIndex((segment) => segment.id === state.selection_anchor_id);
     const railIndex = rail.findIndex((segment) => segment.id === id);
@@ -606,14 +629,28 @@ export function selectTimelineSegment(
       const range = rail
         .slice(start, end + 1)
         .map((segment) => segment.id);
+      const selected = options.additive
+        ? [...new Set([...state.selected_segment_ids, ...range])]
+        : range;
+      const active = state.active_segment_id ?? id;
       return {
         ...state,
-        selected_segment_ids: options.additive
-          ? [...new Set([...state.selected_segment_ids, ...range])]
-          : range,
-        active_segment_id: id,
+        selected_segment_ids: selected.includes(active) ? selected : [active, ...selected],
+        active_segment_id: active,
       };
     }
+    // A range cannot span the enabled and disabled rails. Retain the current
+    // source and start a new target-rail anchor at the clicked clip.
+    const active = state.active_segment_id ?? id;
+    const selected = options.additive
+      ? [...new Set([...state.selected_segment_ids, id])]
+      : active === id ? [id] : [active, id];
+    return {
+      ...state,
+      selected_segment_ids: selected,
+      active_segment_id: active,
+      selection_anchor_id: id,
+    };
   }
   if (options.additive) {
     const exists = state.selected_segment_ids.includes(id);
@@ -624,12 +661,14 @@ export function selectTimelineSegment(
       ? state.active_segment_id === id
         ? selected.at(-1) ?? null
         : state.active_segment_id
-      : id;
+      : state.active_segment_id ?? id;
     return {
       ...state,
       selected_segment_ids: selected,
       active_segment_id: active,
-      selection_anchor_id: exists ? active : id,
+      selection_anchor_id: exists && state.active_segment_id === id
+        ? active
+        : state.selection_anchor_id ?? active,
     };
   }
   return {
@@ -1086,37 +1125,99 @@ export function duplicateSelectedSegments(state: TimelineEditorState): TimelineE
   };
 }
 
+function copyTimelineSegmentReferences(
+  source: TimelineSegment,
+  target: TimelineSegment,
+): TimelineSegment {
+  if (source.mode !== target.mode) return target;
+  if (source.mode === "fl2va" && target.mode === "fl2va") {
+    return {
+      ...target,
+      first_image: structuredClone(source.first_image),
+      last_image: structuredClone(source.last_image),
+    };
+  }
+  if (source.mode === "ref2va" && target.mode === "ref2va") {
+    return {
+      ...target,
+      source_video: structuredClone(source.source_video),
+      source_start_seconds: source.source_start_seconds,
+      source_duration_seconds: source.source_duration_seconds,
+      source_audio_as_reference: source.source_audio_as_reference,
+      reference_images: structuredClone(source.reference_images),
+      reference_audios: structuredClone(source.reference_audios),
+      reference_videos: structuredClone(source.reference_videos),
+    };
+  }
+  return target;
+}
+
 /**
- * Copies exactly one strict union variant while preserving target identity and
- * participation state. This deliberately cannot retain fields from the
- * target's previous mode.
+ * Copies only the explicitly selected configuration while preserving target
+ * identity, title, participation state, and target-local material bindings
+ * unless the linked Prompt reference option is enabled.
  */
 export function copyTimelineSegmentConfiguration(
   source: TimelineSegment,
   target: TimelineSegment,
+  options: TimelineSegmentCopyOptions,
 ): TimelineSegment {
-  return {
-    ...structuredClone(source),
-    id: target.id,
-    title: target.title,
-    enabled: target.enabled,
-  } as TimelineSegment;
+  if (options.promptReferences && (!options.prompt || !options.mode)) return target;
+  if (!Object.values(options).some(Boolean)) return target;
+
+  let copied = options.mode && source.mode !== target.mode
+    ? changeSegmentMode(target, source.mode)
+    : target;
+
+  if (options.prompt && options.promptReferences) {
+    copied = copyTimelineSegmentReferences(source, copied);
+  }
+
+  if (options.duration || options.continuity || options.audioMode || options.refImageSize || options.prompt) {
+    copied = {
+      ...copied,
+      ...(options.duration ? { duration_seconds: source.duration_seconds } : {}),
+      ...(options.continuity ? { continuity: { ...source.continuity } } : {}),
+      ...(options.audioMode ? { audio_mode: source.audio_mode } : {}),
+      ...(options.refImageSize ? { ref_image_size: source.ref_image_size } : {}),
+      ...(options.prompt ? { prompt: source.prompt } : {}),
+    } as TimelineSegment;
+  }
+
+  // An explicit first-frame anchor is always a continuity boundary, including
+  // when the anchor and continuity settings were selected independently.
+  if (copied.mode === "fl2va" && copied.first_image && copied.continuity.enabled) {
+    copied = {
+      ...copied,
+      continuity: { ...copied.continuity, enabled: false },
+    };
+  }
+  return copied;
 }
 
 export function applyTimelineSegmentConfiguration(
   state: TimelineEditorState,
   sourceId: string,
-  scope: "following" | "all-other",
+  scope: "following" | "selected",
+  options: TimelineSegmentCopyOptions,
 ): TimelineEditorState {
   const sourceIndex = timelineIndexById(state.project, sourceId);
   if (sourceIndex < 0) return state;
+  if (options.promptReferences && (!options.prompt || !options.mode)) return state;
+  if (!Object.values(options).some(Boolean)) return state;
   const source = state.project.segments[sourceIndex];
+  const selected = new Set(state.selected_segment_ids);
+  let copiedCount = 0;
   const segments = state.project.segments.map((target, index) => {
     const included = scope === "following"
       ? index > sourceIndex
-      : target.id !== sourceId;
-    return included ? copyTimelineSegmentConfiguration(source, target) : target;
+      : target.id !== sourceId && selected.has(target.id);
+    if (!included) return target;
+    const copied = copyTimelineSegmentConfiguration(source, target, options);
+    if (copied !== target) copiedCount += 1;
+    return copied;
   });
+  if (!copiedCount) return state;
   return clampTimelinePlayhead({ ...state, project: touchProject(state.project, segments) });
 }
 
@@ -1241,7 +1342,7 @@ export type TimelineAction =
   | { type: "segment/set-mode"; ids: string[]; mode: TimelineGenerationMode }
   | { type: "segment/insert-reference-token"; id: string; token: string; selectionStart: number; selectionEnd: number; expectedMention: string }
   | { type: "segment/insert-subject-token"; id: string; token: string; selectionStart: number; selectionEnd: number; expectedMention: string }
-  | { type: "segment/apply-config"; sourceId: string; scope: "following" | "all-other" }
+  | { type: "segment/apply-config"; sourceId: string; scope: "following" | "selected"; options: TimelineSegmentCopyOptions }
   | { type: "assets/add"; assets: AssetReference[] }
   | { type: "assets/replace"; assets: AssetReference[] }
   | { type: "assets/move"; draggedId: string; targetId: string }
@@ -1437,7 +1538,7 @@ export function timelineEditorReducer(
           action.expectedMention,
         ));
     case "segment/apply-config":
-      return applyTimelineSegmentConfiguration(state, action.sourceId, action.scope);
+      return applyTimelineSegmentConfiguration(state, action.sourceId, action.scope, action.options);
     case "assets/add":
       return addWorkspaceAssets(state, action.assets);
     case "assets/replace":

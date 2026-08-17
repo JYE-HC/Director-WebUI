@@ -1,8 +1,11 @@
 import {
+  loadTimelineSegmentCopyOptions,
   loadTimelineSegmentSelectionPreference,
   loadTimelineWorkspacePreferences,
+  saveTimelineSegmentCopyOptions,
   saveTimelineSegmentSelectionPreference,
   saveTimelineWorkspacePreferences,
+  TIMELINE_SEGMENT_COPY_OPTIONS_KEY,
   TIMELINE_WORKSPACE_PREFERENCES_KEY,
 } from "../domain/workspacePreferences";
 
@@ -92,6 +95,54 @@ describe("时间线工作区浏览器偏好", () => {
       taskCurrentProjectOnly: true,
       taskSort: "duration",
     });
+  });
+
+  it("版本化保存片段复制选项，并约束提示词引用素材依赖", () => {
+    expect(loadTimelineSegmentCopyOptions()).toEqual({
+      mode: true,
+      duration: true,
+      continuity: true,
+      audioMode: true,
+      refImageSize: true,
+      prompt: false,
+      promptReferences: false,
+    });
+
+    saveTimelineSegmentCopyOptions({
+      mode: true,
+      duration: false,
+      continuity: false,
+      audioMode: true,
+      refImageSize: false,
+      prompt: true,
+      promptReferences: true,
+    });
+    expect(loadTimelineSegmentCopyOptions()).toEqual({
+      mode: true,
+      duration: false,
+      continuity: false,
+      audioMode: true,
+      refImageSize: false,
+      prompt: true,
+      promptReferences: true,
+    });
+
+    localStorage.setItem(TIMELINE_SEGMENT_COPY_OPTIONS_KEY, JSON.stringify({
+      version: 1,
+      mode: false,
+      prompt: true,
+      promptReferences: true,
+      duration: "损坏",
+    }));
+    expect(loadTimelineSegmentCopyOptions()).toMatchObject({
+      mode: false,
+      duration: true,
+      prompt: true,
+      promptReferences: false,
+    });
+
+    localStorage.setItem(TIMELINE_SEGMENT_COPY_OPTIONS_KEY, JSON.stringify({ version: 2 }));
+    expect(loadTimelineSegmentCopyOptions().prompt).toBe(false);
   });
 
   it("按数据库与项目恢复统一选择，并保留停用片段、全选意图和明确空集合", () => {
