@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Server-owned native ComfyUI workflows for MiniMax H3 long-form timelines"
 readme = "README.md"
 license = "GPL-3.0-only"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
   "anyio>=4.6,<4.10",
   "fastapi>=0.116,<0.117",

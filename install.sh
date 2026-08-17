@@ -162,10 +162,10 @@ check_node() {
   local version major minor
   version="$(PATH="$NODE_BIN_DIR:$PATH" "$NODE_BIN_DIR/node" -p 'process.versions.node')"
   IFS=. read -r major minor _ <<<"$version"
-  if ((major == 20 && minor >= 19)) || ((major == 22 && minor >= 13)) || ((major >= 24)); then
+  if ((major == 22 && minor >= 13)) || ((major >= 24)); then
     pass "Node.js $version"
   else
-    fail "Node.js $version 不满足 ^20.19、^22.13 或 >=24"
+    fail "Node.js $version 不满足 ^22.13 或 >=24"
     return 1
   fi
   pass "npm $(PATH="$NODE_BIN_DIR:$PATH" "$NODE_BIN_DIR/npm" --version)"

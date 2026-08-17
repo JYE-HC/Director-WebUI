@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.10", "3.12"]
+        python: ["3.12"]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: ["20.19", "22.13"]
+        node: ["22.13"]
     defaults:
       run:
         working-directory: frontend

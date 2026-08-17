@@ -2,10 +2,8 @@
 # shellcheck shell=bash
 # Automatic installation helpers for system packages, uv, Node.js and ffmpeg.
 
-NODE_MIN_MAJOR=20
-NODE_MIN_MINOR=19
-NODE_ALT_MIN_MAJOR=22
-NODE_ALT_MIN_MINOR=13
+NODE_MIN_MAJOR=22
+NODE_MIN_MINOR=13
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -62,7 +60,6 @@ node_version_compatible() {
   local version="$1" major minor
   IFS=. read -r major minor _ <<<"$version"
   ((major == NODE_MIN_MAJOR && minor >= NODE_MIN_MINOR)) \
-    || ((major == NODE_ALT_MIN_MAJOR && minor >= NODE_ALT_MIN_MINOR)) \
     || ((major >= 24))
 }
 
@@ -159,7 +156,7 @@ ensure_node() {
       ok "Node.js $version（$NODE_BIN_DIR）"
       return 0
     fi
-    warn "现有 Node.js $version 不满足 ^20.19、^22.13 或 >=24"
+    warn "现有 Node.js $version 不满足 ^22.13 或 >=24"
     if ! ask_yes_no "是否安装 Node.js 22 LTS 到项目 .tools？" y; then
       error "Node.js 版本不兼容"
       return 1
