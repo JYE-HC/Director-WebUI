@@ -14,6 +14,24 @@ BACKEND_PORT="8787"
 FRONTEND_HOST="127.0.0.1"
 FRONTEND_PORT="4173"
 
+if [[ -f "$SCRIPT_DIR/.director-install/env.sh" ]]; then
+  declare -A _external_env
+  declare _var
+  for _var in DIRECTOR_HOST DIRECTOR_PORT DIRECTOR_FRONTEND_HOST DIRECTOR_FRONTEND_PORT DIRECTOR_API_ORIGIN DIRECTOR_NODE_BIN_DIR DIRECTOR_COMFYUI_ROOT DIRECTOR_COMFYUI_PORT DIRECTOR_COMFYUI_LISTEN DIRECTOR_COMFYUI_URL DIRECTOR_TMPDIR DIRECTOR_FORCE_SUPERVISOR; do
+    [[ -v $_var ]] && _external_env[$_var]="${!_var}"
+  done
+  # shellcheck disable=SC1090
+  source "$SCRIPT_DIR/.director-install/env.sh"
+  for _var in "${!_external_env[@]}"; do
+    printf -v "$_var" '%s' "${_external_env[$_var]}"
+    export "$_var"
+  done
+fi
+BACKEND_HOST="${DIRECTOR_HOST:-$BACKEND_HOST}"
+BACKEND_PORT="${DIRECTOR_PORT:-$BACKEND_PORT}"
+FRONTEND_HOST="${DIRECTOR_FRONTEND_HOST:-$FRONTEND_HOST}"
+FRONTEND_PORT="${DIRECTOR_FRONTEND_PORT:-$FRONTEND_PORT}"
+
 usage() {
   cat <<'EOF'
 用法：
@@ -35,6 +53,13 @@ usage() {
   ./director.sh start
   ./director.sh restart --host 0.0.0.0 --backend-port 8788 --frontend-port 4174
 EOF
+}
+
+systemd_available() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  [[ -d /run/systemd/system ]] || return 1
+  timeout 3 systemctl --user show-environment >/dev/null 2>&1
 }
 
 die() {
@@ -224,6 +249,12 @@ main() {
     exit 1
   }
   shift
+
+  if [[ "${DIRECTOR_FORCE_SUPERVISOR:-false}" == true ]] || ! systemd_available; then
+    [[ -x "$SCRIPT_DIR/.venv/bin/python" ]] || \
+      die "内置 supervisor 需要后端 Python；请先运行 ./bootstrap.sh install"
+    exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/tools/director_supervisor.py" "$command" "$@"
+  fi
 
   case "$command" in
     start)
