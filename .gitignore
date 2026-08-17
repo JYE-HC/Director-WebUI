@@ -34,3 +34,7 @@ coverage/
 # Maintainer-only files (not part of release snapshots)
 AGENTS.md
 踩坑*.md
+ComfyUI/
+.director-install/
+.tools/
+.tmp/
