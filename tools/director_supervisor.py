@@ -306,8 +306,10 @@ def start_director(args: argparse.Namespace) -> int:
         stop_process("backend")
         return 1
 
-    print_service_url("Director 前端", frontend_host, frontend_port)
-    print_service_url("Director 后端", backend_host, backend_port)
+    print_service_url("Director-WebUI", frontend_host, frontend_port)
+    print(f"Director 后端 API 监听: http://{backend_host}:{backend_port}")
+    if backend_host in ("0.0.0.0", "::"):
+        print(f"后端 API 访问地址: http://127.0.0.1:{backend_port}（0.0.0.0 仅用于监听；跨机器请用服务器实际 IP）")
     return 0
 
 
@@ -349,8 +351,10 @@ def logs_director(args: argparse.Namespace) -> int:
 
 def print_service_url(label: str, host: str, port: str) -> None:
     print(f"{label}监听: http://{host}:{port}")
-    if host in ("0.0.0.0", "::"):
-        print(f"{label}访问: http://127.0.0.1:{port}（0.0.0.0 仅用于监听；跨机器请用服务器实际 IP）")
+    wildcard = host in ("0.0.0.0", "::")
+    visit_host = "127.0.0.1" if wildcard else host
+    suffix = "（0.0.0.0 仅用于监听；跨机器请把 127.0.0.1 换成服务器实际 IP）" if wildcard else ""
+    print(f"浏览器输入 http://{visit_host}:{port} 访问 {label}{suffix}")
 
 
 def start_comfyui(args: argparse.Namespace) -> int:

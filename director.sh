@@ -222,13 +222,12 @@ start_units() {
 
   printf 'Director 已启动：\n'
   printf '  前端监听：http://%s:%s\n' "$FRONTEND_HOST" "$FRONTEND_PORT"
-  printf '  后端监听：http://%s:%s\n' "$BACKEND_HOST" "$BACKEND_PORT"
   if [[ "$FRONTEND_HOST" == "0.0.0.0" || "$FRONTEND_HOST" == "::" ]]; then
-    printf '  浏览器访问前端：http://127.0.0.1:%s（0.0.0.0 仅用于监听；跨机器请用服务器实际 IP）\n' "$FRONTEND_PORT"
+    printf '  浏览器输入 http://127.0.0.1:%s 访问 Director-WebUI（0.0.0.0 仅用于监听；跨机器请把 127.0.0.1 换成服务器实际 IP）\n' "$FRONTEND_PORT"
+  else
+    printf '  浏览器输入 http://%s:%s 访问 Director-WebUI\n' "$FRONTEND_HOST" "$FRONTEND_PORT"
   fi
-  if [[ "$BACKEND_HOST" == "0.0.0.0" || "$BACKEND_HOST" == "::" ]]; then
-    printf '  后端 API 访问：http://127.0.0.1:%s（0.0.0.0 仅用于监听；跨机器请用服务器实际 IP）\n' "$BACKEND_PORT"
-  fi
+  printf '  后端 API 监听：http://%s:%s\n' "$BACKEND_HOST" "$BACKEND_PORT"
 }
 
 show_status() {
