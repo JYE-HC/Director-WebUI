@@ -323,7 +323,7 @@ run_service_command() {
     start-comfyui|stop-comfyui|status-comfyui|logs-comfyui)
       load_env_file
       [[ -x "$SCRIPT_DIR/.venv/bin/python" ]] || die "后端 Python 尚未安装" 4
-      exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/tools/director_supervisor.py" "${COMMAND/-comfyui/}" "${ORIGINAL_ARGS[@]}"
+      exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/tools/director_supervisor.py" "$COMMAND" "${ORIGINAL_ARGS[@]}"
       ;;
     *)
       load_env_file
