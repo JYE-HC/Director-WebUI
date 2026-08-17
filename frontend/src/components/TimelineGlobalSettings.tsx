@@ -25,7 +25,13 @@ interface TimelineGlobalSettingsProps {
   runtimeReady: boolean;
   modelSaving: boolean;
   onClose: () => void;
-  onChange: (project: TimelineProject) => void;
+  onProjectPatch: (
+    patch: Partial<Pick<TimelineProject, "render" | "export_mode">>,
+  ) => void;
+  onSamplingChange: (
+    family: keyof TimelineProject["sampling"],
+    patch: Partial<SamplingConfig>,
+  ) => void;
   onRuntimeModelChange: (
     role: DiffusionModelRole,
     patch: Partial<DiffusionModelBinding>,
@@ -41,8 +47,8 @@ function modelOptions(
 
 function GlobalOutputSpecs({
   project,
-  onChange,
-}: Pick<TimelineGlobalSettingsProps, "project" | "onChange">) {
+  onProjectPatch,
+}: Pick<TimelineGlobalSettingsProps, "project" | "onProjectPatch">) {
   const aspect = inferTimelineOutputAspect(project.render.width, project.render.height);
   const resolutions = aspect ? timelineOutputResolutions(aspect) : [];
   const nativeResolution = isTimelineOutputResolution(
@@ -59,14 +65,13 @@ function GlobalOutputSpecs({
       project.render.height,
       nextAspect,
     );
-    onChange({ ...project, render: { ...project.render, ...resolution, fps: 24 } });
+    onProjectPatch({ render: { ...project.render, ...resolution, fps: 24 } });
   };
   const changeResolution = (value: string) => {
     const resolution = resolutions.find(
       (candidate) => `${candidate.width}x${candidate.height}` === value,
     );
-    if (resolution) onChange({
-      ...project,
+    if (resolution) onProjectPatch({
       render: { ...project.render, ...resolution, fps: 24 },
     });
   };
@@ -89,7 +94,7 @@ function GlobalOutputSpecs({
           </select>
         </Field>
         <Field label="导出方式" className="field--inline">
-          <select aria-label="导出方式" value={project.export_mode} onChange={(event) => onChange({ ...project, export_mode: event.target.value as TimelineProject["export_mode"] })}><option value="all">组装完整视频</option><option value="segments">输出独立片段</option></select>
+          <select aria-label="导出方式" value={project.export_mode} onChange={(event) => onProjectPatch({ export_mode: event.target.value as TimelineProject["export_mode"] })}><option value="all">组装完整视频</option><option value="segments">输出独立片段</option></select>
         </Field>
       </div>
     </section>
@@ -105,19 +110,14 @@ export function TimelineGlobalSettings({
   runtimeReady,
   modelSaving,
   onClose,
-  onChange,
+  onProjectPatch,
+  onSamplingChange,
   onRuntimeModelChange,
 }: TimelineGlobalSettingsProps) {
   const updateSampling = (
     role: keyof TimelineProject["sampling"],
     patch: Partial<SamplingConfig>,
-  ) => onChange({
-    ...project,
-    sampling: {
-      ...project.sampling,
-      [role]: { ...project.sampling[role], ...patch },
-    },
-  });
+  ) => onSamplingChange(role, patch);
 
   return (
     <section id={id} className="timeline-global-settings" aria-label="时间线全局设置" hidden={!open}>
@@ -127,7 +127,7 @@ export function TimelineGlobalSettings({
       </header>
 
       <div className="timeline-global-settings__body">
-        <GlobalOutputSpecs project={project} onChange={onChange} />
+        <GlobalOutputSpecs project={project} onProjectPatch={onProjectPatch} />
         {(["fl2va", "ref2va"] as const).map((role) => {
           const binding = settings.models[role];
           const sampling = project.sampling[role];
@@ -136,7 +136,7 @@ export function TimelineGlobalSettings({
             <section className="timeline-family-settings" aria-labelledby={`${id}-${role}-title`} key={role}>
               <header>
                 <div className="timeline-family-settings__title"><strong id={`${id}-${role}-title`}>{label}</strong><small>{role === "fl2va" ? "文 / 图 / 首尾帧生成" : "参考 / 源视频生成"}</small><small>LoRA 加载：{describeLoraLoader(binding)}</small>{modelSaving && <Spinner label={`同步 ${label} 模型`} />}</div>
-                <div className="timeline-family-settings__models">
+                <div className="timeline-family-settings__models" data-timeline-history-ignore>
                   <Field label="Diffusion 模型" className="field--inline"><select aria-label={`${role.toUpperCase()} Diffusion 模型快捷选择`} disabled={!runtimeReady} value={binding.filename} onChange={(event) => onRuntimeModelChange(role, { filename: event.target.value })}>{modelOptions(binding.filename, models[role]).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>
                   <Field label="LoRA" className="field--inline"><select aria-label={`${role.toUpperCase()} LoRA 模型快捷选择`} disabled={!runtimeReady} value={binding.lora_name ?? ""} onChange={(event) => onRuntimeModelChange(role, { lora_name: event.target.value || null })}><option value="">不使用 LoRA</option>{modelOptions(binding.lora_name, models.loras).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>
                 </div>

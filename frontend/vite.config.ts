@@ -18,6 +18,10 @@ export default defineConfig({
     },
   },
   test: {
+    // Playwright specs use a different runner. Keep Vitest's discovery rooted
+    // in the jsdom unit/integration suite so `npm test` never imports `test()`
+    // from @playwright/test as a zero-test Vitest suite.
+    include: ["src/test/**/*.{test,spec}.{ts,tsx}"],
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
     css: true,

@@ -578,6 +578,48 @@ describe("统一时间线关键交互", () => {
     expect(screen.getByText(/1 项上传失败：损坏.txt/)).toBeInTheDocument();
   });
 
+  it("导入并追加多个视频只发出一个保持上传顺序的批量插入 action", async () => {
+    const state = createTimelineEditorState();
+    const secondVideo = {
+      ...replacementVideo,
+      metadata: { ...replacementVideo.metadata!, duration: 18 },
+    };
+    const onUploadFiles = vi.fn().mockResolvedValue({
+      assets: [video, image, secondVideo],
+      failures: [],
+      authority_stale: false,
+    });
+    const onDispatch = vi.fn();
+    render(<LongFormTimelineWorkspace
+      {...commonProps(state)}
+      onDispatch={onDispatch}
+      onUploadFiles={onUploadFiles}
+    />);
+    const files = [
+      new File(["first"], "第一段.mp4", { type: "video/mp4" }),
+      new File(["image"], "参考.png", { type: "image/png" }),
+      new File(["second"], "第二段.mp4", { type: "video/mp4" }),
+    ];
+
+    fireEvent.change(screen.getByLabelText("选择要导入并追加的视频"), {
+      target: { files },
+    });
+
+    await waitFor(() => expect(onUploadFiles).toHaveBeenCalledWith(files));
+    await waitFor(() => expect(onDispatch).toHaveBeenCalledTimes(2));
+    expect(onDispatch).toHaveBeenNthCalledWith(1, {
+      type: "assets/add",
+      assets: [video, image, secondVideo],
+    });
+    expect(onDispatch).toHaveBeenNthCalledWith(2, {
+      type: "segment/insert-videos",
+      assets: [video, secondVideo],
+      anchorId: state.project.segments[0].id,
+      position: "after",
+    });
+    expect(screen.getByText("已按顺序追加 2 个视频片段；1 个非视频素材仅加入素材库")).toBeInTheDocument();
+  });
+
   it("站内视频拖入空源视频区会用素材全长重建当前时间线段", () => {
     const state = createTimelineEditorState();
     state.project.segments = [{

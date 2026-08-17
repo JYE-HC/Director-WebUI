@@ -629,7 +629,8 @@ def test_atomic_validate_and_put_cannot_resurrect_asset_after_cascade_delete(
 def persisted_rows(database) -> tuple[Any, Any, Any]:
     with database.connect() as connection:
         timeline_row = connection.execute(
-            "SELECT document, updated_at FROM unified_timeline WHERE singleton = 1"
+            "SELECT document, updated_at, revision FROM unified_timeline "
+            "WHERE singleton = 1"
         ).fetchone()
         draft_rows = connection.execute(
             "SELECT mode, document, updated_at FROM mode_drafts ORDER BY mode"

@@ -752,7 +752,21 @@ export function insertTimelineVideoAssetAtAnchor(
   anchorId: string | null,
   position: "before" | "after" = "after",
 ): TimelineEditorState {
-  if (asset.kind !== "video" || state.project.segments.length >= 128) return state;
+  return insertTimelineVideoAssetsAtAnchor(state, [asset], anchorId, position);
+}
+
+/** Inserts multiple source-backed Ref2VA segments in one reducer transition. */
+export function insertTimelineVideoAssetsAtAnchor(
+  state: TimelineEditorState,
+  assets: readonly AssetReference[],
+  anchorId: string | null,
+  position: "before" | "after" = "after",
+): TimelineEditorState {
+  const capacity = Math.max(0, 128 - state.project.segments.length);
+  const videos = assets
+    .filter((asset) => asset.kind === "video")
+    .slice(0, capacity);
+  if (!videos.length) return state;
   const anchorIndex = anchorId ? timelineIndexById(state.project, anchorId) : -1;
   const fallbackIndex = state.selected_segment_ids.at(-1)
     ? timelineIndexById(state.project, state.selected_segment_ids.at(-1) as string)
@@ -761,31 +775,45 @@ export function insertTimelineVideoAssetAtAnchor(
   const insertionIndex = resolvedAnchor < 0
     ? state.project.segments.length
     : resolvedAnchor + (position === "after" ? 1 : 0);
-  // A source video is editing material, not a five-second reference sample.
-  // Materialize its complete server-probed range on the timeline first;
-  // compile validation remains the boundary that requires the user to split a
-  // long source into native H3-sized generation segments.
-  const duration = Math.max(0.01, asset.metadata?.duration ?? 5);
-  const nextDefaultIndex = nextDefaultTimelineSegmentNumber(state.project);
-  const segment: Ref2VASegment = {
-    ...createTimelineSegment("ref2va", nextDefaultIndex),
-    title: asset.name.replace(/\.[^.]+$/, "") || defaultTimelineSegmentTitle(
-      nextDefaultIndex,
-    ),
-    duration_seconds: duration,
-    source_video: asset,
-    source_start_seconds: 0,
-    source_duration_seconds: duration,
-  };
+  let allocationProject = state.project;
+  const inserted = videos.map((asset) => {
+    // A source video is editing material, not a five-second reference sample.
+    // Materialize its complete server-probed range on the timeline first;
+    // compile validation remains the boundary that requires the user to split a
+    // long source into native H3-sized generation segments.
+    const duration = Math.max(0.01, asset.metadata?.duration ?? 5);
+    const nextDefaultIndex = nextDefaultTimelineSegmentNumber(allocationProject);
+    const segment: Ref2VASegment = {
+      ...createTimelineSegment("ref2va", nextDefaultIndex),
+      title: asset.name.replace(/\.[^.]+$/, "") || defaultTimelineSegmentTitle(
+        nextDefaultIndex,
+      ),
+      duration_seconds: duration,
+      source_video: asset,
+      source_start_seconds: 0,
+      source_duration_seconds: duration,
+    };
+    // Keep fallback title allocation identical to sequential insertion without
+    // exposing intermediate editor states or history entries.
+    allocationProject = touchProject(
+      allocationProject,
+      [...allocationProject.segments, segment],
+    );
+    return segment;
+  });
   const segments = [...state.project.segments];
-  segments.splice(insertionIndex, 0, segment);
-  const selected = new Set([...state.selected_segment_ids, segment.id]);
+  segments.splice(insertionIndex, 0, ...inserted);
+  const selected = new Set([
+    ...state.selected_segment_ids,
+    ...inserted.map((segment) => segment.id),
+  ]);
+  const active = inserted[0];
   return {
     ...state,
     project: touchProject(state.project, segments),
     selected_segment_ids: segments.filter((item) => selected.has(item.id)).map((item) => item.id),
-    active_segment_id: segment.id,
-    selection_anchor_id: segment.id,
+    active_segment_id: active.id,
+    selection_anchor_id: active.id,
   };
 }
 
@@ -1321,13 +1349,22 @@ export function timelineAssetUsages(
 
 export type TimelineAction =
   | { type: "project/replace"; project: TimelineProject }
+  | {
+      type: "history/restore";
+      project: TimelineProject;
+      selected_segment_ids: string[];
+      active_segment_id: string | null;
+      selection_anchor_id: string | null;
+    }
   | { type: "project/patch"; patch: Partial<Pick<TimelineProject, "title" | "render" | "sampling" | "export_mode">> }
+  | { type: "project/update-sampling"; family: keyof TimelineProject["sampling"]; patch: Partial<SamplingConfig> }
   | { type: "segment/select"; id: string; additive?: boolean; range?: boolean }
   | { type: "segment/toggle-selection"; id: string }
   | { type: "segment/set-selection"; ids: string[] }
   | { type: "segment/set-enabled"; ids: string[]; enabled: boolean }
   | { type: "segment/insert"; position: "before" | "after"; mode?: TimelineGenerationMode }
   | { type: "segment/insert-video"; position?: "before" | "after"; anchorId?: string | null; asset: AssetReference }
+  | { type: "segment/insert-videos"; position?: "before" | "after"; anchorId?: string | null; assets: AssetReference[] }
   | { type: "segment/move"; draggedId: string; targetId: string }
   | { type: "segment/delete-selected" }
   | { type: "segment/merge-selected" }
@@ -1335,6 +1372,19 @@ export type TimelineAction =
   | { type: "segment/apply-source-cuts"; id: string; cutFrames: number[]; frameRate: number; expected: SourceCutExpectation }
   | { type: "segment/split-evenly"; id: string; pieces: number }
   | { type: "segment/duplicate-selected" }
+  | {
+      type: "segment/patch-base";
+      id: string;
+      patch: Partial<Pick<TimelineSegment, "title" | "prompt" | "duration_seconds" | "enabled" | "audio_mode" | "ref_image_size">>;
+    }
+  | { type: "segment/set-continuity"; id: string; patch: Partial<TimelineSegmentContinuity> }
+  | { type: "segment/remove-asset"; id: string; assetId: string }
+  | {
+      type: "segment/set-source-range";
+      id: string;
+      patch: Partial<Pick<Ref2VASegment, "source_start_seconds" | "source_duration_seconds">>;
+    }
+  | { type: "segment/set-source-audio-reference"; id: string; enabled: boolean }
   | { type: "segment/replace"; segment: TimelineSegment }
   | { type: "segment/bind-asset"; id: string; asset: AssetReference; target?: SegmentAssetTarget; select?: boolean }
   | { type: "segment/bind-assets"; id: string; assets: AssetReference[]; target?: SegmentAssetTarget; select?: boolean }
@@ -1353,11 +1403,37 @@ export type TimelineAction =
   | { type: "assets/grid-size"; size: AssetGridSize }
   | { type: "playhead/set"; seconds: number };
 
+/**
+ * Commands that may originate from workspace controls. Authority replacement
+ * and history replay stay private to the App timeline controller.
+ */
+export type TimelineUserAction = Exclude<
+  TimelineAction,
+  { type: "project/replace" } | { type: "history/restore" }
+>;
+
 export function timelineEditorReducer(
   state: TimelineEditorState,
   action: TimelineAction,
 ): TimelineEditorState {
   switch (action.type) {
+    case "history/restore": {
+      const ids = new Set(action.project.segments.map((segment) => segment.id));
+      const selected = action.selected_segment_ids.filter((id) => ids.has(id));
+      const active = action.active_segment_id && selected.includes(action.active_segment_id)
+        ? action.active_segment_id
+        : selected[0] ?? null;
+      const anchor = action.selection_anchor_id && selected.includes(action.selection_anchor_id)
+        ? action.selection_anchor_id
+        : active;
+      return clampTimelinePlayhead({
+        ...state,
+        project: action.project,
+        selected_segment_ids: selected,
+        active_segment_id: active,
+        selection_anchor_id: anchor,
+      });
+    }
     case "project/replace": {
       const ids = new Set(action.project.segments.map((segment) => segment.id));
       const sharesSegmentIdentity = state.project.segments.some((segment) => ids.has(segment.id));
@@ -1385,6 +1461,20 @@ export function timelineEditorReducer(
         project: {
           ...state.project,
           ...action.patch,
+        },
+      });
+    case "project/update-sampling":
+      return clampTimelinePlayhead({
+        ...state,
+        project: {
+          ...state.project,
+          sampling: {
+            ...state.project.sampling,
+            [action.family]: {
+              ...state.project.sampling[action.family],
+              ...action.patch,
+            },
+          },
         },
       });
     case "segment/select": {
@@ -1440,6 +1530,13 @@ export function timelineEditorReducer(
         action.anchorId ?? state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null,
         action.position,
       );
+    case "segment/insert-videos":
+      return insertTimelineVideoAssetsAtAnchor(
+        state,
+        action.assets,
+        action.anchorId ?? state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null,
+        action.position,
+      );
     case "segment/move":
       return moveTimelineSegment(state, action.draggedId, action.targetId);
     case "segment/delete-selected":
@@ -1460,6 +1557,37 @@ export function timelineEditorReducer(
       return splitTimelineSourceSegmentEvenly(state, action.id, action.pieces);
     case "segment/duplicate-selected":
       return duplicateSelectedSegments(state);
+    case "segment/patch-base":
+      return updateTimelineSegment(state, action.id, (segment) => ({
+        ...segment,
+        ...action.patch,
+      } as TimelineSegment));
+    case "segment/set-continuity":
+      return updateTimelineSegment(state, action.id, (segment) => ({
+        ...segment,
+        continuity: { ...segment.continuity, ...action.patch },
+      } as TimelineSegment));
+    case "segment/remove-asset":
+      return updateTimelineSegment(
+        state,
+        action.id,
+        (segment) => removeAssetFromSegment(segment, action.assetId),
+      );
+    case "segment/set-source-range":
+      return updateTimelineSegment(state, action.id, (segment) =>
+        segment.mode === "ref2va"
+          ? updateRef2VASourceRange(segment, {
+              source_start_seconds: action.patch.source_start_seconds ??
+                segment.source_start_seconds,
+              source_duration_seconds: action.patch.source_duration_seconds ??
+                segment.source_duration_seconds,
+            })
+          : segment);
+    case "segment/set-source-audio-reference":
+      return updateTimelineSegment(state, action.id, (segment) =>
+        segment.mode === "ref2va"
+          ? setSourceAudioAsReference(segment, action.enabled)
+          : segment);
     case "segment/replace":
       return updateTimelineSegment(state, action.segment.id, () => action.segment);
     case "segment/bind-asset": {
@@ -3068,14 +3196,32 @@ export const QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY = "director-web:v3:tim
 // v4 carried a single unscoped pending timeline (pre-multi-project). Its bytes
 // are quarantined rather than replayed because they cannot name a project.
 export const LEGACY_V4_TIMELINE_WAL_STORAGE_KEY = "director-web:v4:timeline-wal";
-export const TIMELINE_WAL_STORAGE_KEY = "director-web:v5:timeline-wal";
-export const QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY = "director-web:v5:timeline-wal-quarantine";
-const TIMELINE_WAL_FORMAT = "director-pending-timeline";
-const LEGACY_BOUND_TIMELINE_WAL_VERSION = 2;
-const TIMELINE_WAL_VERSION = 4;
+// v5 proved database/project ownership but did not record the exact server
+// revision and base document. It is evidence only and must never be promoted.
+export const LEGACY_V5_TIMELINE_WAL_STORAGE_KEY = "director-web:v5:timeline-wal";
+export const QUARANTINED_LEGACY_V5_TIMELINE_WAL_STORAGE_KEY =
+  "director-web:v5:timeline-wal-quarantine";
+/**
+ * The v6 WAL used one process-wide key. Keep it byte-for-byte as foreign
+ * evidence: a v7 page must never promote, overwrite, or silently quarantine
+ * it merely because another page has opened the same project.
+ */
+export const LEGACY_V6_TIMELINE_WAL_STORAGE_KEY = "director-web:v6:timeline-wal";
+/** @deprecated This is a v7 key prefix, not a complete localStorage key. */
+export const TIMELINE_WAL_STORAGE_KEY = "director-web:v7:timeline-wal:";
+export const TIMELINE_WAL_STORAGE_PREFIX = TIMELINE_WAL_STORAGE_KEY;
+export const QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY =
+  "director-web:v6:timeline-wal-quarantine";
+export const TIMELINE_WAL_FORMAT = "director-revision-aware-timeline-wal";
+const LEGACY_V6_TIMELINE_WAL_VERSION = 1;
+export const TIMELINE_WAL_VERSION = 2;
 let timelineWalOwnerCache: string | null = null;
-let adoptedTimelineWalRaw: string | null = null;
-let latestTimelineWalRaw: string | null = null;
+interface TimelineWalStorageToken {
+  key: string;
+  raw: string;
+}
+let latestTimelineWalToken: TimelineWalStorageToken | null = null;
+const timelineWalTokenByValue = new WeakMap<LocalTimelineWal, TimelineWalStorageToken>();
 const ASSET_LAYOUT_STORAGE_KEY = "director-web:v2:asset-layout";
 
 export interface AssetLayoutPreference {
@@ -3168,7 +3314,13 @@ function quarantineObsoleteTimelineStorage(): void {
   // than replay so a stale pending edit cannot cross project boundaries.
   quarantineStorageEntry(
     LEGACY_V4_TIMELINE_WAL_STORAGE_KEY,
-    QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY,
+    QUARANTINED_LEGACY_V5_TIMELINE_WAL_STORAGE_KEY,
+  );
+  // v5 cannot prove which server revision and exact document its pending head
+  // was derived from. Preserve the bytes for manual recovery only.
+  quarantineStorageEntry(
+    LEGACY_V5_TIMELINE_WAL_STORAGE_KEY,
+    QUARANTINED_LEGACY_V5_TIMELINE_WAL_STORAGE_KEY,
   );
 }
 
@@ -3185,6 +3337,82 @@ export interface TimelineWalDatabaseIdentity {
   active_database_identity: string;
 }
 
+export interface LocalTimelineWal {
+  format: typeof TIMELINE_WAL_FORMAT;
+  version: typeof TIMELINE_WAL_VERSION;
+  owner_id: string;
+  pending: true;
+  project_id: string;
+  active_database_path: string;
+  active_database_identity: string;
+  written_at_ms: number;
+  base_server_revision: number;
+  base_document_hash: string;
+  head_document_hash: string;
+  base_project: TimelineProject;
+  pending_project: TimelineProject;
+}
+
+export interface SaveLocalTimelineWalInput {
+  database: TimelineWalDatabaseIdentity;
+  project_id: string;
+  base_server_revision: number;
+  base_project: TimelineProject;
+  pending_project: TimelineProject;
+  /** Defaults to the random owner of this JavaScript realm. */
+  owner_id?: string;
+}
+
+export interface LocalTimelineWalBranchEvidence {
+  kind: "wal";
+  ownership: "owned" | "foreign" | "legacy";
+  /** Opaque physical key. Database paths and project ids never appear in it. */
+  storage_key: string;
+  /** Exact compare-and-delete token captured while enumerating this branch. */
+  storage_token: string;
+  wal: LocalTimelineWal;
+}
+
+export interface CorruptLocalTimelineWalBranchEvidence {
+  kind: "corrupt";
+  ownership: "foreign" | "legacy";
+  storage_key: string;
+  storage_token: string;
+}
+
+export interface LocalTimelineWalBranches {
+  owner_id: string;
+  owned: LocalTimelineWalBranchEvidence | null;
+  foreign: LocalTimelineWalBranchEvidence[];
+  legacy: LocalTimelineWalBranchEvidence[];
+  corrupt: CorruptLocalTimelineWalBranchEvidence[];
+}
+
+export interface TimelineWalAuthority {
+  revision: number;
+  document: TimelineProject;
+}
+
+export type LocalTimelineWalResolution =
+  | {
+      status: "replay";
+      project: TimelineProject;
+      expected_server_revision: number;
+    }
+  | {
+      status: "acknowledged";
+      project: TimelineProject;
+      server_revision: number;
+    }
+  | {
+      status: "conflict";
+      reason: "revision-mismatch" | "base-document-mismatch";
+      local_project: TimelineProject;
+      server_project: TimelineProject;
+      base_server_revision: number;
+      server_revision: number;
+    };
+
 function isTimelineWalDatabaseIdentity(value: TimelineWalDatabaseIdentity): boolean {
   return isActiveDatabaseIdentity(value.active_database_path) &&
     /^[0-9a-f]{64}$/.test(value.active_database_identity);
@@ -3199,142 +3427,558 @@ function validTimelineWalProjectId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(value);
 }
 
-function timelineWalOwner(): string {
-  if (timelineWalOwnerCache) return timelineWalOwnerCache;
+export function createTimelineBranchOwnerId(): string {
   // Keep ownership document-scoped. sessionStorage can be cloned when a tab is
   // duplicated, which would let two live pages mistake each other's WAL for
   // their own and clear it after a late response.
-  const generated = typeof globalThis.crypto?.randomUUID === "function"
+  return typeof globalThis.crypto?.randomUUID === "function"
     ? `tab-${globalThis.crypto.randomUUID()}`
     : `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
-  timelineWalOwnerCache = generated;
-  return generated;
 }
 
-function parseTimelineWalEnvelope(raw: string): Record<string, unknown> | null {
+export function getTimelineBranchOwnerId(): string {
+  if (!timelineWalOwnerCache) timelineWalOwnerCache = createTimelineBranchOwnerId();
+  return timelineWalOwnerCache;
+}
+
+function canonicalTimelineJson(
+  value: unknown,
+  ancestors = new Set<object>(),
+  depth = 0,
+): string | null {
+  if (depth > 32) return null;
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    return Number.isFinite(value) && !Object.is(value, -0) ? JSON.stringify(value) : null;
+  }
+  if (typeof value !== "object" || ancestors.has(value)) return null;
+  ancestors.add(value);
+  let serialized: string | null = null;
+  if (Array.isArray(value)) {
+    const keys = Object.keys(value);
+    if (keys.length === value.length && keys.every((key, index) => key === String(index))) {
+      const items = value.map((item) => canonicalTimelineJson(item, ancestors, depth + 1));
+      if (items.every((item): item is string => item !== null)) {
+        serialized = `[${items.join(",")}]`;
+      }
+    }
+  } else {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) {
+      const record = value as Record<string, unknown>;
+      const keys = Object.keys(record).sort();
+      if (Reflect.ownKeys(record).length === keys.length) {
+        const entries: string[] = [];
+        let valid = true;
+        for (const key of keys) {
+          const descriptor = Object.getOwnPropertyDescriptor(record, key);
+          const item = descriptor && "value" in descriptor && descriptor.enumerable
+            ? canonicalTimelineJson(descriptor.value, ancestors, depth + 1)
+            : null;
+          if (item === null) {
+            valid = false;
+            break;
+          }
+          entries.push(`${JSON.stringify(key)}:${item}`);
+        }
+        if (valid) serialized = `{${entries.join(",")}}`;
+      }
+    }
+  }
+  ancestors.delete(value);
+  return serialized;
+}
+
+function fnv1a64(value: string, offset = 0xcbf29ce484222325n): string {
+  let hash = offset;
+  for (const byte of new TextEncoder().encode(value)) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+function timelineProjectHashOrNull(project: unknown): string | null {
+  const canonical = canonicalTimelineJson(project);
+  if (canonical === null) return null;
+  return `fnv1a64:${fnv1a64(canonical)}`;
+}
+
+/** Stable synchronous hash for pagehide WAL writes; exact equality is still authoritative. */
+export function timelineProjectDocumentHash(project: TimelineProject): string {
+  const hash = timelineProjectHashOrNull(project);
+  if (!hash) throw new TypeError("Timeline project is not canonical JSON.");
+  return hash;
+}
+
+function normalizeExactTimelineProject(value: unknown): TimelineProject | null {
+  if (!isRecord(value) || value.version !== 4) return null;
+  const raw = canonicalTimelineJson(value);
+  if (raw === null) return null;
+  const normalized = normalizeTimelineProject(value);
+  if (!normalized || canonicalTimelineJson(normalized) !== raw) return null;
+  return structuredClone(normalized);
+}
+
+function timelineProjectDocumentsEqual(left: TimelineProject, right: TimelineProject): boolean {
+  const leftJson = canonicalTimelineJson(left);
+  return leftJson !== null && leftJson === canonicalTimelineJson(right);
+}
+
+function timelineWalScopeDigest(
+  database: TimelineWalDatabaseIdentity,
+  projectId: string,
+): string {
+  const canonicalScope = JSON.stringify([
+    database.active_database_path,
+    database.active_database_identity,
+    projectId,
+  ]);
+  // Two independently seeded 64-bit hashes keep the physical key opaque and
+  // make an accidental scope collision vanishingly unlikely. The exact scope
+  // in the envelope remains the final authority gate.
+  return `${fnv1a64(`scope-a:${canonicalScope}`)}${fnv1a64(
+    `scope-b:${canonicalScope}`,
+    0x84222325cbf29ce4n,
+  )}`;
+}
+
+export function localTimelineWalStorageKey(
+  database: TimelineWalDatabaseIdentity,
+  projectId: string = DEFAULT_PROJECT_ID,
+  ownerId: string = getTimelineBranchOwnerId(),
+): string | null {
+  if (
+    !isTimelineWalDatabaseIdentity(database) ||
+    !validTimelineWalProjectId(projectId) ||
+    !validTimelineWalOwner(ownerId)
+  ) return null;
+  return `${TIMELINE_WAL_STORAGE_PREFIX}${timelineWalScopeDigest(database, projectId)}:${encodeURIComponent(ownerId)}`;
+}
+
+function parseTimelineWalValue(
+  value: unknown,
+  persistedVersion: number = TIMELINE_WAL_VERSION,
+): LocalTimelineWal | null {
+  if (!isRecord(value)) return null;
+  if (Object.keys(value).sort().join("|") !== [
+    "active_database_identity",
+    "active_database_path",
+    "base_document_hash",
+    "base_project",
+    "base_server_revision",
+    "format",
+    "head_document_hash",
+    "owner_id",
+    "pending",
+    "pending_project",
+    "project_id",
+    "version",
+    "written_at_ms",
+  ].sort().join("|")) return null;
+  if (
+    value.format !== TIMELINE_WAL_FORMAT ||
+    value.version !== persistedVersion ||
+    value.pending !== true ||
+    !validTimelineWalOwner(value.owner_id) ||
+    !validTimelineWalProjectId(value.project_id) ||
+    !isActiveDatabaseIdentity(value.active_database_path) ||
+    typeof value.active_database_identity !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.active_database_identity) ||
+    !Number.isSafeInteger(value.written_at_ms) ||
+    (value.written_at_ms as number) <= 0 ||
+    !Number.isSafeInteger(value.base_server_revision) ||
+    (value.base_server_revision as number) < 0 ||
+    typeof value.base_document_hash !== "string" ||
+    !/^fnv1a64:[0-9a-f]{16}$/.test(value.base_document_hash) ||
+    typeof value.head_document_hash !== "string" ||
+    !/^fnv1a64:[0-9a-f]{16}$/.test(value.head_document_hash)
+  ) return null;
+  const baseProject = normalizeExactTimelineProject(value.base_project);
+  const pendingProject = normalizeExactTimelineProject(value.pending_project);
+  if (
+    !baseProject ||
+    !pendingProject ||
+    timelineProjectDocumentsEqual(baseProject, pendingProject) ||
+    timelineProjectHashOrNull(baseProject) !== value.base_document_hash ||
+    timelineProjectHashOrNull(pendingProject) !== value.head_document_hash
+  ) return null;
+  return {
+    format: TIMELINE_WAL_FORMAT,
+    version: TIMELINE_WAL_VERSION,
+    owner_id: value.owner_id,
+    pending: true,
+    project_id: value.project_id,
+    active_database_path: value.active_database_path,
+    active_database_identity: value.active_database_identity,
+    written_at_ms: value.written_at_ms as number,
+    base_server_revision: value.base_server_revision as number,
+    base_document_hash: value.base_document_hash,
+    head_document_hash: value.head_document_hash,
+    base_project: baseProject,
+    pending_project: pendingProject,
+  };
+}
+
+function parseTimelineWalEnvelope(raw: string): LocalTimelineWal | null {
   try {
     const value: unknown = JSON.parse(raw);
-    if (!isRecord(value)) return null;
-    const keys = Object.keys(value).sort().join("|");
-    const legacy = value.version === LEGACY_BOUND_TIMELINE_WAL_VERSION &&
-      keys === "active_database_identity|active_database_path|format|pending|project|version|written_at_ms";
-    const owned = value.version === TIMELINE_WAL_VERSION &&
-      keys === "active_database_identity|active_database_path|format|owner_id|pending|project|project_id|version|written_at_ms" &&
-      validTimelineWalOwner(value.owner_id) &&
-      validTimelineWalProjectId(value.project_id);
+    return parseTimelineWalValue(value);
+  } catch {
+    return null;
+  }
+}
+
+function parseLegacyV6TimelineWalEnvelope(raw: string): LocalTimelineWal | null {
+  try {
+    const value: unknown = JSON.parse(raw);
+    return parseTimelineWalValue(value, LEGACY_V6_TIMELINE_WAL_VERSION);
+  } catch {
+    return null;
+  }
+}
+
+function timelineWalMatchesScope(
+  wal: LocalTimelineWal,
+  database: TimelineWalDatabaseIdentity,
+  projectId: string,
+): boolean {
+  return wal.active_database_path === database.active_database_path &&
+    wal.active_database_identity === database.active_database_identity &&
+    wal.project_id === projectId;
+}
+
+function rememberTimelineWal(
+  wal: LocalTimelineWal,
+  key: string,
+  raw: string,
+): TimelineWalStorageToken {
+  const token = { key, raw };
+  timelineWalTokenByValue.set(wal, token);
+  return token;
+}
+
+function timelineWalEvidence(
+  ownership: LocalTimelineWalBranchEvidence["ownership"],
+  key: string,
+  raw: string,
+  wal: LocalTimelineWal,
+): LocalTimelineWalBranchEvidence {
+  rememberTimelineWal(wal, key, raw);
+  return {
+    kind: "wal",
+    ownership,
+    storage_key: key,
+    storage_token: raw,
+    wal,
+  };
+}
+
+/**
+ * Enumerates every recoverable branch in one exact database/project scope.
+ * Foreign and legacy branches are evidence only; callers must require an
+ * explicit user choice before cloning or replaying either one.
+ */
+export function listLocalTimelineWalBranches(
+  database: TimelineWalDatabaseIdentity,
+  projectId: string = DEFAULT_PROJECT_ID,
+  ownerId: string = getTimelineBranchOwnerId(),
+): LocalTimelineWalBranches {
+  quarantineObsoleteTimelineStorage();
+  const empty: LocalTimelineWalBranches = {
+    owner_id: ownerId,
+    owned: null,
+    foreign: [],
+    legacy: [],
+    corrupt: [],
+  };
+  if (
+    !isTimelineWalDatabaseIdentity(database) ||
+    !validTimelineWalProjectId(projectId) ||
+    !validTimelineWalOwner(ownerId)
+  ) return empty;
+  try {
+    const scopePrefix = `${TIMELINE_WAL_STORAGE_PREFIX}${timelineWalScopeDigest(database, projectId)}:`;
+    const keys: string[] = [];
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(scopePrefix)) keys.push(key);
+    }
+    for (const key of keys) {
+      const raw = localStorage.getItem(key);
+      if (raw === null) continue;
+      const wal = parseTimelineWalEnvelope(raw);
+      const expectedKey = wal
+        ? localTimelineWalStorageKey(database, projectId, wal.owner_id)
+        : null;
+      if (!wal || !timelineWalMatchesScope(wal, database, projectId) || expectedKey !== key) {
+        empty.corrupt.push({
+          kind: "corrupt",
+          ownership: "foreign",
+          storage_key: key,
+          storage_token: raw,
+        });
+        continue;
+      }
+      const ownership = wal.owner_id === ownerId ? "owned" : "foreign";
+      const evidence = timelineWalEvidence(ownership, key, raw, wal);
+      if (ownership === "owned") empty.owned = evidence;
+      else empty.foreign.push(evidence);
+    }
+
+    // v6 is deliberately never moved: its singleton bytes may be the only
+    // surviving copy of a pending edit from an older page.
+    const legacyRaw = localStorage.getItem(LEGACY_V6_TIMELINE_WAL_STORAGE_KEY);
+    if (legacyRaw !== null) {
+      const wal = parseLegacyV6TimelineWalEnvelope(legacyRaw);
+      if (wal && timelineWalMatchesScope(wal, database, projectId)) {
+        empty.legacy.push(timelineWalEvidence(
+          "legacy",
+          LEGACY_V6_TIMELINE_WAL_STORAGE_KEY,
+          legacyRaw,
+          wal,
+        ));
+      } else if (!wal) {
+        empty.corrupt.push({
+          kind: "corrupt",
+          ownership: "legacy",
+          storage_key: LEGACY_V6_TIMELINE_WAL_STORAGE_KEY,
+          storage_token: legacyRaw,
+        });
+      }
+    }
+    const newestFirst = (
+      left: LocalTimelineWalBranchEvidence,
+      right: LocalTimelineWalBranchEvidence,
+    ) => right.wal.written_at_ms - left.wal.written_at_ms ||
+      left.wal.owner_id.localeCompare(right.wal.owner_id);
+    empty.foreign.sort(newestFirst);
+    empty.legacy.sort(newestFirst);
+    return empty;
+  } catch {
+    return empty;
+  }
+}
+
+/** Reads a scoped WAL but never decides that it may supersede server authority. */
+export function loadLocalTimelineWal(
+  database: TimelineWalDatabaseIdentity,
+  projectId: string = DEFAULT_PROJECT_ID,
+  ownerId: string = getTimelineBranchOwnerId(),
+): LocalTimelineWal | null {
+  quarantineObsoleteTimelineStorage();
+  const key = localTimelineWalStorageKey(database, projectId, ownerId);
+  if (!key) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const value = parseTimelineWalEnvelope(raw);
     if (
-      (!legacy && !owned) ||
-      value.format !== TIMELINE_WAL_FORMAT ||
-      value.pending !== true ||
-      !isActiveDatabaseIdentity(value.active_database_path) ||
-      typeof value.active_database_identity !== "string" ||
-      !/^[0-9a-f]{64}$/.test(value.active_database_identity) ||
-      !Number.isSafeInteger(value.written_at_ms) ||
-      (value.written_at_ms as number) <= 0
+      !value ||
+      value.owner_id !== ownerId ||
+      !timelineWalMatchesScope(value, database, projectId)
     ) return null;
+    latestTimelineWalToken = rememberTimelineWal(value, key, raw);
     return value;
   } catch {
     return null;
   }
 }
 
-function timelineWalOwnedByCurrentTab(
-  raw: string,
-  database: TimelineWalDatabaseIdentity,
-  owner: string,
-): boolean {
-  const value = parseTimelineWalEnvelope(raw);
-  return value?.version === TIMELINE_WAL_VERSION &&
-    value.owner_id === owner &&
-    value.active_database_path === database.active_database_path &&
-    value.active_database_identity === database.active_database_identity;
-}
-
-export function loadLocalTimeline(
-  database: TimelineWalDatabaseIdentity,
-  projectId: string = DEFAULT_PROJECT_ID,
-): TimelineProject | null {
+/** Synchronously persists a revision-aware WAL, including during pagehide. */
+export function saveLocalTimelineWal(input: SaveLocalTimelineWalInput): LocalTimelineWal | null {
   quarantineObsoleteTimelineStorage();
-  if (!isTimelineWalDatabaseIdentity(database)) return null;
-  try {
-    // Only an explicit pending-write envelope owned by the currently active
-    // SQLite database AND the requested project may win over the server GET.
-    const raw = localStorage.getItem(TIMELINE_WAL_STORAGE_KEY);
-    if (!raw) return null;
-    const value = parseTimelineWalEnvelope(raw);
-    if (
-      !value ||
-      value.active_database_path !== database.active_database_path ||
-      value.active_database_identity !== database.active_database_identity ||
-      value.project_id !== projectId
-    ) throw new Error("invalid timeline WAL envelope");
-    const project = normalizeTimelineProject(value.project);
-    if (!project) throw new Error("invalid timeline WAL project");
-    adoptedTimelineWalRaw = raw;
-    return project;
-  } catch {
-    quarantineStorageEntry(
-      TIMELINE_WAL_STORAGE_KEY,
-      QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY,
-    );
+  const { database } = input;
+  if (
+    !isTimelineWalDatabaseIdentity(database) ||
+    !validTimelineWalProjectId(input.project_id) ||
+    !Number.isSafeInteger(input.base_server_revision) ||
+    input.base_server_revision < 0
+  ) return null;
+  const baseProject = normalizeExactTimelineProject(input.base_project);
+  const pendingProject = normalizeExactTimelineProject(input.pending_project);
+  if (!baseProject || !pendingProject) return null;
+  const owner = input.owner_id ?? getTimelineBranchOwnerId();
+  const key = localTimelineWalStorageKey(database, input.project_id, owner);
+  if (!key) return null;
+  if (timelineProjectDocumentsEqual(baseProject, pendingProject)) {
+    const existing = loadLocalTimelineWal(database, input.project_id, owner);
+    if (existing) clearLocalTimelineWal(existing);
     return null;
   }
-}
-
-export function saveLocalTimeline(
-  project: TimelineProject,
-  database: TimelineWalDatabaseIdentity,
-  projectId: string = DEFAULT_PROJECT_ID,
-): void {
-  quarantineObsoleteTimelineStorage();
-  if (!isTimelineWalDatabaseIdentity(database)) return;
   try {
-    const owner = timelineWalOwner();
-    const raw = JSON.stringify({
+    const writtenAt = Date.now();
+    if (!Number.isSafeInteger(writtenAt) || writtenAt <= 0) return null;
+    const wal: LocalTimelineWal = {
       format: TIMELINE_WAL_FORMAT,
       version: TIMELINE_WAL_VERSION,
       owner_id: owner,
       pending: true,
-      project_id: projectId,
+      project_id: input.project_id,
       active_database_path: database.active_database_path,
       active_database_identity: database.active_database_identity,
-      written_at_ms: Date.now(),
-      project,
-    });
-    const existing = localStorage.getItem(TIMELINE_WAL_STORAGE_KEY);
-    if (existing !== null && !timelineWalOwnedByCurrentTab(existing, database, owner)) {
-      quarantineStorageEntry(
-        TIMELINE_WAL_STORAGE_KEY,
-        QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY,
-      );
-      // Never overwrite bytes that could not be copied, or that another tab
-      // raced into the shared source key while quarantine was in progress.
-      if (localStorage.getItem(TIMELINE_WAL_STORAGE_KEY) !== null) return;
+      written_at_ms: writtenAt,
+      base_server_revision: input.base_server_revision,
+      base_document_hash: timelineProjectDocumentHash(baseProject),
+      head_document_hash: timelineProjectDocumentHash(pendingProject),
+      base_project: baseProject,
+      pending_project: pendingProject,
+    };
+    const raw = JSON.stringify(wal);
+    const existing = localStorage.getItem(key);
+    if (existing !== null) {
+      const existingWal = parseTimelineWalEnvelope(existing);
+      if (
+        !existingWal ||
+        existingWal.owner_id !== owner ||
+        !timelineWalMatchesScope(existingWal, database, input.project_id)
+      ) return null;
     }
-    localStorage.setItem(TIMELINE_WAL_STORAGE_KEY, raw);
-    if (localStorage.getItem(TIMELINE_WAL_STORAGE_KEY) === raw) {
-      latestTimelineWalRaw = raw;
+    localStorage.setItem(key, raw);
+    if (localStorage.getItem(key) === raw) {
+      latestTimelineWalToken = rememberTimelineWal(wal, key, raw);
+      return wal;
     }
   } catch {
     // In-memory editing remains available when browser storage is unavailable.
   }
+  return null;
 }
 
 /**
- * Discards a browser draft that can no longer be trusted to match the server.
- * Used after an atomic server mutation succeeds but its authoritative document
- * cannot be read back; a reload must then prefer GET /api/timeline.
+ * Classifies a loaded WAL only after a GET established current authority.
+ * Hashes are fast integrity hints; normalized structural equality is the final gate.
  */
-export function clearLocalTimeline(): void {
+export function resolveLocalTimelineWal(
+  wal: LocalTimelineWal,
+  authority: TimelineWalAuthority,
+): LocalTimelineWalResolution {
+  const parsedWal = parseTimelineWalValue(wal);
+  const serverProject = normalizeExactTimelineProject(authority.document);
+  if (
+    !parsedWal ||
+    !serverProject ||
+    !Number.isSafeInteger(authority.revision) ||
+    authority.revision < 0
+  ) throw new TypeError("Invalid timeline WAL resolution input.");
+
+  const serverHash = timelineProjectDocumentHash(serverProject);
+  if (
+    authority.revision > parsedWal.base_server_revision &&
+    serverHash === parsedWal.head_document_hash &&
+    timelineProjectDocumentsEqual(serverProject, parsedWal.pending_project)
+  ) {
+    return {
+      status: "acknowledged",
+      project: structuredClone(serverProject),
+      server_revision: authority.revision,
+    };
+  }
+  if (
+    authority.revision === parsedWal.base_server_revision &&
+    serverHash === parsedWal.base_document_hash &&
+    timelineProjectDocumentsEqual(serverProject, parsedWal.base_project)
+  ) {
+    return {
+      status: "replay",
+      project: structuredClone(parsedWal.pending_project),
+      expected_server_revision: parsedWal.base_server_revision,
+    };
+  }
+  return {
+    status: "conflict",
+    reason: authority.revision === parsedWal.base_server_revision
+      ? "base-document-mismatch"
+      : "revision-mismatch",
+    local_project: structuredClone(parsedWal.pending_project),
+    server_project: structuredClone(serverProject),
+    base_server_revision: parsedWal.base_server_revision,
+    server_revision: authority.revision,
+  };
+}
+
+/**
+ * Deletes only bytes written or explicitly loaded by this document. A later
+ * write from another tab remains untouched even when it uses the same scope.
+ */
+export function clearLocalTimelineWal(wal?: LocalTimelineWal): void {
   quarantineObsoleteTimelineStorage();
   try {
-    const current = localStorage.getItem(TIMELINE_WAL_STORAGE_KEY);
-    if (current !== null && (current === latestTimelineWalRaw || current === adoptedTimelineWalRaw)) {
-      localStorage.removeItem(TIMELINE_WAL_STORAGE_KEY);
-    }
-    latestTimelineWalRaw = null;
-    adoptedTimelineWalRaw = null;
+    const token = wal ? timelineWalTokenByValue.get(wal) ?? null : latestTimelineWalToken;
+    if (!token) return;
+    if (localStorage.getItem(token.key) === token.raw) localStorage.removeItem(token.key);
+    if (
+      latestTimelineWalToken?.key === token.key &&
+      latestTimelineWalToken.raw === token.raw
+    ) latestTimelineWalToken = null;
   } catch {
     // The current tab remains fail-closed even if storage is unavailable.
   }
+}
+
+/** Exact-byte deletion for an explicitly confirmed recovery/discard action. */
+export function discardLocalTimelineWalBranch(
+  evidence: LocalTimelineWalBranchEvidence | CorruptLocalTimelineWalBranchEvidence,
+): boolean {
+  try {
+    const current = localStorage.getItem(evidence.storage_key);
+    // Idempotent convergence after a prior partial WAL+journal discard: an
+    // absent exact branch is already in the requested state. Different bytes
+    // still fail closed because they belong to a newer write.
+    if (current === null) return true;
+    if (current !== evidence.storage_token) return false;
+    localStorage.removeItem(evidence.storage_key);
+    const removed = localStorage.getItem(evidence.storage_key) === null;
+    if (
+      removed &&
+      latestTimelineWalToken?.key === evidence.storage_key &&
+      latestTimelineWalToken.raw === evidence.storage_token
+    ) latestTimelineWalToken = null;
+    return removed;
+  } catch {
+    return false;
+  }
+}
+
+/** @deprecated Use loadLocalTimelineWal + resolveLocalTimelineWal after authority GET. */
+export function loadLocalTimeline(
+  database: TimelineWalDatabaseIdentity,
+  projectId: string = DEFAULT_PROJECT_ID,
+  authority?: TimelineWalAuthority,
+): TimelineProject | null {
+  if (!authority) {
+    quarantineObsoleteTimelineStorage();
+    return null;
+  }
+  const wal = loadLocalTimelineWal(database, projectId);
+  if (!wal) return null;
+  const resolution = resolveLocalTimelineWal(wal, authority);
+  return resolution.status === "replay" ? resolution.project : null;
+}
+
+/** @deprecated Pass an exact base authority or use saveLocalTimelineWal directly. */
+export function saveLocalTimeline(
+  project: TimelineProject,
+  database: TimelineWalDatabaseIdentity,
+  projectId: string = DEFAULT_PROJECT_ID,
+  baseServerRevision?: number,
+  baseProject?: TimelineProject,
+): void {
+  if (baseServerRevision === undefined || baseProject === undefined) {
+    quarantineObsoleteTimelineStorage();
+    return;
+  }
+  saveLocalTimelineWal({
+    database,
+    project_id: projectId,
+    base_server_revision: baseServerRevision,
+    base_project: baseProject,
+    pending_project: project,
+  });
+}
+
+/** @deprecated Use clearLocalTimelineWal. */
+export function clearLocalTimeline(): void {
+  clearLocalTimelineWal();
 }

@@ -40,7 +40,15 @@ from .compiler import (
     validate_runnable,
     validate_unified_runnable,
 )
-from .database import Database
+from .database import (
+    AssetTrashInUse,
+    AssetTrashOriginConflict,
+    AssetTrashRestoreConflict,
+    Database,
+    TimelineComfyOriginConflict,
+    TimelineRevisionConflict,
+    TimelineRevisionExhausted,
+)
 from .instance_lock import DirectorInstanceLock
 from .media import (
     MediaToolError,
@@ -83,6 +91,12 @@ from .schemas import (
     AssetDeleteRead,
     AssetListRead,
     AssetReference,
+    AssetTrashBatchRead,
+    AssetTrashListRead,
+    AssetTrashPurgeRead,
+    AssetTrashRequest,
+    AssetTrashRestoreRead,
+    AssetTrashRestoreRequest,
     ComfyURLRequest,
     CreateJobRequest,
     DetectShotsRequest,
@@ -116,8 +130,13 @@ from .schemas import (
     StorageMigrateRequest,
     StorageMigrationRead,
     StorageStatusRead,
+    TimelineAuthorityRead,
+    TimelineAuthorityWriteRequest,
+    TimelineComfyOriginConflictRead,
     TimelineCompileRead,
     TimelineJobRequest,
+    TimelineRevisionConflictRead,
+    TimelineRevisionExhaustedRead,
     UnifiedFL2VASegment,
     UnifiedTimelineDraft,
     VideoMetadata,
@@ -660,6 +679,45 @@ def _validation_error(exc: ValidationError | ValueError) -> RequestValidationErr
     return RequestValidationError(
         [{"type": "value_error", "loc": ("body",), "msg": str(exc), "input": None}]
     )
+
+
+def _timeline_revision_conflict(exc: TimelineRevisionConflict) -> HTTPException:
+    detail = TimelineRevisionConflictRead(
+        message=(
+            "timeline changed on the server; fetch the current authority "
+            "before retrying"
+        ),
+        project_id=exc.project_id,
+        expected_revision=exc.expected_revision,
+        actual_revision=exc.actual_revision,
+    )
+    return HTTPException(status_code=409, detail=detail.model_dump(mode="json"))
+
+
+def _timeline_revision_exhausted(exc: TimelineRevisionExhausted) -> HTTPException:
+    detail = TimelineRevisionExhaustedRead(
+        message=(
+            "timeline revision space is exhausted; create or import a new "
+            "project before editing further"
+        ),
+        project_id=exc.project_id,
+        revision=exc.revision,
+    )
+    return HTTPException(status_code=409, detail=detail.model_dump(mode="json"))
+
+
+def _timeline_comfy_origin_conflict(
+    exc: TimelineComfyOriginConflict,
+) -> HTTPException:
+    detail = TimelineComfyOriginConflictRead(
+        message=(
+            "ComfyUI endpoint changed before the timeline write acquired its "
+            "transaction; fetch current settings and timeline authorities "
+            "before retrying"
+        ),
+        project_id=exc.project_id,
+    )
+    return HTTPException(status_code=409, detail=detail.model_dump(mode="json"))
 
 
 def _normalize_shot_detection(value: Any, *, total_frames: int) -> DetectShotsResponse:
@@ -6724,6 +6782,33 @@ def create_app(
         except (ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
 
+    @app.get("/api/timeline/authority", response_model=TimelineAuthorityRead)
+    async def get_timeline_authority(request: Request) -> TimelineAuthorityRead:
+        document, revision = _db(request).get_timeline_authority()
+        return TimelineAuthorityRead(document=document, revision=revision)
+
+    @app.put("/api/timeline/authority", response_model=TimelineAuthorityRead)
+    async def put_timeline_authority(
+        request: Request,
+        body: TimelineAuthorityWriteRequest,
+    ) -> TimelineAuthorityRead:
+        database = _db(request)
+        try:
+            document, revision = database.validate_and_put_timeline_authority(
+                body.document,
+                expected_revision=body.expected_revision,
+                comfy_origin=str(database.get_settings().comfy_url),
+            )
+        except TimelineRevisionConflict as exc:
+            raise _timeline_revision_conflict(exc) from None
+        except TimelineRevisionExhausted as exc:
+            raise _timeline_revision_exhausted(exc) from None
+        except TimelineComfyOriginConflict as exc:
+            raise _timeline_comfy_origin_conflict(exc) from None
+        except (ValidationError, ValueError) as exc:
+            raise _validation_error(exc) from exc
+        return TimelineAuthorityRead(document=document, revision=revision)
+
     @app.post("/api/timeline/compile", response_model=TimelineCompileRead)
     async def compile_timeline(
         request: Request, body: TimelineJobRequest
@@ -6740,7 +6825,19 @@ def create_app(
 
     @app.get("/api/projects", response_model=ProjectListRead)
     async def list_projects(request: Request) -> ProjectListRead:
-        return ProjectListRead(projects=_db(request).list_projects())
+        database = _db(request)
+        storage = request.app.state.storage
+        active_database_identity = storage.active_database_identity
+        projects = database.list_projects()
+        if storage.active_database_identity != active_database_identity:
+            raise HTTPException(
+                status_code=409,
+                detail="the active Director database changed while listing projects",
+            )
+        return ProjectListRead(
+            projects=projects,
+            active_database_identity=active_database_identity,
+        )
 
     @app.post("/api/projects", response_model=ProjectSummaryRead)
     async def create_project(
@@ -6828,6 +6925,52 @@ def create_app(
         except (ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
 
+    @app.get(
+        "/api/projects/{project_id}/timeline/authority",
+        response_model=TimelineAuthorityRead,
+    )
+    async def get_project_timeline_authority(
+        request: Request, project_id: str
+    ) -> TimelineAuthorityRead:
+        try:
+            document, revision = _db(request).get_project_timeline_authority(
+                project_id
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="project not found") from None
+        return TimelineAuthorityRead(document=document, revision=revision)
+
+    @app.put(
+        "/api/projects/{project_id}/timeline/authority",
+        response_model=TimelineAuthorityRead,
+    )
+    async def put_project_timeline_authority(
+        request: Request,
+        project_id: str,
+        body: TimelineAuthorityWriteRequest,
+    ) -> TimelineAuthorityRead:
+        database = _db(request)
+        try:
+            document, revision = (
+                database.validate_and_put_project_timeline_authority(
+                    project_id,
+                    body.document,
+                    expected_revision=body.expected_revision,
+                    comfy_origin=str(database.get_settings().comfy_url),
+                )
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="project not found") from None
+        except TimelineRevisionConflict as exc:
+            raise _timeline_revision_conflict(exc) from None
+        except TimelineRevisionExhausted as exc:
+            raise _timeline_revision_exhausted(exc) from None
+        except TimelineComfyOriginConflict as exc:
+            raise _timeline_comfy_origin_conflict(exc) from None
+        except (ValidationError, ValueError) as exc:
+            raise _validation_error(exc) from exc
+        return TimelineAuthorityRead(document=document, revision=revision)
+
     @app.post(
         "/api/projects/{project_id}/compile",
         response_model=TimelineCompileRead,
@@ -6858,13 +7001,169 @@ def create_app(
         settings = database.get_settings()
         if not str(settings.comfy_url).strip():
             raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
+        comfy_origin = Database.canonical_comfy_origin(settings.comfy_url)
+        active_database_identity = request.app.state.storage.active_database_identity
         try:
             assets = database.list_assets(
-                comfy_origin=str(settings.comfy_url), kind=kind
+                comfy_origin=comfy_origin, kind=kind
             )
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return AssetListRead(assets=assets)
+        return AssetListRead(
+            assets=assets,
+            active_database_identity=active_database_identity,
+            comfy_origin=comfy_origin,
+        )
+
+    @app.get("/api/asset-trash", response_model=AssetTrashListRead)
+    async def list_asset_trash(request: Request) -> AssetTrashListRead:
+        database = _db(request)
+        settings = database.get_settings()
+        if not str(settings.comfy_url).strip():
+            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
+        comfy_origin = Database.canonical_comfy_origin(settings.comfy_url)
+        active_database_identity = request.app.state.storage.active_database_identity
+        try:
+            batches = database.list_asset_trash_batches(
+                comfy_origin=comfy_origin
+            )
+        except AssetTrashOriginConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "asset_trash_origin_conflict",
+                    "message": str(exc),
+                    "remote_files_preserved": True,
+                },
+            ) from exc
+        return AssetTrashListRead(
+            batches=[AssetTrashBatchRead.model_validate(item) for item in batches],
+            active_database_identity=active_database_identity,
+            comfy_origin=comfy_origin,
+        )
+
+    @app.post("/api/asset-trash", response_model=AssetTrashBatchRead)
+    async def trash_assets(
+        request: Request, body: AssetTrashRequest
+    ) -> AssetTrashBatchRead:
+        database = _db(request)
+        settings = database.get_settings()
+        if not str(settings.comfy_url).strip():
+            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
+        try:
+            result = database.trash_assets(
+                body.asset_ids,
+                cascade=body.cascade,
+                expected_comfy_origin=str(settings.comfy_url),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="asset not found") from exc
+        except AssetTrashInUse as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "assets_in_use",
+                    "message": "one or more assets are still referenced by saved drafts",
+                    "usages": exc.usages,
+                    "usages_by_asset": exc.usages_by_asset,
+                    "remote_files_preserved": True,
+                },
+            ) from exc
+        except AssetTrashOriginConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "asset_trash_origin_conflict",
+                    "message": str(exc),
+                    "remote_files_preserved": True,
+                },
+            ) from exc
+        except OverflowError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return AssetTrashBatchRead.model_validate(result)
+
+    @app.post(
+        "/api/asset-trash/{batch_id}/restore",
+        response_model=AssetTrashRestoreRead,
+    )
+    async def restore_asset_trash(
+        request: Request,
+        batch_id: str,
+        body: AssetTrashRestoreRequest,
+    ) -> AssetTrashRestoreRead:
+        database = _db(request)
+        settings = database.get_settings()
+        if not str(settings.comfy_url).strip():
+            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
+        try:
+            result = database.restore_asset_trash_batch(
+                batch_id,
+                mode=body.mode,
+                expected_comfy_origin=str(settings.comfy_url),
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail="asset trash batch not found"
+            ) from exc
+        except AssetTrashOriginConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "asset_trash_origin_conflict",
+                    "message": str(exc),
+                    "remote_files_preserved": True,
+                },
+            ) from exc
+        except AssetTrashRestoreConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "asset_trash_restore_conflict",
+                    "message": str(exc),
+                    "conflicts": exc.conflicts,
+                    "remote_files_preserved": True,
+                },
+            ) from exc
+        return AssetTrashRestoreRead.model_validate(result)
+
+    @app.delete(
+        "/api/asset-trash/{batch_id}", response_model=AssetTrashPurgeRead
+    )
+    async def purge_asset_trash(
+        request: Request, batch_id: str
+    ) -> AssetTrashPurgeRead:
+        database = _db(request)
+        settings = database.get_settings()
+        if not str(settings.comfy_url).strip():
+            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
+        try:
+            result = database.purge_asset_trash_batch(
+                batch_id, expected_comfy_origin=str(settings.comfy_url)
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail="asset trash batch not found"
+            ) from exc
+        except AssetTrashOriginConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "asset_trash_origin_conflict",
+                    "message": str(exc),
+                    "remote_files_preserved": True,
+                },
+            ) from exc
+        except AssetTrashRestoreConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "asset_trash_purge_conflict",
+                    "message": str(exc),
+                    "conflicts": exc.conflicts,
+                    "remote_files_preserved": True,
+                },
+            ) from exc
+        return AssetTrashPurgeRead.model_validate(result)
 
     @app.get("/api/uploads/{upload_id}")
     async def get_upload_progress(request: Request, upload_id: str) -> dict[str, Any]:
@@ -6985,11 +7284,25 @@ def create_app(
                     ),
                 }
                 asset = AssetReference.model_validate(document).model_dump(mode="json")
-                _db(request).put_asset(
+                if not _db(request).put_asset_if_current_origin(
                     asset_id,
                     asset,
-                    comfy_origin=Database.canonical_comfy_origin(settings.comfy_url),
-                )
+                    expected_comfy_origin=Database.canonical_comfy_origin(
+                        settings.comfy_url
+                    ),
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "asset_upload_origin_changed",
+                            "message": (
+                                "ComfyUI endpoint changed while the upload was in "
+                                "progress; the remote file was preserved but was not "
+                                "registered in Director"
+                            ),
+                            "remote_files_preserved": True,
+                        },
+                    )
                 timings["persist"] = time.monotonic() - phase_started
                 elapsed = time.monotonic() - started_at
                 _upload_progress(
@@ -7087,9 +7400,23 @@ def create_app(
                 ),
             )
         try:
-            usages = database.delete_asset_if_unused(asset_id, cascade=cascade)
+            usages = database.delete_asset_if_unused(
+                asset_id,
+                cascade=cascade,
+                expected_comfy_origin=active_origin,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="asset not found") from exc
+        except AssetTrashOriginConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "asset_trash_origin_conflict",
+                    "message": str(exc),
+                    "outputs_preserved": True,
+                    "remote_files_preserved": True,
+                },
+            ) from exc
         if usages and not cascade:
             raise HTTPException(
                 status_code=409,

@@ -41,6 +41,10 @@ StandardLoraLoader: TypeAlias = Literal[
 
 MODE_ORDER: tuple[GenerationMode, ...] = ("t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v")
 MINIMAX_H3_PROMPT_MAX_CHARACTERS = 7_000
+# Timeline revisions cross the JSON boundary and are compared exactly by the
+# browser. Keep the durable counter inside JavaScript's safe-integer range just
+# like timeline seeds; silently rounding a CAS value would defeat the lock.
+MAX_TIMELINE_REVISION = 2**53 - 1
 MODEL_ROUTE: dict[GenerationMode | TimelineMode, TimelineMode] = {
     "t2v": "fl2va",
     "i2v": "fl2va",
@@ -1342,12 +1346,69 @@ class TimelineCompileRead(StrictModel):
 class AssetListRead(StrictModel):
     assets: list[AssetReference]
     outputs_preserved: Literal[True] = True
+    active_database_identity: Annotated[
+        str, Field(pattern=r"^[0-9a-f]{64}$")
+    ]
+    comfy_origin: Annotated[str, Field(min_length=1)]
 
 
 class AssetDeleteRead(StrictModel):
     deleted_asset_id: str
     outputs_preserved: Literal[True] = True
     unbound_usages: list[str] = Field(default_factory=list)
+
+
+class AssetTrashRequest(StrictModel):
+    asset_ids: Annotated[list[str], Field(min_length=1, max_length=128)]
+    cascade: bool = False
+
+    @field_validator("asset_ids")
+    @classmethod
+    def validate_asset_ids(cls, value: list[str]) -> list[str]:
+        if any(not asset_id for asset_id in value):
+            raise ValueError("asset ids must be non-empty")
+        if len(set(value)) != len(value):
+            raise ValueError("asset ids must be unique")
+        return value
+
+
+class AssetTrashBatchRead(StrictModel):
+    batch_id: str
+    comfy_origin: str
+    asset_ids: list[str]
+    assets: list[AssetReference]
+    cascade: bool
+    unbound_usages: list[str] = Field(default_factory=list)
+    unbound_usages_by_asset: dict[str, list[str]] = Field(default_factory=dict)
+    created_at: str
+    remote_files_preserved: Literal[True] = True
+
+
+class AssetTrashListRead(StrictModel):
+    batches: list[AssetTrashBatchRead]
+    remote_files_preserved: Literal[True] = True
+    active_database_identity: Annotated[
+        str, Field(pattern=r"^[0-9a-f]{64}$")
+    ]
+    comfy_origin: Annotated[str, Field(min_length=1)]
+
+
+class AssetTrashRestoreRequest(StrictModel):
+    mode: Literal["registration_only", "with_references"]
+
+
+class AssetTrashRestoreRead(StrictModel):
+    batch_id: str
+    restored_asset_ids: list[str]
+    restored_references: bool
+    mode: Literal["registration_only", "with_references"]
+    remote_files_preserved: Literal[True] = True
+
+
+class AssetTrashPurgeRead(StrictModel):
+    batch_id: str
+    purged_asset_ids: list[str]
+    remote_files_preserved: Literal[True] = True
 
 
 class JobChildRead(StrictModel):
@@ -1643,6 +1704,9 @@ class ProjectSummaryRead(StrictModel):
 
 class ProjectListRead(StrictModel):
     projects: list[ProjectSummaryRead]
+    active_database_identity: Annotated[
+        str, Field(pattern=r"^[0-9a-f]{64}$")
+    ]
 
 
 class ProjectCreateRequest(StrictModel):
@@ -1663,6 +1727,43 @@ class ProjectImportRequest(StrictModel):
 
     title: Annotated[str, Field(min_length=0, max_length=256)] = ""
     document: UnifiedTimelineDraft
+
+
+class TimelineAuthorityRead(StrictModel):
+    """One timeline document together with its durable server CAS revision."""
+
+    document: UnifiedTimelineDraft
+    revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
+
+
+class TimelineAuthorityWriteRequest(StrictModel):
+    """A conditional timeline replacement based on an exact server revision."""
+
+    document: UnifiedTimelineDraft
+    expected_revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
+
+
+class TimelineRevisionConflictRead(StrictModel):
+    code: Literal["timeline_revision_conflict"] = "timeline_revision_conflict"
+    message: str
+    project_id: str
+    expected_revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
+    actual_revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
+
+
+class TimelineRevisionExhaustedRead(StrictModel):
+    code: Literal["timeline_revision_exhausted"] = "timeline_revision_exhausted"
+    message: str
+    project_id: str
+    revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
+
+
+class TimelineComfyOriginConflictRead(StrictModel):
+    code: Literal["timeline_comfy_origin_conflict"] = (
+        "timeline_comfy_origin_conflict"
+    )
+    message: str
+    project_id: str
 
 
 class ProjectDeleteRead(StrictModel):

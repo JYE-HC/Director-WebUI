@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { IDBFactory } from "fake-indexeddb";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import App, {
@@ -12,6 +13,7 @@ import {
   DEFAULT_SETTINGS,
   EMPTY_CAPABILITIES,
   EMPTY_RAYLIGHT_RUNTIME_STATUS,
+  type AssetTrashBatch,
   type CapabilityReport,
   type GenerationTask,
   type TimelineCompileReport,
@@ -21,24 +23,68 @@ import {
   createTimelineProject,
   createTimelineSegment,
   DEFAULT_PROJECT_ID,
+  getTimelineBranchOwnerId,
   LEGACY_TIMELINE_STORAGE_KEY,
+  loadLocalTimelineWal,
   QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY,
   QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY,
   QUARANTINED_TIMELINE_STORAGE_KEY,
-  saveLocalTimeline as saveLocalTimelineForDatabase,
-  TIMELINE_WAL_STORAGE_KEY,
+  saveLocalTimelineWal,
+  localTimelineWalStorageKey,
   UNBOUND_TIMELINE_WAL_STORAGE_KEY,
 } from "../domain/timelineProject";
 import {
   loadTimelineSegmentSelectionPreference,
   saveTimelineSegmentSelectionPreference,
 } from "../domain/workspacePreferences";
+import {
+  createTimelineHistory,
+  recordTimelineHistory,
+} from "../state/timelineHistory";
+import { createTimelineRevisionChannel } from "../state/timelineCoordination";
+import {
+  readTimelineHistoryJournalVersionToken,
+  saveTimelineHistoryJournal,
+  timelineHistoryJournalKey,
+} from "../state/timelinePersistence";
+
+class AppTestBroadcastChannel {
+  static channels = new Map<string, Set<AppTestBroadcastChannel>>();
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+
+  constructor(readonly name: string) {
+    const peers = AppTestBroadcastChannel.channels.get(name) ?? new Set();
+    peers.add(this);
+    AppTestBroadcastChannel.channels.set(name, peers);
+  }
+
+  postMessage(value: unknown) {
+    for (const peer of AppTestBroadcastChannel.channels.get(this.name) ?? []) {
+      if (peer !== this) peer.onmessage?.(new MessageEvent("message", { data: value }));
+    }
+  }
+
+  close() {
+    AppTestBroadcastChannel.channels.get(this.name)?.delete(this);
+  }
+}
 
 const ACTIVE_DATABASE_PATH = "/srv/director/data/director.sqlite3";
 const ACTIVE_DATABASE_IDENTITY = "a".repeat(64);
 const ACTIVE_DATABASE = {
   active_database_path: ACTIVE_DATABASE_PATH,
   active_database_identity: ACTIVE_DATABASE_IDENTITY,
+};
+// Test-only shorthand for this realm's exact v7 branch key. Production code
+// enumerates by scope and never treats the v7 prefix as a singleton key.
+const TIMELINE_WAL_STORAGE_KEY = localTimelineWalStorageKey(ACTIVE_DATABASE)!;
+const timelineWalStorageRaw = (
+  projectId = DEFAULT_PROJECT_ID,
+  database = ACTIVE_DATABASE,
+  ownerId = getTimelineBranchOwnerId(),
+) => {
+  const key = localTimelineWalStorageKey(database, projectId, ownerId);
+  return key ? localStorage.getItem(key) : null;
 };
 const ACTIVE_STORAGE_CONFIGURATION = {
   ...ACTIVE_DATABASE,
@@ -47,8 +93,61 @@ const ACTIVE_STORAGE_CONFIGURATION = {
   source: "default" as const,
   restart_required: false,
 };
-const saveLocalTimeline = (project: Parameters<typeof saveLocalTimelineForDatabase>[0]) =>
-  saveLocalTimelineForDatabase(project, ACTIVE_DATABASE);
+
+async function readRawTimelineJournal(key: string): Promise<unknown | undefined> {
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("director-web-timeline-history", 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("journals")) {
+        request.result.createObjectStore("journals", { keyPath: "key" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = database.transaction("journals", "readonly")
+        .objectStore("journals").get(key);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function putRawTimelineJournal(value: unknown): Promise<void> {
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("director-web-timeline-history", 1);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction("journals", "readwrite");
+      transaction.objectStore("journals").put(value);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  } finally {
+    database.close();
+  }
+}
+let seededTimelineServerProject: ReturnType<typeof createTimelineProject> | null = null;
+const saveLocalTimeline = (project: ReturnType<typeof createTimelineProject>) => {
+  const base = structuredClone(project);
+  base.title = `服务器基线：${base.title}`;
+  seededTimelineServerProject = base;
+  return saveLocalTimelineWal({
+    database: ACTIVE_DATABASE,
+    project_id: DEFAULT_PROJECT_ID,
+    base_server_revision: 0,
+    base_project: base,
+    pending_project: project,
+  });
+};
 const saveRuntimeSettingsWal = (
   settings: typeof CONFIGURED_SETTINGS,
   database = ACTIVE_DATABASE,
@@ -77,6 +176,53 @@ const endpointBImageAsset: AssetReference = {
   name: "B 服务器素材.png",
   preview_url: "/api/assets/asset-image-endpoint-b/preview",
 };
+
+function appAssetTrashBatch(
+  assetIds: readonly string[] = [imageAsset.id],
+  cascade = false,
+  usagesByAsset: Record<string, string[]> = Object.fromEntries(
+    assetIds.map((assetId) => [assetId, []]),
+  ),
+  batchId = "asset-trash-batch-app",
+): AssetTrashBatch {
+  return {
+    batch_id: batchId,
+    comfy_origin: CONFIGURED_SETTINGS.comfy_url,
+    asset_ids: [...assetIds],
+    assets: assetIds.map((assetId) => assetId === imageAsset.id
+      ? imageAsset
+      : { ...imageAsset, id: assetId, name: `${assetId}.png` }),
+    cascade,
+    unbound_usages: assetIds.flatMap((assetId) => usagesByAsset[assetId] ?? []),
+    unbound_usages_by_asset: Object.fromEntries(
+      assetIds.map((assetId) => [assetId, [...(usagesByAsset[assetId] ?? [])]]),
+    ),
+    created_at: "2026-08-16T12:00:00Z",
+    remote_files_preserved: true,
+  };
+}
+
+function appAssetTrashList(batches: AssetTrashBatch[]) {
+  return {
+    batches,
+    remote_files_preserved: true as const,
+    active_database_identity: ACTIVE_DATABASE_IDENTITY,
+    comfy_origin: CONFIGURED_SETTINGS.comfy_url,
+  };
+}
+
+function appAssetList(
+  assets: AssetReference[],
+  comfyOrigin = CONFIGURED_SETTINGS.comfy_url,
+  databaseIdentity = ACTIVE_DATABASE_IDENTITY,
+) {
+  return {
+    assets,
+    outputs_preserved: true as const,
+    active_database_identity: databaseIdentity,
+    comfy_origin: comfyOrigin,
+  };
+}
 
 const CONFIGURED_SETTINGS = {
   ...DEFAULT_SETTINGS,
@@ -165,6 +311,11 @@ const succeededTask: GenerationTask = {
 };
 
 function mockCommonRequests(settings = CONFIGURED_SETTINGS) {
+  let timelineAuthorityRevision = 0;
+  const projectAuthorityRevisions = new Map<string, number>();
+  const defaultTimeline = structuredClone(
+    seededTimelineServerProject ?? createTimelineProject(),
+  );
   vi.spyOn(directorApi, "getSettings").mockResolvedValue(settings);
   vi.spyOn(directorApi, "getSettingsAuthority").mockResolvedValue(runtimeAuthority(settings));
   vi.spyOn(directorApi, "getStorage").mockResolvedValue(ACTIVE_STORAGE_CONFIGURATION);
@@ -175,10 +326,46 @@ function mockCommonRequests(settings = CONFIGURED_SETTINGS) {
   );
   vi.spyOn(directorApi, "getModels").mockResolvedValue(MODEL_INVENTORY);
   vi.spyOn(directorApi, "listTasks").mockResolvedValue({ jobs: [] });
-  vi.spyOn(directorApi, "listAssets").mockResolvedValue({ assets: [], outputs_preserved: true });
-  vi.spyOn(directorApi, "getTimeline").mockResolvedValue(createTimelineProject());
+  vi.spyOn(directorApi, "listAssets").mockResolvedValue(appAssetList([]));
+  vi.spyOn(directorApi, "listAssetTrash").mockResolvedValue(appAssetTrashList([]));
+  vi.spyOn(directorApi, "trashAssets").mockImplementation(async (assetIds, cascade = false) =>
+    appAssetTrashBatch(assetIds, cascade));
+  vi.spyOn(directorApi, "restoreAssetTrash").mockImplementation(async (batchId, mode) => ({
+    batch_id: batchId,
+    restored_asset_ids: [imageAsset.id],
+    restored_references: mode === "with_references",
+    mode,
+    remote_files_preserved: true,
+  }));
+  vi.spyOn(directorApi, "purgeAssetTrash").mockImplementation(async (batchId) => ({
+    batch_id: batchId,
+    purged_asset_ids: [imageAsset.id],
+    remote_files_preserved: true,
+  }));
+  vi.spyOn(directorApi, "getTimeline").mockImplementation(async () =>
+    structuredClone(defaultTimeline));
   vi.spyOn(directorApi, "updateTimeline").mockImplementation(async (project) => project);
+  vi.spyOn(directorApi, "getTimelineAuthority").mockImplementation(async (signal) => ({
+    document: await directorApi.getTimeline(signal),
+    revision: timelineAuthorityRevision,
+  }));
+  vi.spyOn(directorApi, "updateTimelineAuthority").mockImplementation(async (project, expectedRevision) => {
+    const document = await directorApi.updateTimeline(project);
+    timelineAuthorityRevision = expectedRevision + 1;
+    return { document, revision: timelineAuthorityRevision };
+  });
+  vi.spyOn(directorApi, "getProjectTimelineAuthority").mockImplementation(async (projectId, signal) => ({
+    document: await directorApi.getProjectTimeline(projectId, signal),
+    revision: projectAuthorityRevisions.get(projectId) ?? 0,
+  }));
+  vi.spyOn(directorApi, "updateProjectTimelineAuthority").mockImplementation(async (projectId, project, expectedRevision) => {
+    const document = await directorApi.updateProjectTimeline(projectId, project);
+    const revision = expectedRevision + 1;
+    projectAuthorityRevisions.set(projectId, revision);
+    return { document, revision };
+  });
   vi.spyOn(directorApi, "listProjects").mockResolvedValue({
+    active_database_identity: ACTIVE_DATABASE_IDENTITY,
     projects: [{
       id: "default",
       title: "未命名长视频",
@@ -207,6 +394,8 @@ async function openGlobalSettings(user: ReturnType<typeof userEvent.setup>) {
 
 beforeEach(() => {
   localStorage.clear();
+  AppTestBroadcastChannel.channels.clear();
+  seededTimelineServerProject = null;
   directorApi.resetDatabaseIdentityForTests();
 });
 afterEach(() => {
@@ -280,6 +469,34 @@ describe("统一长视频时间线应用", () => {
     expect(update).not.toHaveBeenCalled();
   });
 
+  it("素材列表须等待数据库与 endpoint 权威，并拒绝错 scope 响应", async () => {
+    const foreignAsset = {
+      ...imageAsset,
+      id: "asset-from-foreign-scope",
+      name: "其他数据库的素材.png",
+    };
+    mockCommonRequests();
+    let resolveStorage!: (value: typeof ACTIVE_STORAGE_CONFIGURATION) => void;
+    vi.mocked(directorApi.getStorage)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveStorage = resolve; }))
+      .mockResolvedValue(ACTIVE_STORAGE_CONFIGURATION);
+    vi.mocked(directorApi.listAssets).mockResolvedValue(appAssetList(
+      [foreignAsset],
+      "http://foreign-comfy.test:8188",
+      "b".repeat(64),
+    ));
+
+    render(<App />);
+
+    await waitFor(() => expect(directorApi.getSettingsAuthority).toHaveBeenCalled());
+    expect(directorApi.listAssets).not.toHaveBeenCalled();
+
+    await act(async () => resolveStorage(ACTIVE_STORAGE_CONFIGURATION));
+    await waitUntilReady();
+    await waitFor(() => expect(directorApi.listAssets).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(foreignAsset.name)).not.toBeInTheDocument();
+  });
+
   it("旧 v2 长期镜像只隔离保留，不参与启动恢复或反写服务器", async () => {
     const staleMirror = createTimelineProject();
     staleMirror.title = "旧浏览器镜像";
@@ -326,9 +543,851 @@ describe("统一长视频时间线应用", () => {
     await act(async () => resolveStorage(ACTIVE_STORAGE_CONFIGURATION));
     expect((await screen.findAllByText(pending.title)).length).toBeGreaterThan(0);
     expect(screen.getByLabelText("片段提示词")).toHaveValue("只属于数据库 A");
+    expect(directorApi.getTimeline).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "采用服务器版本" })).not.toBeInTheDocument();
     await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({ title: pending.title })));
-    expect(directorApi.getTimeline).not.toHaveBeenCalled();
+    await waitFor(() => expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull());
+  });
+
+  it("启动时服务器已等于 WAL head 会识别 lost ACK，只清精确 WAL 而不重复 PUT", async () => {
+    const base = createTimelineProject();
+    base.segments[0].prompt = "lost ACK 前基线";
+    const pending = structuredClone(base);
+    pending.segments[0].prompt = "服务器已提交但响应丢失";
+    const wal = saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      base_server_revision: 6,
+      base_project: base,
+      pending_project: pending,
+    });
+    expect(wal).not.toBeNull();
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: pending,
+      revision: 7,
+    });
+    const update = vi.mocked(directorApi.updateTimeline);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("服务器已提交但响应丢失");
+    expect(screen.queryByRole("button", { name: "采用服务器版本" })).not.toBeInTheDocument();
+    expect(update).not.toHaveBeenCalled();
     expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
+  });
+
+  it("同 scope WAL 与服务器 revision/base 不匹配时冻结自动写并保留取证 bytes", async () => {
+    const base = createTimelineProject();
+    base.segments[0].prompt = "WAL 基线";
+    const pending = structuredClone(base);
+    pending.segments[0].prompt = "本地分支";
+    const remote = structuredClone(base);
+    remote.segments[0].prompt = "远端分支";
+    saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      base_server_revision: 9,
+      base_project: base,
+      pending_project: pending,
+    });
+    const forensicBytes = localStorage.getItem(TIMELINE_WAL_STORAGE_KEY);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: remote,
+      revision: 10,
+    });
+    const update = vi.mocked(directorApi.updateTimeline);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("本地分支");
+    expect(screen.getByRole("button", { name: "采用服务器版本" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保留本地版本" })).toBeInTheDocument();
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
+    expect(update).not.toHaveBeenCalled();
+    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBe(forensicBytes);
+  });
+
+  it("IndexedDB journal 在 exact authority 上恢复 pending head 与可撤销历史", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.segments[0].prompt = "journal 基线";
+    const pending = structuredClone(base);
+    pending.segments[0].prompt = "journal 恢复版本";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before: base,
+      after: pending,
+      mergeKey: `${base.segments[0].id}:prompt`,
+      now: 1,
+    });
+    await saveTimelineHistoryJournal({
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: getTimelineBranchOwnerId(),
+    }, {
+      document: base,
+      revision: 12,
+    }, history);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: base,
+      revision: 12,
+    });
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("journal 恢复版本");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("journal 基线");
+  });
+
+  it("foreign WAL 默认只列为恢复分支，继续服务器时不 replay、不 PUT 且保留原证据", async () => {
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.title = "服务器项目";
+    base.segments[0].prompt = "服务器内容";
+    const pending = structuredClone(base);
+    pending.title = "另一标签页草稿";
+    pending.segments[0].prompt = "foreign pending";
+    const foreignOwner = "foreign-tab-a";
+    saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      owner_id: foreignOwner,
+      base_server_revision: 0,
+      base_project: base,
+      pending_project: pending,
+    });
+    const foreignKey = localTimelineWalStorageKey(
+      ACTIVE_DATABASE,
+      DEFAULT_PROJECT_ID,
+      foreignOwner,
+    )!;
+    const foreignBytes = localStorage.getItem(foreignKey);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({ document: base, revision: 0 });
+    const update = vi.mocked(directorApi.updateTimeline);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("服务器内容");
+    expect(screen.getByRole("radio", { name: /另一标签页草稿/ })).toBeInTheDocument();
+    expect(screen.getByText(/可恢复的本地分支（1）/)).toBeInTheDocument();
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
+    expect(update).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "继续服务器并保留记录" }));
+    await waitFor(() => expect(screen.queryByRole("button", {
+      name: "继续服务器并保留记录",
+    })).not.toBeInTheDocument());
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("服务器内容");
+    expect(update).not.toHaveBeenCalled();
+    expect(localStorage.getItem(foreignKey)).toBe(foreignBytes);
+  });
+
+  it("显式选择 exact-base foreign 分支后才克隆到新 owner 并按 CAS 同步，原分支保留", async () => {
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.title = "服务器基线";
+    const pending = structuredClone(base);
+    pending.title = "显式恢复的分支";
+    pending.segments[0].prompt = "恢复后同步";
+    const foreignOwner = "foreign-tab-safe";
+    saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      owner_id: foreignOwner,
+      base_server_revision: 4,
+      base_project: base,
+      pending_project: pending,
+    });
+    const foreignKey = localTimelineWalStorageKey(
+      ACTIVE_DATABASE,
+      DEFAULT_PROJECT_ID,
+      foreignOwner,
+    )!;
+    const foreignBytes = localStorage.getItem(foreignKey);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({ document: base, revision: 4 });
+    const update = vi.mocked(directorApi.updateTimeline);
+
+    render(<App />);
+    await waitUntilReady();
+    expect(update).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("radio", { name: /显式恢复的分支/ }));
+    await user.click(screen.getByRole("button", { name: "恢复所选分支" }));
+
+    await waitFor(() => expect(screen.getByLabelText("片段提示词")).toHaveValue("恢复后同步"));
+    await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      title: "显式恢复的分支",
+    })));
+    expect(localStorage.getItem(foreignKey)).toBe(foreignBytes);
+  });
+
+  it("显式恢复时若 foreign base 已过期，只进入现有 CAS 冲突确认而不直接覆盖", async () => {
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.title = "旧服务器基线";
+    const pending = structuredClone(base);
+    pending.title = "过期恢复分支";
+    pending.segments[0].prompt = "本地待确认";
+    const remote = structuredClone(base);
+    remote.title = "点击时的新服务器版本";
+    const foreignOwner = "foreign-tab-stale";
+    saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      owner_id: foreignOwner,
+      base_server_revision: 5,
+      base_project: base,
+      pending_project: pending,
+    });
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: base, revision: 5 })
+      .mockResolvedValue({ document: remote, revision: 6 });
+    const update = vi.mocked(directorApi.updateTimeline);
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("radio", { name: /过期恢复分支/ }));
+    await user.click(screen.getByRole("button", { name: "恢复所选分支" }));
+
+    await waitFor(() => expect(screen.getByLabelText("片段提示词")).toHaveValue("本地待确认"));
+    expect(screen.getByRole("button", { name: "保留本地版本" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "采用服务器版本" })).toBeInTheDocument();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("多个 foreign 分支全部可键盘选择，逐项确认丢弃只删除所选 owner", async () => {
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    const first = { ...structuredClone(base), title: "foreign A" };
+    const second = { ...structuredClone(base), title: "foreign B" };
+    saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      owner_id: "foreign-multi-a",
+      base_server_revision: 0,
+      base_project: base,
+      pending_project: first,
+    });
+    saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      owner_id: "foreign-multi-b",
+      base_server_revision: 0,
+      base_project: base,
+      pending_project: second,
+    });
+    const firstKey = localTimelineWalStorageKey(
+      ACTIVE_DATABASE,
+      DEFAULT_PROJECT_ID,
+      "foreign-multi-a",
+    )!;
+    const secondKey = localTimelineWalStorageKey(
+      ACTIVE_DATABASE,
+      DEFAULT_PROJECT_ID,
+      "foreign-multi-b",
+    )!;
+    mockCommonRequests();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+
+    const radios = screen.getAllByRole("radio");
+    expect(radios).toHaveLength(2);
+    radios[0]!.focus();
+    expect(radios[0]).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "丢弃恢复记录：foreign A" }));
+    await waitFor(() => expect(screen.getAllByRole("radio")).toHaveLength(1));
+    expect(localStorage.getItem(firstKey)).toBeNull();
+    expect(localStorage.getItem(secondKey)).not.toBeNull();
+  });
+
+  it("同 owner 的 WAL A 与 journal B 若 head 分叉会显示两份证据并零 PUT", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.title = "同 owner 服务器基线";
+    const walHead = structuredClone(base);
+    walHead.title = "localStorage 分支 A";
+    const journalHead = structuredClone(base);
+    journalHead.title = "IndexedDB 分支 B";
+    const ownerId = getTimelineBranchOwnerId();
+    const wal = saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      owner_id: ownerId,
+      base_server_revision: 7,
+      base_project: base,
+      pending_project: walHead,
+    });
+    expect(wal).not.toBeNull();
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "重命名项目",
+      before: base,
+      after: journalHead,
+      now: 15,
+    });
+    const journalScope = {
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId,
+    };
+    await saveTimelineHistoryJournal(journalScope, {
+      document: base,
+      revision: 7,
+    }, history);
+    const walBytes = timelineWalStorageRaw();
+    const journalToken = await readTimelineHistoryJournalVersionToken(journalScope);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: base,
+      revision: 7,
+    });
+    const update = vi.mocked(directorApi.updateTimelineAuthority);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.getByLabelText("片段提示词")).toHaveValue(base.segments[0].prompt);
+    expect(screen.getByText(/可恢复的本地分支（2）/)).toBeInTheDocument();
+    const walRadio = screen.getByRole("radio", { name: /localStorage 分支 A/ });
+    const journalRadio = screen.getByRole("radio", { name: /IndexedDB 分支 B/ });
+    await user.click(walRadio);
+    expect(walRadio).toBeChecked();
+    await user.click(journalRadio);
+    expect(journalRadio).toBeChecked();
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
+    expect(update).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "继续服务器并保留记录" }));
+    await waitFor(() => expect(screen.queryByRole("button", {
+      name: "继续服务器并保留记录",
+    })).not.toBeInTheDocument());
+    expect(timelineWalStorageRaw()).toBe(walBytes);
+    expect(await readTimelineHistoryJournalVersionToken(journalScope)).toEqual(journalToken);
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("无 pending WAL 时自动选择 newest foreign lost-ACK journal 恢复 undo，但不删除其他 history branch", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.segments[0].prompt = "提交前";
+    const acknowledged = structuredClone(base);
+    acknowledged.segments[0].prompt = "服务器已包含";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before: base,
+      after: acknowledged,
+      now: 10,
+    });
+    await saveTimelineHistoryJournal({
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: "foreign-journal-ack",
+    }, {
+      document: base,
+      revision: 3,
+    }, history);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: acknowledged,
+      revision: 4,
+    });
+    const update = vi.mocked(directorApi.updateTimeline);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.queryByRole("button", { name: "恢复所选分支" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    expect(update).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("提交前");
+  });
+
+  it("刷新后的 foreign clean journal 只恢复 undo，不误报 pending recovery 或 PUT", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.segments[0].prompt = "clean history 前";
+    const confirmed = structuredClone(base);
+    confirmed.segments[0].prompt = "clean history head";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before: base,
+      after: confirmed,
+      now: 18,
+    });
+    await saveTimelineHistoryJournal({
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: "previous-page-clean-owner",
+    }, {
+      document: confirmed,
+      revision: 9,
+    }, history);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: confirmed,
+      revision: 9,
+    });
+    const update = vi.mocked(directorApi.updateTimelineAuthority);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.queryByText(/可恢复的本地分支/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "恢复所选分支" })).not.toBeInTheDocument();
+    expect(update).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("clean history 前");
+  });
+
+  it("独立 pending WAL 不会压掉 exact server-head history，丢弃后仍可 undo 且零 PUT", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const before = createTimelineProject();
+    before.segments[0].prompt = "ack history 前";
+    const server = structuredClone(before);
+    server.segments[0].prompt = "ack history head";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before,
+      after: server,
+      now: 21,
+    });
+    await saveTimelineHistoryJournal({
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: "foreign-clean-history",
+    }, {
+      document: server,
+      revision: 8,
+    }, history);
+    const pending = structuredClone(server);
+    pending.title = "独立待处理分支";
+    const pendingOwner = "foreign-pending-with-history";
+    saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      owner_id: pendingOwner,
+      base_server_revision: 8,
+      base_project: server,
+      pending_project: pending,
+    });
+    const pendingKey = localTimelineWalStorageKey(
+      ACTIVE_DATABASE,
+      DEFAULT_PROJECT_ID,
+      pendingOwner,
+    )!;
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: server,
+      revision: 8,
+    });
+    const update = vi.mocked(directorApi.updateTimelineAuthority);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.getByRole("radio", { name: /独立待处理分支/ })).toBeInTheDocument();
+    expect(update).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "丢弃恢复记录：独立待处理分支" }));
+    await waitFor(() => expect(screen.queryByText(/可恢复的本地分支/))
+      .not.toBeInTheDocument());
+    expect(localStorage.getItem(pendingKey)).toBeNull();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("ack history 前");
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("单个当前 owner 损坏 journal 只显示服务器并保留取证，显式丢弃后才删除", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const server = createTimelineProject();
+    server.title = "损坏记录后的服务器版本";
+    const pending = structuredClone(server);
+    pending.title = "损坏前本地版本";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "重命名项目",
+      before: server,
+      after: pending,
+      now: 22,
+    });
+    const scope = {
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: getTimelineBranchOwnerId(),
+    };
+    await saveTimelineHistoryJournal(scope, {
+      document: server,
+      revision: 6,
+    }, history);
+    const key = timelineHistoryJournalKey(scope);
+    const raw = await readRawTimelineJournal(key);
+    if (!raw || typeof raw !== "object") throw new Error("expected raw journal");
+    await putRawTimelineJournal({ ...raw, headDocumentHash: "tampered" });
+    const corruptToken = await readTimelineHistoryJournalVersionToken(scope);
+    expect(corruptToken).not.toBeNull();
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: server,
+      revision: 6,
+    });
+    const update = vi.mocked(directorApi.updateTimelineAuthority);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+
+    expect(screen.getByText(/可恢复的本地分支（1）/)).toBeInTheDocument();
+    expect(screen.getByText(/记录损坏，仅可丢弃/)).toBeInTheDocument();
+    expect(screen.getByRole("button", {
+      name: "重命名项目，当前名称：损坏记录后的服务器版本",
+    })).toBeInTheDocument();
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    expect(await readTimelineHistoryJournalVersionToken(scope)).toEqual(corruptToken);
+    expect(update).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: /丢弃恢复记录/ }));
+    await waitFor(async () => expect(await readTimelineHistoryJournalVersionToken(scope)).toBeNull());
+    expect(screen.queryByText(/可恢复的本地分支/)).not.toBeInTheDocument();
+  });
+
+  it("恢复分支 gate 期间的同文档高 revision 广播只作提示，WAL 与 journal 原证据不变", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    vi.stubGlobal("BroadcastChannel", AppTestBroadcastChannel);
+    const base = createTimelineProject();
+    base.title = "广播服务器基线";
+    const pending = structuredClone(base);
+    pending.title = "广播期间必须保留的分支";
+    pending.segments[0].prompt = "foreign evidence";
+    const ownerId = "foreign-broadcast-evidence";
+    const wal = saveLocalTimelineWal({
+      database: ACTIVE_DATABASE,
+      project_id: DEFAULT_PROJECT_ID,
+      owner_id: ownerId,
+      base_server_revision: 4,
+      base_project: base,
+      pending_project: pending,
+    });
+    expect(wal).not.toBeNull();
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before: base,
+      after: pending,
+      now: 20,
+    });
+    const journalScope = {
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId,
+    };
+    await saveTimelineHistoryJournal(journalScope, {
+      document: base,
+      revision: 4,
+    }, history);
+    const walKey = localTimelineWalStorageKey(ACTIVE_DATABASE, DEFAULT_PROJECT_ID, ownerId)!;
+    const walBytes = localStorage.getItem(walKey);
+    const journalToken = await readTimelineHistoryJournalVersionToken(journalScope);
+    mockCommonRequests();
+    const getAuthority = vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: base, revision: 4 })
+      .mockResolvedValue({ document: base, revision: 5 });
+    const update = vi.mocked(directorApi.updateTimelineAuthority);
+
+    render(<App />);
+    await waitUntilReady();
+    expect(screen.getByRole("radio", { name: /广播期间必须保留的分支/ }))
+      .toBeInTheDocument();
+    await waitFor(() => expect(
+      [...AppTestBroadcastChannel.channels.values()].some((peers) => peers.size > 0),
+    ).toBe(true));
+    const peer = createTimelineRevisionChannel({
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+    }, null, vi.fn());
+    peer.publish({ revision: 5, documentHash: "remote-five" });
+    await waitFor(() => expect(getAuthority).toHaveBeenCalledTimes(2));
+
+    expect(screen.getByRole("radio", { name: /广播期间必须保留的分支/ }))
+      .toBeInTheDocument();
+    expect(localStorage.getItem(walKey)).toBe(walBytes);
+    expect(await readTimelineHistoryJournalVersionToken(journalScope)).toEqual(journalToken);
+    expect(update).not.toHaveBeenCalled();
+    peer.close();
+  });
+
+  it("迟到的广播 GET 不能回滚本地 CAS 已接受的文档、revision 或撤销历史", async () => {
+    vi.stubGlobal("BroadcastChannel", AppTestBroadcastChannel);
+    const base = createTimelineProject();
+    base.segments[0].prompt = "广播前 A";
+    mockCommonRequests();
+    let resolveRemote!: (authority: { document: typeof base; revision: number }) => void;
+    const getAuthority = vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: base, revision: 4 })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRemote = resolve; }))
+      .mockResolvedValue({ document: base, revision: 4 });
+    const update = vi.mocked(directorApi.updateTimelineAuthority)
+      .mockImplementation(async (document, expectedRevision) => ({
+        document,
+        revision: expectedRevision + 1,
+      }));
+
+    render(<App />);
+    await waitUntilReady();
+    const peer = createTimelineRevisionChannel({
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+    }, null, vi.fn());
+    peer.publish({ revision: 5, documentHash: "remote-stale-get" });
+    await waitFor(() => expect(getAuthority).toHaveBeenCalledTimes(2));
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "本地 CAS B" },
+    });
+    await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "本地 CAS B" })],
+    }), 4));
+    await act(async () => resolveRemote({ document: base, revision: 4 }));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("本地 CAS B");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "本地 CAS C" },
+    });
+    await waitFor(() => expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "本地 CAS C" })],
+    }), 5));
+    peer.close();
+  });
+
+  it("广播确认当前 head 已落服时会失效旧 PUT，迟到 409 不制造虚假冲突", async () => {
+    vi.stubGlobal("BroadcastChannel", AppTestBroadcastChannel);
+    const base = createTimelineProject();
+    base.segments[0].prompt = "服务器基线";
+    const remoteHead = structuredClone(base);
+    remoteHead.segments[0].prompt = "本地更新 B";
+    mockCommonRequests();
+    const getAuthority = vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: base, revision: 4 })
+      .mockResolvedValue({ document: remoteHead, revision: 6 });
+    let rejectOldPut!: (reason: unknown) => void;
+    const update = vi.mocked(directorApi.updateTimelineAuthority)
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectOldPut = reject; }))
+      .mockImplementation(async (document, expectedRevision) => ({
+        document,
+        revision: expectedRevision + 1,
+      }));
+
+    render(<App />);
+    await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "本地更新 A" },
+    });
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "本地更新 B" },
+    });
+    const peer = createTimelineRevisionChannel({
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+    }, null, vi.fn());
+    peer.publish({ revision: 6, documentHash: "remote-current-head" });
+    await waitFor(() => expect(getAuthority).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull());
+
+    await act(async () => rejectOldPut(
+      new ApiError("stale PUT", 409, undefined, "timeline_revision_conflict"),
+    ));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(screen.queryByRole("button", { name: "采用服务器版本" }))
+      .not.toBeInTheDocument();
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("本地更新 B");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "本地更新 C" },
+    });
+    await waitFor(() => expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "本地更新 C" })],
+    }), 6));
+    peer.close();
+  });
+
+  it("reload journal conflict 后保留本地版本仍保有原 undo 栈", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.segments[0].prompt = "冲突前基线";
+    const pending = structuredClone(base);
+    pending.segments[0].prompt = "刷新前本地编辑";
+    const remote = structuredClone(base);
+    remote.title = "服务器并发版本";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before: base,
+      after: pending,
+      now: 30,
+    });
+    await saveTimelineHistoryJournal({
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: getTimelineBranchOwnerId(),
+    }, {
+      document: base,
+      revision: 2,
+    }, history);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: remote,
+      revision: 3,
+    });
+    vi.mocked(directorApi.updateTimelineAuthority)
+      .mockImplementation(async (document, expectedRevision) => ({
+        document,
+        revision: expectedRevision + 1,
+      }));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("刷新前本地编辑");
+    expect(screen.getByRole("button", { name: "保留本地版本" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "保留本地版本" }));
+    await waitFor(() => expect(screen.queryByRole("button", {
+      name: "保留本地版本",
+    })).not.toBeInTheDocument());
+
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("冲突前基线");
+  });
+
+  it("采用服务器版本会精确删除当前 owner 冲突 journal，reload 不再复活旧历史", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.segments[0].prompt = "adopt 前基线";
+    const pending = structuredClone(base);
+    pending.segments[0].prompt = "必须被显式放弃的本地版本";
+    const remote = structuredClone(base);
+    remote.segments[0].prompt = "采用后的服务器版本";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before: base,
+      after: pending,
+      now: 31,
+    });
+    const scope = {
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: getTimelineBranchOwnerId(),
+    };
+    await saveTimelineHistoryJournal(scope, {
+      document: base,
+      revision: 2,
+    }, history);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: remote,
+      revision: 3,
+    });
+    const update = vi.mocked(directorApi.updateTimelineAuthority);
+
+    const first = render(<App />);
+    await waitUntilReady();
+    expect(screen.getByLabelText("片段提示词"))
+      .toHaveValue("必须被显式放弃的本地版本");
+    await user.click(screen.getByRole("button", { name: "采用服务器版本" }));
+    await waitFor(() => expect(screen.getByLabelText("片段提示词"))
+      .toHaveValue("采用后的服务器版本"));
+    await waitFor(async () => expect(await readTimelineHistoryJournalVersionToken(scope)).toBeNull());
+    first.unmount();
+
+    render(<App />);
+    await waitUntilReady();
+    expect(screen.queryByRole("button", { name: "采用服务器版本" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("采用后的服务器版本");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("采用服务器的 authority GET 在数据库变 stale 后不得落地或删除冲突证据", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.segments[0].prompt = "stale adopt 基线";
+    const pending = structuredClone(base);
+    pending.segments[0].prompt = "stale 后必须保留";
+    const remote = structuredClone(base);
+    remote.segments[0].prompt = "迟到 GET 不得安装";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before: base,
+      after: pending,
+      now: 32,
+    });
+    const scope = {
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: getTimelineBranchOwnerId(),
+    };
+    await saveTimelineHistoryJournal(scope, {
+      document: base,
+      revision: 2,
+    }, history);
+    const evidenceToken = await readTimelineHistoryJournalVersionToken(scope);
+    mockCommonRequests();
+    let resolveAdopt!: (authority: { document: typeof remote; revision: number }) => void;
+    vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: remote, revision: 3 })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveAdopt = resolve; }));
+    const update = vi.mocked(directorApi.updateTimelineAuthority);
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "采用服务器版本" }));
+    await waitFor(() => expect(vi.mocked(directorApi.getTimelineAuthority))
+      .toHaveBeenCalledTimes(2));
+    act(() => window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT)));
+    await act(async () => resolveAdopt({ document: remote, revision: 3 }));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("stale 后必须保留");
+    expect(screen.getByText(/本页已停止修改/)).toBeInTheDocument();
+    expect(await readTimelineHistoryJournalVersionToken(scope)).toEqual(evidenceToken);
+    expect(update).not.toHaveBeenCalled();
   });
 
   it("storage A 后读取到 timeline B 时二次身份核对失败并保持整页只读", async () => {
@@ -390,9 +1449,17 @@ describe("统一长视频时间线应用", () => {
   it("跨库 v4 WAL 与无身份 v3 WAL 都只隔离，服务器项目保持权威", async () => {
     const stale = createTimelineProject();
     stale.title = "其他数据库的待同步项目";
-    saveLocalTimelineForDatabase(stale, {
+    const staleBase = structuredClone(stale);
+    staleBase.title = "其他数据库的服务器基线";
+    saveLocalTimelineWal({
+      database: {
       active_database_path: "/srv/director/data/other.sqlite3",
       active_database_identity: "b".repeat(64),
+      },
+      project_id: DEFAULT_PROJECT_ID,
+      base_server_revision: 0,
+      base_project: staleBase,
+      pending_project: stale,
     });
     const mismatchedRaw = localStorage.getItem(TIMELINE_WAL_STORAGE_KEY);
     const unboundRaw = JSON.stringify({
@@ -647,10 +1714,10 @@ describe("统一长视频时间线应用", () => {
     await user.click(await screen.findByRole("button", { name: "取消切换并继续使用当前库" }));
 
     await waitFor(() => expect(cancelSwitch).toHaveBeenCalledWith(ACTIVE_DATABASE_PATH));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(pendingSettings));
     await waitFor(() => expect(updateTimeline).toHaveBeenCalledWith(
       expect.objectContaining({ title: pendingTimeline.title }),
     ));
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(pendingSettings), { timeout: 3_000 });
     expect(cancelSwitch.mock.invocationCallOrder[0]).toBeLessThan(updateSettings.mock.invocationCallOrder[0]);
     expect(cancelSwitch.mock.invocationCallOrder[0]).toBeLessThan(updateTimeline.mock.invocationCallOrder[0]);
     await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull());
@@ -826,6 +1893,406 @@ describe("统一长视频时间线应用", () => {
     ));
   });
 
+  it("项目编辑历史按钮初始禁用，并能准确撤销和重做提示词编辑", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "基线提示词";
+    project.segments.push({
+      ...structuredClone(project.segments[0]),
+      id: "history-selection-segment",
+      title: "历史选择测试片段",
+    });
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.listAssets).mockResolvedValue(appAssetList([imageAsset]));
+
+    render(<App />);
+    await waitUntilReady();
+
+    const undo = screen.getByRole("button", { name: "撤销" });
+    const redo = screen.getByRole("button", { name: "重做" });
+    expect(undo).toBeDisabled();
+    expect(redo).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "雨夜街头，低机位推进" },
+    });
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("雨夜街头，低机位推进");
+    expect(undo).toBeEnabled();
+    expect(undo).toHaveAttribute("title", expect.stringContaining("编辑提示词"));
+    expect(redo).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: /聚焦并选择片段 2：历史选择测试片段/ }));
+    await user.click(screen.getByRole("checkbox", { name: `选择素材 ${imageAsset.name}` }));
+    await user.click(undo);
+    expect(screen.getByRole("button", { name: /聚焦并选择片段 2：历史选择测试片段/ }))
+      .toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("checkbox", { name: `选择素材 ${imageAsset.name}` })).toBeChecked();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重做" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: /聚焦并选择片段 1：/ }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("基线提示词");
+    expect(screen.getByRole("button", { name: "重做" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "重做" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("雨夜街头，低机位推进");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "重做" })).toBeDisabled();
+  });
+
+  it("Ctrl/Cmd+Z、Ctrl/Cmd+Shift+Z 与 Ctrl+Y 在非文本控件上驱动项目历史", async () => {
+    const project = createTimelineProject();
+    project.segments[0].prompt = "原始版本";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    const trash = vi.mocked(directorApi.trashAssets);
+    const upload = vi.spyOn(directorApi, "uploadAsset");
+    const createTask = vi.spyOn(directorApi, "createTimelineTask");
+    const deleteTask = vi.spyOn(directorApi, "deleteTask");
+
+    render(<App />);
+    await waitUntilReady();
+
+    const prompt = screen.getByLabelText("片段提示词");
+    fireEvent.change(prompt, { target: { value: "快捷键版本" } });
+    const nonTextTarget = screen.getByRole("button", { name: "全局设置" });
+    nonTextTarget.focus();
+
+    fireEvent.keyDown(nonTextTarget, { key: "z", ctrlKey: true });
+    expect(prompt).toHaveValue("原始版本");
+    fireEvent.keyDown(nonTextTarget, { key: "z", ctrlKey: true, shiftKey: true });
+    expect(prompt).toHaveValue("快捷键版本");
+
+    fireEvent.keyDown(nonTextTarget, { key: "z", metaKey: true });
+    expect(prompt).toHaveValue("原始版本");
+    fireEvent.keyDown(nonTextTarget, { key: "z", metaKey: true, shiftKey: true });
+    expect(prompt).toHaveValue("快捷键版本");
+
+    fireEvent.keyDown(nonTextTarget, { key: "z", ctrlKey: true });
+    expect(prompt).toHaveValue("原始版本");
+    fireEvent.keyDown(nonTextTarget, { key: "y", ctrlKey: true });
+    expect(prompt).toHaveValue("快捷键版本");
+    expect(trash).not.toHaveBeenCalled();
+    expect(upload).not.toHaveBeenCalled();
+    expect(createTask).not.toHaveBeenCalled();
+    expect(deleteTask).not.toHaveBeenCalled();
+  });
+
+  it("播放头的被动更新不打断同一提示词的输入合并", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "输入前";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+
+    render(<App />);
+    await waitUntilReady();
+
+    const prompt = screen.getByLabelText("片段提示词");
+    fireEvent.change(prompt, { target: { value: "输入第一步" } });
+    fireEvent.change(screen.getByRole("slider", { name: "主预览播放头" }), {
+      target: { value: "0.25" },
+    });
+    fireEvent.change(prompt, { target: { value: "输入第二步" } });
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(prompt).toHaveValue("输入前");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+  });
+
+  it("同一提示词内移动光标会结束上一段输入合并", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "光标移动前";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+
+    render(<App />);
+    await waitUntilReady();
+
+    const prompt = screen.getByLabelText("片段提示词");
+    fireEvent.change(prompt, { target: { value: "第一段输入" } });
+    fireEvent.keyDown(prompt, { key: "ArrowLeft" });
+    fireEvent.change(prompt, { target: { value: "移动光标后的输入" } });
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(prompt).toHaveValue("第一段输入");
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(prompt).toHaveValue("光标移动前");
+  });
+
+  it("提示词选区变化会结束上一段输入合并", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "选择前";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+
+    render(<App />);
+    await waitUntilReady();
+
+    const prompt = screen.getByLabelText("片段提示词") as HTMLTextAreaElement;
+    fireEvent.change(prompt, { target: { value: "选择前的输入" } });
+    prompt.setSelectionRange(0, "选择前的输入".length);
+    fireEvent.select(prompt);
+    fireEvent.change(prompt, { target: { value: "替换选区" } });
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(prompt).toHaveValue("选择前的输入");
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(prompt).toHaveValue("选择前");
+  });
+
+  it("输入法组合输入超过普通合并窗口仍作为一次文本编辑撤销", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "组合输入前";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+
+    render(<App />);
+    await waitUntilReady();
+
+    let now = 1_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const prompt = screen.getByLabelText("片段提示词");
+    fireEvent.compositionStart(prompt);
+    fireEvent.change(prompt, { target: { value: "组合输入中" } });
+    fireEvent.keyDown(prompt, { key: "ArrowDown", isComposing: true });
+    now = 5_000;
+    fireEvent.change(prompt, { target: { value: "组合输入完成" } });
+    fireEvent.compositionEnd(prompt);
+    await act(async () => Promise.resolve());
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(prompt).toHaveValue("组合输入前");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+  });
+
+  it("撤销项目重命名时同步恢复标题与项目切换器", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.title = "原项目名称";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [{
+        id: DEFAULT_PROJECT_ID,
+        title: project.title,
+        created_at: "2026-08-12T00:00:00Z",
+        updated_at: "2026-08-12T00:00:00Z",
+        segment_count: project.segments.length,
+      }],
+    });
+
+    render(<App />);
+    await waitUntilReady();
+
+    await user.click(screen.getByRole("button", { name: "重命名项目，当前名称：原项目名称" }));
+    const titleInput = screen.getByRole("textbox", { name: "编辑项目名称" });
+    await user.clear(titleInput);
+    await user.type(titleInput, "新项目名称{Enter}");
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toHaveDisplayValue("新项目名称");
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByRole("button", { name: "重命名项目，当前名称：原项目名称" }))
+      .toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toHaveDisplayValue("原项目名称");
+  });
+
+  it("提示词 textarea 聚焦时由项目历史统一接管撤销与重做", async () => {
+    const project = createTimelineProject();
+    project.segments[0].prompt = "原始提示词";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+
+    render(<App />);
+    await waitUntilReady();
+
+    const prompt = screen.getByLabelText("片段提示词");
+    fireEvent.change(prompt, { target: { value: "正在 textarea 中编辑" } });
+    prompt.focus();
+    expect(prompt).toHaveFocus();
+
+    expect(fireEvent.keyDown(prompt, { key: "z", ctrlKey: true })).toBe(false);
+    expect(prompt).toHaveValue("原始提示词");
+    expect(screen.getByRole("button", { name: "重做" })).toBeEnabled();
+
+    expect(fireEvent.keyDown(prompt, { key: "z", ctrlKey: true, shiftKey: true })).toBe(false);
+    expect(prompt).toHaveValue("正在 textarea 中编辑");
+  });
+
+  it("顶栏撤销重做保留同一提示词焦点并恢复替换选区与插入光标", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "0123456789";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+
+    render(<App />);
+    await waitUntilReady();
+
+    const prompt = screen.getByLabelText("片段提示词") as HTMLTextAreaElement;
+    prompt.focus();
+    prompt.setSelectionRange(2, 5, "forward");
+    fireEvent(prompt, new InputEvent("beforeinput", {
+      bubbles: true,
+      inputType: "insertText",
+      data: "X",
+    }));
+    fireEvent.input(prompt, {
+      target: { value: "01X56789", selectionStart: 3, selectionEnd: 3 },
+      inputType: "insertText",
+      data: "X",
+    });
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    await act(async () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
+    expect(prompt).toHaveFocus();
+    expect(prompt).toHaveValue("0123456789");
+    expect(prompt.selectionStart).toBe(2);
+    expect(prompt.selectionEnd).toBe(5);
+
+    await user.click(screen.getByRole("button", { name: "重做" }));
+    await act(async () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
+    expect(prompt).toHaveFocus();
+    expect(prompt).toHaveValue("01X56789");
+    expect(prompt.selectionStart).toBe(3);
+    expect(prompt.selectionEnd).toBe(3);
+  });
+
+  it("编辑历史面板按游标一次跳转，并只保存最终项目状态", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "历史起点";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    const update = vi.mocked(directorApi.updateTimeline);
+
+    render(<App />);
+    await waitUntilReady();
+    update.mockClear();
+
+    const prompt = screen.getByLabelText("片段提示词");
+    fireEvent.input(prompt, { target: { value: "历史第一步" }, inputType: "insertText" });
+    fireEvent.keyDown(prompt, { key: "ArrowLeft" });
+    fireEvent.input(prompt, { target: { value: "历史第二步" }, inputType: "insertText" });
+    await waitFor(() => expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "历史第二步" })],
+    })));
+    update.mockClear();
+
+    await user.click(screen.getByRole("button", { name: "编辑历史" }));
+    const panel = screen.getByRole("complementary", { name: "编辑历史" });
+    expect(within(panel).getByText("当前位置 2 / 2")).toBeInTheDocument();
+    const entries = within(panel).getAllByRole("button", { name: /编辑提示词/ });
+    expect(entries).toHaveLength(2);
+    await user.click(entries[0]);
+
+    expect(prompt).toHaveValue("历史第一步");
+    expect(within(panel).getByText("当前位置 1 / 2")).toBeInTheDocument();
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "历史第一步" })],
+    }));
+  });
+
+  it("撤销作为新 revision 严格串行自动保存，旧 PUT 晚回包不覆盖已撤销状态", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "服务器基线";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    let resolveFirst!: (value: typeof project) => void;
+    const update = vi.mocked(directorApi.updateTimeline)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementation(async (value) => value);
+
+    render(<App />);
+    await waitUntilReady();
+    update.mockClear();
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "应被撤销的新版本" },
+    });
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "应被撤销的新版本" })],
+    }));
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("服务器基线");
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+    expect(update).toHaveBeenCalledTimes(1);
+
+    const staleResponse = structuredClone(update.mock.calls[0][0]);
+    staleResponse.segments[0].prompt = "迟到旧 PUT 响应";
+    await act(async () => resolveFirst(staleResponse));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "服务器基线" })],
+    }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("服务器基线");
+    expect(screen.queryByDisplayValue("迟到旧 PUT 响应")).not.toBeInTheDocument();
+    await waitFor(() => expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull());
+  });
+
+  it("服务器 exact ACK 的同拓扑规范化会安全 rebase 并保留可撤销历史", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "服务端基线";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.updateTimeline).mockImplementation(async (value) => {
+      const confirmed = structuredClone(value);
+      confirmed.segments[0].prompt = `${value.segments[0].prompt}（服务端规范）`;
+      return confirmed;
+    });
+
+    render(<App />);
+    await waitUntilReady();
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "客户端修改" },
+    });
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    await waitFor(() => expect(screen.getByLabelText("片段提示词"))
+      .toHaveValue("客户端修改（服务端规范）"));
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "重做" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("服务端基线");
+  });
+
+  it("服务器 exact ACK 改变素材身份时清空不能安全 rebase 的历史", async () => {
+    const project = createTimelineProject();
+    project.segments[0].prompt = "服务端基线";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.updateTimeline).mockImplementation(async (value) => {
+      const confirmed = structuredClone(value);
+      if (confirmed.segments[0].mode === "fl2va") {
+        confirmed.segments[0].first_image = imageAsset;
+      }
+      return confirmed;
+    });
+
+    render(<App />);
+    await waitUntilReady();
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "客户端修改" },
+    });
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "重做" })).toBeDisabled();
+  });
+
   it("快速连续编辑只同步最终快照，纯选择不触发时间线写入", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
@@ -948,6 +2415,103 @@ describe("统一长视频时间线应用", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("CAS 409 保留本地历史与 WAL，并只在用户选择后采用服务器版本", async () => {
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    base.segments[0].prompt = "服务器基线";
+    const remote = structuredClone(base);
+    remote.segments[0].prompt = "其他页面的新版本";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: base, revision: 4 })
+      .mockResolvedValue({ document: remote, revision: 5 });
+    const update = vi.mocked(directorApi.updateTimelineAuthority).mockRejectedValueOnce(
+      new ApiError("时间线修订冲突", 409, undefined, "timeline_revision_conflict"),
+    );
+
+    render(<App />);
+    await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "本地未提交版本" } });
+
+    expect(await screen.findByRole("button", { name: "采用服务器版本" })).toBeInTheDocument();
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("本地未提交版本");
+    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).not.toBeNull();
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "本地未提交版本" })],
+    }), 4);
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "采用服务器版本" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "采用服务器版本" })).not.toBeInTheDocument());
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("其他页面的新版本");
+    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
+  });
+
+  it("用户确认保留本地版本时以最新 GET revision 再执行一次 CAS", async () => {
+    const user = userEvent.setup();
+    const base = createTimelineProject();
+    const remote = structuredClone(base);
+    remote.title = "远端新版本";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: base, revision: 2 })
+      .mockResolvedValue({ document: remote, revision: 3 });
+    const update = vi.mocked(directorApi.updateTimelineAuthority)
+      .mockRejectedValueOnce(new ApiError("时间线修订冲突", 409, undefined, "timeline_revision_conflict"))
+      .mockImplementation(async (document, expectedRevision) => ({
+        document,
+        revision: expectedRevision + 1,
+      }));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "要保留的本地版本" } });
+    await screen.findByRole("button", { name: "保留本地版本" });
+    await user.click(screen.getByRole("button", { name: "保留本地版本" }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "要保留的本地版本" })],
+    }), 3);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "保留本地版本" })).not.toBeInTheDocument());
+    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
+  });
+
+  it("409 后 authority 已等于提交快照时按 ambiguous ACK 推进基线并续写更新编辑", async () => {
+    const base = createTimelineProject();
+    base.segments[0].prompt = "服务器基线";
+    mockCommonRequests();
+    let submitted!: ReturnType<typeof createTimelineProject>;
+    let resolveAuthority!: (authority: { document: typeof base; revision: number }) => void;
+    vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: base, revision: 9 })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveAuthority = resolve; }));
+    const update = vi.mocked(directorApi.updateTimelineAuthority)
+      .mockImplementationOnce(async (document) => {
+        submitted = structuredClone(document);
+        throw new ApiError("时间线修订冲突", 409, undefined, "timeline_revision_conflict");
+      })
+      .mockImplementation(async (document, expectedRevision) => ({
+        document,
+        revision: expectedRevision + 1,
+      }));
+
+    render(<App />);
+    await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "第一版" } });
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "第二版" } });
+    await act(async () => resolveAuthority({ document: submitted, revision: 10 }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      segments: [expect.objectContaining({ prompt: "第二版" })],
+    }), 10);
+    expect(screen.queryByRole("button", { name: "采用服务器版本" })).not.toBeInTheDocument();
+    await waitFor(() => expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull());
   });
 
   it("从 Director 品牌切换素材库宽栏与常驻窄轨", async () => {
@@ -1196,9 +2760,11 @@ describe("统一长视频时间线应用", () => {
     expect(commandbar).not.toBeNull();
     const runActions = within(topbar as HTMLElement).getByRole("group", { name: "时间线生成操作" });
     const globalSettings = within(topbar as HTMLElement).getByRole("button", { name: "全局设置" });
+    const assetTrash = within(topbar as HTMLElement).getByRole("button", { name: "素材回收站" });
     expect(runActions).toBeInTheDocument();
     expect(globalSettings.closest(".topbar__right")).not.toBeNull();
-    expect(globalSettings.nextElementSibling).toBe(runActions);
+    expect(globalSettings.nextElementSibling).toBe(assetTrash);
+    expect(assetTrash.nextElementSibling).toBe(runActions);
     expect(within(topbar as HTMLElement).getByRole("button", { name: "预检执行计划" })).toBeInTheDocument();
     expect(within(topbar as HTMLElement).getByRole("button", { name: "生成任务 1" })).toBeInTheDocument();
     expect(within(commandbar as HTMLElement).queryByRole("button", { name: "预检执行计划" })).not.toBeInTheDocument();
@@ -1273,6 +2839,237 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByRole("button", { name: "生成任务 0" })).toBeDisabled();
   });
 
+  it("持久项目已被删除时先失效旧 hydration，再从默认项目 authority 重新建立 CAS 基线", async () => {
+    const removedProjectId = "removed-project";
+    const defaultProject = createTimelineProject();
+    defaultProject.title = "默认项目权威";
+    defaultProject.segments[0].prompt = "默认项目提示词";
+    localStorage.setItem("director-web:v1:active-project-id", removedProjectId);
+    mockCommonRequests();
+
+    vi.mocked(directorApi.getProjectTimelineAuthority)
+      .mockRejectedValue(new ApiError("project not found", 404));
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: defaultProject,
+      revision: 23,
+    });
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [{
+        id: DEFAULT_PROJECT_ID,
+        title: defaultProject.title,
+        created_at: "2026-08-12T00:00:00Z",
+        updated_at: "2026-08-12T00:00:00Z",
+        segment_count: 1,
+      }],
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(directorApi.getProjectTimelineAuthority)
+      .toHaveBeenCalledWith(removedProjectId, expect.any(AbortSignal)));
+    await waitFor(() => expect(directorApi.listProjects)
+      .toHaveBeenCalledWith(expect.any(AbortSignal)));
+
+    expect(await screen.findByRole("button", {
+      name: `重命名项目，当前名称：${defaultProject.title}`,
+    })).toBeInTheDocument();
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("默认项目提示词");
+    expect(localStorage.getItem("director-web:v1:active-project-id")).toBe(DEFAULT_PROJECT_ID);
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "只写回默认项目" },
+    });
+    await waitFor(() => expect(directorApi.updateTimelineAuthority).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: defaultProject.title,
+        segments: expect.arrayContaining([
+          expect.objectContaining({ prompt: "只写回默认项目" }),
+        ]),
+      }),
+      23,
+    ));
+    expect(directorApi.updateProjectTimelineAuthority).not.toHaveBeenCalled();
+  });
+
+  it("持久项目 404 的列表尾验发现数据库已切换时 fail-closed 且不安装默认项目", async () => {
+    const removedProjectId = "removed-project";
+    const databaseB = {
+      ...ACTIVE_STORAGE_CONFIGURATION,
+      active_database_path: "/srv/director/data/director-b.sqlite3",
+      active_database_identity: "b".repeat(64),
+    };
+    localStorage.setItem("director-web:v1:active-project-id", removedProjectId);
+    mockCommonRequests();
+    vi.mocked(directorApi.getProjectTimelineAuthority)
+      .mockRejectedValue(new ApiError("project not found", 404));
+    vi.mocked(directorApi.getStorage)
+      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
+      .mockResolvedValue(databaseB);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [{
+        id: DEFAULT_PROJECT_ID,
+        title: "数据库 A 默认项目",
+        created_at: "2026-08-12T00:00:00Z",
+        updated_at: "2026-08-12T00:00:00Z",
+        segment_count: 1,
+      }],
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(/数据库身份.*变化|数据库身份已过期/)).toBeInTheDocument();
+    expect(directorApi.getTimelineAuthority).not.toHaveBeenCalled();
+    expect(localStorage.getItem("director-web:v1:active-project-id")).toBe(removedProjectId);
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toBeDisabled();
+  });
+
+  it("迟到的初始项目列表不能覆盖新建项目、摘要、撤销历史或待同步 WAL", async () => {
+    const user = userEvent.setup();
+    const defaultProject = createTimelineProject();
+    defaultProject.title = "默认项目";
+    const createdProject = createTimelineProject();
+    createdProject.title = "竞态中新建项目";
+    createdProject.segments[0].prompt = "新建项目基线";
+    const createdSummary = {
+      id: "created-during-list",
+      title: createdProject.title,
+      created_at: "2026-08-12T00:01:00Z",
+      updated_at: "2026-08-12T00:01:00Z",
+      segment_count: 1,
+    };
+    const defaultSummary = {
+      id: DEFAULT_PROJECT_ID,
+      title: defaultProject.title,
+      created_at: "2026-08-12T00:00:00Z",
+      updated_at: "2026-08-12T00:00:00Z",
+      segment_count: 1,
+    };
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: defaultProject,
+      revision: 5,
+    });
+    let resolveInitialList!: (value: Awaited<ReturnType<typeof directorApi.listProjects>>) => void;
+    vi.mocked(directorApi.listProjects)
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveInitialList = resolve;
+      }))
+      .mockResolvedValue({
+        active_database_identity: ACTIVE_DATABASE_IDENTITY,
+        projects: [defaultSummary, createdSummary],
+      });
+    vi.spyOn(directorApi, "createProject").mockResolvedValue(createdSummary);
+    vi.mocked(directorApi.getProjectTimelineAuthority).mockResolvedValue({
+      document: createdProject,
+      revision: 11,
+    });
+    vi.mocked(directorApi.updateProjectTimelineAuthority)
+      .mockImplementation(() => new Promise<never>(() => undefined));
+
+    render(<App />);
+    await waitUntilReady();
+    await waitFor(() => expect(directorApi.listProjects).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(screen.getByRole("combobox", { name: "切换项目" }), {
+      target: { value: "__new__" },
+    });
+    expect(await screen.findByRole("button", {
+      name: `重命名项目，当前名称：${createdProject.title}`,
+    })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toHaveValue(createdSummary.id);
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "必须保留的新项目编辑" },
+    });
+    await waitFor(() => expect(timelineWalStorageRaw(createdSummary.id)).not.toBeNull());
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+
+    await act(async () => resolveInitialList({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [defaultSummary],
+    }));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toHaveValue(createdSummary.id);
+    expect(screen.getByRole("option", { name: createdProject.title })).toBeInTheDocument();
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("必须保留的新项目编辑");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    expect(timelineWalStorageRaw(createdSummary.id)).not.toBeNull();
+    expect(directorApi.getTimelineAuthority).toHaveBeenCalledTimes(1);
+  });
+
+  it("删除请求在途时禁止切回目标项目，完成后保持默认项目且不再写入已删项目", async () => {
+    const user = userEvent.setup();
+    const defaultProject = createTimelineProject();
+    defaultProject.title = "保留的默认项目";
+    const deletedProject = createTimelineProject();
+    deletedProject.title = "待删除项目 B";
+    const deletedProjectId = "project-b";
+    const summaries = [
+      {
+        id: DEFAULT_PROJECT_ID,
+        title: defaultProject.title,
+        created_at: "2026-08-12T00:00:00Z",
+        updated_at: "2026-08-12T00:00:00Z",
+        segment_count: 1,
+      },
+      {
+        id: deletedProjectId,
+        title: deletedProject.title,
+        created_at: "2026-08-12T00:01:00Z",
+        updated_at: "2026-08-12T00:01:00Z",
+        segment_count: 1,
+      },
+    ];
+    localStorage.setItem("director-web:v1:active-project-id", deletedProjectId);
+    mockCommonRequests();
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: summaries,
+    });
+    vi.mocked(directorApi.getProjectTimelineAuthority).mockResolvedValue({
+      document: deletedProject,
+      revision: 4,
+    });
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: defaultProject,
+      revision: 9,
+    });
+    let resolveDelete!: (value: Awaited<ReturnType<typeof directorApi.deleteProject>>) => void;
+    vi.spyOn(directorApi, "deleteProject").mockImplementation(() => new Promise((resolve) => {
+      resolveDelete = resolve;
+    }));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toHaveValue(deletedProjectId);
+    await user.click(screen.getByRole("button", { name: `删除项目 ${deletedProject.title}` }));
+
+    await waitFor(() => expect(directorApi.deleteProject).toHaveBeenCalledWith(deletedProjectId));
+    const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    expect(switcher).toBeDisabled();
+    expect(switcher).toHaveValue(DEFAULT_PROJECT_ID);
+    fireEvent.change(switcher, { target: { value: deletedProjectId } });
+    expect(directorApi.getProjectTimelineAuthority).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolveDelete({
+      deleted_project_id: deletedProjectId,
+      outputs_preserved: true,
+      orphaned_jobs: 2,
+    }));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "切换项目" })).toBeEnabled());
+    expect(screen.getByRole("combobox", { name: "切换项目" })).toHaveValue(DEFAULT_PROJECT_ID);
+    expect(screen.queryByRole("option", { name: deletedProject.title })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", {
+      name: `重命名项目，当前名称：${defaultProject.title}`,
+    })).toBeInTheDocument();
+    expect(vi.mocked(directorApi.updateProjectTimelineAuthority).mock.calls
+      .some(([projectId]) => projectId === deletedProjectId)).toBe(false);
+  });
+
   it("切换到复用相同 segment ID 的项目时不继承上一项目的子集选择", async () => {
     const user = userEvent.setup();
     const projectA = createTimelineProject();
@@ -1295,6 +3092,7 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         {
           id: DEFAULT_PROJECT_ID,
@@ -1319,14 +3117,19 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(screen.getByRole("button", {
       name: /^聚焦并选择片段 1：/,
     })).toHaveAttribute("aria-pressed", "false"));
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "项目 A 中待清理的历史" },
+    });
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
 
     await user.selectOptions(
       await screen.findByRole("combobox", { name: "切换项目" }),
       "project-b",
     );
-    await waitFor(() => expect(screen.getByRole("checkbox", { name: "全选" })).toBeChecked());
-    expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：B 片段 1/ }))
-      .toHaveAttribute("aria-pressed", "true");
+    await screen.findByRole("button", { name: /^聚焦并选择片段 1：B 片段 1/ });
+    await waitFor(() => expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：B 片段 1/ }))
+      .toHaveAttribute("aria-pressed", "true"));
+    expect(screen.getByRole("checkbox", { name: "全选" })).toBeChecked();
     expect(screen.getByRole("button", { name: /^聚焦并选择片段 2：B 片段 2/ }))
       .toHaveAttribute("aria-pressed", "true");
     expect(loadTimelineSegmentSelectionPreference(
@@ -1334,6 +3137,8 @@ describe("统一长视频时间线应用", () => {
       "project-b",
       segmentIds,
     )).toBeNull();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重做" })).toBeDisabled();
   });
 
   it("快速切换项目时迟到的旧项目响应不能覆盖最新目标", async () => {
@@ -1346,6 +3151,7 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -1382,6 +3188,7 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -1406,14 +3213,23 @@ describe("统一长视频时间线应用", () => {
   });
 
   it("目标项目加载期间的新编辑会在切换交接前同步", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const user = userEvent.setup();
     const projectA = createTimelineProject();
     projectA.title = "项目 A";
     projectA.segments[0].prompt = "原提示词";
     const projectB = structuredClone(projectA);
     projectB.title = "项目 B";
     mockCommonRequests();
-    vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
+    let serverProjectA = structuredClone(projectA);
+    vi.mocked(directorApi.getTimeline).mockImplementation(async () =>
+      structuredClone(serverProjectA));
+    vi.mocked(directorApi.updateTimeline).mockImplementation(async (project) => {
+      serverProjectA = structuredClone(project);
+      return structuredClone(serverProjectA);
+    });
     vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -1442,8 +3258,178 @@ describe("统一长视频时间线应用", () => {
         expect.objectContaining({ prompt: "加载等待期间的新提示词" }),
       ]),
     })));
-    expect(screen.getByRole("button", { name: "重命名项目，当前名称：项目 B" }))
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "重命名项目，当前名称：项目 B",
+    })).toBeInTheDocument());
+
+    fireEvent.change(screen.getByRole("combobox", { name: "切换项目" }), {
+      target: { value: DEFAULT_PROJECT_ID },
+    });
+    await waitFor(() => expect(screen.getByLabelText("片段提示词"))
+      .toHaveValue("加载等待期间的新提示词"));
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("原提示词");
+  });
+
+  it("项目切换最终 journal drain 被阻塞时拒绝新的旧项目编辑", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const projectA = createTimelineProject();
+    projectA.title = "handoff 项目 A";
+    projectA.segments[0].prompt = "handoff 原提示词";
+    const projectB = structuredClone(projectA);
+    projectB.title = "handoff 项目 B";
+    mockCommonRequests();
+    let serverProjectA = structuredClone(projectA);
+    vi.mocked(directorApi.getTimeline).mockImplementation(async () =>
+      structuredClone(serverProjectA));
+    vi.mocked(directorApi.updateTimeline).mockImplementation(async (project) => {
+      serverProjectA = structuredClone(project);
+      return structuredClone(serverProjectA);
+    });
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [
+        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+      ],
+    });
+    let resolveProjectB!: (project: typeof projectB) => void;
+    vi.spyOn(directorApi, "getProjectTimeline")
+      .mockImplementation(() => new Promise((resolve) => { resolveProjectB = resolve; }));
+
+    render(<App />);
+    await waitUntilReady();
+    await new Promise((resolve) => window.setTimeout(resolve, 30));
+    const realOpen = indexedDB.open.bind(indexedDB);
+    let openCount = 0;
+    let releaseJournal!: () => void;
+    let markJournalBlocked!: () => void;
+    const journalGate = new Promise<void>((resolve) => { releaseJournal = resolve; });
+    const journalBlocked = new Promise<void>((resolve) => { markJournalBlocked = resolve; });
+    vi.spyOn(indexedDB, "open").mockImplementation((name, version) => {
+      const request = version === undefined ? realOpen(name) : realOpen(name, version);
+      openCount += 1;
+      return new Proxy(request, {
+        get(target, property) {
+          return Reflect.get(target, property, target);
+        },
+        set(target, property, value) {
+          if (openCount === 4 && property === "onsuccess" && typeof value === "function") {
+            target.onsuccess = (event) => {
+              markJournalBlocked();
+              void journalGate.then(() => value.call(target, event));
+            };
+            return true;
+          }
+          return Reflect.set(target, property, value, target);
+        },
+      });
+    });
+
+    const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    fireEvent.change(switcher, { target: { value: "project-b" } });
+    await waitFor(() => expect(directorApi.getProjectTimeline)
+      .toHaveBeenCalledWith("project-b", undefined));
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "交接前已保存" },
+    });
+    await act(async () => resolveProjectB(projectB));
+    await journalBlocked;
+    expect(await screen.findByText("正在完成项目切换交接；完成前不能编辑当前项目"))
       .toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "交接窗口中必须拒绝" },
+    });
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("交接前已保存");
+    expect(serverProjectA.segments[0].prompt).toBe("交接前已保存");
+
+    releaseJournal();
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "重命名项目，当前名称：handoff 项目 B",
+    })).toBeInTheDocument());
+  });
+
+  it("目标 authority 已返回但 journal 仍在读取时数据库变 stale，不安装迟到项目", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const projectA = createTimelineProject();
+    projectA.title = "数据库 A 当前项目";
+    const projectBBase = structuredClone(projectA);
+    projectBBase.title = "目标 B 基线";
+    const projectB = structuredClone(projectBBase);
+    projectB.title = "绝不能跨 stale 安装的 B";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "重命名项目",
+      before: projectBBase,
+      after: projectB,
+      now: 40,
+    });
+    await saveTimelineHistoryJournal({
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: "project-b",
+      ownerId: getTimelineBranchOwnerId(),
+    }, {
+      document: projectBBase,
+      revision: 0,
+    }, history);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [
+        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+      ],
+    });
+    const targetAuthority = vi.mocked(directorApi.getProjectTimelineAuthority)
+      .mockResolvedValue({ document: projectB, revision: 1 });
+    const updateTarget = vi.mocked(directorApi.updateProjectTimelineAuthority);
+
+    render(<App />);
+    await waitUntilReady();
+    let releaseJournal!: () => void;
+    const journalGate = new Promise<void>((resolve) => { releaseJournal = resolve; });
+    const realOpen = indexedDB.open.bind(indexedDB);
+    let blockedOpenCount = 0;
+    vi.spyOn(indexedDB, "open").mockImplementation((name, version) => {
+      const request = version === undefined ? realOpen(name) : realOpen(name, version);
+      blockedOpenCount += 1;
+      return new Proxy(request, {
+        get(target, property) {
+          return Reflect.get(target, property, target);
+        },
+        set(target, property, value) {
+          if (property === "onsuccess" && typeof value === "function") {
+            target.onsuccess = (event) => {
+              void journalGate.then(() => value.call(target, event));
+            };
+            return true;
+          }
+          return Reflect.set(target, property, value, target);
+        },
+      });
+    });
+    const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    await screen.findByRole("option", { name: projectB.title });
+    fireEvent.change(switcher, { target: { value: "project-b" } });
+    await waitFor(() => expect(targetAuthority).toHaveBeenCalledWith("project-b", undefined));
+    await waitFor(() => expect(blockedOpenCount).toBeGreaterThan(0));
+
+    act(() => window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT)));
+    releaseJournal();
+    await new Promise((resolve) => window.setTimeout(resolve, 30));
+
+    expect(switcher).toHaveValue(DEFAULT_PROJECT_ID);
+    expect(switcher).toBeDisabled();
+    expect(screen.getByRole("button", {
+      name: "重命名项目，当前名称：数据库 A 当前项目",
+    })).toBeInTheDocument();
+    expect(screen.queryByRole("button", {
+      name: "重命名项目，当前名称：绝不能跨 stale 安装的 B",
+    })).not.toBeInTheDocument();
+    expect(updateTarget).not.toHaveBeenCalled();
   });
 
   it("只选择停用片段时明确阻止预检和生成，重新启用后自动恢复", async () => {
@@ -1820,8 +3806,10 @@ describe("统一长视频时间线应用", () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "等待权威确认后生成";
-    saveLocalTimeline(project);
     mockCommonRequests();
+    const serverProject = structuredClone(project);
+    serverProject.segments[0].prompt = "服务器基线";
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(serverProject);
     let resolveUpdate!: (value: typeof project) => void;
     const update = vi.mocked(directorApi.updateTimeline).mockImplementationOnce(
       () => new Promise((resolve) => { resolveUpdate = resolve; }),
@@ -1830,6 +3818,9 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: project.segments[0].prompt },
+    });
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
     expect(submit).not.toHaveBeenCalled();
@@ -1847,8 +3838,10 @@ describe("统一长视频时间线应用", () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "点击时版本";
-    saveLocalTimeline(project);
     mockCommonRequests();
+    const serverProject = structuredClone(project);
+    serverProject.segments[0].prompt = "服务器基线";
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(serverProject);
     let resolveUpdate!: (value: typeof project) => void;
     vi.mocked(directorApi.updateTimeline).mockImplementationOnce(
       () => new Promise((resolve) => { resolveUpdate = resolve; }),
@@ -1857,6 +3850,9 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: project.segments[0].prompt },
+    });
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
     fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "点击后的新版本" } });
@@ -1874,8 +3870,10 @@ describe("统一长视频时间线应用", () => {
     const first = { ...project.segments[0], prompt: "第一段" };
     const second = { ...createTimelineSegment("fl2va", 2), prompt: "第二段" };
     project.segments = [first, second];
-    saveLocalTimeline(project);
     mockCommonRequests();
+    const serverProject = structuredClone(project);
+    serverProject.segments[0].prompt = "第一段服务器基线";
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(serverProject);
     let resolveUpdate!: (value: typeof project) => void;
     vi.mocked(directorApi.updateTimeline).mockImplementationOnce(
       () => new Promise((resolve) => { resolveUpdate = resolve; }),
@@ -1884,6 +3882,9 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: first.prompt },
+    });
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: "生成任务 2" }));
     expect(screen.getByRole("combobox", { name: "切换项目" })).toBeDisabled();
@@ -1900,8 +3901,10 @@ describe("统一长视频时间线应用", () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "执行设置边界";
-    saveLocalTimeline(project);
     mockCommonRequests();
+    const serverProject = structuredClone(project);
+    serverProject.segments[0].prompt = "服务器基线";
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(serverProject);
     const confirmed = structuredClone(CONFIGURED_SETTINGS);
     confirmed.models.fl2va.filename = "alternate-diffusion.safetensors";
     vi.mocked(directorApi.getSettingsAuthority)
@@ -1920,6 +3923,9 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: project.segments[0].prompt },
+    });
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
     await openGlobalSettings(user);
@@ -1934,7 +3940,7 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(createTask).toHaveBeenCalledTimes(1));
     expect(updateSettings).not.toHaveBeenCalled();
     await act(async () => resolveTask(queuedTimelineTask));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1), { timeout: 3_000 });
   });
 
   it("生成内部随机 Seed 更新不被排队 endpoint 冻结，仍先按旧权威提交任务", async () => {
@@ -1942,7 +3948,6 @@ describe("统一长视频时间线应用", () => {
     const project = createTimelineProject();
     project.segments[0].prompt = "随机种子执行边界";
     project.sampling.fl2va = { ...project.sampling.fl2va, seed: 101, random_seed: true };
-    saveLocalTimeline(project);
     vi.spyOn(globalThis.crypto, "getRandomValues").mockImplementation(
       <T extends ArrayBufferView | null>(array: T): T => {
         if (array instanceof Uint32Array) { array[0] = 0; array[1] = 909; }
@@ -1950,6 +3955,9 @@ describe("统一长视频时间线应用", () => {
       },
     );
     mockCommonRequests();
+    const serverProject = structuredClone(project);
+    serverProject.segments[0].prompt = "服务器基线";
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(serverProject);
     const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://queued-during-seed.test:8188" };
     vi.mocked(directorApi.getSettingsAuthority)
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
@@ -1967,6 +3975,9 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: project.segments[0].prompt },
+    });
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
     await user.click(screen.getByRole("button", { name: "系统设置" }));
@@ -1993,9 +4004,9 @@ describe("统一长视频时间线应用", () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments = [{ ...createTimelineSegment("fl2va", 1), prompt: "执行素材边界", first_image: imageAsset }];
-    saveLocalTimeline(project);
     mockCommonRequests();
-    vi.mocked(directorApi.listAssets).mockResolvedValue({ assets: [imageAsset], outputs_preserved: true });
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.listAssets).mockResolvedValue(appAssetList([imageAsset]));
     let resolveTask!: (value: GenerationTask) => void;
     vi.spyOn(directorApi, "createTimelineTask").mockImplementation(
       () => new Promise((resolve) => { resolveTask = resolve; }),
@@ -2004,8 +4015,7 @@ describe("统一长视频时间线应用", () => {
     vi.spyOn(directorApi, "compileTimeline").mockImplementation(
       () => new Promise((resolve) => { resolveCompile = resolve; }),
     );
-    const remove = vi.spyOn(directorApi, "deleteAsset");
-    const cascade = vi.spyOn(directorApi, "deleteAssetCascade");
+    const trash = vi.mocked(directorApi.trashAssets);
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
     render(<App />);
@@ -2020,8 +4030,7 @@ describe("统一长视频时间线应用", () => {
     }
     expect(screen.getByRole("combobox", { name: "切换项目" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "移出素材库" }));
-    expect(remove).not.toHaveBeenCalled();
-    expect(cascade).not.toHaveBeenCalled();
+    expect(trash).not.toHaveBeenCalled();
     expect(screen.getByText(/生成或预检正在使用当前素材/)).toBeInTheDocument();
 
     if (kind === "生成") await act(async () => resolveTask(queuedTimelineTask));
@@ -2040,6 +4049,9 @@ describe("统一长视频时间线应用", () => {
     saveLocalTimeline(project);
     mockCommonRequests();
     const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy-after-compile.test:8188" };
+    const listAssets = vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([]))
+      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
     vi.mocked(directorApi.getSettingsAuthority)
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
@@ -2064,6 +4076,7 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalled());
     await user.click(screen.getByRole("button", { name: "预检执行计划" }));
     await waitFor(() => expect(compile).toHaveBeenCalledTimes(1));
@@ -2689,6 +4702,9 @@ describe("统一长视频时间线应用", () => {
     saveLocalTimeline(project);
     mockCommonRequests();
     const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://external-b.test:8188" };
+    const listAssets = vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([]))
+      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
     const blockedStatus = {
       active: true,
       recovery_required: true,
@@ -2730,6 +4746,7 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: "系统设置" }));
     await user.click(await screen.findByRole("button", {
       name: "确认 ComfyUI 已重启并恢复 RayLight",
@@ -2965,8 +4982,8 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValue(runtimeAuthority(endpointBSettings));
     vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce({ assets: [imageAsset], outputs_preserved: true })
-      .mockResolvedValue({ assets: [endpointBImageAsset], outputs_preserved: true });
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([endpointBImageAsset], endpointBSettings.comfy_url));
     let resolvePut!: (settings: typeof endpointBSettings) => void;
     const update = vi.spyOn(directorApi, "updateSettings").mockImplementation(
       () => new Promise((resolve) => { resolvePut = resolve; }),
@@ -3119,6 +5136,58 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
   });
 
+  it("上传 intent 会失效在途项目切换，完成结果只绑定发起上传的项目", async () => {
+    const projectA = createTimelineProject();
+    projectA.title = "上传所属项目 A";
+    const staleProjectB = structuredClone(projectA);
+    staleProjectB.title = "不应接收上传的项目 B";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [
+        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-b", title: staleProjectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+      ],
+    });
+    let resolveProjectB!: (project: typeof staleProjectB) => void;
+    vi.spyOn(directorApi, "getProjectTimeline")
+      .mockImplementation(() => new Promise((resolve) => { resolveProjectB = resolve; }));
+    let resolveUpload!: (asset: AssetReference) => void;
+    const upload = vi.spyOn(directorApi, "uploadAsset")
+      .mockImplementation(() => new Promise((resolve) => { resolveUpload = resolve; }));
+
+    render(<App />);
+    await waitUntilReady();
+    const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    fireEvent.change(switcher, { target: { value: "project-b" } });
+    await waitFor(() => expect(directorApi.getProjectTimeline)
+      .toHaveBeenCalledWith("project-b", undefined));
+    const file = new File(["image"], "属于A.png", { type: "image/png" });
+    const input = document.querySelector<HTMLInputElement>(
+      '.asset-sidebar__upload input[type="file"]',
+    );
+    expect(input).not.toBeNull();
+    fireEvent.change(input!, { target: { files: [file] } });
+    await waitFor(() => expect(upload).toHaveBeenCalledWith(file, "image", expect.any(Function)));
+    expect(switcher).toBeDisabled();
+
+    await act(async () => resolveUpload({
+      ...imageAsset,
+      id: "upload-owned-by-a",
+      name: file.name,
+    }));
+    expect(await screen.findByText(file.name)).toBeInTheDocument();
+    await act(async () => resolveProjectB(staleProjectB));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(switcher).toHaveValue(DEFAULT_PROJECT_ID);
+    expect(screen.getByRole("button", {
+      name: "重命名项目，当前名称：上传所属项目 A",
+    })).toBeInTheDocument();
+    expect(screen.getByText(file.name)).toBeInTheDocument();
+  });
+
   it("endpoint 切换先等待在途时间线确认，并在边界内拒绝新的项目编辑", async () => {
     const user = userEvent.setup();
     mockCommonRequests();
@@ -3264,6 +5333,9 @@ describe("统一长视频时间线应用", () => {
     const user = userEvent.setup();
     mockCommonRequests();
     const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://confirmed-b.test:8188" };
+    const listAssets = vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([]))
+      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
     vi.mocked(directorApi.getSettingsAuthority)
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
@@ -3283,6 +5355,7 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: "系统设置" }));
     const endpoint = screen.getByLabelText("ComfyUI 地址");
     await user.clear(endpoint);
@@ -3344,9 +5417,9 @@ describe("统一长视频时间线应用", () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "雾中推进";
-    saveLocalTimeline(project);
     mockCommonRequests();
-    vi.mocked(directorApi.listAssets).mockResolvedValue({ assets: [imageAsset], outputs_preserved: true });
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.listAssets).mockResolvedValue(appAssetList([imageAsset]));
     const confirmed = structuredClone(CONFIGURED_SETTINGS);
     confirmed.models.ref2va.filename = "alternate-diffusion.safetensors";
     vi.mocked(directorApi.getSettingsAuthority)
@@ -3359,7 +5432,7 @@ describe("统一长视频时间线应用", () => {
     );
     const compile = vi.spyOn(directorApi, "compileTimeline");
     const submit = vi.spyOn(directorApi, "createTimelineTask");
-    const remove = vi.spyOn(directorApi, "deleteAsset");
+    const trash = vi.mocked(directorApi.trashAssets);
 
     render(<App />);
     await waitUntilReady();
@@ -3380,7 +5453,7 @@ describe("统一长视频时间线应用", () => {
     fireEvent.click(screen.getByRole("button", { name: "移出素材库" }));
     expect(compile).not.toHaveBeenCalled();
     expect(submit).not.toHaveBeenCalled();
-    expect(remove).not.toHaveBeenCalled();
+    expect(trash).not.toHaveBeenCalled();
 
     await act(async () => resolvePut(confirmed));
     await waitFor(
@@ -3409,7 +5482,7 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValue(runtimeAuthority(endpointBSettings));
     vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce({ assets: [imageAsset], outputs_preserved: true })
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
       .mockRejectedValue(new Error("B 素材接口离线"));
     vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointBSettings);
 
@@ -3493,8 +5566,8 @@ describe("统一长视频时间线应用", () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "资源重试";
-    saveLocalTimeline(project);
     mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
     const confirmed = { ...CONFIGURED_SETTINGS, client_id: "resource-retry-client" };
     vi.mocked(directorApi.getSettingsAuthority)
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
@@ -3532,6 +5605,9 @@ describe("统一长视频时间线应用", () => {
     saveLocalTimeline(project);
     mockCommonRequests();
     const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy-resource-b.test:8188" };
+    const listAssets = vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([]))
+      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
     vi.mocked(directorApi.getSettingsAuthority)
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
@@ -3548,6 +5624,7 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: "系统设置" }));
     const endpoint = screen.getByLabelText("ComfyUI 地址");
     await user.clear(endpoint);
@@ -3774,7 +5851,24 @@ describe("统一长视频时间线应用", () => {
       updated_at: "2026-08-12T00:00:00Z",
       segment_count: 2,
     };
-    vi.spyOn(directorApi, "importProject").mockResolvedValue(imported);
+    let importCreated = false;
+    vi.mocked(directorApi.listProjects).mockImplementation(async () => ({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [
+        {
+          id: DEFAULT_PROJECT_ID,
+          title: project.title,
+          created_at: "2026-08-12T00:00:00Z",
+          updated_at: "2026-08-12T00:00:00Z",
+          segment_count: 1,
+        },
+        ...(importCreated ? [imported] : []),
+      ],
+    }));
+    vi.spyOn(directorApi, "importProject").mockImplementation(async () => {
+      importCreated = true;
+      return imported;
+    });
     vi.spyOn(directorApi, "getProjectTimeline").mockResolvedValue(project);
     vi.spyOn(directorApi, "updateProjectTimeline").mockImplementation(async (_id, value) => value);
     const compile = vi.spyOn(directorApi, "compileProjectTimeline").mockRejectedValue(
@@ -3790,7 +5884,7 @@ describe("统一长视频时间线应用", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ })).toHaveAttribute("aria-pressed", "false"));
     expect(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: "生成任务 1" })).toBeEnabled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "生成任务 1" })).toBeEnabled());
     await waitFor(() => expect(loadTimelineSegmentSelectionPreference(
       ACTIVE_DATABASE,
       imported.id,
@@ -3888,15 +5982,215 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByLabelText("片段提示词")).toHaveValue("服务端片段提示");
   });
 
-  it("移出被引用素材先保存完整时间线，再级联删除并回读服务器降级结果", async () => {
+  it("按当前 endpoint 加载素材回收站批次并明确远端文件保留", async () => {
+    const user = userEvent.setup();
+    mockCommonRequests();
+    const batch = appAssetTrashBatch([imageAsset.id]);
+    vi.mocked(directorApi.listAssetTrash).mockResolvedValue(appAssetTrashList([batch]));
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "素材回收站" }));
+
+    expect(await screen.findByRole("complementary", { name: "素材回收站" }))
+      .toBeVisible();
+    expect(await screen.findByText(imageAsset.name)).toBeInTheDocument();
+    expect(screen.getByText(/ComfyUI 中的输入文件始终保留/)).toBeInTheDocument();
+    expect(directorApi.listAssetTrash).toHaveBeenCalledTimes(1);
+  });
+
+  it("registration-only 只恢复素材登记并保留项目编辑历史", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "恢复登记前";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([]))
+      .mockResolvedValue(appAssetList([imageAsset]));
+    const batch = appAssetTrashBatch([imageAsset.id]);
+    vi.mocked(directorApi.listAssetTrash)
+      .mockResolvedValueOnce(appAssetTrashList([batch]))
+      .mockResolvedValue(appAssetTrashList([]));
+    const restore = vi.mocked(directorApi.restoreAssetTrash).mockResolvedValue({
+      batch_id: batch.batch_id,
+      restored_asset_ids: [imageAsset.id],
+      restored_references: false,
+      mode: "registration_only",
+      remote_files_preserved: true,
+    });
+
+    render(<App />);
+    await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "恢复登记后的本地编辑" },
+    });
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "素材回收站" }));
+    await user.click(await screen.findByRole("button", { name: "仅恢复素材" }));
+
+    await waitFor(() => expect(restore).toHaveBeenCalledWith(
+      batch.batch_id,
+      "registration_only",
+    ));
+    expect(await screen.findByRole("listitem")).toHaveTextContent(imageAsset.name);
+    expect(await screen.findByText(/没有可恢复的素材/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+  });
+
+  it("非级联移出响应丢失后以素材库与回收站双权威确认提交", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "移出前基线";
+    const batch = appAssetTrashBatch([imageAsset.id]);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue({
+        assets: [],
+        outputs_preserved: true,
+        active_database_identity: ACTIVE_DATABASE_IDENTITY,
+        comfy_origin: CONFIGURED_SETTINGS.comfy_url,
+      });
+    vi.mocked(directorApi.listAssetTrash).mockResolvedValue(appAssetTrashList([batch]));
+    const trash = vi.mocked(directorApi.trashAssets).mockRejectedValue(
+      new TypeError("Failed to fetch"),
+    );
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "移出前的本地编辑" },
+    });
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    await user.click(await screen.findByRole("listitem"));
+    await user.click(screen.getByRole("button", { name: "移出素材库" }));
+
+    await waitFor(() => expect(trash).toHaveBeenCalledWith([imageAsset.id], false));
+    expect(await screen.findByText(/先前响应在返回途中丢失/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+    expect(screen.queryByRole("checkbox", { name: `选择素材 ${imageAsset.name}` }))
+      .not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "素材回收站" }));
+    expect(await screen.findByText(imageAsset.name)).toBeInTheDocument();
+  });
+
+  it("with-references 冲突后仅对该批次提供 registration-only 降级", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.title = "恢复冲突前的项目";
+    const externalAuthority = structuredClone(project);
+    externalAuthority.title = "外部更新后的权威项目";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline)
+      .mockResolvedValueOnce(project)
+      .mockResolvedValue(externalAuthority);
+    const usage = "timeline.segments[0].first_image";
+    const batch = appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [usage] },
+    );
+    vi.mocked(directorApi.listAssetTrash)
+      .mockResolvedValueOnce(appAssetTrashList([batch]))
+      .mockResolvedValueOnce(appAssetTrashList([batch]))
+      .mockResolvedValue(appAssetTrashList([]));
+    const restore = vi.mocked(directorApi.restoreAssetTrash)
+      .mockRejectedValueOnce(new ApiError(
+        "asset references changed after the trash operation",
+        409,
+        {
+          detail: {
+            code: "asset_trash_restore_conflict",
+            message: "asset references changed after the trash operation",
+            conflicts: [{
+              owner_kind: "timeline",
+              owner_id: "default",
+              reason: "document_changed,revision_changed",
+              expected_revision: 1,
+              actual_revision: 2,
+            }],
+            remote_files_preserved: true,
+          },
+        },
+        "asset_trash_restore_conflict",
+      ))
+      .mockResolvedValueOnce({
+        batch_id: batch.batch_id,
+        restored_asset_ids: [imageAsset.id],
+        restored_references: false,
+        mode: "registration_only",
+        remote_files_preserved: true,
+      });
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "素材回收站" }));
+    await user.click(await screen.findByRole("button", { name: "恢复素材与原引用" }));
+
+    expect(await screen.findByRole("button", {
+      name: "重命名项目，当前名称：外部更新后的权威项目",
+    })).toBeInTheDocument();
+    expect(await within(screen.getByRole("complementary", { name: "素材回收站" }))
+      .findByRole("alert")).toHaveTextContent("无法安全恢复旧引用");
+    expect(screen.queryByRole("button", { name: "恢复素材与原引用" }))
+      .not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "仅恢复素材" }));
+    await waitFor(() => expect(restore).toHaveBeenNthCalledWith(
+      2,
+      batch.batch_id,
+      "registration_only",
+    ));
+    expect(await screen.findByText(/没有可恢复的素材/)).toBeInTheDocument();
+    expect(directorApi.getTimeline).toHaveBeenCalledTimes(2);
+  });
+
+  it("回收站恢复按钮快速双击仍只有一个 mutation 在途", async () => {
+    const user = userEvent.setup();
+    mockCommonRequests();
+    const batch = appAssetTrashBatch([imageAsset.id]);
+    vi.mocked(directorApi.listAssetTrash)
+      .mockResolvedValueOnce(appAssetTrashList([batch]))
+      .mockResolvedValue(appAssetTrashList([]));
+    let resolveRestore!: (value: {
+      batch_id: string;
+      restored_asset_ids: string[];
+      restored_references: boolean;
+      mode: "registration_only";
+      remote_files_preserved: true;
+    }) => void;
+    const restore = vi.mocked(directorApi.restoreAssetTrash).mockImplementation(
+      () => new Promise((resolve) => { resolveRestore = resolve; }),
+    );
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "素材回收站" }));
+    const restoreButton = await screen.findByRole("button", { name: "仅恢复素材" });
+    fireEvent.click(restoreButton);
+    fireEvent.click(restoreButton);
+    expect(restore).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolveRestore({
+      batch_id: batch.batch_id,
+      restored_asset_ids: [imageAsset.id],
+      restored_references: false,
+      mode: "registration_only",
+      remote_files_preserved: true,
+    }));
+    expect(await screen.findByText(/没有可恢复的素材/)).toBeInTheDocument();
+  });
+
+  it("移出被引用素材先保存完整时间线，再以单次 batch 级联并回读服务器结果", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments = [{ ...createTimelineSegment("fl2va", 1), prompt: "人物走近", first_image: imageAsset }];
-    saveLocalTimeline(project);
     mockCommonRequests();
     vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce({ assets: [imageAsset], outputs_preserved: true })
-      .mockResolvedValue({ assets: [], outputs_preserved: true });
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([]));
     const authoritative = {
       ...project,
       segments: [{
@@ -3913,38 +6207,326 @@ describe("统一长视频时间线应用", () => {
         last_image: null,
       }],
     };
-    vi.mocked(directorApi.getTimeline).mockResolvedValue(authoritative);
+    vi.mocked(directorApi.getTimeline)
+      .mockResolvedValueOnce(project)
+      .mockResolvedValue(authoritative);
     const save = vi.spyOn(directorApi, "updateTimeline").mockImplementation(async (value) => value);
-    const cascade = vi.spyOn(directorApi, "deleteAssetCascade").mockResolvedValue({
-      deleted_asset_id: imageAsset.id,
-      outputs_preserved: true,
-      unbound_usages: [`timeline:${project.segments[0].id}:first_image`],
+    const trash = vi.mocked(directorApi.trashAssets).mockResolvedValue(appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [`timeline:${project.segments[0].id}:first_image`] },
+    ));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "人物走近，准备移出素材" },
     });
-    const plainDelete = vi.spyOn(directorApi, "deleteAsset");
+    await user.click(await screen.findByRole("listitem"));
+    await user.click(screen.getByRole("button", { name: "移出素材库" }));
+
+    await waitFor(() => expect(trash).toHaveBeenCalledWith([imageAsset.id], true));
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ segments: [expect.objectContaining({ mode: "fl2va", first_image: imageAsset })] }));
+    expect(save.mock.invocationCallOrder[0]).toBeLessThan(trash.mock.invocationCallOrder[0]);
+    expect(trash).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.getByLabelText("片段生成模式")).toHaveValue("fl2va"));
+    expect(directorApi.getTimeline).toHaveBeenCalledTimes(2);
+  });
+
+  it("在途目标项目 GET 会被素材级联 intent 失效，不能迟到安装级联前的旧项目", async () => {
+    const user = userEvent.setup();
+    const projectA = createTimelineProject();
+    projectA.title = "项目 A（级联前）";
+    projectA.segments = [{
+      ...createTimelineSegment("fl2va", 1),
+      prompt: "A 引用素材",
+      first_image: imageAsset,
+    }];
+    const authoritativeA = structuredClone(projectA);
+    authoritativeA.title = "项目 A（级联后权威）";
+    const authoritativeASegment = authoritativeA.segments[0];
+    if (authoritativeASegment?.mode !== "fl2va") throw new Error("expected fl2va segment");
+    authoritativeASegment.first_image = null;
+    const staleProjectB = structuredClone(projectA);
+    staleProjectB.title = "不应安装的旧项目 B";
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline)
+      .mockResolvedValueOnce(projectA)
+      .mockResolvedValue(authoritativeA);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [
+        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-b", title: staleProjectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+      ],
+    });
+    vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([]));
+    let resolveProjectB!: (project: typeof staleProjectB) => void;
+    vi.spyOn(directorApi, "getProjectTimeline")
+      .mockImplementation(() => new Promise((resolve) => { resolveProjectB = resolve; }));
+    let resolveTrash!: (batch: AssetTrashBatch) => void;
+    const trash = vi.mocked(directorApi.trashAssets)
+      .mockImplementation(() => new Promise((resolve) => { resolveTrash = resolve; }));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+    const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    fireEvent.change(switcher, { target: { value: "project-b" } });
+    await waitFor(() => expect(directorApi.getProjectTimeline)
+      .toHaveBeenCalledWith("project-b", undefined));
+    await user.click(await screen.findByRole("listitem"));
+    const removeButton = screen.getByRole("button", { name: "移出素材库" });
+    expect(removeButton).toBeEnabled();
+    await user.click(removeButton);
+    await waitFor(() => expect(trash).toHaveBeenCalledWith([imageAsset.id], true));
+    expect(switcher).toBeDisabled();
+
+    await act(async () => resolveTrash(appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [`timeline:${projectA.segments[0].id}:first_image`] },
+    )));
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "重命名项目，当前名称：项目 A（级联后权威）",
+    })).toBeInTheDocument());
+    await act(async () => resolveProjectB(staleProjectB));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(switcher).toHaveValue(DEFAULT_PROJECT_ID);
+    expect(screen.queryByRole("button", {
+      name: "重命名项目，当前名称：不应安装的旧项目 B",
+    })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("片段提示词")).toHaveValue("A 引用素材");
+  });
+
+  it("在途目标项目 GET 会被 with-references 恢复 intent 失效，回读固定当前项目", async () => {
+    const user = userEvent.setup();
+    const projectA = createTimelineProject();
+    projectA.title = "项目 A（恢复前）";
+    const restoredA = structuredClone(projectA);
+    restoredA.title = "项目 A（恢复引用后权威）";
+    const restoredASegment = restoredA.segments[0];
+    if (restoredASegment?.mode !== "fl2va") throw new Error("expected fl2va segment");
+    restoredASegment.first_image = imageAsset;
+    const staleProjectB = structuredClone(projectA);
+    staleProjectB.title = "不应安装的恢复前项目 B";
+    const batch = appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [`timeline:${projectA.segments[0].id}:first_image`] },
+    );
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline)
+      .mockResolvedValueOnce(projectA)
+      .mockResolvedValue(restoredA);
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      active_database_identity: ACTIVE_DATABASE_IDENTITY,
+      projects: [
+        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+        { id: "project-b", title: staleProjectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
+      ],
+    });
+    vi.mocked(directorApi.listAssetTrash)
+      .mockResolvedValueOnce(appAssetTrashList([batch]))
+      .mockResolvedValue(appAssetTrashList([]));
+    vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([]))
+      .mockResolvedValue(appAssetList([imageAsset]));
+    let resolveProjectB!: (project: typeof staleProjectB) => void;
+    vi.spyOn(directorApi, "getProjectTimeline")
+      .mockImplementation(() => new Promise((resolve) => { resolveProjectB = resolve; }));
+    let resolveRestore!: (result: {
+      batch_id: string;
+      restored_asset_ids: string[];
+      restored_references: boolean;
+      mode: "with_references";
+      remote_files_preserved: true;
+    }) => void;
+    const restore = vi.mocked(directorApi.restoreAssetTrash)
+      .mockImplementation(() => new Promise((resolve) => { resolveRestore = resolve; }));
+
+    render(<App />);
+    await waitUntilReady();
+    const switcher = screen.getByRole("combobox", { name: "切换项目" });
+    fireEvent.change(switcher, { target: { value: "project-b" } });
+    await waitFor(() => expect(directorApi.getProjectTimeline)
+      .toHaveBeenCalledWith("project-b", undefined));
+    await user.click(screen.getByRole("button", { name: "素材回收站" }));
+    await user.click(await screen.findByRole("button", { name: "恢复素材与原引用" }));
+    await waitFor(() => expect(restore).toHaveBeenCalledWith(
+      batch.batch_id,
+      "with_references",
+    ));
+    expect(switcher).toBeDisabled();
+
+    await act(async () => resolveRestore({
+      batch_id: batch.batch_id,
+      restored_asset_ids: [imageAsset.id],
+      restored_references: true,
+      mode: "with_references",
+      remote_files_preserved: true,
+    }));
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "重命名项目，当前名称：项目 A（恢复引用后权威）",
+    })).toBeInTheDocument());
+    await act(async () => resolveProjectB(staleProjectB));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(switcher).toHaveValue(DEFAULT_PROJECT_ID);
+    expect(screen.queryByRole("button", {
+      name: "重命名项目，当前名称：不应安装的恢复前项目 B",
+    })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("片段提示词")).toHaveValue(projectA.segments[0].prompt);
+  });
+
+  it("素材 authority mutation 后的下一笔 WAL 使用新 revision 与新 base document", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments = [{
+      ...createTimelineSegment("fl2va", 1),
+      prompt: "素材级联前",
+      first_image: imageAsset,
+    }];
+    const authoritative = structuredClone(project);
+    const authoritativeSegment = authoritative.segments[0];
+    if (authoritativeSegment?.mode !== "fl2va") throw new Error("expected fl2va segment");
+    authoritativeSegment.first_image = null;
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: project, revision: 4 })
+      .mockResolvedValue({ document: authoritative, revision: 5 });
+    vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([]));
+    vi.mocked(directorApi.trashAssets).mockResolvedValue(appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [`timeline:${project.segments[0].id}:first_image`] },
+    ));
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
     render(<App />);
     await waitUntilReady();
     await user.click(await screen.findByRole("listitem"));
     await user.click(screen.getByRole("button", { name: "移出素材库" }));
+    await waitFor(() => expect(directorApi.getTimelineAuthority).toHaveBeenCalledTimes(2));
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "新 authority 上的编辑" },
+    });
 
-    await waitFor(() => expect(cascade).toHaveBeenCalledWith(imageAsset.id));
-    expect(save).toHaveBeenCalledWith(expect.objectContaining({ segments: [expect.objectContaining({ mode: "fl2va", first_image: imageAsset })] }));
-    expect(save.mock.invocationCallOrder[0]).toBeLessThan(cascade.mock.invocationCallOrder[0]);
-    expect(plainDelete).not.toHaveBeenCalled();
-    await waitFor(() => expect(screen.getByLabelText("片段生成模式")).toHaveValue("fl2va"));
-    expect(directorApi.getTimeline).toHaveBeenCalledTimes(1);
+    const wal = loadLocalTimelineWal(ACTIVE_DATABASE);
+    expect(wal?.base_server_revision).toBe(5);
+    expect(wal?.base_project).toEqual(authoritative);
+    expect(wal?.pending_project.segments[0].prompt).toBe("新 authority 上的编辑");
+  });
+
+  it("素材 mutation 已提交后即使外部 endpoint 改变，仍按项目数据库 scope 完成 timeline resync", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.title = "外部 endpoint 切换前";
+    project.segments = [{
+      ...createTimelineSegment("fl2va", 1),
+      prompt: "等待素材提交",
+      first_image: imageAsset,
+    }];
+    const authoritative = structuredClone(project);
+    authoritative.title = "外部 endpoint 切换后的 timeline 权威";
+    const authoritativeSegment = authoritative.segments[0];
+    if (authoritativeSegment?.mode !== "fl2va") throw new Error("expected fl2va segment");
+    authoritativeSegment.first_image = null;
+    const endpointB = {
+      ...CONFIGURED_SETTINGS,
+      comfy_url: "http://external-during-trash.test:8188",
+    };
+    const authorityA = runtimeAuthority(CONFIGURED_SETTINGS);
+    const authorityB = runtimeAuthority(endpointB);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimelineAuthority)
+      .mockResolvedValueOnce({ document: project, revision: 4 })
+      .mockResolvedValue({ document: authoritative, revision: 5 });
+    vi.mocked(directorApi.getSettingsAuthority)
+      // Initial runtime head/tail, then connection-test head/tail observes A→B.
+      .mockResolvedValueOnce(authorityA)
+      .mockResolvedValueOnce(authorityA)
+      .mockResolvedValueOnce(authorityA)
+      .mockResolvedValueOnce(authorityB)
+      // External-authority refresh establishes a complete B head/tail.
+      .mockResolvedValue(authorityB);
+    vi.mocked(directorApi.listAssets)
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
+    let resolveConnection!: (result: { ok: boolean; message: string }) => void;
+    vi.spyOn(directorApi, "testConnection")
+      .mockImplementation(() => new Promise((resolve) => { resolveConnection = resolve; }));
+    const updateSettings = vi.spyOn(directorApi, "updateSettings")
+      .mockImplementation(async (value) => value);
+    let resolveTrash!: (batch: AssetTrashBatch) => void;
+    const trash = vi.mocked(directorApi.trashAssets)
+      .mockImplementation(() => new Promise((resolve) => { resolveTrash = resolve; }));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+    await screen.findByRole("listitem");
+    await user.click(screen.getByRole("button", { name: "系统设置" }));
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    await waitFor(() => expect(directorApi.testConnection).toHaveBeenCalled());
+    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
+    await user.click(await screen.findByRole("listitem"));
+    await user.click(screen.getByRole("button", { name: "移出素材库" }));
+    await waitFor(() => expect(trash).toHaveBeenCalledWith([imageAsset.id], true));
+
+    await act(async () => resolveConnection({ ok: true, message: "连接成功" }));
+    await waitFor(() => expect(vi.mocked(directorApi.getSettingsAuthority).mock.calls.length)
+      .toBeGreaterThanOrEqual(5));
+    await waitFor(() => expect(vi.mocked(directorApi.listAssets).mock.calls.length)
+      .toBeGreaterThanOrEqual(2));
+    await act(async () => resolveTrash(appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [`timeline:${project.segments[0].id}:first_image`] },
+    )));
+
+    await waitFor(() => expect(directorApi.getTimelineAuthority).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("button", {
+      name: "重命名项目，当前名称：外部 endpoint 切换后的 timeline 权威",
+    })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "预检执行计划" }))
+      .toBeEnabled());
+    expect(updateSettings).not.toHaveBeenCalled();
   });
 
   it("级联成功但权威回读失败时不套用不完整本地降级，并自动恢复权威时间线", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments = [{ ...createTimelineSegment("fl2va", 1), prompt: "人物走近", first_image: imageAsset }];
-    saveLocalTimeline(project);
+    const before = structuredClone(project);
+    before.segments[0].prompt = "级联前可撤销历史";
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑提示词",
+      before,
+      after: project,
+      now: 50,
+    });
+    const journalScope = {
+      databasePath: ACTIVE_DATABASE_PATH,
+      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      projectId: DEFAULT_PROJECT_ID,
+      ownerId: getTimelineBranchOwnerId(),
+    };
+    await saveTimelineHistoryJournal(journalScope, {
+      document: project,
+      revision: 0,
+    }, history);
     mockCommonRequests();
     vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce({ assets: [imageAsset], outputs_preserved: true })
-      .mockResolvedValue({ assets: [], outputs_preserved: true });
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([]));
     const authoritative = {
       ...project,
       title: "服务器权威降级",
@@ -3963,14 +6545,15 @@ describe("统一长视频时间线应用", () => {
       }],
     };
     vi.mocked(directorApi.getTimeline)
+      .mockResolvedValueOnce(project)
       .mockRejectedValueOnce(new Error("临时回读失败"))
       .mockResolvedValue(authoritative);
     vi.spyOn(directorApi, "updateTimeline").mockImplementation(async (value) => value);
-    vi.spyOn(directorApi, "deleteAssetCascade").mockResolvedValue({
-      deleted_asset_id: imageAsset.id,
-      outputs_preserved: true,
-      unbound_usages: [`timeline:${project.segments[0].id}:first_image`],
-    });
+    vi.mocked(directorApi.trashAssets).mockResolvedValue(appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [`timeline:${project.segments[0].id}:first_image`] },
+    ));
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
     render(<App />);
@@ -3979,9 +6562,15 @@ describe("统一长视频时间线应用", () => {
     await user.click(screen.getByRole("button", { name: "移出素材库" }));
 
     expect(screen.queryByRole("button", { name: "重新同步" })).not.toBeInTheDocument();
-    expect(await screen.findByText("服务器权威降级")).toBeInTheDocument();
+    expect(await screen.findByRole("button", {
+      name: "重命名项目，当前名称：服务器权威降级",
+    })).toBeInTheDocument();
     expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
     expect(screen.queryByRole("button", { name: /保存时间线|重新同步/ })).not.toBeInTheDocument();
+    await waitFor(async () => expect(
+      await readTimelineHistoryJournalVersionToken(journalScope),
+    ).toBeNull());
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
   });
 
   it("资产级联与在途自动同步串行化，旧响应不能覆盖权威时间线", async () => {
@@ -3989,11 +6578,10 @@ describe("统一长视频时间线应用", () => {
     const project = createTimelineProject();
     project.title = "编辑中项目";
     project.segments = [{ ...createTimelineSegment("fl2va", 1), prompt: "人物走近", first_image: imageAsset }];
-    saveLocalTimeline(project);
     mockCommonRequests();
     vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce({ assets: [imageAsset], outputs_preserved: true })
-      .mockResolvedValue({ assets: [], outputs_preserved: true });
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([]));
     const authoritative = {
       ...project,
       title: "级联后的权威项目",
@@ -4011,30 +6599,37 @@ describe("统一长视频时间线应用", () => {
         last_image: null,
       }],
     };
-    vi.mocked(directorApi.getTimeline).mockResolvedValue(authoritative);
+    vi.mocked(directorApi.getTimeline)
+      .mockResolvedValueOnce(project)
+      .mockResolvedValue(authoritative);
     let resolveManualSave!: (value: typeof project) => void;
     const update = vi.spyOn(directorApi, "updateTimeline")
       .mockImplementationOnce(() => new Promise((resolve) => { resolveManualSave = resolve; }))
       .mockImplementation(async (value) => value);
-    const cascade = vi.spyOn(directorApi, "deleteAssetCascade").mockResolvedValue({
-      deleted_asset_id: imageAsset.id,
-      outputs_preserved: true,
-      unbound_usages: [`timeline:${project.segments[0].id}:first_image`],
-    });
+    const trash = vi.mocked(directorApi.trashAssets).mockResolvedValue(appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [`timeline:${project.segments[0].id}:first_image`] },
+    ));
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "人物走近，等待同步" },
+    });
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     await user.click(await screen.findByRole("listitem"));
     await user.click(screen.getByRole("button", { name: "移出素材库" }));
-    expect(cascade).not.toHaveBeenCalled();
+    expect(trash).not.toHaveBeenCalled();
 
     await act(async () => resolveManualSave({ ...project, title: "迟到的旧保存响应" }));
-    await waitFor(() => expect(cascade).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(trash).toHaveBeenCalledTimes(1));
     expect(update).toHaveBeenCalledTimes(1);
-    expect(update.mock.invocationCallOrder[0]).toBeLessThan(cascade.mock.invocationCallOrder[0]);
-    expect(await screen.findByText("级联后的权威项目")).toBeInTheDocument();
+    expect(update.mock.invocationCallOrder[0]).toBeLessThan(trash.mock.invocationCallOrder[0]);
+    expect(await screen.findByRole("button", {
+      name: "重命名项目，当前名称：级联后的权威项目",
+    })).toBeInTheDocument();
     expect(screen.queryByText("迟到的旧保存响应")).not.toBeInTheDocument();
   });
 
@@ -4042,7 +6637,6 @@ describe("统一长视频时间线应用", () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments = [{ ...createTimelineSegment("fl2va", 1), prompt: "删除边界", first_image: imageAsset }];
-    saveLocalTimeline(project);
     mockCommonRequests();
     const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy-after-delete.test:8188" };
     vi.mocked(directorApi.getSettingsAuthority)
@@ -4050,30 +6644,31 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValue(runtimeAuthority(endpointB));
     vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce({ assets: [imageAsset], outputs_preserved: true })
-      .mockResolvedValue({ assets: [], outputs_preserved: true });
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([]));
     const authoritative = {
       ...project,
       segments: [{ ...project.segments[0], first_image: null, last_image: null }],
     };
-    vi.mocked(directorApi.getTimeline).mockResolvedValue(authoritative);
+    vi.mocked(directorApi.getTimeline)
+      .mockResolvedValueOnce(project)
+      .mockResolvedValue(authoritative);
     let resolveTimeline!: (value: typeof project) => void;
     vi.mocked(directorApi.updateTimeline).mockImplementationOnce(
       () => new Promise((resolve) => { resolveTimeline = resolve; }),
     );
-    let resolveCascade!: (value: {
-      deleted_asset_id: string;
-      outputs_preserved: true;
-      unbound_usages: string[];
-    }) => void;
-    const cascade = vi.spyOn(directorApi, "deleteAssetCascade").mockImplementation(
-      () => new Promise((resolve) => { resolveCascade = resolve; }),
+    let resolveTrash!: (value: AssetTrashBatch) => void;
+    const trash = vi.mocked(directorApi.trashAssets).mockImplementation(
+      () => new Promise((resolve) => { resolveTrash = resolve; }),
     );
     const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointB);
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "删除边界，等待同步" },
+    });
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
     await user.click(await screen.findByRole("listitem"));
     await user.click(screen.getByRole("button", { name: "移出素材库" }));
@@ -4086,32 +6681,35 @@ describe("统一长视频时间线应用", () => {
     expect(updateSettings).not.toHaveBeenCalled();
 
     await act(async () => resolveTimeline(project));
-    await waitFor(() => expect(cascade).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(trash).toHaveBeenCalledTimes(1));
     expect(updateSettings).not.toHaveBeenCalled();
-    await act(async () => resolveCascade({
-      deleted_asset_id: imageAsset.id,
-      outputs_preserved: true,
-      unbound_usages: [`timeline:${project.segments[0].id}:first_image`],
-    }));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
+    await act(async () => resolveTrash(appAssetTrashBatch(
+      [imageAsset.id],
+      true,
+      { [imageAsset.id]: [`timeline:${project.segments[0].id}:first_image`] },
+    )));
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1), { timeout: 3_000 });
   });
 
   it("级联等待的在途同步失败时保留 WAL 且不显示保存功能", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments = [{ ...createTimelineSegment("fl2va", 1), first_image: imageAsset }];
-    saveLocalTimeline(project);
     mockCommonRequests();
-    vi.mocked(directorApi.listAssets).mockResolvedValue({ assets: [imageAsset], outputs_preserved: true });
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    vi.mocked(directorApi.listAssets).mockResolvedValue(appAssetList([imageAsset]));
     let rejectAutosave!: (reason: unknown) => void;
     vi.spyOn(directorApi, "updateTimeline")
       .mockImplementationOnce(() => new Promise((_, reject) => { rejectAutosave = reject; }))
       .mockImplementation(async (value) => value);
-    const cascade = vi.spyOn(directorApi, "deleteAssetCascade");
+    const trash = vi.mocked(directorApi.trashAssets);
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "等待失败的前置同步" },
+    });
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
     await user.click(await screen.findByRole("listitem"));
     await user.click(screen.getByRole("button", { name: "移出素材库" }));
@@ -4121,38 +6719,54 @@ describe("统一长视频时间线应用", () => {
     expect(screen.queryByText("保存失败")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "保存时间线" })).not.toBeInTheDocument();
     expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).not.toBeNull();
-    expect(cascade).not.toHaveBeenCalled();
+    expect(trash).not.toHaveBeenCalled();
   });
 
   it("本地无引用但隐藏草稿 409 时要求二次确认，然后走原子级联", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "雨夜";
-    saveLocalTimeline(project);
     mockCommonRequests();
     vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce({ assets: [imageAsset], outputs_preserved: true })
-      .mockResolvedValue({ assets: [], outputs_preserved: true });
+      .mockResolvedValueOnce(appAssetList([imageAsset]))
+      .mockResolvedValue(appAssetList([]));
     vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
     const save = vi.spyOn(directorApi, "updateTimeline").mockImplementation(async (value) => value);
-    const plainDelete = vi.spyOn(directorApi, "deleteAsset").mockRejectedValue(new ApiError(
-      "素材仍被引用",
-      409,
-      { detail: { message: "素材仍被引用", usages: ["legacy:i2v:shot-1:first_image"] } },
-    ));
-    const cascade = vi.spyOn(directorApi, "deleteAssetCascade").mockResolvedValue({
-      deleted_asset_id: imageAsset.id,
-      outputs_preserved: true,
-      unbound_usages: ["legacy:i2v:shot-1:first_image"],
-    });
+    const trash = vi.mocked(directorApi.trashAssets)
+      .mockRejectedValueOnce(new ApiError(
+        "素材仍被引用",
+        409,
+        {
+          detail: {
+            code: "assets_in_use",
+            message: "素材仍被引用",
+            usages: ["legacy:i2v:shot-1:first_image"],
+            usages_by_asset: {
+              [imageAsset.id]: ["legacy:i2v:shot-1:first_image"],
+            },
+            remote_files_preserved: true,
+          },
+        },
+        "assets_in_use",
+      ))
+      .mockResolvedValueOnce(appAssetTrashBatch(
+        [imageAsset.id],
+        true,
+        { [imageAsset.id]: ["legacy:i2v:shot-1:first_image"] },
+      ));
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
 
     render(<App />);
     await waitUntilReady();
+    fireEvent.change(screen.getByLabelText("片段提示词"), {
+      target: { value: "雨夜，准备移出素材" },
+    });
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
     await user.click(await screen.findByRole("listitem"));
     await user.click(screen.getByRole("button", { name: "移出素材库" }));
-    await waitFor(() => expect(cascade).toHaveBeenCalledWith(imageAsset.id));
-    expect(save.mock.invocationCallOrder[0]).toBeLessThan(plainDelete.mock.invocationCallOrder[0]);
+    await waitFor(() => expect(trash).toHaveBeenNthCalledWith(2, [imageAsset.id], true));
+    expect(trash).toHaveBeenNthCalledWith(1, [imageAsset.id], false);
+    expect(save.mock.invocationCallOrder[0]).toBeLessThan(trash.mock.invocationCallOrder[0]);
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("legacy:i2v:shot-1:first_image"));
   });
 

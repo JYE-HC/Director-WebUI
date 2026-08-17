@@ -10,7 +10,9 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:e2e": "playwright test --project=chromium",
+    "test:e2e:all": "playwright test"
   },
   "dependencies": {
     "@vitejs/plugin-react": "6.0.5",
@@ -20,11 +22,13 @@
     "vite": "8.2.1"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.4",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
+    "fake-indexeddb": "6.2.5",
     "jsdom": "29.1.1",
     "vitest": "4.1.10"
   }

@@ -1,4 +1,4 @@
-import type { GenerationMode, ModeDraft } from "../domain/modes";
+import type { AssetReference, GenerationMode, ModeDraft } from "../domain/modes";
 import type {
   DerivedGenerationRecipe,
   TimelineGenerationMode,
@@ -313,6 +313,10 @@ export interface TimelineCompileReport {
 export interface AssetListResponse {
   assets: import("../domain/modes").AssetReference[];
   outputs_preserved: true;
+  /** Missing only when talking to a pre-scope-metadata Director backend. */
+  active_database_identity?: string;
+  /** Canonical active ComfyUI origin; paired with active_database_identity. */
+  comfy_origin?: string;
 }
 
 export type AssetUploadStage =
@@ -340,6 +344,59 @@ export interface AssetDeleteResponse {
 
 export interface AssetCascadeDeleteResponse extends AssetDeleteResponse {
   unbound_usages: string[];
+}
+
+export type AssetTrashRestoreMode = "registration_only" | "with_references";
+
+export interface AssetTrashBatch {
+  batch_id: string;
+  comfy_origin: string;
+  asset_ids: string[];
+  assets: AssetReference[];
+  cascade: boolean;
+  unbound_usages: string[];
+  unbound_usages_by_asset: Record<string, string[]>;
+  created_at: string;
+  remote_files_preserved: true;
+}
+
+export interface AssetTrashListResponse {
+  batches: AssetTrashBatch[];
+  remote_files_preserved: true;
+  /** Missing only when talking to a pre-scope-metadata Director backend. */
+  active_database_identity?: string;
+  /** Canonical active ComfyUI origin; paired with active_database_identity. */
+  comfy_origin?: string;
+}
+
+export interface AssetTrashRestoreResponse {
+  batch_id: string;
+  restored_asset_ids: string[];
+  restored_references: boolean;
+  mode: AssetTrashRestoreMode;
+  remote_files_preserved: true;
+}
+
+export interface AssetTrashPurgeResponse {
+  batch_id: string;
+  purged_asset_ids: string[];
+  remote_files_preserved: true;
+}
+
+export type AssetTrashConflictOwnerKind =
+  | "timeline"
+  | "project"
+  | "draft"
+  | "asset"
+  | "batch";
+
+export interface AssetTrashConflictOwner {
+  owner_kind: AssetTrashConflictOwnerKind;
+  owner_id: string;
+  reason: string;
+  expected_revision?: number | null;
+  actual_revision?: number | null;
+  message?: string;
 }
 
 export interface TaskListResponse {
@@ -385,12 +442,19 @@ export interface ProjectSummary {
 
 export interface ProjectListResponse {
   projects: ProjectSummary[];
+  active_database_identity: string;
 }
 
 export interface ProjectDeleteResponse {
   deleted_project_id: string;
   outputs_preserved: true;
   orphaned_jobs: number;
+}
+
+/** Server-owned timeline document paired with its exact CAS revision. */
+export interface TimelineAuthority {
+  document: TimelineProject;
+  revision: number;
 }
 
 export interface TaskDiagnosticChild {
