@@ -99,7 +99,7 @@ ask_yes_no() {
   if [[ "$default" == y ]]; then suffix="[Y/n]"; else suffix="[y/N]"; fi
   while true; do
     printf '%s %s ' "$prompt" "$suffix"
-    read -r answer
+    read -re answer
     answer="${answer,,}"
     [[ -z "$answer" ]] && answer="$default"
     case "$answer" in
@@ -127,7 +127,7 @@ ask_choice() {
     local i=1
     for line in "$@"; do printf '  %s) %s\n' "$i" "$line" >&2; i=$((i + 1)); done
     printf '请选择 [%s]: ' "$default" >&2
-    read -r index
+    read -re index
     [[ -z "$index" ]] && index="$default"
     if [[ "$index" =~ ^[0-9]+$ ]] && ((index >= 1 && index <= $#)); then
       printf '%s\n' "$index"
@@ -149,7 +149,7 @@ ask_text() {
   else
     printf '%s: ' "$prompt" >&2
   fi
-  read -r value
+  read -re value
   printf '%s\n' "${value:-$default}"
 }
 
