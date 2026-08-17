@@ -1,9 +1,11 @@
 import "@testing-library/jest-dom/vitest";
 import { configure } from "@testing-library/react";
 
-// Slow shared CI runners can take more than the 1s default for async UI state
-// (conflict dialogs, project option lists) to settle after hydration.
-configure({ asyncUtilTimeout: 5000 });
+// Slow shared CI runners can take far more than the 1s default for async UI
+// state (conflict dialogs, project option lists) to settle after hydration;
+// 5s still proved flaky under push+PR double runs. Keep well below the
+// Vitest per-test timeout so the RTL error wins over a hard kill.
+configure({ asyncUtilTimeout: 15000 });
 
 // Node 25 exposes an incomplete experimental localStorage object when it is
 // started without --localstorage-file. Install the browser Storage contract
