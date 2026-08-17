@@ -25,6 +25,19 @@ def test_default_settings_has_an_explicit_empty_comfy_url() -> None:
         default_settings("ftp://comfy.test:8188")
 
 
+def test_comfy_url_is_persisted_verbatim(tmp_path: Path) -> None:
+    app = create_app(database_path=tmp_path / "director.sqlite3")
+    app.state.database.initialize()
+
+    for url in (
+        "http://127.0.0.1:28188",
+        "http://127.0.0.1:28188/",
+        "https://comfy.example.com:8443/base/",
+    ):
+        app.state.database.put_settings(default_settings(url))
+        assert app.state.database.get_settings().comfy_url == url
+
+
 def test_fresh_database_ignores_env_and_restart_preserves_saved_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -305,7 +305,9 @@ async def test_authority_rechecks_comfy_origin_after_route_snapshot(
         }
     }
     assert (await client.get(endpoint)).json() == before
-    assert str(database.get_settings().comfy_url) == "http://switched-comfy.test:8188/"
+    # The settings document keeps the user's spelling verbatim; the origin
+    # comparison helpers rstrip("/") where the distinction matters.
+    assert str(database.get_settings().comfy_url) == "http://switched-comfy.test:8188"
 
 
 def test_origin_check_and_cas_update_share_one_write_transaction(
@@ -362,7 +364,7 @@ def test_origin_check_and_cas_update_share_one_write_transaction(
     assert revision == 1
     assert saved.title == "CAS transaction winner"
     assert database.get_timeline_authority() == (timeline, 1)
-    assert str(database.get_settings().comfy_url) == f"{second_origin}/"
+    assert str(database.get_settings().comfy_url) == second_origin
 
 
 async def test_asset_cascade_advances_only_changed_project_revisions(client) -> None:

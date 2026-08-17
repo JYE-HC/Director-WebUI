@@ -53,7 +53,7 @@ async def test_runtime_resource_authority_token_rejects_aba_settings_switch(
         lambda: "2026-08-15T20:00:00+00:00",
     )
     initial = (await client.get("/api/settings/authority")).json()
-    assert initial["settings"]["comfy_url"] == "http://comfy.test:8188/"
+    assert initial["settings"]["comfy_url"] == "http://comfy.test:8188"
     assert len(initial["authority_token"]) == 64
     database = client.director_app.state.database
     original = database.get_settings()

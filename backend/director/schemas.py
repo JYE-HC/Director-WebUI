@@ -138,7 +138,15 @@ class StandardLoraLoaderOverride(StrictModel):
     loader: StandardLoraLoader
     lora_name: Annotated[str, Field(min_length=1, max_length=1024)]
     model_filename: Annotated[str, Field(min_length=1, max_length=1024)]
-    comfy_origin: AnyHttpUrl
+    # Verbatim like RuntimeSettings.comfy_url: AnyHttpUrl would re-add "/" to
+    # bare origins and break the browser's byte-exact settings round-trip.
+    comfy_origin: Annotated[str, Field(min_length=1, max_length=2048)]
+
+    @field_validator("comfy_origin", mode="after")
+    @classmethod
+    def validate_comfy_origin(cls, value: str) -> str:
+        AnyHttpUrl(value)
+        return value
 
 
 class DiffusionModelBinding(ModelBinding):
@@ -197,7 +205,11 @@ class RuntimeSettings(StrictModel):
     # require a configured URL before constructing a ComfyUI client; keeping
     # the empty state in this persisted model lets the settings page be the
     # sole source of that configuration.
-    comfy_url: AnyHttpUrl | Literal[""] = ""
+    # The string is validated but persisted verbatim: AnyHttpUrl re-adds "/"
+    # to bare origins, and the browser compares the authoritative GET
+    # byte-for-byte with the payload it just PUT — any server-side rewrite
+    # becomes an infinite "settings differ" retry loop.
+    comfy_url: str = ""
     client_id: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")]
     # Pure Standard segment prompts repeat stable loader ids/inputs so ComfyUI
     # may retain its endpoint-local cache between prompts. RayLight uses an
@@ -216,10 +228,11 @@ class RuntimeSettings(StrictModel):
 
     @field_validator("comfy_url", mode="after")
     @classmethod
-    def normalize_comfy_url(cls, value: AnyHttpUrl | Literal[""]) -> AnyHttpUrl | Literal[""]:
+    def normalize_comfy_url(cls, value: str) -> str:
         if value == "":
             return ""
-        return AnyHttpUrl(str(value).rstrip("/"))
+        AnyHttpUrl(value)
+        return value
 
     @model_validator(mode="after")
     def validate_standard_lora_override_origins(self) -> "RuntimeSettings":
