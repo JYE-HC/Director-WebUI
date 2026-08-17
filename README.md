@@ -170,8 +170,37 @@ RayLight；`ComfyUI-MiniMax-H3-Turbo` 只在选择旧版专用 Turbo LoRA 时使
 `director.sh` 使用用户级临时 systemd unit 管理前后端进程，默认只监听 `127.0.0.1`，日志写入
 `data/director-backend.log` 和 `data/director-frontend.log`，可用 `./bootstrap.sh logs backend`
 或 `./bootstrap.sh logs frontend` 跟踪。`0.0.0.0` 仅用于监听，浏览器访问时应使用服务器实际 IP。
-首次启动后在“系统设置”填写 ComfyUI URL。数据库默认位于 `.data/database/director.sqlite3`，
-升级时不会自动删除或覆盖旧库。
+
+不具备引导脚本条件时也可手动安装。后端：
+
+```bash
+uv sync --all-groups
+uv run director-web
+```
+
+前端：
+
+```bash
+cd frontend
+npm ci        # 生产构建：npm run build；开发调试：npm run dev
+```
+
+Vite 仅监听本机并把 `/api` 代理到后端。首次启动没有写死的 ComfyUI URL；在“系统设置”填写
+有效地址后会自动应用，权威回读完成后应用才读取模型、GPU 与节点能力并开放上传和提交。
+
+数据库默认位于 Director 项目根目录下的 `.data/database/director.sqlite3`，不随启动工作目录
+变化。升级时若新位置尚不存在但仓库旧路径 `data/director.sqlite3` 存在，Director 会继续打开旧库，
+避免一次升级直接出现空工作区。随后可在“系统设置 → 数据存储”中把当前库一致性迁移到默认位置，
+或选择另一个已经存在且通过校验的 Director 数据库。迁移/切换成功后当前进程会停止普通写入；重启
+Director 后新路径才生效。路径选择保存在数据库外的 `.data/database/storage.json`；可用
+`DIRECTOR_STORAGE_CONFIG_PATH` 覆盖该配置文件位置，`DIRECTOR_DATABASE_PATH` 启动数据库覆盖
+仍有更高优先级。页面会在操作前确认运行设置和时间线均已同步，并在成功后锁定编辑直到整页刷新；
+每个写请求还携带本页启动时取得的数据库身份，因此只重启后端而保留旧页面也不能把旧库内容写进新库。
+
+SQLite 的 `director.sqlite3-wal` 与 `director.sqlite3-shm` 是活动数据库的事务旁路文件，
+`director.sqlite3.instance.lock` 是单实例锁元数据；它们都不是额外工作区，也不应在运行时单独
+复制或删除。手工备份文件只有在明确恢复时才会使用，Director 不会自动把名字相似的备份当作
+当前数据库。
 
 本版没有登录鉴权，不要直接暴露到公网。跨机器访问前应在反向代理层增加 TLS、身份认证与来源限制。
 
