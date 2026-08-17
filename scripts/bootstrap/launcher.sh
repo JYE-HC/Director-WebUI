@@ -157,6 +157,10 @@ start_director_if_requested() {
 }
 
 step_start_services_optional() {
+  # The supervisor reads DIRECTOR_* only from its process environment, so the
+  # install-time start must load the launcher env written by
+  # step_configure_launcher, exactly like the CLI service commands do.
+  load_env_file
   start_comfyui_if_requested || return 1
   start_director_if_requested || return 1
   return 0
