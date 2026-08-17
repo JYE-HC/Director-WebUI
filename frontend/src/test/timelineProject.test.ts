@@ -8,6 +8,7 @@ import {
   canMergeSelectedSegments,
   changeSegmentMode,
   clearLocalTimeline,
+  clearLocalTimelineWal,
   createTimelineEditorState,
   createTimelineProject,
   createTimelineSegment,
@@ -23,16 +24,24 @@ import {
   insertPromptSubjectToken,
   isTimelineOutputResolution,
   LEGACY_TIMELINE_STORAGE_KEY,
+  LEGACY_V5_TIMELINE_WAL_STORAGE_KEY,
+  LEGACY_V6_TIMELINE_WAL_STORAGE_KEY,
+  listLocalTimelineWalBranches,
   loadLocalTimeline,
+  loadLocalTimelineWal,
+  localTimelineWalStorageKey,
   normalizeTimelineProject,
   orderAssetsByPreference,
   promptSubjectReferences,
-  QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY,
+  QUARANTINED_LEGACY_V5_TIMELINE_WAL_STORAGE_KEY,
   QUARANTINED_TIMELINE_STORAGE_KEY,
   QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY,
   removeAssetFromSegment,
   reorderSegmentReference,
+  resolveLocalTimelineWal,
+  discardLocalTimelineWalBranch,
   saveLocalTimeline,
+  saveLocalTimelineWal,
   segmentReferenceTag,
   setSourceAudioAsReference,
   sourcePreviewTime,
@@ -46,7 +55,10 @@ import {
   timelineSegmentAt,
   timelineEditorReducer,
   timelineOutputResolutions,
-  TIMELINE_WAL_STORAGE_KEY,
+  timelineProjectDocumentHash,
+  TIMELINE_WAL_FORMAT,
+  TIMELINE_WAL_VERSION,
+  type TimelineProject,
   UNBOUND_TIMELINE_WAL_STORAGE_KEY,
   updateRef2VASourceRange,
   runnableTimelineSegmentIds,
@@ -91,6 +103,33 @@ const ACTIVE_DATABASE = {
   active_database_path: "/srv/director/data/director.sqlite3",
   active_database_identity: "a".repeat(64),
 };
+
+function writeTimelineWal(
+  baseProject: TimelineProject,
+  pendingProject: TimelineProject,
+  baseServerRevision = 7,
+  projectId = "default",
+  database = ACTIVE_DATABASE,
+  ownerId?: string,
+) {
+  return saveLocalTimelineWal({
+    database,
+    project_id: projectId,
+    base_server_revision: baseServerRevision,
+    base_project: baseProject,
+    pending_project: pendingProject,
+    owner_id: ownerId,
+  });
+}
+
+function readTimelineWalRaw(
+  projectId = "default",
+  database = ACTIVE_DATABASE,
+  ownerId?: string,
+): string | null {
+  const key = localTimelineWalStorageKey(database, projectId, ownerId);
+  return key ? localStorage.getItem(key) : null;
+}
 
 describe("统一 timeline domain", () => {
   it("新建片段默认空提示词，按模式生成对应骨架", () => {
@@ -241,6 +280,76 @@ describe("统一 timeline domain", () => {
     );
   });
 
+  it("批量插入视频一次保持输入顺序，并原子维护稳定锚点、选择与焦点", () => {
+    const state = createTimelineEditorState();
+    const first = state.project.segments[0];
+    const tail = createTimelineSegment("fl2va", 2);
+    state.project.segments = [first, tail];
+    state.selected_segment_ids = [tail.id];
+    state.active_segment_id = tail.id;
+    state.selection_anchor_id = tail.id;
+    const videos = [
+      { ...video, id: "batch-video-1", name: "第一段.mp4" },
+      { ...video, id: "batch-video-2", name: "第二段.mp4" },
+      { ...video, id: "batch-video-3", name: "第三段.mp4" },
+    ];
+
+    const next = timelineEditorReducer(state, {
+      type: "segment/insert-videos",
+      assets: videos,
+      anchorId: first.id,
+      position: "after",
+    });
+    const inserted = next.project.segments.slice(1, 4);
+
+    expect(next.project.segments.map((segment) =>
+      segment.mode === "ref2va" ? segment.source_video?.id : segment.id,
+    )).toEqual([first.id, ...videos.map((asset) => asset.id), tail.id]);
+    expect(inserted.map((segment) => segment.title)).toEqual(["第一段", "第二段", "第三段"]);
+    expect(next.selected_segment_ids).toEqual([
+      ...inserted.map((segment) => segment.id),
+      tail.id,
+    ]);
+    expect(next.active_segment_id).toBe(inserted[0].id);
+    expect(next.selection_anchor_id).toBe(inserted[0].id);
+    expect(state.project.segments).toEqual([first, tail]);
+  });
+
+  it("批量插入只消费视频并在 reducer 内守住 128 段上限", () => {
+    const state = createTimelineEditorState();
+    state.project.segments = Array.from({ length: 127 }, (_, index) => ({
+      ...createTimelineSegment("fl2va", index + 1),
+      id: `existing-segment-${index}`,
+    }));
+    const anchor = state.project.segments.at(-1)!;
+    state.selected_segment_ids = [anchor.id];
+    state.active_segment_id = anchor.id;
+    state.selection_anchor_id = anchor.id;
+    const firstVideo = { ...video, id: "capacity-video-1", name: "可插入.mp4" };
+    const overflowVideo = { ...video, id: "capacity-video-2", name: "超额.mp4" };
+
+    const next = timelineEditorReducer(state, {
+      type: "segment/insert-videos",
+      assets: [image, firstVideo, overflowVideo],
+      anchorId: anchor.id,
+      position: "after",
+    });
+
+    expect(next.project.segments).toHaveLength(128);
+    expect(next.project.segments.at(-1)).toMatchObject({
+      mode: "ref2va",
+      source_video: { id: firstVideo.id },
+    });
+    expect(next.project.segments.some((segment) =>
+      segment.mode === "ref2va" && segment.source_video?.id === overflowVideo.id,
+    )).toBe(false);
+    expect(timelineEditorReducer(next, {
+      type: "segment/insert-videos",
+      assets: [overflowVideo],
+      anchorId: next.project.segments.at(-1)!.id,
+    })).toBe(next);
+  });
+
   it("源范围编辑与更短替换视频保持既有源到输出时长比例", () => {
     const source = {
       ...createTimelineSegment("ref2va", 1),
@@ -287,6 +396,43 @@ describe("统一 timeline domain", () => {
     ]) {
       expect(updateRef2VASourceRange(source, invalidRange)).toBe(source);
     }
+  });
+
+  it("粒度化命令总是基于 gateway 当前状态合并，不会用旧快照覆盖同批 sibling 字段", () => {
+    const initial = createTimelineEditorState();
+    const segmentId = initial.project.segments[0].id;
+
+    const withPrompt = timelineEditorReducer(initial, {
+      type: "segment/patch-base",
+      id: segmentId,
+      patch: { prompt: "先完成的提示词" },
+    });
+    const withContinuity = timelineEditorReducer(withPrompt, {
+      type: "segment/set-continuity",
+      id: segmentId,
+      patch: { enabled: true },
+    });
+    const withSamplingSteps = timelineEditorReducer(withContinuity, {
+      type: "project/update-sampling",
+      family: "fl2va",
+      patch: { steps: 31 },
+    });
+    const completed = timelineEditorReducer(withSamplingSteps, {
+      type: "project/update-sampling",
+      family: "fl2va",
+      patch: { shift: 8 },
+    });
+
+    expect(completed.project.segments[0]).toMatchObject({
+      prompt: "先完成的提示词",
+      continuity: { enabled: true },
+    });
+    expect(completed.project.sampling.fl2va).toMatchObject({
+      steps: 31,
+      shift: 8,
+    });
+    expect(initial.project.segments[0].prompt).toBe("");
+    expect(initial.project.sampling.fl2va).toMatchObject({ steps: 25, shift: 12 });
   });
 
   it("保留源音频时重复输入同一源时长不会继承上次自动适配比例", () => {
@@ -939,6 +1085,71 @@ describe("统一 timeline domain", () => {
     expect(state.selected_segment_ids).toEqual([]);
     expect(state.active_segment_id).toBeNull();
     expect(state.selection_anchor_id).toBeNull();
+  });
+
+  it("历史回放原子恢复项目与选择上下文，并保留素材、网格和合法播放头", () => {
+    const first = createTimelineSegment("fl2va", 1);
+    const second = createTimelineSegment("ref2va", 2);
+    const third = createTimelineSegment("fl2va", 3);
+    const restoredProject = {
+      ...createTimelineProject(),
+      title: "撤销后的项目",
+      segments: [first, second, third],
+    };
+    const assets = [image, audio, video];
+    const state = {
+      ...createTimelineEditorState(),
+      assets,
+      selected_asset_ids: [image.id],
+      asset_grid_size: "large" as const,
+      playhead_seconds: 2,
+    };
+
+    const restored = timelineEditorReducer(state, {
+      type: "history/restore",
+      project: restoredProject,
+      selected_segment_ids: [first.id, third.id],
+      active_segment_id: third.id,
+      selection_anchor_id: first.id,
+    });
+
+    expect(restored.project).toBe(restoredProject);
+    expect(restored.selected_segment_ids).toEqual([first.id, third.id]);
+    expect(restored.active_segment_id).toBe(third.id);
+    expect(restored.selection_anchor_id).toBe(first.id);
+    expect(restored.assets).toBe(assets);
+    expect(restored.selected_asset_ids).toEqual([image.id]);
+    expect(restored.asset_grid_size).toBe("large");
+    expect(restored.playhead_seconds).toBe(2);
+  });
+
+  it("历史回放过滤已失效稳定 ID，并把失效焦点和锚点收敛到首个有效选择", () => {
+    const first = createTimelineSegment("fl2va", 1);
+    const second = createTimelineSegment("ref2va", 2);
+    const project = { ...createTimelineProject(), segments: [first, second] };
+
+    const restored = timelineEditorReducer(createTimelineEditorState(), {
+      type: "history/restore",
+      project,
+      selected_segment_ids: ["deleted-segment", second.id],
+      active_segment_id: "deleted-active",
+      selection_anchor_id: "deleted-anchor",
+    });
+
+    expect(restored.selected_segment_ids).toEqual([second.id]);
+    expect(restored.active_segment_id).toBe(second.id);
+    expect(restored.selection_anchor_id).toBe(second.id);
+
+    const empty = timelineEditorReducer(restored, {
+      type: "history/restore",
+      project,
+      selected_segment_ids: ["deleted-segment"],
+      active_segment_id: second.id,
+      selection_anchor_id: second.id,
+    });
+    expect(empty.selected_segment_ids).toEqual([]);
+    expect(empty.active_segment_id).toBeNull();
+    expect(empty.selection_anchor_id).toBeNull();
   });
 
   it("用单一选择派生启用运行集合，禁用和重新启用不丢失选择", () => {
@@ -1973,181 +2184,305 @@ describe("统一 timeline domain", () => {
     expect(singleOverflow).toBe(result.segment);
   });
 
-  it("旧 v2 长期镜像隔离后不作为 pending WAL 回放，且 clear 不删除人工恢复副本", () => {
+  it("旧 v2/v3 浏览器数据逐字节隔离，clear 不删除人工恢复副本", () => {
     localStorage.clear();
     const legacy = createTimelineProject();
     legacy.title = "待人工判断的旧镜像";
-    const raw = JSON.stringify(legacy);
-    localStorage.setItem(LEGACY_TIMELINE_STORAGE_KEY, raw);
-
-    expect(loadLocalTimeline(ACTIVE_DATABASE)).toBeNull();
-    expect(localStorage.getItem(LEGACY_TIMELINE_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(QUARANTINED_TIMELINE_STORAGE_KEY)).toBe(raw);
-
-    const pending = createTimelineProject();
-    pending.title = "明确待同步的新 WAL";
-    saveLocalTimeline(pending, ACTIVE_DATABASE);
-    expect(loadLocalTimeline(ACTIVE_DATABASE)).toMatchObject({ title: "明确待同步的新 WAL" });
-    clearLocalTimeline();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(QUARANTINED_TIMELINE_STORAGE_KEY)).toBe(raw);
-  });
-
-  it("无数据库身份的 v3 WAL 原样隔离且永不回放", () => {
-    localStorage.clear();
-    const project = createTimelineProject();
-    const raw = JSON.stringify({
+    const legacyRaw = JSON.stringify(legacy);
+    const unboundRaw = JSON.stringify({
       format: "director-pending-timeline",
       version: 1,
       pending: true,
       written_at_ms: Date.now(),
-      project,
+      project: legacy,
     });
-    localStorage.setItem(UNBOUND_TIMELINE_WAL_STORAGE_KEY, raw);
+    localStorage.setItem(LEGACY_TIMELINE_STORAGE_KEY, legacyRaw);
+    localStorage.setItem(UNBOUND_TIMELINE_WAL_STORAGE_KEY, unboundRaw);
 
-    expect(loadLocalTimeline(ACTIVE_DATABASE)).toBeNull();
+    expect(loadLocalTimelineWal(ACTIVE_DATABASE)).toBeNull();
+    expect(localStorage.getItem(LEGACY_TIMELINE_STORAGE_KEY)).toBeNull();
     expect(localStorage.getItem(UNBOUND_TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY)).toBe(raw);
-    clearLocalTimeline();
-    expect(localStorage.getItem(QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY)).toBe(raw);
+    expect(localStorage.getItem(QUARANTINED_TIMELINE_STORAGE_KEY)).toBe(legacyRaw);
+    expect(localStorage.getItem(QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY)).toBe(unboundRaw);
+
+    clearLocalTimelineWal();
+    expect(localStorage.getItem(QUARANTINED_TIMELINE_STORAGE_KEY)).toBe(legacyRaw);
+    expect(localStorage.getItem(QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY)).toBe(unboundRaw);
   });
 
-  it("新 WAL 只恢复数据库路径与身份都精确匹配的 pending envelope", () => {
+  it("旧 v5 WAL 原样隔离，绝不自动迁移到 revision-aware key", () => {
     localStorage.clear();
     const project = createTimelineProject();
-    project.title = "数据库 A 的待同步时间线";
-    saveLocalTimeline(project, ACTIVE_DATABASE);
-    const raw = localStorage.getItem(TIMELINE_WAL_STORAGE_KEY);
+    project.title = "v5 待人工判断";
+    const raw = JSON.stringify({
+      format: "director-pending-timeline",
+      version: 4,
+      owner_id: "old-tab",
+      pending: true,
+      project_id: "default",
+      active_database_path: ACTIVE_DATABASE.active_database_path,
+      active_database_identity: ACTIVE_DATABASE.active_database_identity,
+      written_at_ms: Date.now(),
+      project,
+    });
+    localStorage.setItem(LEGACY_V5_TIMELINE_WAL_STORAGE_KEY, raw);
+
+    expect(loadLocalTimelineWal(ACTIVE_DATABASE)).toBeNull();
+    expect(localStorage.getItem(LEGACY_V5_TIMELINE_WAL_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(QUARANTINED_LEGACY_V5_TIMELINE_WAL_STORAGE_KEY)).toBe(raw);
+    expect(readTimelineWalRaw()).toBeNull();
+  });
+
+  it("同步保存完整 base/head 权威并使用稳定 canonical document hash", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "尚未确认的新标题" };
+    const wal = writeTimelineWal(base, pending);
+    const raw = readTimelineWalRaw();
+
+    expect(wal).not.toBeNull();
     expect(raw).not.toBeNull();
     expect(JSON.parse(raw!)).toMatchObject({
-      version: 4,
+      format: TIMELINE_WAL_FORMAT,
+      version: TIMELINE_WAL_VERSION,
       owner_id: expect.any(String),
       pending: true,
       project_id: "default",
       active_database_path: ACTIVE_DATABASE.active_database_path,
       active_database_identity: ACTIVE_DATABASE.active_database_identity,
+      base_server_revision: 7,
+      base_document_hash: timelineProjectDocumentHash(base),
+      head_document_hash: timelineProjectDocumentHash(pending),
+      base_project: base,
+      pending_project: pending,
     });
-    expect(loadLocalTimeline(ACTIVE_DATABASE)).toMatchObject({ title: project.title });
+    const reordered: TimelineProject = {
+      segments: structuredClone(base.segments),
+      export_mode: base.export_mode,
+      sampling: structuredClone(base.sampling),
+      render: structuredClone(base.render),
+      title: base.title,
+      version: 4,
+    };
+    expect(timelineProjectDocumentHash(reordered)).toBe(timelineProjectDocumentHash(base));
+    expect(loadLocalTimelineWal(ACTIVE_DATABASE)).toEqual(wal);
+  });
 
-    const otherDatabase = {
+  it("authority revision 与 exact base 同时匹配时才允许 replay", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "可安全重放" };
+    const wal = writeTimelineWal(base, pending)!;
+    const raw = readTimelineWalRaw();
+
+    expect(resolveLocalTimelineWal(wal, { revision: 7, document: structuredClone(base) })).toEqual({
+      status: "replay",
+      project: pending,
+      expected_server_revision: 7,
+    });
+    // Resolution is pure: caller decides when to replay or clear evidence.
+    expect(readTimelineWalRaw()).toBe(raw);
+  });
+
+  it("revision 或 exact base 不匹配时返回冲突并原地保留取证 WAL", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "本地待同步" };
+    const wal = writeTimelineWal(base, pending)!;
+    const raw = readTimelineWalRaw();
+
+    const revisionConflict = resolveLocalTimelineWal(wal, {
+      revision: 8,
+      document: structuredClone(base),
+    });
+    expect(revisionConflict).toMatchObject({
+      status: "conflict",
+      reason: "revision-mismatch",
+      local_project: pending,
+      server_revision: 8,
+      base_server_revision: 7,
+    });
+
+    const differentBase = { ...structuredClone(base), title: "同 revision 的不同服务端文档" };
+    expect(resolveLocalTimelineWal(wal, { revision: 7, document: differentBase })).toMatchObject({
+      status: "conflict",
+      reason: "base-document-mismatch",
+      local_project: pending,
+      server_project: differentBase,
+    });
+    expect(readTimelineWalRaw()).toBe(raw);
+  });
+
+  it("server exact 等于 pending head 且 revision 已推进时识别 lost ACK", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "服务端其实已经提交" };
+    writeTimelineWal(base, pending);
+    const wal = loadLocalTimelineWal(ACTIVE_DATABASE)!;
+
+    expect(resolveLocalTimelineWal(wal, {
+      revision: 8,
+      document: structuredClone(pending),
+    })).toEqual({
+      status: "acknowledged",
+      project: pending,
+      server_revision: 8,
+    });
+    expect(readTimelineWalRaw()).not.toBeNull();
+    clearLocalTimelineWal(wal);
+    expect(readTimelineWalRaw()).toBeNull();
+  });
+
+  it("lost ACK 只匹配被核对的具体 branch head", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pendingA = { ...structuredClone(base), title: "A 已提交但响应丢失" };
+    const pendingB = { ...structuredClone(base), title: "B 仍待处理" };
+    const walA = writeTimelineWal(
+      base,
+      pendingA,
+      7,
+      "default",
+      ACTIVE_DATABASE,
+      "tab-lost-ack-a",
+    )!;
+    const walB = writeTimelineWal(
+      base,
+      pendingB,
+      7,
+      "default",
+      ACTIVE_DATABASE,
+      "tab-lost-ack-b",
+    )!;
+
+    expect(resolveLocalTimelineWal(walA, { revision: 8, document: pendingA }).status)
+      .toBe("acknowledged");
+    expect(resolveLocalTimelineWal(walB, { revision: 8, document: pendingA })).toMatchObject({
+      status: "conflict",
+      local_project: pendingB,
+    });
+    expect(listLocalTimelineWalBranches(ACTIVE_DATABASE, "default", "tab-current").foreign)
+      .toHaveLength(2);
+  });
+
+  it("项目和数据库 scope 使用不透明物理 key，读取其他 scope 不移动任何 bytes", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "仅属于项目 A" };
+    writeTimelineWal(base, pending, 3, "project-a", ACTIVE_DATABASE, "tab-owner-a");
+    const key = localTimelineWalStorageKey(ACTIVE_DATABASE, "project-a", "tab-owner-a")!;
+    const raw = localStorage.getItem(key);
+
+    expect(key).not.toContain(ACTIVE_DATABASE.active_database_path);
+    expect(key).not.toContain("project-a");
+    expect(loadLocalTimelineWal(ACTIVE_DATABASE, "project-b", "tab-owner-a")).toBeNull();
+    expect(loadLocalTimelineWal({
       active_database_path: "/srv/director/data/other.sqlite3",
       active_database_identity: "b".repeat(64),
-    };
-    expect(loadLocalTimeline(otherDatabase)).toBeNull();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY)).toBe(raw);
+    }, "project-a", "tab-owner-a")).toBeNull();
+    expect(localStorage.getItem(key)).toBe(raw);
   });
 
-  it("损坏的新 WAL 只隔离，不参与恢复", () => {
+  it("损坏 hash 或 widened 项目失败封闭且原 bytes 保留为可见证据", () => {
     localStorage.clear();
-    const project = createTimelineProject();
-    localStorage.setItem(TIMELINE_WAL_STORAGE_KEY, JSON.stringify({
-      format: "director-pending-timeline",
-      version: 2,
-      pending: false,
-      active_database_path: ACTIVE_DATABASE.active_database_path,
-      active_database_identity: ACTIVE_DATABASE.active_database_identity,
-      written_at_ms: Date.now(),
-      project,
-    }));
-    const raw = localStorage.getItem(TIMELINE_WAL_STORAGE_KEY);
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "待同步" };
+    writeTimelineWal(base, pending, 7, "default", ACTIVE_DATABASE, "tab-corrupt");
+    const key = localTimelineWalStorageKey(ACTIVE_DATABASE, "default", "tab-corrupt")!;
+    const corrupt = JSON.parse(localStorage.getItem(key)!) as Record<string, unknown>;
+    corrupt.head_document_hash = "fnv1a64:0000000000000000";
+    const corruptRaw = JSON.stringify(corrupt);
+    localStorage.setItem(key, corruptRaw);
+
+    expect(loadLocalTimelineWal(ACTIVE_DATABASE, "default", "tab-corrupt")).toBeNull();
+    expect(localStorage.getItem(key)).toBe(corruptRaw);
+    expect(listLocalTimelineWalBranches(ACTIVE_DATABASE, "default", "tab-current").corrupt)
+      .toEqual([expect.objectContaining({ storage_key: key, storage_token: corruptRaw })]);
+
+    localStorage.clear();
+    writeTimelineWal(base, pending, 7, "default", ACTIVE_DATABASE, "tab-widened");
+    const widenedKey = localTimelineWalStorageKey(ACTIVE_DATABASE, "default", "tab-widened")!;
+    const widened = JSON.parse(localStorage.getItem(widenedKey)!) as Record<string, unknown>;
+    const widenedBase = {
+      ...(widened.base_project as TimelineProject),
+      unexpected_second_authority: true,
+    } as TimelineProject;
+    widened.base_project = widenedBase;
+    widened.base_document_hash = timelineProjectDocumentHash(widenedBase);
+    const widenedRaw = JSON.stringify(widened);
+    localStorage.setItem(widenedKey, widenedRaw);
+
+    expect(loadLocalTimelineWal(ACTIVE_DATABASE, "default", "tab-widened")).toBeNull();
+    expect(localStorage.getItem(widenedKey)).toBe(widenedRaw);
+  });
+
+  it("两个 owner 同 scope 使用独立 branch，逐分支精确 clear 且 stale token 不删新写", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pendingA = { ...structuredClone(base), title: "tab A" };
+    const pendingB = { ...structuredClone(base), title: "tab B" };
+    const walA = writeTimelineWal(base, pendingA, 7, "default", ACTIVE_DATABASE, "tab-a")!;
+    writeTimelineWal(base, pendingB, 7, "default", ACTIVE_DATABASE, "tab-b");
+    const keyA = localTimelineWalStorageKey(ACTIVE_DATABASE, "default", "tab-a")!;
+    const keyB = localTimelineWalStorageKey(ACTIVE_DATABASE, "default", "tab-b")!;
+
+    const branches = listLocalTimelineWalBranches(ACTIVE_DATABASE, "default", "tab-a");
+    expect(branches.owned?.wal.pending_project.title).toBe("tab A");
+    expect(branches.foreign.map((branch) => branch.wal.pending_project.title)).toEqual(["tab B"]);
+    expect(localStorage.getItem(keyA)).not.toBeNull();
+    expect(localStorage.getItem(keyB)).not.toBeNull();
+
+    clearLocalTimelineWal(walA);
+    expect(localStorage.getItem(keyA)).toBeNull();
+    expect(localStorage.getItem(keyB)).not.toBeNull();
+
+    const staleEvidence = branches.foreign[0]!;
+    const newerB = { ...structuredClone(base), title: "tab B newer" };
+    writeTimelineWal(base, newerB, 7, "default", ACTIVE_DATABASE, "tab-b");
+    expect(discardLocalTimelineWalBranch(staleEvidence)).toBe(false);
+    expect(loadLocalTimelineWal(ACTIVE_DATABASE, "default", "tab-b")?.pending_project.title)
+      .toBe("tab B newer");
+  });
+
+  it("旧 v6 单例只作为 foreign evidence，绝不自动 load 或迁移", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "旧 v6 待恢复" };
+    writeTimelineWal(base, pending, 7, "default", ACTIVE_DATABASE, "old-tab");
+    const v7Key = localTimelineWalStorageKey(ACTIVE_DATABASE, "default", "old-tab")!;
+    const legacyEnvelope = JSON.parse(localStorage.getItem(v7Key)!) as Record<string, unknown>;
+    legacyEnvelope.version = 1;
+    const legacyRaw = JSON.stringify(legacyEnvelope);
+    localStorage.removeItem(v7Key);
+    localStorage.setItem(LEGACY_V6_TIMELINE_WAL_STORAGE_KEY, legacyRaw);
+
+    expect(loadLocalTimelineWal(ACTIVE_DATABASE, "default", "old-tab")).toBeNull();
+    const branches = listLocalTimelineWalBranches(ACTIVE_DATABASE, "default", "new-tab");
+    expect(branches.legacy).toHaveLength(1);
+    expect(branches.legacy[0]?.wal.pending_project).toEqual(pending);
+    expect(localStorage.getItem(LEGACY_V6_TIMELINE_WAL_STORAGE_KEY)).toBe(legacyRaw);
+
+    clearLocalTimelineWal();
+    expect(localStorage.getItem(LEGACY_V6_TIMELINE_WAL_STORAGE_KEY)).toBe(legacyRaw);
+    expect(discardLocalTimelineWalBranch(branches.legacy[0]!)).toBe(true);
+    expect(localStorage.getItem(LEGACY_V6_TIMELINE_WAL_STORAGE_KEY)).toBeNull();
+  });
+
+  it("旧 API 无 base authority 时失败封闭，提供 exact base 时安全委托新 API", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "兼容入口编辑" };
+
+    saveLocalTimeline(pending, ACTIVE_DATABASE);
+    expect(readTimelineWalRaw()).toBeNull();
     expect(loadLocalTimeline(ACTIVE_DATABASE)).toBeNull();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY)).toBe(raw);
-  });
 
-  it("隔离槽已有另一份 WAL 时仍为新 WAL 创建副本后再删除源键", () => {
-    localStorage.clear();
-    const firstQuarantine = "first-database-wal";
-    localStorage.setItem(QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY, firstQuarantine);
-    const project = createTimelineProject();
-    project.title = "第二个数据库的 WAL";
-    saveLocalTimeline(project, ACTIVE_DATABASE);
-    const raw = localStorage.getItem(TIMELINE_WAL_STORAGE_KEY);
-
-    expect(loadLocalTimeline({
-      active_database_path: "/srv/director/data/third.sqlite3",
-      active_database_identity: "c".repeat(64),
-    })).toBeNull();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY)).toBe(firstQuarantine);
-    expect(localStorage.getItem(`${QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY}:1`)).toBe(raw);
-  });
-
-  it("旧数据库页面保存前先无损隔离另一数据库页面的 pending WAL", () => {
-    localStorage.clear();
-    const databaseB = {
-      active_database_path: "/srv/director/data/database-b.sqlite3",
-      active_database_identity: "b".repeat(64),
-    };
-    const projectB = createTimelineProject();
-    projectB.title = "数据库 B 未同步项目";
-    const rawB = JSON.stringify({
-      format: "director-pending-timeline",
-      version: 3,
-      owner_id: "tab-b",
-      pending: true,
-      active_database_path: databaseB.active_database_path,
-      active_database_identity: databaseB.active_database_identity,
-      written_at_ms: Date.now(),
-      project: projectB,
-    });
-    localStorage.setItem(TIMELINE_WAL_STORAGE_KEY, rawB);
-    const projectA = createTimelineProject();
-    projectA.title = "旧数据库 A 页面修改";
-
-    saveLocalTimeline(projectA, ACTIVE_DATABASE);
-
-    expect(localStorage.getItem(QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY)).toBe(rawB);
-    expect(JSON.parse(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)!)).toMatchObject({
-      active_database_identity: ACTIVE_DATABASE.active_database_identity,
-      project: { title: projectA.title },
-    });
-  });
-
-  it("同数据库另一 tab 的 WAL 会先隔离，旧请求清理也不会删除后来写入的 WAL", () => {
-    localStorage.clear();
-    const otherTabProject = createTimelineProject();
-    otherTabProject.title = "同库另一个标签页";
-    const otherTabRaw = JSON.stringify({
-      format: "director-pending-timeline",
-      version: 3,
-      owner_id: "other-tab",
-      pending: true,
-      active_database_path: ACTIVE_DATABASE.active_database_path,
-      active_database_identity: ACTIVE_DATABASE.active_database_identity,
-      written_at_ms: Date.now(),
-      project: otherTabProject,
-    });
-    localStorage.setItem(TIMELINE_WAL_STORAGE_KEY, otherTabRaw);
-    const currentProject = createTimelineProject();
-    currentProject.title = "当前标签页";
-    saveLocalTimeline(currentProject, ACTIVE_DATABASE);
-    expect(localStorage.getItem(QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY)).toBe(otherTabRaw);
-
-    const laterOtherTabRaw = JSON.stringify({
-      ...JSON.parse(otherTabRaw),
-      written_at_ms: Date.now() + 1,
-      project: { ...otherTabProject, title: "稍后写入的另一标签页" },
-    });
-    localStorage.setItem(TIMELINE_WAL_STORAGE_KEY, laterOtherTabRaw);
+    saveLocalTimeline(pending, ACTIVE_DATABASE, "default", 11, base);
+    expect(loadLocalTimeline(ACTIVE_DATABASE, "default", {
+      revision: 11,
+      document: base,
+    })).toEqual(pending);
     clearLocalTimeline();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBe(laterOtherTabRaw);
-  });
-
-  it("v5 WAL 按项目隔离：只恢复匹配项目的 pending 编辑", () => {
-    localStorage.clear();
-    const project = createTimelineProject();
-    project.title = "项目 A 的待同步编辑";
-    saveLocalTimeline(project, ACTIVE_DATABASE, "project-a");
-    expect(loadLocalTimeline(ACTIVE_DATABASE, "project-a")).toMatchObject({
-      title: "项目 A 的待同步编辑",
-    });
-    // 另一个项目绝不能拿到 A 的 pending 编辑，且会被隔离而不是静默回放。
-    expect(loadLocalTimeline(ACTIVE_DATABASE, "project-b")).toBeNull();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(
-      localStorage.getItem(QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY),
-    ).not.toBeNull();
+    expect(readTimelineWalRaw()).toBeNull();
   });
 });

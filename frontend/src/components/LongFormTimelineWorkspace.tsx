@@ -35,12 +35,10 @@ import {
   promptSubjectReferences,
   promptSkeleton,
   effectiveTimelineSegmentDuration,
-  removeAssetFromSegment,
   segmentAcceptsAsset,
   segmentAssetReferences,
   segmentPromptReferenceTags,
   segmentReferenceTag,
-  setSourceAudioAsReference,
   segmentStartTime,
   sourceTrimFrameCount,
   sourcePreviewTime,
@@ -50,18 +48,17 @@ import {
   timelineContinuityBoundaries,
   timelineContinuityRunIssues,
   timelineSegmentAt,
-  updateRef2VASourceRange,
   runnableTimelineSegmentIds,
   DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS,
   TIMELINE_MODE_META,
   TIMELINE_MODE_ORDER,
   type SegmentAssetTarget,
   type AssetBindingResult,
-  type TimelineAction,
   type TimelineEditorState,
   type TimelineGenerationMode,
   type TimelineSegment,
   type TimelineSegmentCopyOptions,
+  type TimelineUserAction,
 } from "../domain/timelineProject";
 import { alignH3Frames } from "../domain/timing";
 import { minimaxH3ReferenceCapacities } from "../domain/h3Capabilities";
@@ -90,7 +87,7 @@ interface LongFormTimelineWorkspaceProps {
   }>;
   compileReport: TimelineCompileReport | null;
   selectionValidationErrors: string[];
-  onDispatch: (action: TimelineAction) => void;
+  onDispatch: (action: TimelineUserAction) => void;
   onCloseCompile: () => void;
   onCancelTask: (taskId: string) => void;
   onUploadFiles?: (
@@ -806,7 +803,7 @@ function SegmentInspector({
   segment: TimelineSegment;
   capabilities: CapabilityReport;
   runtimeEnabled: boolean;
-  onDispatch: (action: TimelineAction) => void;
+  onDispatch: (action: TimelineUserAction) => void;
   onBindAssets: (segmentId: string, assetIds: string[], target?: SegmentAssetTarget) => void;
   onDropFiles: (segmentId: string, files: File[], target?: SegmentAssetTarget) => void;
   dropNotice: AssetDropNotice | null;
@@ -859,8 +856,11 @@ function SegmentInspector({
     const timer = window.setTimeout(() => setCopyFeedback(null), 3_000);
     return () => window.clearTimeout(timer);
   }, [copyFeedback]);
-  const replace = (next: TimelineSegment) => onDispatch({ type: "segment/replace", segment: next });
-  const updateBase = (patch: Partial<Pick<TimelineSegment, "title" | "prompt" | "duration_seconds" | "enabled" | "audio_mode" | "ref_image_size">>) => replace({ ...segment, ...patch } as TimelineSegment);
+  const updateBase = (patch: Partial<Pick<TimelineSegment, "title" | "prompt" | "duration_seconds" | "enabled" | "audio_mode" | "ref_image_size">>) => onDispatch({
+    type: "segment/patch-base",
+    id: segment.id,
+    patch,
+  });
   const insertToken = (token: string) => {
     setPromptPicker(null);
     const textarea = promptRef.current;
@@ -877,7 +877,11 @@ function SegmentInspector({
       textarea?.setSelectionRange(cursor, cursor);
     });
   };
-  const remove = (assetId: string) => replace(removeAssetFromSegment(segment, assetId));
+  const remove = (assetId: string) => onDispatch({
+    type: "segment/remove-asset",
+    id: segment.id,
+    assetId,
+  });
   const reorderReferenceImage = (draggedAssetId: string, targetAssetId: string) => onDispatch({
     type: "segment/reorder-reference",
     id: segment.id,
@@ -1086,11 +1090,11 @@ function SegmentInspector({
     >
       <header className="segment-inspector__controlbar">
         <h2 className="segment-inspector__title">片段编辑</h2>
-        <Field label="片段名称" className="field--inline segment-inspector__name"><input maxLength={256} value={segment.title} onChange={(event) => updateBase({ title: event.target.value })} /></Field>
+        <Field label="片段名称" className="field--inline segment-inspector__name"><input data-timeline-history-field={`segment:${segment.id}:title`} maxLength={256} value={segment.title} onChange={(event) => updateBase({ title: event.target.value })} /></Field>
         <span className="segment-inspector__divider" aria-hidden="true" />
         <div className="segment-inspector__continuity" role="group" aria-label="当前片段连续性" aria-describedby={continuityHelpId} title={continuityHelp}>
-          <label className="toggle"><input aria-label="启用当前片段连续性" type="checkbox" disabled={!segment.continuity.enabled && !continuityCanEnable} checked={segment.continuity.enabled} onChange={(event) => replace({ ...segment, continuity: { ...segment.continuity, enabled: event.target.checked } } as TimelineSegment)} /><span />连续性</label>
-          <label className="segment-inspector__continuity-frames"><span>接续帧</span><select aria-label="当前片段接续尾帧数" aria-invalid={Boolean(continuityParameterIssue) || undefined} disabled={!segment.continuity.enabled} value={segment.continuity.overlap_frames} onChange={(event) => replace({ ...segment, continuity: { ...segment.continuity, overlap_frames: Number(event.target.value) as TimelineSegment["continuity"]["overlap_frames"] } } as TimelineSegment)}>{[5, 22, 39, 56].map((frames) => <option key={frames} value={frames}>{frames}</option>)}</select></label>
+          <label className="toggle"><input aria-label="启用当前片段连续性" type="checkbox" disabled={!segment.continuity.enabled && !continuityCanEnable} checked={segment.continuity.enabled} onChange={(event) => onDispatch({ type: "segment/set-continuity", id: segment.id, patch: { enabled: event.target.checked } })} /><span />连续性</label>
+          <label className="segment-inspector__continuity-frames"><span>接续帧</span><select aria-label="当前片段接续尾帧数" aria-invalid={Boolean(continuityParameterIssue) || undefined} disabled={!segment.continuity.enabled} value={segment.continuity.overlap_frames} onChange={(event) => onDispatch({ type: "segment/set-continuity", id: segment.id, patch: { overlap_frames: Number(event.target.value) as TimelineSegment["continuity"]["overlap_frames"] } })}>{[5, 22, 39, 56].map((frames) => <option key={frames} value={frames}>{frames}</option>)}</select></label>
           <span id={continuityHelpId} className="sr-only">{continuityHelp}</span>
         </div>
         <Field label="生成模式" className="field--inline segment-inspector__mode"><select aria-label="片段生成模式" value={segment.mode} onChange={(event) => onDispatch({ type: "segment/set-mode", ids: [segment.id], mode: event.target.value as TimelineGenerationMode })}>{TIMELINE_MODE_ORDER.map((mode) => <option key={mode} value={mode}>{segmentModeLabel(mode)}</option>)}</select></Field>
@@ -1160,18 +1164,19 @@ function SegmentInspector({
           >
             {segment.source_video && (
               <div className="segment-source-range">
-                <Field label="源视频入点（秒）" className="segment-source-range__field"><DeferredNumberInput min="0" max={segment.source_video.metadata?.duration ?? 86_400} step="0.01" value={segment.source_start_seconds} onValueCommit={(value) => replace(updateRef2VASourceRange(segment, { source_start_seconds: value, source_duration_seconds: segment.source_duration_seconds }))} /></Field>
-                <Field label="源截取时长（秒）" className="segment-source-range__field"><DeferredNumberInput min="0.01" max={segment.source_video.metadata ? Math.max(0.01, segment.source_video.metadata.duration - segment.source_start_seconds) : 86_400} step="0.01" value={segment.source_duration_seconds} onValueCommit={(value) => replace(updateRef2VASourceRange(segment, { source_start_seconds: segment.source_start_seconds, source_duration_seconds: value }))} /></Field>
+                <Field label="源视频入点（秒）" className="segment-source-range__field"><DeferredNumberInput min="0" max={segment.source_video.metadata?.duration ?? 86_400} step="0.01" value={segment.source_start_seconds} onValueCommit={(value) => onDispatch({ type: "segment/set-source-range", id: segment.id, patch: { source_start_seconds: value } })} /></Field>
+                <Field label="源截取时长（秒）" className="segment-source-range__field"><DeferredNumberInput min="0.01" max={segment.source_video.metadata ? Math.max(0.01, segment.source_video.metadata.duration - segment.source_start_seconds) : 86_400} step="0.01" value={segment.source_duration_seconds} onValueCommit={(value) => onDispatch({ type: "segment/set-source-range", id: segment.id, patch: { source_duration_seconds: value } })} /></Field>
                 <label className="source-audio-reference-toggle">
                   <input
                     aria-label="参考源视频音轨"
                     type="checkbox"
                     checked={segment.source_audio_as_reference}
                     disabled={segment.source_video.metadata?.has_audio !== true && !segment.source_audio_as_reference}
-                    onChange={(event) => replace(setSourceAudioAsReference(
-                      segment,
-                      event.target.checked,
-                    ))}
+                    onChange={(event) => onDispatch({
+                      type: "segment/set-source-audio-reference",
+                      id: segment.id,
+                      enabled: event.target.checked,
+                    })}
                   />
                   <strong>参考源视频音轨</strong>
                 </label>
@@ -1202,6 +1207,7 @@ function SegmentInspector({
           </header>
         <textarea
           ref={promptRef}
+          data-timeline-history-field={`segment:${segment.id}:prompt`}
           aria-label="片段提示词"
           aria-autocomplete="list"
           aria-expanded={promptPicker !== null}
@@ -1705,15 +1711,12 @@ export function LongFormTimelineWorkspace({
       const videos = result.assets.filter((asset) => asset.kind === "video");
       const inserted = videos.slice(0, capacity);
       const anchorId = latestStateRef.current.project.segments.at(-1)?.id ?? null;
-      // Repeated insertion at one stable tail anchor is intentionally reversed:
-      // every reducer transition inserts immediately after that anchor, leaving
-      // the final timeline in the user's original file order.
-      [...inserted].reverse().forEach((asset) => onDispatch({
-        type: "segment/insert-video",
-        asset,
+      if (inserted.length) onDispatch({
+        type: "segment/insert-videos",
+        assets: inserted,
         anchorId,
         position: "after",
-      }));
+      });
       const parts = inserted.length ? [`已按顺序追加 ${inserted.length} 个视频片段`] : [];
       if (videos.length > inserted.length) parts.push(`${videos.length - inserted.length} 个视频仅入库（已达 128 段上限）`);
       const nonVideos = result.assets.length - videos.length;

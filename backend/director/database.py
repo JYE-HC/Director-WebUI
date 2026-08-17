@@ -21,6 +21,7 @@ from .native_templates import (
 from .schemas import (
     AssetReference,
     GenerationMode,
+    MAX_TIMELINE_REVISION,
     MODE_ORDER,
     ModeDraft,
     RuntimeSettings,
@@ -37,6 +38,89 @@ from .schemas import (
     validate_mode_draft,
     validate_timeline_draft,
 )
+
+
+class TimelineRevisionConflict(RuntimeError):
+    """A conditional timeline write was based on an obsolete server revision."""
+
+    def __init__(
+        self,
+        project_id: str,
+        expected_revision: int,
+        actual_revision: int,
+    ) -> None:
+        super().__init__(
+            f"timeline revision conflict for {project_id}: "
+            f"expected {expected_revision}, actual {actual_revision}"
+        )
+        self.project_id = project_id
+        self.expected_revision = expected_revision
+        self.actual_revision = actual_revision
+
+
+class TimelineRevisionExhausted(OverflowError):
+    """A timeline can no longer advance its JSON-safe durable revision."""
+
+    def __init__(self, project_id: str, revision: int) -> None:
+        super().__init__(
+            f"timeline revision space is exhausted for {project_id} at {revision}"
+        )
+        self.project_id = project_id
+        self.revision = revision
+
+
+class TimelineComfyOriginConflict(RuntimeError):
+    """A timeline write captured a ComfyUI endpoint that is no longer active."""
+
+    def __init__(
+        self,
+        project_id: str,
+        expected_origin: str,
+        actual_origin: str,
+    ) -> None:
+        super().__init__(
+            f"timeline ComfyUI origin conflict for {project_id}: "
+            f"expected '{expected_origin}', actual '{actual_origin}'"
+        )
+        self.project_id = project_id
+        self.expected_origin = expected_origin
+        self.actual_origin = actual_origin
+
+
+class AssetTrashOriginConflict(RuntimeError):
+    """A recycle-bin mutation crossed the active ComfyUI origin boundary."""
+
+    def __init__(self, expected_origin: str, actual_origin: str) -> None:
+        super().__init__(
+            "asset operation crossed a ComfyUI origin boundary: "
+            f"expected '{expected_origin}', actual '{actual_origin}'"
+        )
+        self.expected_origin = expected_origin
+        self.actual_origin = actual_origin
+
+
+class AssetTrashInUse(RuntimeError):
+    """One or more assets are still referenced and cascade was not requested."""
+
+    def __init__(self, usages_by_asset: dict[str, list[str]]) -> None:
+        super().__init__("assets are still referenced by saved drafts")
+        self.usages_by_asset = usages_by_asset
+
+    @property
+    def usages(self) -> list[str]:
+        return [
+            usage
+            for usages in self.usages_by_asset.values()
+            for usage in usages
+        ]
+
+
+class AssetTrashRestoreConflict(RuntimeError):
+    """An inverse bundle no longer matches the post-trash authority."""
+
+    def __init__(self, conflicts: list[dict[str, Any]]) -> None:
+        super().__init__("asset references changed after the trash operation")
+        self.conflicts = conflicts
 
 
 def _copy_sqlite_database(
@@ -266,14 +350,18 @@ class Database:
                 CREATE TABLE IF NOT EXISTS unified_timeline (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     document TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0
+                        CHECK (revision >= 0 AND revision <= 9007199254740991)
                 );
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     document TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0
+                        CHECK (revision >= 0 AND revision <= 9007199254740991)
                 );
                 CREATE TABLE IF NOT EXISTS migration_notices (
                     id TEXT PRIMARY KEY,
@@ -284,7 +372,28 @@ class Database:
                     id TEXT PRIMARY KEY,
                     document TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    comfy_origin TEXT
+                    comfy_origin TEXT,
+                    trashed_at TEXT,
+                    trash_batch_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS asset_trash_batches (
+                    id TEXT PRIMARY KEY,
+                    comfy_origin TEXT NOT NULL,
+                    asset_ids TEXT NOT NULL,
+                    cascade INTEGER NOT NULL CHECK (cascade IN (0, 1)),
+                    unbound_usages TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS asset_trash_document_changes (
+                    batch_id TEXT NOT NULL REFERENCES asset_trash_batches(id)
+                        ON DELETE CASCADE,
+                    owner_kind TEXT NOT NULL
+                        CHECK (owner_kind IN ('timeline', 'project', 'draft')),
+                    owner_id TEXT NOT NULL,
+                    before_document TEXT NOT NULL,
+                    after_digest TEXT NOT NULL,
+                    after_revision INTEGER,
+                    PRIMARY KEY(batch_id, owner_kind, owner_id)
                 );
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
@@ -363,6 +472,28 @@ class Database:
                 """
             )
             now = utc_now()
+            timeline_columns = {
+                str(row["name"])
+                for row in db.execute(
+                    "PRAGMA table_info(unified_timeline)"
+                ).fetchall()
+            }
+            if "revision" not in timeline_columns:
+                db.execute(
+                    "ALTER TABLE unified_timeline ADD COLUMN revision INTEGER "
+                    "NOT NULL DEFAULT 0 CHECK (revision >= 0 AND "
+                    "revision <= 9007199254740991)"
+                )
+            project_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(projects)").fetchall()
+            }
+            if "revision" not in project_columns:
+                db.execute(
+                    "ALTER TABLE projects ADD COLUMN revision INTEGER "
+                    "NOT NULL DEFAULT 0 CHECK (revision >= 0 AND "
+                    "revision <= 9007199254740991)"
+                )
             job_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(jobs)").fetchall()
@@ -416,6 +547,22 @@ class Database:
             }
             if "comfy_origin" not in asset_columns:
                 db.execute("ALTER TABLE assets ADD COLUMN comfy_origin TEXT")
+            if "trashed_at" not in asset_columns:
+                db.execute("ALTER TABLE assets ADD COLUMN trashed_at TEXT")
+            if "trash_batch_id" not in asset_columns:
+                db.execute("ALTER TABLE assets ADD COLUMN trash_batch_id TEXT")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS assets_live_origin_idx "
+                "ON assets(comfy_origin, trashed_at, created_at DESC, id DESC)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS assets_trash_batch_idx "
+                "ON assets(trash_batch_id) WHERE trash_batch_id IS NOT NULL"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS asset_trash_batches_origin_idx "
+                "ON asset_trash_batches(comfy_origin, created_at DESC, id DESC)"
+            )
             settings_row = db.execute(
                 "SELECT document FROM settings WHERE singleton = 1"
             ).fetchone()
@@ -579,7 +726,8 @@ class Database:
                 ).model_dump(mode="json")
                 if json.loads(timeline_row["document"]) != normalized_timeline:
                     db.execute(
-                        "UPDATE unified_timeline SET document = ?, updated_at = ? WHERE singleton = 1",
+                        "UPDATE unified_timeline SET document = ?, updated_at = ?, "
+                        "revision = revision + 1 WHERE singleton = 1",
                         (json.dumps(normalized_timeline, ensure_ascii=False), now),
                     )
 
@@ -1472,19 +1620,44 @@ class Database:
     def _is_legacy_project_id(self, project_id: str) -> bool:
         return project_id == self.LEGACY_DEFAULT_PROJECT_ID
 
-    def get_timeline(self) -> UnifiedTimelineDraft:
+    @staticmethod
+    def _assert_expected_timeline_revision(
+        *,
+        project_id: str,
+        expected_revision: int,
+        actual_revision: int,
+    ) -> None:
+        if expected_revision != actual_revision:
+            raise TimelineRevisionConflict(
+                project_id,
+                expected_revision,
+                actual_revision,
+            )
+        if actual_revision >= MAX_TIMELINE_REVISION:
+            raise TimelineRevisionExhausted(project_id, actual_revision)
+
+    def get_timeline_authority(self) -> tuple[UnifiedTimelineDraft, int]:
+        """Return the legacy/default project document and durable CAS revision."""
+
         with self.connect() as db:
             row = db.execute(
-                "SELECT document FROM unified_timeline WHERE singleton = 1"
+                "SELECT document, revision FROM unified_timeline WHERE singleton = 1"
             ).fetchone()
         if row is None:
             raise RuntimeError("unified timeline row is missing")
-        return validate_timeline_draft(json.loads(row["document"]))
+        return (
+            validate_timeline_draft(json.loads(row["document"])),
+            int(row["revision"]),
+        )
+
+    def get_timeline(self) -> UnifiedTimelineDraft:
+        return self.get_timeline_authority()[0]
 
     def put_timeline(self, timeline: UnifiedTimelineDraft) -> UnifiedTimelineDraft:
         with self.connect() as db:
             db.execute(
-                "UPDATE unified_timeline SET document = ?, updated_at = ? WHERE singleton = 1",
+                "UPDATE unified_timeline SET document = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE singleton = 1",
                 (timeline.model_dump_json(), utc_now()),
             )
         return timeline
@@ -1505,10 +1678,54 @@ class Database:
                 comfy_origin=comfy_origin,
             )
             db.execute(
-                "UPDATE unified_timeline SET document = ?, updated_at = ? WHERE singleton = 1",
+                "UPDATE unified_timeline SET document = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE singleton = 1",
                 (timeline.model_dump_json(), utc_now()),
             )
         return timeline
+
+    def validate_and_put_timeline_authority(
+        self,
+        timeline: UnifiedTimelineDraft,
+        *,
+        expected_revision: int,
+        comfy_origin: str,
+    ) -> tuple[UnifiedTimelineDraft, int]:
+        """CAS-replace the default timeline under the asset-validation lock."""
+
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_timeline_comfy_origin_in_connection(
+                db,
+                project_id=self.LEGACY_DEFAULT_PROJECT_ID,
+                expected_comfy_origin=comfy_origin,
+            )
+            row = db.execute(
+                "SELECT revision FROM unified_timeline WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("unified timeline row is missing")
+            current_revision = int(row["revision"])
+            self._assert_expected_timeline_revision(
+                project_id=self.LEGACY_DEFAULT_PROJECT_ID,
+                expected_revision=expected_revision,
+                actual_revision=current_revision,
+            )
+            self._validate_asset_iterator_in_connection(
+                db,
+                iter_timeline_assets(timeline),
+                comfy_origin=comfy_origin,
+            )
+            cursor = db.execute(
+                "UPDATE unified_timeline SET document = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE singleton = 1 AND revision = ?",
+                (timeline.model_dump_json(), utc_now(), current_revision),
+            )
+            if cursor.rowcount != 1:
+                # BEGIN IMMEDIATE serializes writers, so this can only indicate
+                # database corruption or a trigger that violated the CAS row.
+                raise RuntimeError("timeline CAS update did not affect one row")
+        return timeline, current_revision + 1
 
     @staticmethod
     def _project_row_summary(row: sqlite3.Row) -> dict[str, Any]:
@@ -1645,6 +1862,7 @@ class Database:
             raise ValueError("project title must not be empty")
         if self._is_legacy_project_id(project_id):
             with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
                 row = db.execute(
                     "SELECT document FROM unified_timeline WHERE singleton = 1"
                 ).fetchone()
@@ -1653,7 +1871,8 @@ class Database:
                 timeline = validate_timeline_draft(json.loads(row["document"]))
                 timeline = timeline.model_copy(update={"title": normalized})
                 db.execute(
-                    "UPDATE unified_timeline SET document = ?, updated_at = ? "
+                    "UPDATE unified_timeline SET document = ?, updated_at = ?, "
+                    "revision = revision + 1 "
                     "WHERE singleton = 1",
                     (timeline.model_dump_json(), utc_now()),
                 )
@@ -1662,6 +1881,7 @@ class Database:
                 raise RuntimeError("renamed project disappeared")
             return project
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT document FROM projects WHERE id = ?", (project_id,)
             ).fetchone()
@@ -1670,7 +1890,8 @@ class Database:
             timeline = validate_timeline_draft(json.loads(row["document"]))
             timeline = timeline.model_copy(update={"title": normalized})
             db.execute(
-                "UPDATE projects SET title = ?, document = ?, updated_at = ? WHERE id = ?",
+                "UPDATE projects SET title = ?, document = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE id = ?",
                 (normalized, timeline.model_dump_json(), utc_now(), project_id),
             )
         project = self.get_project(project_id)
@@ -1701,12 +1922,29 @@ class Database:
         return int(orphaned)
 
     def get_project_timeline(self, project_id: str) -> UnifiedTimelineDraft:
+        # Keep the legacy/default read flowing through get_timeline(). Besides
+        # preserving the established public delegation contract, job-list
+        # snapshot comparison can continue to prefetch that authority once.
         if self._is_legacy_project_id(project_id):
             return self.get_timeline()
-        project = self.get_project(project_id)
-        if project is None:
+        return self.get_project_timeline_authority(project_id)[0]
+
+    def get_project_timeline_authority(
+        self, project_id: str
+    ) -> tuple[UnifiedTimelineDraft, int]:
+        if self._is_legacy_project_id(project_id):
+            return self.get_timeline_authority()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT document, revision FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
             raise KeyError(project_id)
-        return validate_timeline_draft(project["document"])
+        return (
+            validate_timeline_draft(json.loads(row["document"])),
+            int(row["revision"]),
+        )
 
     def put_project_timeline(
         self, project_id: str, timeline: UnifiedTimelineDraft
@@ -1715,7 +1953,8 @@ class Database:
             return self.put_timeline(timeline)
         with self.connect() as db:
             cursor = db.execute(
-                "UPDATE projects SET document = ?, title = ?, updated_at = ? WHERE id = ?",
+                "UPDATE projects SET document = ?, title = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE id = ?",
                 (timeline.model_dump_json(), timeline.title, utc_now(), project_id),
             )
         if cursor.rowcount != 1:
@@ -1750,14 +1989,118 @@ class Database:
                 comfy_origin=comfy_origin,
             )
             db.execute(
-                "UPDATE projects SET document = ?, title = ?, updated_at = ? WHERE id = ?",
+                "UPDATE projects SET document = ?, title = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE id = ?",
                 (timeline.model_dump_json(), timeline.title, utc_now(), project_id),
             )
         return timeline
 
+    def validate_and_put_project_timeline_authority(
+        self,
+        project_id: str,
+        timeline: UnifiedTimelineDraft,
+        *,
+        expected_revision: int,
+        comfy_origin: str,
+    ) -> tuple[UnifiedTimelineDraft, int]:
+        """CAS-replace one project timeline under the asset-validation lock."""
+
+        if self._is_legacy_project_id(project_id):
+            return self.validate_and_put_timeline_authority(
+                timeline,
+                expected_revision=expected_revision,
+                comfy_origin=comfy_origin,
+            )
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT revision FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(project_id)
+            self._assert_timeline_comfy_origin_in_connection(
+                db,
+                project_id=project_id,
+                expected_comfy_origin=comfy_origin,
+            )
+            current_revision = int(row["revision"])
+            self._assert_expected_timeline_revision(
+                project_id=project_id,
+                expected_revision=expected_revision,
+                actual_revision=current_revision,
+            )
+            self._validate_asset_iterator_in_connection(
+                db,
+                iter_timeline_assets(timeline),
+                comfy_origin=comfy_origin,
+            )
+            cursor = db.execute(
+                "UPDATE projects SET document = ?, title = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE id = ? AND revision = ?",
+                (
+                    timeline.model_dump_json(),
+                    timeline.title,
+                    utc_now(),
+                    project_id,
+                    current_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("project timeline CAS update did not affect one row")
+        return timeline, current_revision + 1
+
     @staticmethod
     def canonical_comfy_origin(value: Any) -> str:
         return str(value).rstrip("/")
+
+    @staticmethod
+    def _document_digest(document: str) -> str:
+        return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+    def _current_comfy_origin_in_connection(
+        self,
+        db: sqlite3.Connection,
+    ) -> str:
+        row = db.execute(
+            "SELECT document FROM settings WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("settings row is missing")
+        settings = canonicalize_live_runtime_settings(
+            RuntimeSettings.model_validate_json(row["document"])
+        )
+        return self.canonical_comfy_origin(settings.comfy_url)
+
+    def _assert_timeline_comfy_origin_in_connection(
+        self,
+        db: sqlite3.Connection,
+        *,
+        project_id: str,
+        expected_comfy_origin: str,
+    ) -> str:
+        # An unconfigured endpoint is a valid authority snapshot for a draft
+        # without assets. It must still compare exactly so an empty -> A or
+        # A -> empty switch cannot cross this timeline transaction.
+        expected = self.canonical_comfy_origin(expected_comfy_origin)
+        actual = self._current_comfy_origin_in_connection(db)
+        if actual != expected:
+            raise TimelineComfyOriginConflict(project_id, expected, actual)
+        return actual
+
+    def _assert_current_comfy_origin_in_connection(
+        self,
+        db: sqlite3.Connection,
+        *,
+        expected_comfy_origin: str,
+    ) -> str:
+        expected = self.canonical_comfy_origin(expected_comfy_origin)
+        if not expected:
+            raise ValueError("active ComfyUI origin is required")
+        actual = self._current_comfy_origin_in_connection(db)
+        if actual != expected:
+            raise AssetTrashOriginConflict(expected, actual)
+        return actual
 
     def put_asset(
         self,
@@ -1818,10 +2161,18 @@ class Database:
         record = self.get_asset_record(asset_id)
         return record[0] if record is not None else None
 
-    def get_asset_record(self, asset_id: str) -> tuple[dict[str, Any], str] | None:
+    def get_asset_record(
+        self,
+        asset_id: str,
+        *,
+        include_trashed: bool = False,
+    ) -> tuple[dict[str, Any], str] | None:
+        live_clause = "" if include_trashed else " AND trashed_at IS NULL"
         with self.connect() as db:
             row = db.execute(
-                "SELECT document, comfy_origin FROM assets WHERE id = ?", (asset_id,)
+                "SELECT document, comfy_origin FROM assets WHERE id = ?"
+                + live_clause,
+                (asset_id,),
             ).fetchone()
         if row is None:
             return None
@@ -1843,7 +2194,8 @@ class Database:
             raise ValueError("active ComfyUI origin is required")
         with self.connect() as db:
             rows = db.execute(
-                "SELECT document FROM assets WHERE comfy_origin = ? ORDER BY created_at DESC, id DESC",
+                "SELECT document FROM assets WHERE comfy_origin = ? "
+                "AND trashed_at IS NULL ORDER BY created_at DESC, id DESC",
                 (origin,),
             ).fetchall()
         assets: list[dict[str, Any]] = []
@@ -1852,6 +2204,82 @@ class Database:
             if kind is None or asset.kind == kind:
                 assets.append(asset.model_dump(mode="json"))
         return assets
+
+    @staticmethod
+    def _decode_trash_batch_row(row: sqlite3.Row) -> dict[str, Any]:
+        asset_ids = json.loads(row["asset_ids"])
+        usages_by_asset = json.loads(row["unbound_usages"])
+        if (
+            not isinstance(asset_ids, list)
+            or not all(isinstance(item, str) for item in asset_ids)
+            or not isinstance(usages_by_asset, dict)
+            or set(usages_by_asset) != set(asset_ids)
+            or not all(
+                isinstance(values, list)
+                and all(isinstance(value, str) for value in values)
+                for values in usages_by_asset.values()
+            )
+        ):
+            raise RuntimeError(f"asset trash batch '{row['id']}' is invalid")
+        return {
+            "batch_id": str(row["id"]),
+            "comfy_origin": str(row["comfy_origin"]),
+            "asset_ids": list(asset_ids),
+            "cascade": bool(row["cascade"]),
+            "unbound_usages_by_asset": {
+                asset_id: list(usages_by_asset[asset_id])
+                for asset_id in asset_ids
+            },
+            "unbound_usages": [
+                usage
+                for asset_id in asset_ids
+                for usage in usages_by_asset[asset_id]
+            ],
+            "created_at": str(row["created_at"]),
+        }
+
+    def _trash_batch_read_in_connection(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        batch = self._decode_trash_batch_row(row)
+        asset_rows = db.execute(
+            "SELECT id, document FROM assets WHERE trash_batch_id = ? "
+            "AND trashed_at IS NOT NULL",
+            (batch["batch_id"],),
+        ).fetchall()
+        documents = {str(item["id"]): str(item["document"]) for item in asset_rows}
+        if set(documents) != set(batch["asset_ids"]):
+            raise RuntimeError(
+                f"asset trash batch '{batch['batch_id']}' has inconsistent registrations"
+            )
+        batch["assets"] = [
+            AssetReference.model_validate_json(documents[asset_id]).model_dump(
+                mode="json"
+            )
+            for asset_id in batch["asset_ids"]
+        ]
+        return batch
+
+    def list_asset_trash_batches(
+        self,
+        *,
+        comfy_origin: str,
+    ) -> list[dict[str, Any]]:
+        origin = self.canonical_comfy_origin(comfy_origin)
+        with self.connect() as db:
+            db.execute("BEGIN")
+            self._assert_current_comfy_origin_in_connection(
+                db, expected_comfy_origin=origin
+            )
+            rows = db.execute(
+                "SELECT id, comfy_origin, asset_ids, cascade, unbound_usages, "
+                "created_at FROM asset_trash_batches WHERE comfy_origin = ? "
+                "ORDER BY created_at DESC, id DESC",
+                (origin,),
+            ).fetchall()
+            return [self._trash_batch_read_in_connection(db, row) for row in rows]
 
     @staticmethod
     def _dense_unbind_references(
@@ -2067,105 +2495,528 @@ class Database:
             changed = changed or item_changed
         return changed
 
-    def delete_asset_if_unused(
-        self, asset_id: str, *, cascade: bool = False
-    ) -> list[str]:
-        """Delete an asset, optionally unbinding every saved-document reference.
+    def _saved_asset_document_owners_in_connection(
+        self, db: sqlite3.Connection
+    ) -> list[dict[str, Any]]:
+        owners: list[dict[str, Any]] = []
+        singleton = db.execute(
+            "SELECT document, revision FROM unified_timeline WHERE singleton = 1"
+        ).fetchone()
+        if singleton is not None:
+            owners.append(
+                {
+                    "kind": "timeline",
+                    "id": self.LEGACY_DEFAULT_PROJECT_ID,
+                    "label": "timeline",
+                    "document": str(singleton["document"]),
+                    "revision": int(singleton["revision"]),
+                }
+            )
+        for row in db.execute(
+            "SELECT id, document, revision FROM projects ORDER BY id"
+        ).fetchall():
+            owner_id = str(row["id"])
+            owners.append(
+                {
+                    "kind": "project",
+                    "id": owner_id,
+                    "label": f"project.{owner_id}",
+                    "document": str(row["document"]),
+                    "revision": int(row["revision"]),
+                }
+            )
+        for row in db.execute(
+            "SELECT mode, document FROM mode_drafts ORDER BY mode"
+        ).fetchall():
+            mode = str(row["mode"])
+            owners.append(
+                {
+                    "kind": "draft",
+                    "id": mode,
+                    "label": f"drafts.{mode}",
+                    "document": str(row["document"]),
+                    "revision": None,
+                }
+            )
+        return owners
 
-        Returns usage locations when deletion is refused.  The lookup and
-        delete share one immediate transaction so a concurrent draft save
-        cannot slip between reference discovery, typed revalidation and delete.
-        With ``cascade=True`` the same list is the audit trail of locations
-        unbound before deletion; any validation/write failure rolls back all
-        documents and keeps the asset record.
-        """
+    def trash_assets(
+        self,
+        asset_ids: list[str],
+        *,
+        cascade: bool,
+        expected_comfy_origin: str,
+    ) -> dict[str, Any]:
+        """Atomically tombstone one user-intent batch and save its inverse bundle."""
 
+        normalized_ids: list[str] = []
+        seen: set[str] = set()
+        for asset_id in asset_ids:
+            if not isinstance(asset_id, str) or not asset_id:
+                raise ValueError("asset ids must be non-empty strings")
+            if asset_id in seen:
+                raise ValueError("asset ids must be unique")
+            seen.add(asset_id)
+            normalized_ids.append(asset_id)
+        if not normalized_ids:
+            raise ValueError("at least one asset id is required")
+        if len(normalized_ids) > 128:
+            raise ValueError("at most 128 assets may be trashed together")
+
+        origin = self.canonical_comfy_origin(expected_comfy_origin)
+        placeholders = ",".join("?" for _ in normalized_ids)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            exists = db.execute(
-                "SELECT 1 FROM assets WHERE id = ?", (asset_id,)
-            ).fetchone()
-            if exists is None:
-                raise KeyError(asset_id)
-            usages: list[str] = []
-            # Cascade must unbind the legacy singleton timeline and every
-            # created project. Each owner is (project_id, label_prefix,
-            # document_json); the singleton keeps its historical ``timeline.``
-            # label so existing audit output stays stable.
-            document_owners: list[tuple[str, str, str]] = []
-            singleton_row = db.execute(
-                "SELECT document FROM unified_timeline WHERE singleton = 1"
-            ).fetchone()
-            if singleton_row is not None:
-                document_owners.append(
-                    (
-                        self.LEGACY_DEFAULT_PROJECT_ID,
-                        "timeline",
-                        str(singleton_row["document"]),
+            self._assert_current_comfy_origin_in_connection(
+                db, expected_comfy_origin=origin
+            )
+            asset_rows = db.execute(
+                "SELECT id, document, comfy_origin, trashed_at FROM assets "
+                f"WHERE id IN ({placeholders})",
+                tuple(normalized_ids),
+            ).fetchall()
+            rows_by_id = {str(row["id"]): row for row in asset_rows}
+            for asset_id in normalized_ids:
+                row = rows_by_id.get(asset_id)
+                if row is None or row["trashed_at"] is not None:
+                    raise KeyError(asset_id)
+                stored_origin = self.canonical_comfy_origin(
+                    row["comfy_origin"] or ""
+                )
+                if stored_origin != origin:
+                    raise AssetTrashOriginConflict(origin, stored_origin)
+                AssetReference.model_validate_json(row["document"])
+
+            target_ids = set(normalized_ids)
+            usages_by_asset = {asset_id: [] for asset_id in normalized_ids}
+            owners = self._saved_asset_document_owners_in_connection(db)
+            for owner in owners:
+                if owner["kind"] == "draft":
+                    validated = validate_mode_draft(
+                        owner["id"], json.loads(owner["document"])
                     )
-                )
-            for project_row in db.execute(
-                "SELECT id, document FROM projects ORDER BY id"
-            ).fetchall():
-                document_owners.append(
-                    (
-                        str(project_row["id"]),
-                        f"project.{project_row['id']}",
-                        str(project_row["document"]),
+                    references = iter_draft_assets(validated)
+                else:
+                    validated = validate_timeline_draft(
+                        json.loads(owner["document"])
                     )
-                )
-            for _project_id, label_prefix, document_json in document_owners:
-                timeline = validate_timeline_draft(json.loads(document_json))
-                usages.extend(
-                    f"{label_prefix}.{location}"
-                    for location, asset in iter_timeline_assets(timeline)
-                    if asset.id == asset_id
-                )
-            for row in db.execute(
-                "SELECT mode, document FROM mode_drafts ORDER BY mode"
-            ).fetchall():
-                mode = str(row["mode"])
-                draft = validate_mode_draft(mode, json.loads(row["document"]))
-                usages.extend(
-                    f"drafts.{mode}.{location}"
-                    for location, asset in iter_draft_assets(draft)
-                    if asset.id == asset_id
-                )
-            if usages and not cascade:
-                return usages
-            if cascade and usages:
-                now = utc_now()
-                for project_id, _label, document_json in document_owners:
-                    timeline_document = json.loads(document_json)
-                    if not self._unbind_asset_document(timeline_document, asset_id):
+                    references = iter_timeline_assets(validated)
+                for location, asset in references:
+                    if asset.id in target_ids:
+                        usages_by_asset[asset.id].append(
+                            f"{owner['label']}.{location}"
+                        )
+            if any(usages_by_asset.values()) and not cascade:
+                raise AssetTrashInUse(usages_by_asset)
+
+            batch_id = str(uuid.uuid4())
+            now = utc_now()
+            db.execute(
+                "INSERT INTO asset_trash_batches("
+                "id, comfy_origin, asset_ids, cascade, unbound_usages, created_at"
+                ") VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    origin,
+                    json.dumps(normalized_ids, ensure_ascii=False),
+                    int(cascade),
+                    json.dumps(usages_by_asset, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+            if cascade and any(usages_by_asset.values()):
+                for owner in owners:
+                    document = json.loads(owner["document"])
+                    changed = False
+                    for asset_id in normalized_ids:
+                        changed = (
+                            self._unbind_asset_document(document, asset_id)
+                            or changed
+                        )
+                    if not changed:
                         continue
-                    normalized = validate_timeline_draft(timeline_document)
-                    if project_id == self.LEGACY_DEFAULT_PROJECT_ID:
-                        db.execute(
-                            "UPDATE unified_timeline SET document = ?, updated_at = ? "
-                            "WHERE singleton = 1",
-                            (normalized.model_dump_json(), now),
+                    if owner["kind"] == "draft":
+                        normalized = validate_mode_draft(owner["id"], document)
+                    else:
+                        normalized = validate_timeline_draft(document)
+                        if owner["revision"] >= MAX_TIMELINE_REVISION:
+                            raise OverflowError("timeline revision space is exhausted")
+                    after_document = normalized.model_dump_json()
+                    after_revision = (
+                        None
+                        if owner["revision"] is None
+                        else int(owner["revision"]) + 1
+                    )
+                    if owner["kind"] == "timeline":
+                        cursor = db.execute(
+                            "UPDATE unified_timeline SET document = ?, updated_at = ?, "
+                            "revision = revision + 1 WHERE singleton = 1 "
+                            "AND revision = ?",
+                            (after_document, now, owner["revision"]),
+                        )
+                    elif owner["kind"] == "project":
+                        cursor = db.execute(
+                            "UPDATE projects SET document = ?, title = ?, "
+                            "updated_at = ?, revision = revision + 1 "
+                            "WHERE id = ? AND revision = ?",
+                            (
+                                after_document,
+                                normalized.title,
+                                now,
+                                owner["id"],
+                                owner["revision"],
+                            ),
                         )
                     else:
-                        db.execute(
-                            "UPDATE projects SET document = ?, updated_at = ? WHERE id = ?",
-                            (normalized.model_dump_json(), now, project_id),
+                        cursor = db.execute(
+                            "UPDATE mode_drafts SET document = ?, updated_at = ? "
+                            "WHERE mode = ?",
+                            (after_document, now, owner["id"]),
                         )
-                for row in db.execute(
-                    "SELECT mode, document FROM mode_drafts ORDER BY mode"
-                ).fetchall():
-                    mode = str(row["mode"])
-                    draft_document = json.loads(row["document"])
-                    if not self._unbind_asset_document(draft_document, asset_id):
-                        continue
-                    normalized = validate_mode_draft(mode, draft_document)
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(
+                            "asset cascade document update did not affect one row"
+                        )
                     db.execute(
-                        "UPDATE mode_drafts SET document = ?, updated_at = ? "
-                        "WHERE mode = ?",
-                        (normalized.model_dump_json(), now, mode),
+                        "INSERT INTO asset_trash_document_changes("
+                        "batch_id, owner_kind, owner_id, before_document, "
+                        "after_digest, after_revision) VALUES(?, ?, ?, ?, ?, ?)",
+                        (
+                            batch_id,
+                            owner["kind"],
+                            owner["id"],
+                            owner["document"],
+                            self._document_digest(after_document),
+                            after_revision,
+                        ),
                     )
-            db.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
-        return usages if cascade else []
+
+            cursor = db.execute(
+                "UPDATE assets SET trashed_at = ?, trash_batch_id = ? "
+                f"WHERE id IN ({placeholders}) AND trashed_at IS NULL",
+                (now, batch_id, *normalized_ids),
+            )
+            if cursor.rowcount != len(normalized_ids):
+                raise RuntimeError(
+                    "asset trash update did not affect every requested registration"
+                )
+            batch_row = db.execute(
+                "SELECT id, comfy_origin, asset_ids, cascade, unbound_usages, "
+                "created_at FROM asset_trash_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch_row is None:
+                raise RuntimeError("created asset trash batch disappeared")
+            return self._trash_batch_read_in_connection(db, batch_row)
+
+    def delete_asset_if_unused(
+        self,
+        asset_id: str,
+        *,
+        cascade: bool = False,
+        expected_comfy_origin: str | None = None,
+    ) -> list[str]:
+        """Compatibility wrapper around the recoverable single-asset trash path."""
+
+        record = self.get_asset_record(asset_id)
+        if record is None:
+            raise KeyError(asset_id)
+        origin = expected_comfy_origin or record[1]
+        try:
+            batch = self.trash_assets(
+                [asset_id],
+                cascade=cascade,
+                expected_comfy_origin=origin,
+            )
+        except AssetTrashInUse as exc:
+            return exc.usages
+        return list(batch["unbound_usages"]) if cascade else []
+
+    def _require_asset_trash_batch_in_connection(
+        self,
+        db: sqlite3.Connection,
+        batch_id: str,
+        *,
+        comfy_origin: str,
+    ) -> tuple[sqlite3.Row, dict[str, Any]]:
+        row = db.execute(
+            "SELECT id, comfy_origin, asset_ids, cascade, unbound_usages, "
+            "created_at FROM asset_trash_batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(batch_id)
+        stored_origin = self.canonical_comfy_origin(row["comfy_origin"])
+        if stored_origin != comfy_origin:
+            raise AssetTrashOriginConflict(comfy_origin, stored_origin)
+        return row, self._trash_batch_read_in_connection(db, row)
+
+    @staticmethod
+    def _trash_owner_state_in_connection(
+        db: sqlite3.Connection,
+        owner_kind: str,
+        owner_id: str,
+    ) -> tuple[str, int | None] | None:
+        if owner_kind == "timeline":
+            row = db.execute(
+                "SELECT document, revision FROM unified_timeline WHERE singleton = 1"
+            ).fetchone()
+            return (
+                (str(row["document"]), int(row["revision"]))
+                if row is not None
+                else None
+            )
+        if owner_kind == "project":
+            row = db.execute(
+                "SELECT document, revision FROM projects WHERE id = ?",
+                (owner_id,),
+            ).fetchone()
+            return (
+                (str(row["document"]), int(row["revision"]))
+                if row is not None
+                else None
+            )
+        if owner_kind == "draft":
+            row = db.execute(
+                "SELECT document FROM mode_drafts WHERE mode = ?",
+                (owner_id,),
+            ).fetchone()
+            return (str(row["document"]), None) if row is not None else None
+        raise RuntimeError(f"unknown asset trash owner kind '{owner_kind}'")
+
+    def restore_asset_trash_batch(
+        self,
+        batch_id: str,
+        *,
+        mode: str,
+        expected_comfy_origin: str,
+    ) -> dict[str, Any]:
+        if mode not in {"registration_only", "with_references"}:
+            raise ValueError("unknown asset trash restore mode")
+        origin = self.canonical_comfy_origin(expected_comfy_origin)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_current_comfy_origin_in_connection(
+                db, expected_comfy_origin=origin
+            )
+            _row, batch = self._require_asset_trash_batch_in_connection(
+                db, batch_id, comfy_origin=origin
+            )
+            changes = db.execute(
+                "SELECT owner_kind, owner_id, before_document, after_digest, "
+                "after_revision FROM asset_trash_document_changes "
+                "WHERE batch_id = ? ORDER BY owner_kind, owner_id",
+                (batch_id,),
+            ).fetchall()
+
+            conflicts: list[dict[str, Any]] = []
+            current_states: dict[tuple[str, str], tuple[str, int | None]] = {}
+            if mode == "with_references":
+                for change in changes:
+                    owner_kind = str(change["owner_kind"])
+                    owner_id = str(change["owner_id"])
+                    state = self._trash_owner_state_in_connection(
+                        db, owner_kind, owner_id
+                    )
+                    if state is None:
+                        conflicts.append(
+                            {
+                                "owner_kind": owner_kind,
+                                "owner_id": owner_id,
+                                "reason": "owner_missing",
+                            }
+                        )
+                        continue
+                    current_document, current_revision = state
+                    current_states[(owner_kind, owner_id)] = state
+                    expected_revision = change["after_revision"]
+                    reasons: list[str] = []
+                    if self._document_digest(current_document) != str(
+                        change["after_digest"]
+                    ):
+                        reasons.append("document_changed")
+                    if owner_kind in {"timeline", "project"}:
+                        if current_revision != int(expected_revision):
+                            reasons.append("revision_changed")
+                        if current_revision is not None and current_revision >= MAX_TIMELINE_REVISION:
+                            reasons.append("revision_exhausted")
+                    if reasons:
+                        conflicts.append(
+                            {
+                                "owner_kind": owner_kind,
+                                "owner_id": owner_id,
+                                "reason": ",".join(reasons),
+                                "expected_revision": (
+                                    int(expected_revision)
+                                    if expected_revision is not None
+                                    else None
+                                ),
+                                "actual_revision": current_revision,
+                            }
+                        )
+            if conflicts:
+                raise AssetTrashRestoreConflict(conflicts)
+
+            placeholders = ",".join("?" for _ in batch["asset_ids"])
+            rows = db.execute(
+                "SELECT id, comfy_origin, trashed_at, trash_batch_id FROM assets "
+                f"WHERE id IN ({placeholders})",
+                tuple(batch["asset_ids"]),
+            ).fetchall()
+            rows_by_id = {str(row["id"]): row for row in rows}
+            for asset_id in batch["asset_ids"]:
+                asset_row = rows_by_id.get(asset_id)
+                if (
+                    asset_row is None
+                    or asset_row["trashed_at"] is None
+                    or asset_row["trash_batch_id"] != batch_id
+                    or self.canonical_comfy_origin(asset_row["comfy_origin"] or "")
+                    != origin
+                ):
+                    conflicts.append(
+                        {
+                            "owner_kind": "asset",
+                            "owner_id": asset_id,
+                            "reason": "registration_changed",
+                        }
+                    )
+            if conflicts:
+                raise AssetTrashRestoreConflict(conflicts)
+
+            cursor = db.execute(
+                "UPDATE assets SET trashed_at = NULL, trash_batch_id = NULL "
+                "WHERE trash_batch_id = ? AND trashed_at IS NOT NULL",
+                (batch_id,),
+            )
+            if cursor.rowcount != len(batch["asset_ids"]):
+                raise RuntimeError(
+                    "asset restore did not affect every trashed registration"
+                )
+
+            if mode == "with_references":
+                now = utc_now()
+                for change in changes:
+                    owner_kind = str(change["owner_kind"])
+                    owner_id = str(change["owner_id"])
+                    before_document = str(change["before_document"])
+                    try:
+                        if owner_kind == "draft":
+                            restored = validate_mode_draft(
+                                owner_id, json.loads(before_document)
+                            )
+                            self._validate_asset_iterator_in_connection(
+                                db,
+                                iter_draft_assets(restored),
+                                comfy_origin=origin,
+                            )
+                        else:
+                            restored = validate_timeline_draft(
+                                json.loads(before_document)
+                            )
+                            self._validate_asset_iterator_in_connection(
+                                db,
+                                iter_timeline_assets(restored),
+                                comfy_origin=origin,
+                            )
+                    except (ValidationError, ValueError, RuntimeError) as exc:
+                        raise AssetTrashRestoreConflict(
+                            [
+                                {
+                                    "owner_kind": owner_kind,
+                                    "owner_id": owner_id,
+                                    "reason": "inverse_document_unavailable",
+                                    "message": str(exc),
+                                }
+                            ]
+                        ) from exc
+
+                    if owner_kind == "timeline":
+                        _current_document, revision = current_states[
+                            (owner_kind, owner_id)
+                        ]
+                        cursor = db.execute(
+                            "UPDATE unified_timeline SET document = ?, updated_at = ?, "
+                            "revision = revision + 1 WHERE singleton = 1 "
+                            "AND revision = ?",
+                            (before_document, now, revision),
+                        )
+                    elif owner_kind == "project":
+                        _current_document, revision = current_states[
+                            (owner_kind, owner_id)
+                        ]
+                        cursor = db.execute(
+                            "UPDATE projects SET document = ?, title = ?, "
+                            "updated_at = ?, revision = revision + 1 "
+                            "WHERE id = ? AND revision = ?",
+                            (
+                                before_document,
+                                restored.title,
+                                now,
+                                owner_id,
+                                revision,
+                            ),
+                        )
+                    else:
+                        cursor = db.execute(
+                            "UPDATE mode_drafts SET document = ?, updated_at = ? "
+                            "WHERE mode = ?",
+                            (before_document, now, owner_id),
+                        )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(
+                            "asset restore document update did not affect one row"
+                        )
+
+            db.execute("DELETE FROM asset_trash_batches WHERE id = ?", (batch_id,))
+            return {
+                "batch_id": batch_id,
+                "restored_asset_ids": list(batch["asset_ids"]),
+                "restored_references": mode == "with_references" and bool(changes),
+                "mode": mode,
+            }
+
+    def purge_asset_trash_batch(
+        self,
+        batch_id: str,
+        *,
+        expected_comfy_origin: str,
+    ) -> dict[str, Any]:
+        """Forget Director registrations and recovery data, never remote files."""
+
+        origin = self.canonical_comfy_origin(expected_comfy_origin)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_current_comfy_origin_in_connection(
+                db, expected_comfy_origin=origin
+            )
+            _row, batch = self._require_asset_trash_batch_in_connection(
+                db, batch_id, comfy_origin=origin
+            )
+            cursor = db.execute(
+                "DELETE FROM assets WHERE trash_batch_id = ? "
+                "AND trashed_at IS NOT NULL AND comfy_origin = ?",
+                (batch_id, origin),
+            )
+            if cursor.rowcount != len(batch["asset_ids"]):
+                raise AssetTrashRestoreConflict(
+                    [
+                        {
+                            "owner_kind": "batch",
+                            "owner_id": batch_id,
+                            "reason": "registration_changed",
+                        }
+                    ]
+                )
+            deleted = db.execute(
+                "DELETE FROM asset_trash_batches WHERE id = ?", (batch_id,)
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError("asset trash purge did not remove its recovery bundle")
+            return {
+                "batch_id": batch_id,
+                "purged_asset_ids": list(batch["asset_ids"]),
+            }
 
     def validate_draft_assets(self, draft: ModeDraft, *, comfy_origin: str) -> None:
         """Verify draft media against immutable upload records.
@@ -2218,7 +3069,9 @@ class Database:
         expected_origin = self.canonical_comfy_origin(comfy_origin)
         for location, reference in references:
             row = db.execute(
-                "SELECT document, comfy_origin FROM assets WHERE id = ?", (reference.id,)
+                "SELECT document, comfy_origin FROM assets WHERE id = ? "
+                "AND trashed_at IS NULL",
+                (reference.id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"{location}: asset id '{reference.id}' is not registered")

@@ -17,6 +17,12 @@ import type {
   AssetCascadeDeleteResponse,
   AssetDeleteResponse,
   AssetListResponse,
+  AssetTrashBatch,
+  AssetTrashConflictOwner,
+  AssetTrashListResponse,
+  AssetTrashPurgeResponse,
+  AssetTrashRestoreMode,
+  AssetTrashRestoreResponse,
   AssetUploadProgress,
   ConnectionTestResult,
   CreateTaskRequest,
@@ -40,6 +46,7 @@ import type {
   TaskDiagnostic,
   TaskGenerationDetails,
   TaskProjectSnapshotResponse,
+  TimelineAuthority,
   TimelineCompileReport,
   TimelineTaskRequest,
 } from "./types";
@@ -52,7 +59,14 @@ export function taskEventsUrl(): string {
   return `${API_BASE}/tasks/events`;
 }
 
-export type ApiErrorCode = "raylight_recovery_in_flight";
+export type ApiErrorCode =
+  | "raylight_recovery_in_flight"
+  | "timeline_revision_conflict"
+  | "assets_in_use"
+  | "asset_trash_origin_conflict"
+  | "asset_trash_restore_conflict"
+  | "asset_trash_purge_conflict"
+  | "asset_upload_origin_changed";
 
 export class ApiError extends Error {
   constructor(
@@ -192,7 +206,7 @@ function uploadAssetWithProgress(
       stopPolling();
       if (xhr.status < 200 || xhr.status >= 300) {
         const parsed = parseHttpError(xhr.response, xhr.status);
-        reject(new ApiError(parsed.message, xhr.status, parsed.details));
+        reject(new ApiError(parsed.message, xhr.status, parsed.details, parsed.code));
         return;
       }
       const payload = xhr.response;
@@ -251,6 +265,76 @@ function runtimeAuthorityHeaders(authorityToken: string): HeadersInit {
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function parseStringArrayRecord(value: unknown): Record<string, string[]> | null {
+  if (!isRecord(value)) return null;
+  const parsed: Array<[string, string[]]> = [];
+  for (const [key, entries] of Object.entries(value)) {
+    if (!key || !isStringArray(entries)) return null;
+    parsed.push([key, [...entries]]);
+  }
+  return Object.fromEntries(parsed);
+}
+
+function parseAssetTrashConflictOwners(
+  value: unknown,
+): AssetTrashConflictOwner[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const ownerKinds = new Set(["timeline", "project", "draft", "asset", "batch"]);
+  const allowedReasons = new Set([
+    "owner_missing",
+    "document_changed",
+    "revision_changed",
+    "revision_exhausted",
+    "registration_changed",
+    "inverse_document_unavailable",
+  ]);
+  const allowedKeys = new Set([
+    "owner_kind",
+    "owner_id",
+    "reason",
+    "expected_revision",
+    "actual_revision",
+    "message",
+  ]);
+  const parsed: AssetTrashConflictOwner[] = [];
+  for (const item of value) {
+    const reasons: string[] = isRecord(item) && typeof item.reason === "string"
+      ? item.reason.split(",")
+      : [];
+    if (
+      !isRecord(item) ||
+      Object.keys(item).some((key) => !allowedKeys.has(key)) ||
+      !ownerKinds.has(String(item.owner_kind)) ||
+      typeof item.owner_id !== "string" || !item.owner_id ||
+      typeof item.reason !== "string" || !item.reason ||
+      reasons.length === 0 ||
+      new Set(reasons).size !== reasons.length ||
+      reasons.some((reason) => !allowedReasons.has(reason)) ||
+      ("expected_revision" in item &&
+        item.expected_revision !== null &&
+        !isNonNegativeInteger(item.expected_revision)) ||
+      ("actual_revision" in item &&
+        item.actual_revision !== null &&
+        !isNonNegativeInteger(item.actual_revision)) ||
+      ("message" in item &&
+        (typeof item.message !== "string" || !item.message))
+    ) return null;
+    parsed.push({
+      owner_kind: item.owner_kind as AssetTrashConflictOwner["owner_kind"],
+      owner_id: item.owner_id,
+      reason: item.reason,
+      ...(item.expected_revision === null || isNonNegativeInteger(item.expected_revision)
+        ? { expected_revision: item.expected_revision }
+        : {}),
+      ...(item.actual_revision === null || isNonNegativeInteger(item.actual_revision)
+        ? { actual_revision: item.actual_revision }
+        : {}),
+      ...(typeof item.message === "string" ? { message: item.message } : {}),
+    });
+  }
+  return parsed;
 }
 
 function parseLogicalGpuIndexes(value: unknown): number[] | null {
@@ -335,19 +419,60 @@ function parseHttpError(
   if (!isRecord(detail)) {
     return { message: fallback };
   }
-  const code: ApiErrorCode | undefined = detail.code === "raylight_recovery_in_flight"
-    ? detail.code
-    : undefined;
+  const candidateCode: ApiErrorCode | undefined =
+    detail.code === "raylight_recovery_in_flight" ||
+    detail.code === "timeline_revision_conflict" ||
+    detail.code === "assets_in_use" ||
+    detail.code === "asset_trash_origin_conflict" ||
+    detail.code === "asset_trash_restore_conflict" ||
+    detail.code === "asset_trash_purge_conflict" ||
+    detail.code === "asset_upload_origin_changed"
+      ? detail.code
+      : undefined;
+  const assetCode = candidateCode === "assets_in_use" ||
+    candidateCode === "asset_trash_origin_conflict" ||
+    candidateCode === "asset_trash_restore_conflict" ||
+    candidateCode === "asset_trash_purge_conflict" ||
+    candidateCode === "asset_upload_origin_changed";
+  const conflicts = candidateCode === "asset_trash_restore_conflict" ||
+      candidateCode === "asset_trash_purge_conflict"
+    ? parseAssetTrashConflictOwners(detail.conflicts)
+    : null;
+  const code: ApiErrorCode | undefined =
+    assetCode && detail.remote_files_preserved !== true
+      ? undefined
+      : (candidateCode === "asset_trash_restore_conflict" ||
+          candidateCode === "asset_trash_purge_conflict") && conflicts === null
+        ? undefined
+        : candidateCode;
   if (typeof detail.message !== "string" || !detail.message.trim()) {
     return code
       ? { message: fallback, code, details: { detail: { code } } }
       : { message: fallback };
   }
   const usages = isStringArray(detail.usages) ? [...detail.usages] : [];
+  const usagesByAsset = code === "assets_in_use"
+    ? parseStringArrayRecord(detail.usages_by_asset)
+    : null;
+  const timelineConflict = code === "timeline_revision_conflict";
   const safeDetail = {
     ...(code ? { code } : {}),
     message: detail.message,
     ...(usages.length ? { usages } : {}),
+    ...(timelineConflict && typeof detail.project_id === "string" && detail.project_id
+      ? { project_id: detail.project_id }
+      : {}),
+    ...(timelineConflict && isNonNegativeInteger(detail.expected_revision)
+      ? { expected_revision: detail.expected_revision }
+      : {}),
+    ...(timelineConflict && isNonNegativeInteger(detail.actual_revision)
+      ? { actual_revision: detail.actual_revision }
+      : {}),
+    ...(assetCode && detail.remote_files_preserved === true
+      ? { remote_files_preserved: true as const }
+      : {}),
+    ...(usagesByAsset ? { usages_by_asset: usagesByAsset } : {}),
+    ...(conflicts ? { conflicts } : {}),
   };
   return {
     message: usages.length
@@ -841,6 +966,28 @@ function parseTimelineProjectResponse(value: unknown): TimelineProject {
   return project;
 }
 
+function parseTimelineAuthority(value: unknown): TimelineAuthority {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["document", "revision"]) ||
+    !isNonNegativeInteger(value.revision)
+  ) throw new ApiError("时间线权威响应结构无效", 502, value);
+  return {
+    document: parseTimelineProjectResponse(value.document),
+    revision: value.revision,
+  };
+}
+
+function timelineAuthorityWriteBody(
+  document: TimelineProject,
+  expectedRevision: number,
+): string {
+  if (!isNonNegativeInteger(expectedRevision)) {
+    throw new RangeError("时间线 expected revision 必须是非负安全整数");
+  }
+  return JSON.stringify({ document, expected_revision: expectedRevision });
+}
+
 function parseProjectSummary(value: unknown): ProjectSummary {
   if (
     !isRecord(value) ||
@@ -863,10 +1010,15 @@ function parseProjectSummary(value: unknown): ProjectSummary {
 function parseProjectList(value: unknown): ProjectListResponse {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ["projects"]) ||
-    !Array.isArray(value.projects)
+    !hasExactKeys(value, ["projects", "active_database_identity"]) ||
+    !Array.isArray(value.projects) ||
+    typeof value.active_database_identity !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.active_database_identity)
   ) throw new ApiError("项目列表响应结构无效", 502, value);
-  return { projects: value.projects.map(parseProjectSummary) };
+  return {
+    projects: value.projects.map(parseProjectSummary),
+    active_database_identity: value.active_database_identity,
+  };
 }
 
 function parseProjectDelete(value: unknown, expectedId: string): ProjectDeleteResponse {
@@ -1190,6 +1342,259 @@ function parseAssetCascadeDeleteResponse(
   };
 }
 
+function parseUniqueOpaqueIds(value: unknown): string[] | null {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > 128 ||
+    !value.every((item) => typeof item === "string" && item.trim() === item && item.length > 0) ||
+    new Set(value).size !== value.length
+  ) return null;
+  return [...value];
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length &&
+    left.every((item, index) => item === right[index]);
+}
+
+type OptionalAssetResponseScope = {
+  active_database_identity?: string;
+  comfy_origin?: string;
+};
+
+function parseOptionalAssetResponseScope(
+  value: Record<string, unknown>,
+  legacyKeys: readonly string[],
+): OptionalAssetResponseScope | null {
+  if (hasExactKeys(value, legacyKeys)) return {};
+  if (!hasExactKeys(value, [
+    ...legacyKeys,
+    "active_database_identity",
+    "comfy_origin",
+  ])) return null;
+  if (
+    typeof value.active_database_identity !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.active_database_identity) ||
+    typeof value.comfy_origin !== "string" ||
+    value.comfy_origin.trim() !== value.comfy_origin ||
+    !value.comfy_origin ||
+    value.comfy_origin.endsWith("/")
+  ) return null;
+  try {
+    const parsed = new URL(value.comfy_origin);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  } catch {
+    return null;
+  }
+  return {
+    active_database_identity: value.active_database_identity,
+    comfy_origin: value.comfy_origin,
+  };
+}
+
+function parseAssetList(value: unknown): AssetListResponse {
+  if (!isRecord(value)) {
+    throw new ApiError("素材列表响应结构无效", 502, value);
+  }
+  const scope = parseOptionalAssetResponseScope(
+    value,
+    ["assets", "outputs_preserved"],
+  );
+  if (
+    scope === null ||
+    value.outputs_preserved !== true ||
+    !Array.isArray(value.assets)
+  ) throw new ApiError("素材列表响应结构无效", 502, value);
+  const assets: AssetReference[] = [];
+  for (const item of value.assets) {
+    if (!isRecord(item) || !["image", "audio", "video"].includes(String(item.kind))) {
+      throw new ApiError("素材列表响应结构无效", 502, value);
+    }
+    const normalized = normalizeAssetReference(item, item.kind as AssetKind);
+    if (!normalized) throw new ApiError("素材列表响应结构无效", 502, value);
+    assets.push(normalized);
+  }
+  if (new Set(assets.map((asset) => asset.id)).size !== assets.length) {
+    throw new ApiError("素材列表响应结构无效", 502, value);
+  }
+  return {
+    assets,
+    outputs_preserved: true,
+    ...scope,
+  };
+}
+
+function parseAssetTrashBatch(
+  value: unknown,
+  expected?: { assetIds: readonly string[]; cascade: boolean },
+): AssetTrashBatch {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "batch_id",
+      "comfy_origin",
+      "asset_ids",
+      "assets",
+      "cascade",
+      "unbound_usages",
+      "unbound_usages_by_asset",
+      "created_at",
+      "remote_files_preserved",
+    ]) ||
+    typeof value.batch_id !== "string" || !value.batch_id ||
+    typeof value.comfy_origin !== "string" || !value.comfy_origin ||
+    typeof value.cascade !== "boolean" ||
+    typeof value.created_at !== "string" || !value.created_at ||
+    value.remote_files_preserved !== true ||
+    !Array.isArray(value.assets) ||
+    !isStringArray(value.unbound_usages)
+  ) throw new ApiError("素材回收批次响应结构无效", 502, value);
+  const assetIds = parseUniqueOpaqueIds(value.asset_ids);
+  const usagesByAsset = parseStringArrayRecord(value.unbound_usages_by_asset);
+  if (
+    assetIds === null ||
+    usagesByAsset === null ||
+    !sameStrings(Object.keys(usagesByAsset).sort(), [...assetIds].sort()) ||
+    !sameStrings(
+      value.unbound_usages,
+      assetIds.flatMap((assetId) => usagesByAsset[assetId]),
+    ) ||
+    (expected && (
+      !sameStrings(assetIds, expected.assetIds) ||
+      value.cascade !== expected.cascade
+    ))
+  ) throw new ApiError("素材回收批次响应结构无效", 502, value);
+  const assets: AssetReference[] = [];
+  for (const [index, item] of value.assets.entries()) {
+    if (
+      !isRecord(item) ||
+      !["image", "audio", "video"].includes(String(item.kind))
+    ) throw new ApiError("素材回收批次响应结构无效", 502, value);
+    const normalized = normalizeAssetReference(item, item.kind as AssetKind);
+    if (!normalized || normalized.id !== assetIds[index]) {
+      throw new ApiError("素材回收批次响应结构无效", 502, value);
+    }
+    assets.push(normalized);
+  }
+  if (assets.length !== assetIds.length) {
+    throw new ApiError("素材回收批次响应结构无效", 502, value);
+  }
+  return {
+    batch_id: value.batch_id,
+    comfy_origin: value.comfy_origin,
+    asset_ids: assetIds,
+    assets,
+    cascade: value.cascade,
+    unbound_usages: [...value.unbound_usages],
+    unbound_usages_by_asset: Object.fromEntries(
+      assetIds.map((assetId) => [assetId, usagesByAsset[assetId]]),
+    ),
+    created_at: value.created_at,
+    remote_files_preserved: true,
+  };
+}
+
+function parseAssetTrashList(value: unknown): AssetTrashListResponse {
+  if (!isRecord(value)) {
+    throw new ApiError("素材回收站响应结构无效", 502, value);
+  }
+  const scope = parseOptionalAssetResponseScope(
+    value,
+    ["batches", "remote_files_preserved"],
+  );
+  if (
+    scope === null ||
+    !Array.isArray(value.batches) ||
+    value.remote_files_preserved !== true
+  ) throw new ApiError("素材回收站响应结构无效", 502, value);
+  const batches = value.batches.map((item) => parseAssetTrashBatch(item));
+  const batchIds = batches.map((item) => item.batch_id);
+  const assetIds = batches.flatMap((item) => item.asset_ids);
+  if (
+    new Set(batchIds).size !== batchIds.length ||
+    new Set(assetIds).size !== assetIds.length ||
+    (batches.length > 1 &&
+      batches.some((item) => item.comfy_origin !== batches[0].comfy_origin)) ||
+    (scope.comfy_origin !== undefined &&
+      batches.some((item) => item.comfy_origin !== scope.comfy_origin))
+  ) throw new ApiError("素材回收站响应结构无效", 502, value);
+  return { batches, remote_files_preserved: true, ...scope };
+}
+
+function parseAssetTrashRestoreResponse(
+  value: unknown,
+  expectedBatchId: string,
+  expectedMode: AssetTrashRestoreMode,
+): AssetTrashRestoreResponse {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "batch_id",
+      "restored_asset_ids",
+      "restored_references",
+      "mode",
+      "remote_files_preserved",
+    ]) ||
+    value.batch_id !== expectedBatchId ||
+    value.mode !== expectedMode ||
+    typeof value.restored_references !== "boolean" ||
+    (expectedMode === "registration_only" && value.restored_references) ||
+    value.remote_files_preserved !== true
+  ) throw new ApiError("素材恢复响应结构无效", 502, value);
+  const restoredAssetIds = parseUniqueOpaqueIds(value.restored_asset_ids);
+  if (restoredAssetIds === null) {
+    throw new ApiError("素材恢复响应结构无效", 502, value);
+  }
+  return {
+    batch_id: expectedBatchId,
+    restored_asset_ids: restoredAssetIds,
+    restored_references: value.restored_references,
+    mode: expectedMode,
+    remote_files_preserved: true,
+  };
+}
+
+function parseAssetTrashPurgeResponse(
+  value: unknown,
+  expectedBatchId: string,
+): AssetTrashPurgeResponse {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "batch_id",
+      "purged_asset_ids",
+      "remote_files_preserved",
+    ]) ||
+    value.batch_id !== expectedBatchId ||
+    value.remote_files_preserved !== true
+  ) throw new ApiError("素材回收批次清理响应结构无效", 502, value);
+  const purgedAssetIds = parseUniqueOpaqueIds(value.purged_asset_ids);
+  if (purgedAssetIds === null) {
+    throw new ApiError("素材回收批次清理响应结构无效", 502, value);
+  }
+  return {
+    batch_id: expectedBatchId,
+    purged_asset_ids: purgedAssetIds,
+    remote_files_preserved: true,
+  };
+}
+
+function assetTrashIds(assetIds: readonly string[]): string[] {
+  const parsed = parseUniqueOpaqueIds(assetIds);
+  if (parsed === null || parsed.length > 128) {
+    throw new RangeError("素材回收批次必须包含 1 至 128 个不重复的稳定 ID");
+  }
+  return parsed;
+}
+
+function assetTrashBatchId(batchId: string): string {
+  if (!batchId || batchId.trim() !== batchId) {
+    throw new Error("素材回收批次 ID 无效");
+  }
+  return batchId;
+}
+
 function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -1295,6 +1700,15 @@ export const directorApi = {
       method: "PUT",
       body: JSON.stringify(timeline),
     }).then(parseTimelineProjectResponse),
+  getTimelineAuthority: (signal?: AbortSignal) =>
+    request<unknown>("/timeline/authority", { signal }).then(parseTimelineAuthority),
+  updateTimelineAuthority: (
+    timeline: TimelineProject,
+    expectedRevision: number,
+  ) => request<unknown>("/timeline/authority", {
+    method: "PUT",
+    body: timelineAuthorityWriteBody(timeline, expectedRevision),
+  }).then(parseTimelineAuthority),
   createTimelineTask: (payload: TimelineTaskRequest) =>
     request<unknown>("/timeline/jobs", {
       method: "POST",
@@ -1337,6 +1751,17 @@ export const directorApi = {
       method: "PUT",
       body: JSON.stringify(timeline),
     }).then(parseTimelineProjectResponse),
+  getProjectTimelineAuthority: (projectId: string, signal?: AbortSignal) =>
+    request<unknown>(`/projects/${encodeURIComponent(projectId)}/timeline/authority`, { signal })
+      .then(parseTimelineAuthority),
+  updateProjectTimelineAuthority: (
+    projectId: string,
+    timeline: TimelineProject,
+    expectedRevision: number,
+  ) => request<unknown>(`/projects/${encodeURIComponent(projectId)}/timeline/authority`, {
+    method: "PUT",
+    body: timelineAuthorityWriteBody(timeline, expectedRevision),
+  }).then(parseTimelineAuthority),
   compileProjectTimeline: (projectId: string, payload: TimelineTaskRequest) =>
     request<unknown>(`/projects/${encodeURIComponent(projectId)}/compile`, {
       method: "POST",
@@ -1370,7 +1795,7 @@ export const directorApi = {
 
   listAssets(kind?: AssetKind, signal?: AbortSignal): Promise<AssetListResponse> {
     const query = kind ? `?kind=${encodeURIComponent(kind)}` : "";
-    return request<AssetListResponse>(`/assets${query}`, { signal });
+    return request<unknown>(`/assets${query}`, { signal }).then(parseAssetList);
   },
   deleteAsset(assetId: string): Promise<AssetDeleteResponse> {
     return request<AssetDeleteResponse>(`/assets/${encodeURIComponent(assetId)}`, {
@@ -1381,6 +1806,46 @@ export const directorApi = {
     return request<unknown>(`/assets/${encodeURIComponent(assetId)}?cascade=true`, {
       method: "DELETE",
     }).then((value) => parseAssetCascadeDeleteResponse(value, assetId));
+  },
+  trashAssets(
+    assetIds: readonly string[],
+    cascade = false,
+  ): Promise<AssetTrashBatch> {
+    const normalizedIds = assetTrashIds(assetIds);
+    if (typeof cascade !== "boolean") throw new TypeError("素材回收 cascade 标志无效");
+    return request<unknown>("/asset-trash", {
+      method: "POST",
+      body: JSON.stringify({ asset_ids: normalizedIds, cascade }),
+    }).then((value) => parseAssetTrashBatch(value, {
+      assetIds: normalizedIds,
+      cascade,
+    }));
+  },
+  listAssetTrash(signal?: AbortSignal): Promise<AssetTrashListResponse> {
+    return request<unknown>("/asset-trash", { signal }).then(parseAssetTrashList);
+  },
+  restoreAssetTrash(
+    batchId: string,
+    mode: AssetTrashRestoreMode,
+  ): Promise<AssetTrashRestoreResponse> {
+    const normalizedBatchId = assetTrashBatchId(batchId);
+    if (mode !== "registration_only" && mode !== "with_references") {
+      throw new Error("素材恢复模式无效");
+    }
+    return request<unknown>(
+      `/asset-trash/${encodeURIComponent(normalizedBatchId)}/restore`,
+      { method: "POST", body: JSON.stringify({ mode }) },
+    ).then((value) => parseAssetTrashRestoreResponse(
+      value,
+      normalizedBatchId,
+      mode,
+    ));
+  },
+  purgeAssetTrash(batchId: string): Promise<AssetTrashPurgeResponse> {
+    const normalizedBatchId = assetTrashBatchId(batchId);
+    return request<unknown>(`/asset-trash/${encodeURIComponent(normalizedBatchId)}`, {
+      method: "DELETE",
+    }).then((value) => parseAssetTrashPurgeResponse(value, normalizedBatchId));
   },
 
   detectRV2VShots: (payload: RV2VShotDetectionRequest) =>

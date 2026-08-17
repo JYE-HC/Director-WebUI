@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type CSSProperties } from "react";
 import { ApiError, DATABASE_IDENTITY_STALE_EVENT, directorApi, taskEventsUrl } from "./api/client";
 import {
   EMPTY_CAPABILITIES,
@@ -18,6 +18,9 @@ import {
   type RuntimeSettings,
   type RuntimeSettingsAuthority,
   type StorageConfiguration,
+  type AssetTrashBatch,
+  type AssetTrashRestoreMode,
+  type TimelineAuthority,
   type TimelineCompileReport,
 } from "./api/types";
 import {
@@ -26,6 +29,8 @@ import {
 } from "./components/LongFormTimelineWorkspace";
 import { SettingsPage, validateRuntimeSettingsForm } from "./components/SettingsPage";
 import { TaskDrawer } from "./components/TaskDrawer";
+import { AssetTrashPanel } from "./components/AssetTrashPanel";
+import { TimelineHistoryPanel } from "./components/TimelineHistoryPanel";
 import { TimelineGlobalSettings } from "./components/TimelineGlobalSettings";
 import { WorkspaceAssetSidebar } from "./components/WorkspaceAssetSidebar";
 import { Spinner } from "./components/ui";
@@ -45,21 +50,30 @@ import {
 import {
   autoFitSourceAudioTiming,
   createTimelineEditorState,
-  clearLocalTimeline,
+  createTimelineBranchOwnerId,
+  clearLocalTimelineWal,
   DEFAULT_PROJECT_ID,
+  discardLocalTimelineWalBranch,
+  getTimelineBranchOwnerId,
+  listLocalTimelineWalBranches,
   loadAssetLayoutPreference,
-  loadLocalTimeline,
+  loadLocalTimelineWal,
   normalizeTimelineProject,
   orderAssetsByPreference,
+  resolveLocalTimelineWal,
   runnableTimelineSegmentIds,
   saveAssetLayoutPreference,
-  saveLocalTimeline,
+  saveLocalTimelineWal,
   segmentAssetReferences,
   timelineSamplingFamily,
   timelineAssetUsages,
   timelineEditorReducer,
   validateTimelineProject,
+  type LocalTimelineWal,
+  type CorruptLocalTimelineWalBranchEvidence,
+  type LocalTimelineWalBranchEvidence,
   type TimelineAction,
+  type TimelineEditorState,
   type TimelineProject,
 } from "./domain/timelineProject";
 import {
@@ -67,11 +81,50 @@ import {
   loadDirectorState,
   saveDirectorState,
 } from "./state/directorState";
+import {
+  canRedoTimelineHistory,
+  canUndoTimelineHistory,
+  captureTimelineHistoryContext,
+  createTimelineHistory,
+  jumpTimelineHistory,
+  recordTimelineHistory,
+  rebaseTimelineHistoryHead,
+  redoTimelineHistory,
+  resetTimelineHistory,
+  sealTimelineHistoryCoalescing,
+  timelineHistoryRedoLabel,
+  timelineHistoryUndoLabel,
+  timelineProjectsEqual,
+  undoTimelineHistory,
+  type TimelineHistoryContext,
+  type TimelineHistoryReplay,
+  type TimelineHistoryState,
+  type TimelineTextEditingContext,
+} from "./state/timelineHistory";
+import { reduceTimelineTransaction } from "./state/timelineTransactions";
+import {
+  createTimelineRevisionChannel,
+  runWithTimelineWriterLock,
+  type TimelineRevisionChannel,
+} from "./state/timelineCoordination";
+import {
+  deleteTimelineHistoryJournal,
+  listTimelineHistoryJournalBranches,
+  loadTimelineHistoryJournal,
+  readTimelineHistoryJournalVersionToken,
+  saveTimelineHistoryJournal,
+  type TimelineHistoryJournalBranchEvidence,
+  type TimelineHistoryJournalVersionToken,
+  type TimelinePersistenceAuthority,
+  type TimelinePersistenceScope,
+} from "./state/timelinePersistence";
 
 const SIDEBAR_OPEN_KEY = "director-web:sidebar-open";
 const SIDEBAR_WIDTH_KEY = "director-web:sidebar-expanded-width";
 const SIDEBAR_MOBILE_MAX = 760;
 const GLOBAL_SETTINGS_ID = "timeline-global-settings";
+const TIMELINE_HISTORY_PANEL_ID = "timeline-history-panel";
+const ASSET_TRASH_PANEL_ID = "asset-trash-panel";
 export const UNBOUND_RUNTIME_SETTINGS_PENDING_KEY = "director-web:runtime-settings-pending";
 export const QUARANTINED_UNBOUND_RUNTIME_SETTINGS_PENDING_KEY = "director-web:runtime-settings-pending-quarantine";
 export const RUNTIME_SETTINGS_PENDING_KEY = "director-web:v2:runtime-settings-pending";
@@ -84,6 +137,260 @@ const RUNTIME_SETTINGS_RETRY_MS = 1500;
 const STORAGE_AUTHORITY_RETRY_MS = 1000;
 const RAYLIGHT_RECOVERY_RETRY_MS = 300;
 const RAYLIGHT_RECOVERY_MAX_RETRY_MS = 1200;
+
+type TimelineHistoryMode = "record" | "replay" | "skip" | "reset";
+
+interface TimelineDispatchOptions {
+  history?: TimelineHistoryMode;
+  historyLabel?: string;
+  historyMergeKey?: string;
+}
+
+type TimelineRecoveryWalEvidence =
+  | LocalTimelineWalBranchEvidence
+  | CorruptLocalTimelineWalBranchEvidence;
+
+interface TimelineRecoveryBranch {
+  id: string;
+  ownerId: string | null;
+  ownership: "owned" | "foreign" | "legacy";
+  updatedAtMs: number | null;
+  status: "replay" | "acknowledged" | "conflict" | "corrupt";
+  project: TimelineProject | null;
+  history: TimelineHistoryState | null;
+  walEvidence: TimelineRecoveryWalEvidence | null;
+  journalEvidence: TimelineHistoryJournalBranchEvidence | null;
+}
+
+interface TimelineRevisionConflict {
+  projectId: string;
+  localProject: TimelineProject;
+  serverAuthority: TimelineAuthority | null;
+  source: "cas" | "legacy-wal" | "recovery-branches";
+  resolving: boolean;
+  recoveryBranches?: TimelineRecoveryBranch[];
+  selectedRecoveryBranchId?: string | null;
+}
+
+function timelineDocumentHash(project: TimelineProject): string {
+  const value = JSON.stringify(project);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function timelineRecoveryBranchId(
+  wal: TimelineRecoveryWalEvidence | null,
+  journal: TimelineHistoryJournalBranchEvidence | null,
+): string {
+  if (wal) return `wal:${wal.storage_key}`;
+  if (journal?.token) return `journal:${journal.token.key}:${journal.ownerId ?? "legacy"}`;
+  return `journal-corrupt:${journal?.ownerId ?? "legacy"}:${journal?.updatedAtMs ?? "unknown"}`;
+}
+
+function journalRecoveryProject(
+  journal: TimelineHistoryJournalBranchEvidence,
+): TimelineProject | null {
+  return journal.status === "corrupt" ? null : journal.project;
+}
+
+function collectTimelineRecoveryBranches(
+  walBranches: ReturnType<typeof listLocalTimelineWalBranches>,
+  journalBranches: TimelineHistoryJournalBranchEvidence[],
+  authority: TimelineAuthority,
+): {
+  pending: TimelineRecoveryBranch[];
+  newestAcknowledgedHistory: TimelineHistoryState | null;
+} {
+  const pending: TimelineRecoveryBranch[] = [];
+  const consumedJournals = new Set<TimelineHistoryJournalBranchEvidence>();
+  const validWals = [
+    ...(walBranches.owned ? [walBranches.owned] : []),
+    ...walBranches.foreign,
+    ...walBranches.legacy,
+  ];
+  const acknowledgedHistoryCandidates: Array<{
+    history: TimelineHistoryState;
+    updatedAtMs: number;
+  }> = [];
+  const divergentJournals = new Set<TimelineHistoryJournalBranchEvidence>();
+  for (const walEvidence of validWals) {
+    const resolution = resolveLocalTimelineWal(walEvidence.wal, authority);
+    const ownerJournal = journalBranches.find((candidate) =>
+      candidate.ownerId === walEvidence.wal.owner_id) ?? null;
+    const journalMatchesHead = ownerJournal !== null && ownerJournal.status !== "corrupt" &&
+      timelineProjectsEqual(ownerJournal.project, walEvidence.wal.pending_project);
+    const journal = journalMatchesHead ? ownerJournal : null;
+    if (journal) consumedJournals.add(journal);
+    else if (ownerJournal) divergentJournals.add(ownerJournal);
+    if (resolution.status === "acknowledged") {
+      if (journal && journal.status === "acknowledged") {
+        acknowledgedHistoryCandidates.push({
+          history: journal.history,
+          updatedAtMs: journal.updatedAtMs ?? walEvidence.wal.written_at_ms,
+        });
+      }
+      if (ownerJournal && !journalMatchesHead) {
+        // localStorage and IndexedDB can diverge even for one owner (quota,
+        // crash, or a delayed transaction). Preserve both as independent
+        // evidence instead of hiding the newer journal behind this WAL.
+        pending.push({
+          id: timelineRecoveryBranchId(walEvidence, null),
+          ownerId: walEvidence.wal.owner_id,
+          ownership: walEvidence.ownership,
+          updatedAtMs: walEvidence.wal.written_at_ms,
+          status: "acknowledged",
+          project: resolution.project,
+          history: null,
+          walEvidence,
+          journalEvidence: null,
+        });
+      }
+      continue;
+    }
+    pending.push({
+      id: timelineRecoveryBranchId(walEvidence, journal),
+      ownerId: walEvidence.wal.owner_id,
+      ownership: walEvidence.ownership,
+      updatedAtMs: walEvidence.wal.written_at_ms,
+      status: resolution.status,
+      project: resolution.status === "replay" ? resolution.project : resolution.local_project,
+      history: journal && (journal.status === "restored" ||
+          journal.status === "acknowledged" || journal.status === "conflict")
+        ? journal.history
+        : null,
+      walEvidence,
+      journalEvidence: journal,
+    });
+  }
+  for (const walEvidence of walBranches.corrupt) {
+    pending.push({
+      id: timelineRecoveryBranchId(walEvidence, null),
+      ownerId: null,
+      ownership: walEvidence.ownership,
+      updatedAtMs: null,
+      status: "corrupt",
+      project: null,
+      history: null,
+      walEvidence,
+      journalEvidence: null,
+    });
+  }
+
+  for (const journal of journalBranches) {
+    if (consumedJournals.has(journal)) continue;
+    if (journal.status === "acknowledged") {
+      acknowledgedHistoryCandidates.push({
+        history: journal.history,
+        updatedAtMs: journal.updatedAtMs ?? -1,
+      });
+      if (!divergentJournals.has(journal)) continue;
+    }
+    const project = journalRecoveryProject(journal);
+    pending.push({
+      id: timelineRecoveryBranchId(null, journal),
+      ownerId: journal.ownerId,
+      ownership: journal.ownership,
+      updatedAtMs: journal.updatedAtMs,
+      status: journal.status === "restored" ? "replay" : journal.status,
+      project,
+      history: journal.status === "corrupt" ? null : journal.history,
+      walEvidence: null,
+      journalEvidence: journal,
+    });
+  }
+  pending.sort((left, right) =>
+    (right.updatedAtMs ?? -1) - (left.updatedAtMs ?? -1) || left.id.localeCompare(right.id));
+  acknowledgedHistoryCandidates.sort((left, right) => right.updatedAtMs - left.updatedAtMs);
+  // These candidates are already exact server-head matches. A separate
+  // pending branch must not make safe undo history disappear from the server
+  // workspace shown behind the explicit recovery gate.
+  const newestAcknowledgedHistory = acknowledgedHistoryCandidates[0]?.history ?? null;
+  return { pending, newestAcknowledgedHistory };
+}
+
+function shouldKeepNativeUndo(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  if (target.closest("[data-timeline-history-ignore]")) return true;
+  if (target.closest("[data-timeline-history-field]")) return false;
+  if (target.closest("textarea, [contenteditable]:not([contenteditable='false'])")) return true;
+  const input = target.closest("input");
+  if (!(input instanceof HTMLInputElement)) return false;
+  return !["button", "checkbox", "radio", "range", "color", "file", "submit", "reset"].includes(input.type);
+}
+
+function isTimelineHistoryTextTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && Boolean(target.closest("[data-timeline-history-field]"));
+}
+
+function timelineHistoryTextControl(
+  target: EventTarget | null,
+): HTMLInputElement | HTMLTextAreaElement | null {
+  if (!(target instanceof Element)) return null;
+  const field = target.closest("[data-timeline-history-field]");
+  return field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+    ? field
+    : null;
+}
+
+function captureTimelineTextEditingContext(
+  target: EventTarget | null,
+): TimelineTextEditingContext | null {
+  const field = timelineHistoryTextControl(target);
+  const fieldKey = field?.dataset.timelineHistoryField;
+  if (!field || !fieldKey) return null;
+  return {
+    field_key: fieldKey,
+    start: field.selectionStart ?? 0,
+    end: field.selectionEnd ?? field.selectionStart ?? 0,
+    direction: field.selectionDirection ?? "none",
+  };
+}
+
+function timelineTextHistoryContext(
+  state: TimelineEditorState,
+  textEditing: TimelineTextEditingContext,
+): TimelineHistoryContext {
+  return {
+    ...captureTimelineHistoryContext(state),
+    restore_segment_selection: false,
+    text_editing: textEditing,
+  };
+}
+
+function collapsedTimelineTextContextAfter(
+  before: TimelineTextEditingContext,
+  beforeValue: string,
+  afterValue: string,
+): TimelineTextEditingContext {
+  const unchangedSuffix = Math.max(0, beforeValue.length - before.end);
+  const cursor = Math.max(
+    0,
+    Math.min(afterValue.length, afterValue.length - unchangedSuffix),
+  );
+  return { ...before, start: cursor, end: cursor, direction: "none" };
+}
+
+function restoreTimelineTextEditingSelection(
+  context: TimelineTextEditingContext | undefined,
+  sourceFieldKey: string | null,
+): void {
+  if (!context || context.field_key !== sourceFieldKey) return;
+  window.requestAnimationFrame(() => {
+    const stillActive = captureTimelineTextEditingContext(document.activeElement);
+    if (stillActive?.field_key !== sourceFieldKey) return;
+    const field = [...document.querySelectorAll<HTMLElement>("[data-timeline-history-field]")]
+      .find((candidate) => candidate.dataset.timelineHistoryField === context.field_key);
+    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)) return;
+    const start = Math.min(field.value.length, Math.max(0, context.start));
+    const end = Math.min(field.value.length, Math.max(start, context.end));
+    field.focus({ preventScroll: true });
+    field.setSelectionRange(start, end, context.direction);
+  });
+}
 
 function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
@@ -244,6 +551,46 @@ function validActiveDatabasePath(value: unknown): value is string {
 interface ActiveDatabaseIdentity {
   active_database_path: string;
   active_database_identity: string;
+}
+
+const INITIAL_TIMELINE_BRANCH_OWNER_ID = getTimelineBranchOwnerId();
+
+interface AssetAuthorityScope {
+  database: ActiveDatabaseIdentity;
+  comfyOrigin: string;
+}
+
+function timelinePersistenceScope(
+  database: ActiveDatabaseIdentity,
+  projectId: string,
+  ownerId: string = INITIAL_TIMELINE_BRANCH_OWNER_ID,
+): TimelinePersistenceScope {
+  return {
+    databasePath: database.active_database_path,
+    databaseIdentity: database.active_database_identity,
+    projectId,
+    ownerId,
+  };
+}
+
+function timelineJournalTokenMapKey(
+  database: ActiveDatabaseIdentity,
+  projectId: string,
+  ownerId: string = INITIAL_TIMELINE_BRANCH_OWNER_ID,
+): string {
+  return `${database.active_database_identity}:${projectId}:${ownerId}`;
+}
+
+function isCurrentTimelineHydration(
+  signal: AbortSignal,
+  expectedProjectId: string,
+  currentProjectId: string,
+  expectedGeneration: number,
+  currentGeneration: number,
+): boolean {
+  return !signal.aborted &&
+    expectedProjectId === currentProjectId &&
+    expectedGeneration === currentGeneration;
 }
 
 function validActiveDatabaseIdentity(value: ActiveDatabaseIdentity): boolean {
@@ -463,16 +810,20 @@ function persistActiveProjectId(projectId: string): void {
 // default project and to project-scoped endpoints for everything else. This
 // keeps the pre-multi-project contract intact for the first project while
 // giving created projects their own server-owned identity.
-function fetchTimelineForProject(projectId: string, signal?: AbortSignal) {
+function fetchTimelineForProject(projectId: string, signal?: AbortSignal): Promise<TimelineAuthority> {
   return projectId === DEFAULT_PROJECT_ID
-    ? directorApi.getTimeline(signal)
-    : directorApi.getProjectTimeline(projectId, signal);
+    ? directorApi.getTimelineAuthority(signal)
+    : directorApi.getProjectTimelineAuthority(projectId, signal);
 }
 
-function saveTimelineForProject(projectId: string, project: TimelineProject) {
+function saveTimelineForProject(
+  projectId: string,
+  project: TimelineProject,
+  expectedRevision: number,
+): Promise<TimelineAuthority> {
   return projectId === DEFAULT_PROJECT_ID
-    ? directorApi.updateTimeline(project)
-    : directorApi.updateProjectTimeline(projectId, project);
+    ? directorApi.updateTimelineAuthority(project, expectedRevision)
+    : directorApi.updateProjectTimelineAuthority(projectId, project, expectedRevision);
 }
 
 function compileTimelineForProject(
@@ -500,6 +851,11 @@ export default function App() {
     undefined,
     createInitialTimelineState,
   );
+  const [timelineHistory, setTimelineHistoryState] = useState(createTimelineHistory);
+  const [timelineHistoryAnnouncement, setTimelineHistoryAnnouncement] = useState({
+    sequence: 0,
+    message: "",
+  });
   const [capabilities, setCapabilities] = useState<CapabilityReport>({
     ...EMPTY_CAPABILITIES,
     connection: "checking",
@@ -520,6 +876,7 @@ export default function App() {
   const [timelineHydrationStatus, setTimelineHydrationStatus] = useState<
     "loading" | "retrying" | "stale" | "ready"
   >("loading");
+  const [timelineHydrationEpoch, setTimelineHydrationEpoch] = useState(0);
   const [storageRestartRequired, setStorageRestartRequired] = useState(false);
   const [storageOperationStatus, setStorageOperationStatus] = useState<StorageOperationStatus>("idle");
   const [timelinePausedError, setTimelinePausedError] = useState<{
@@ -535,11 +892,20 @@ export default function App() {
   const [assetsUploading, setAssetsUploading] = useState(false);
   const [assetUploadProgress, setAssetUploadProgress] = useState<DroppedUploadProgress | null>(null);
   const [timelineSyncRequired, setTimelineSyncRequired] = useState(false);
+  const [timelineRevisionConflict, setTimelineRevisionConflictState] = useState<TimelineRevisionConflict | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(() => initialUiToggle(SIDEBAR_OPEN_KEY, true));
   const [sidebarViewportWidth, setSidebarViewportWidth] = useState(() => window.innerWidth);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false);
+  const [timelineHistoryPanelOpen, setTimelineHistoryPanelOpen] = useState(false);
+  const [assetTrashPanelOpen, setAssetTrashPanelOpen] = useState(false);
+  const [assetTrashBatches, setAssetTrashBatches] = useState<AssetTrashBatch[]>([]);
+  const [assetTrashLoading, setAssetTrashLoading] = useState(false);
+  const [assetTrashBusyBatchId, setAssetTrashBusyBatchId] = useState<string | null>(null);
+  const [assetTrashConflictBatchIds, setAssetTrashConflictBatchIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [projectTitleEditing, setProjectTitleEditing] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState("");
   const [theme, setTheme] = useState(readUiTheme);
@@ -547,6 +913,8 @@ export default function App() {
   const [clearingTasks, setClearingTasks] = useState(false);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [activeProjectId, setActiveProjectIdState] = useState<string>(loadActiveProjectId);
+  const [projectSwitchHandoffPending, setProjectSwitchHandoffPending] = useState(false);
+  const [projectDeletingId, setProjectDeletingId] = useState<string | null>(null);
   const activeProjectIdRef = useRef(activeProjectId);
   const runtimeRequest = useRef(0);
   const runtimeResourceRequest = useRef(0);
@@ -587,10 +955,20 @@ export default function App() {
   const taskListRefreshQueued = useRef(false);
   const taskListOwnerActive = useRef(false);
   const globalSettingsToggleRef = useRef<HTMLButtonElement>(null);
+  const timelineHistoryToggleRef = useRef<HTMLButtonElement>(null);
+  const assetTrashToggleRef = useRef<HTMLButtonElement>(null);
   const projectTitleInputRef = useRef<HTMLInputElement>(null);
   const sidebarBrandToggleRef = useRef<HTMLButtonElement>(null);
   const settingsToggleRef = useRef<HTMLButtonElement>(null);
   const timelineRevision = useRef(0);
+  const timelineServerRevision = useRef<number | null>(null);
+  const timelineServerProjectRef = useRef<TimelineProject | null>(null);
+  const timelineBranchOwnerRef = useRef(INITIAL_TIMELINE_BRANCH_OWNER_ID);
+  const activeTimelineWalRef = useRef<LocalTimelineWal | null>(null);
+  const timelineJournalGeneration = useRef(0);
+  const timelineJournalChain = useRef<Promise<void>>(Promise.resolve());
+  const timelineJournalTokens = useRef(new Map<string, TimelineHistoryJournalVersionToken>());
+  const timelineHydrationGeneration = useRef(0);
   const timelineHydrationReady = useRef(false);
   const activeDatabaseRef = useRef<ActiveDatabaseIdentity | null>(null);
   const storageRestartRequiredRef = useRef(false);
@@ -601,6 +979,8 @@ export default function App() {
   const segmentSelectionGeneration = useRef(0);
   const restoredSegmentSelectionKey = useRef<string | null>(null);
   const projectSwitchGeneration = useRef(0);
+  const projectListGeneration = useRef(0);
+  const projectDeleteIntent = useRef<string | null>(null);
   const timelinePersistedRevision = useRef(0);
   const timelineWriteGeneration = useRef(0);
   const timelineSaveRequest = useRef<Promise<TimelineProject | null> | null>(null);
@@ -609,6 +989,10 @@ export default function App() {
   const timelineRetryTimer = useRef<number | null>(null);
   const timelineAuthorityRetryTimer = useRef<number | null>(null);
   const timelineSyncRequiredRef = useRef(false);
+  const timelineRevisionConflictRef = useRef<TimelineRevisionConflict | null>(null);
+  const timelineRevisionChannelRef = useRef<TimelineRevisionChannel | null>(null);
+  const timelineRemoteAuthorityRequest = useRef(0);
+  const projectSwitchHandoffIntent = useRef<number | null>(null);
   const timelineRenderedRevision = useRef(timelineRevision.current);
   const flushTimelineAutosaveRef = useRef<() => Promise<TimelineProject>>(
     async () => { throw new Error("时间线自动保存尚未初始化"); },
@@ -616,14 +1000,142 @@ export default function App() {
   const assetDeleteLock = useRef(false);
   const assetDeleteIntent = useRef(false);
   const assetUploadLock = useRef(false);
+  const assetTrashOperationLock = useRef<string | null>(null);
+  const assetTrashListRequest = useRef(0);
   const timelineRef = useRef(timeline);
+  const timelineHistoryRef = useRef(timelineHistory);
+  const timelineTextCompositionActive = useRef(false);
+  const timelineTextBeforeInput = useRef<TimelineTextEditingContext | null>(null);
   const timelineHadLocal = useRef(false);
-  timelineRef.current = timeline;
-  timelineRenderedRevision.current = timelineRevision.current;
+
+  useLayoutEffect(() => {
+    // Reducer dispatches maintain their own synchronous command shadow. Only a
+    // committed render may publish React's copy back into the async owner.
+    timelineRef.current = timeline;
+    timelineRenderedRevision.current = timelineRevision.current;
+  }, [timeline]);
 
   const setSidebarOpenWithFocus = useCallback((open: boolean) => {
     setSidebarOpen(open);
     window.requestAnimationFrame(() => sidebarBrandToggleRef.current?.focus());
+  }, []);
+
+  const commitTimelineHistory = useCallback((history: TimelineHistoryState) => {
+    timelineHistoryRef.current = history;
+    setTimelineHistoryState(history);
+  }, []);
+
+  const enqueueTimelineJournalOperation = useCallback((
+    operation: (generation: number) => Promise<unknown>,
+  ) => {
+    const generation = ++timelineJournalGeneration.current;
+    // IndexedDB puts are serialized as well as generation-guarded. A stale put
+    // that already started may finish, but the latest queued mutation always
+    // runs after it and therefore owns the durable value.
+    timelineJournalChain.current = timelineJournalChain.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (generation !== timelineJournalGeneration.current) return;
+        try {
+          await operation(generation);
+        } catch {
+          // localStorage WAL remains the synchronous crash-recovery boundary.
+        }
+      });
+  }, []);
+
+  const persistTimelineJournal = useCallback((
+    history: TimelineHistoryState,
+    authority: TimelinePersistenceAuthority,
+    database: ActiveDatabaseIdentity,
+    projectId: string,
+  ) => {
+    const ownerId = timelineBranchOwnerRef.current;
+    const scope = timelinePersistenceScope(database, projectId, ownerId);
+    const tokenKey = timelineJournalTokenMapKey(database, projectId, ownerId);
+    enqueueTimelineJournalOperation(async (generation) => {
+      if (history.head) {
+        const token = await saveTimelineHistoryJournal(scope, authority, history);
+        if (generation === timelineJournalGeneration.current && token) {
+          timelineJournalTokens.current.set(tokenKey, token);
+        }
+        return;
+      }
+      const token = timelineJournalTokens.current.get(tokenKey) ??
+        await readTimelineHistoryJournalVersionToken(scope);
+      if (!token) return;
+      const deleted = await deleteTimelineHistoryJournal(scope, token);
+      if (generation === timelineJournalGeneration.current && deleted) {
+        timelineJournalTokens.current.delete(tokenKey);
+      }
+    });
+  }, [enqueueTimelineJournalOperation]);
+
+  const acceptTimelineServerAuthority = useCallback((authority: TimelineAuthority) => {
+    // Every local authority owner invalidates Broadcast-triggered GETs that
+    // started against an older base. Their late responses may never regress
+    // the revision/document pair accepted here.
+    timelineRemoteAuthorityRequest.current += 1;
+    timelineServerRevision.current = authority.revision;
+    timelineServerProjectRef.current = structuredClone(authority.document);
+  }, []);
+
+  // Keep the existing call shape inside mutation owners, including the asset
+  // compensation paths. The implementation is now fail-closed unless an exact
+  // server base has been latched for the active project.
+  const saveLocalTimeline = useCallback((
+    project: TimelineProject,
+    database: ActiveDatabaseIdentity,
+    projectId: string = DEFAULT_PROJECT_ID,
+  ): LocalTimelineWal | null => {
+    const baseRevision = timelineServerRevision.current;
+    const baseProject = timelineServerProjectRef.current;
+    if (baseRevision === null || !baseProject || projectId !== activeProjectIdRef.current) {
+      return null;
+    }
+    const wal = saveLocalTimelineWal({
+      database,
+      project_id: projectId,
+      base_server_revision: baseRevision,
+      base_project: baseProject,
+      pending_project: project,
+      owner_id: timelineBranchOwnerRef.current,
+    });
+    if (wal) activeTimelineWalRef.current = wal;
+    else if (timelineProjectsEqual(project, baseProject)) activeTimelineWalRef.current = null;
+    return wal;
+  }, []);
+
+  const clearLocalTimeline = useCallback((wal?: LocalTimelineWal) => {
+    const target = wal ?? activeTimelineWalRef.current;
+    // No target is not authority to delete the domain module's last observed
+    // branch: it may belong to the previous project after a project switch.
+    if (!target) return;
+    clearLocalTimelineWal(target);
+    if (!wal || activeTimelineWalRef.current === wal) activeTimelineWalRef.current = null;
+  }, []);
+
+  const clearTimelineHistory = useCallback(() => {
+    commitTimelineHistory(resetTimelineHistory(timelineHistoryRef.current));
+    setTimelineHistoryAnnouncement((current) => ({
+      sequence: current.sequence + 1,
+      message: "",
+    }));
+  }, [commitTimelineHistory]);
+
+  const updateProjectSummaryTitle = useCallback((projectId: string, title: string) => {
+    // A list response captured before this local mutation must not restore the
+    // old title (or make a later membership decision against that old list).
+    projectListGeneration.current += 1;
+    setProjects((projects) => {
+      let changed = false;
+      const next = projects.map((project) => {
+        if (project.id !== projectId || project.title === title) return project;
+        changed = true;
+        return { ...project, title };
+      });
+      return changed ? next : projects;
+    });
   }, []);
 
   const setRuntimeAuthorityRequired = useCallback((required: boolean) => {
@@ -636,10 +1148,76 @@ export default function App() {
     setTimelineSyncRequired(required);
   }, []);
 
+  const setTimelineRevisionConflict = useCallback((conflict: TimelineRevisionConflict | null) => {
+    timelineRevisionConflictRef.current = conflict;
+    setTimelineRevisionConflictState(conflict);
+  }, []);
+
   const setStorageOperationLock = useCallback((status: StorageOperationStatus) => {
     storageOperationStatusRef.current = status;
     setStorageOperationStatus(status);
   }, []);
+
+  const restartTimelineHydrationForProject = useCallback((projectId: string) => {
+    if (projectId === activeProjectIdRef.current) return;
+
+    const previousProjectId = activeProjectIdRef.current;
+    const database = activeDatabaseRef.current;
+    if (
+      database &&
+      timelinePersistedRevision.current < timelineRevision.current
+    ) {
+      saveLocalTimeline(timelineRef.current.project, database, previousProjectId);
+    }
+
+    // Invalidate every owner that captured the previous project before changing
+    // the synchronous project id. The next hydration effect establishes a fresh
+    // server revision/document pair for the fallback project.
+    timelineHydrationGeneration.current += 1;
+    timelineWriteGeneration.current += 1;
+    timelineJournalGeneration.current += 1;
+    projectSwitchGeneration.current += 1;
+    projectListGeneration.current += 1;
+    timelineRemoteAuthorityRequest.current += 1;
+    // The old promise remains generation-guarded and cleans up only when it
+    // still owns the slot. Detach it now so the fallback project can start its
+    // own autosave without waiting for an unrelated project response.
+    timelineSaveRequest.current = null;
+    timelineSaveRequestRevision.current = null;
+    if (timelineAutosaveTimer.current !== null) {
+      window.clearTimeout(timelineAutosaveTimer.current);
+      timelineAutosaveTimer.current = null;
+    }
+    if (timelineRetryTimer.current !== null) {
+      window.clearTimeout(timelineRetryTimer.current);
+      timelineRetryTimer.current = null;
+    }
+    if (timelineAuthorityRetryTimer.current !== null) {
+      window.clearTimeout(timelineAuthorityRetryTimer.current);
+      timelineAuthorityRetryTimer.current = null;
+    }
+
+    activeProjectIdRef.current = projectId;
+    setActiveProjectIdState(projectId);
+    persistActiveProjectId(projectId);
+    timelineServerRevision.current = null;
+    timelineServerProjectRef.current = null;
+    activeTimelineWalRef.current = null;
+    timelineRevision.current = 0;
+    timelinePersistedRevision.current = 0;
+    timelineHadLocal.current = false;
+    timelineHydrationReady.current = false;
+    restoredSegmentSelectionKey.current = null;
+    segmentSelectionGeneration.current += 1;
+    setTimelineRevisionConflict(null);
+    setTimelineAuthorityRequired(false);
+    setTimelineDirty(false);
+    setTimelinePausedError(null);
+    setCompileReport(null);
+    clearTimelineHistory();
+    setTimelineHydrationStatus("loading");
+    setTimelineHydrationEpoch((current) => current + 1);
+  }, [clearTimelineHistory, saveLocalTimeline, setTimelineAuthorityRequired, setTimelineRevisionConflict]);
 
   const acceptStorageConfiguration = useCallback((configuration: StorageConfiguration): boolean => {
     const activeDatabase = activeDatabaseRef.current;
@@ -648,21 +1226,36 @@ export default function App() {
       configuration.active_database_path !== activeDatabase.active_database_path ||
       configuration.active_database_identity !== activeDatabase.active_database_identity
     ) {
+      clearTimelineHistory();
+      assetTrashListRequest.current += 1;
+      setAssetTrashBatches([]);
+      setAssetTrashConflictBatchIds(new Set());
+      setAssetTrashPanelOpen(false);
       databaseIdentityStaleRef.current = true;
+      timelineServerRevision.current = null;
+      timelineServerProjectRef.current = null;
       timelineHydrationReady.current = false;
       setTimelineHydrationStatus("stale");
       setToast("Director 后端数据库已变化；请刷新整个页面后继续");
       return false;
     }
+    if (configuration.restart_required) {
+      clearTimelineHistory();
+      assetTrashListRequest.current += 1;
+      setAssetTrashBatches([]);
+      setAssetTrashConflictBatchIds(new Set());
+      setAssetTrashPanelOpen(false);
+    }
     storageRestartRequiredRef.current = configuration.restart_required;
     setStorageRestartRequired(configuration.restart_required);
     setStorageOperationLock("idle");
     return true;
-  }, [setStorageOperationLock]);
+  }, [clearTimelineHistory, setStorageOperationLock]);
 
   const beginStorageOperation = useCallback(() => {
     storageAuthorityControllerRef.current?.abort();
     storageAuthorityControllerRef.current = null;
+    projectSwitchGeneration.current += 1;
     setStorageOperationLock("submitting");
   }, [setStorageOperationLock]);
 
@@ -710,52 +1303,126 @@ export default function App() {
 
   useEffect(() => () => storageAuthorityControllerRef.current?.abort(), []);
 
-  const dispatchTimeline = useCallback((action: TimelineAction) => {
+  const dispatchTimeline = useCallback((
+    action: TimelineAction,
+    options: TimelineDispatchOptions = {},
+  ): boolean => {
     const current = timelineRef.current;
-    const reduced = timelineEditorReducer(current, action);
-    const sourceAudioFit = autoFitSourceAudioTiming(reduced.project);
-    const next = sourceAudioFit.project === reduced.project
-      ? reduced
-      : { ...reduced, project: sourceAudioFit.project };
-    const projectChanged = next.project !== current.project;
-    const selectionChanged = next.selected_segment_ids.length !== current.selected_segment_ids.length ||
-      next.selected_segment_ids.some((id, index) => id !== current.selected_segment_ids[index]);
-    const segmentTopologyChanged = next.project.segments.length !== current.project.segments.length ||
-      next.project.segments.some((segment, index) => segment.id !== current.project.segments[index]?.id);
-    const currentRunnable = runnableTimelineSegmentIds(current);
-    const nextRunnable = runnableTimelineSegmentIds(next);
-    const executableSelectionChanged = nextRunnable.length !== currentRunnable.length ||
-      nextRunnable.some((id, index) => id !== currentRunnable[index]);
+    const historyMode = options.history ?? "record";
+    const transaction = reduceTimelineTransaction(
+      current,
+      action,
+      historyMode === "replay" ? "replay" : undefined,
+    );
+    const next = transaction.next;
+    const projectChanged = transaction.documentChanged;
     if (databaseIdentityStaleRef.current && projectChanged) {
       setToast("本页数据库身份已过期；请刷新整个页面后继续");
-      return;
+      return false;
     }
     if (storageOperationStatusRef.current !== "idle" && projectChanged) {
       setToast("数据库操作结果尚未确认；确认完成前不能继续修改");
-      return;
+      return false;
     }
     if (storageRestartRequiredRef.current && projectChanged) {
       setToast("数据库切换正在等待重启；刷新页面前不能继续修改");
-      return;
+      return false;
     }
     if (!timelineHydrationReady.current && projectChanged) {
       setToast("正在从服务器恢复时间线；恢复完成前暂不能编辑");
-      return;
+      return false;
     }
-    if ((assetDeleteLock.current || assetDeleteIntent.current || timelineSyncRequiredRef.current || runtimeEndpointSwitchRequired.current) && projectChanged) {
+    if (projectSwitchHandoffIntent.current !== null && projectChanged) {
+      setToast("正在完成项目切换交接；完成前不能编辑当前项目");
+      return false;
+    }
+    if ((assetDeleteLock.current || assetDeleteIntent.current || timelineSyncRequiredRef.current || timelineRevisionConflictRef.current || runtimeEndpointSwitchRequired.current) && projectChanged) {
       setToast(runtimeEndpointSwitchRequired.current
         ? "正在切换 ComfyUI 地址；最新时间线确认并完成新地址核对前暂不能编辑"
         : assetDeleteIntent.current
           ? "正在建立素材移出的原子边界；完成后再编辑时间线"
+        : timelineRevisionConflictRef.current
+          ? "检测到服务器时间线已被其他页面修改；请先选择采用服务器版本或保留本地版本"
         : timelineSyncRequiredRef.current
           ? "服务器时间线尚未完成权威回读；恢复同步前暂不能编辑"
           : "正在原子解除素材引用，完成后再编辑时间线");
-      return;
+      return false;
+    }
+    if (projectChanged && historyMode === "record") {
+      const restoreEditingContext = transaction.policy.context === "structural";
+      const captureTextContext = transaction.policy.context === "text";
+      const fieldKey = transaction.policy.mergeKey;
+      const capturedActiveText = captureTextContext
+        ? captureTimelineTextEditingContext(document.activeElement)
+        : null;
+      const activeText = capturedActiveText &&
+        (!fieldKey || capturedActiveText.field_key === fieldKey)
+        ? capturedActiveText
+        : null;
+      const pendingBeforeText = timelineTextBeforeInput.current;
+      const beforeText = captureTextContext
+        ? (pendingBeforeText && (!fieldKey || pendingBeforeText.field_key === fieldKey)
+            ? pendingBeforeText
+            : activeText)
+        : null;
+      let afterText = activeText;
+      if (beforeText && fieldKey && beforeText.field_key === fieldKey) {
+        const segment = current.project.segments.find((candidate) =>
+          "id" in action && action.id === candidate.id);
+        const nextSegment = next.project.segments.find((candidate) =>
+          candidate.id === segment?.id);
+        const changedField = fieldKey.endsWith(":prompt")
+          ? "prompt"
+          : fieldKey.endsWith(":title")
+            ? "title"
+            : null;
+        if (segment && nextSegment && changedField) {
+          const control = timelineHistoryTextControl(document.activeElement);
+          const nextValue = nextSegment[changedField];
+          if (!control || control.value !== nextValue) {
+            afterText = collapsedTimelineTextContextAfter(
+              beforeText,
+              segment[changedField],
+              nextValue,
+            );
+          }
+        }
+      }
+      commitTimelineHistory(recordTimelineHistory(timelineHistoryRef.current, {
+        label: options.historyLabel ?? transaction.policy.label,
+        before: current.project,
+        after: next.project,
+        beforeContext: restoreEditingContext
+          ? captureTimelineHistoryContext(current)
+          : beforeText
+            ? timelineTextHistoryContext(current, beforeText)
+          : undefined,
+        afterContext: restoreEditingContext
+          ? captureTimelineHistoryContext(next)
+          : afterText
+            ? timelineTextHistoryContext(next, afterText)
+          : undefined,
+        mergeKey: options.historyMergeKey ?? transaction.policy.mergeKey,
+        coalesceWindowMs: timelineTextCompositionActive.current
+          ? Number.MAX_SAFE_INTEGER
+          : undefined,
+      }));
+      if (captureTextContext) timelineTextBeforeInput.current = null;
+    } else if (historyMode === "reset") {
+      clearTimelineHistory();
+    } else if (
+      historyMode !== "replay" &&
+      transaction.policy.coalescing !== "preserve"
+    ) {
+      commitTimelineHistory(sealTimelineHistoryCoalescing(timelineHistoryRef.current));
     }
     // Keep an optimistic reducer shadow so several actions batched before the
     // next render are compared and persisted in their exact order.
     timelineRef.current = next;
     if (projectChanged) {
+      if (next.project.title !== current.project.title) {
+        updateProjectSummaryTitle(activeProjectIdRef.current, next.project.title);
+      }
       timelineRevision.current += 1;
       // A deterministic server rejection belongs only to the exact revision
       // that was submitted. Any real project edit supersedes it and schedules
@@ -766,7 +1433,7 @@ export default function App() {
       taskListRequest.current += 1;
       dispatch({ type: "tasks/invalidate-current-snapshots" });
     }
-    if (executableSelectionChanged) {
+    if (transaction.runnableSelectionChanged) {
       segmentSelectionGeneration.current += 1;
       setCompileReport(null);
     }
@@ -777,7 +1444,7 @@ export default function App() {
     if (
       activeDatabase &&
       restoredSegmentSelectionKey.current === selectionPreferenceScope &&
-      (segmentTopologyChanged || selectionChanged)
+      (transaction.topologyChanged || transaction.selectionChanged)
     ) {
       saveTimelineSegmentSelectionPreference(
         activeDatabase,
@@ -787,18 +1454,67 @@ export default function App() {
       );
     }
     rawTimelineDispatch(action);
-    if (sourceAudioFit.project !== reduced.project) {
-      rawTimelineDispatch({ type: "project/replace", project: sourceAudioFit.project });
-      const first = sourceAudioFit.adjustments[0];
+    if (transaction.derivedAdjustments.length) {
+      rawTimelineDispatch({ type: "project/replace", project: next.project });
+      const first = transaction.derivedAdjustments[0];
       const label = first.segment_title || first.segment_id;
-      const seconds = first.source_frames_after / sourceAudioFit.project.render.fps;
+      const seconds = first.source_frames_after / next.project.render.fps;
       const omitted = Math.max(0, first.source_frames_before - first.source_frames_after);
       const detail = first.fallback_to_previous_h3_length
         ? `源素材不足 ${first.output_frames_before} 帧，已自动缩短为 ${first.source_frames_after} 帧（${seconds.toFixed(4)} 秒）${omitted ? `，省略末尾 ${omitted} 帧` : ""}`
         : `已自动将源截取从 ${first.source_frames_before} 帧适配为 ${first.source_frames_after} 帧（${seconds.toFixed(4)} 秒）`;
-      setToast(`${label}：${detail}${sourceAudioFit.adjustments.length > 1 ? `；另有 ${sourceAudioFit.adjustments.length - 1} 个片段已自动适配` : ""}`);
+      setToast(`${label}：${detail}${transaction.derivedAdjustments.length > 1 ? `；另有 ${transaction.derivedAdjustments.length - 1} 个片段已自动适配` : ""}`);
     }
-  }, []);
+    return true;
+  }, [clearTimelineHistory, commitTimelineHistory, updateProjectSummaryTitle]);
+
+  const installTimelineAuthority = useCallback((
+    project: TimelineProject,
+    options: {
+      projectId?: string;
+      selectedSegmentIds?: readonly string[];
+      clearHistory?: boolean;
+    } = {},
+  ): TimelineEditorState => {
+    const current = timelineRef.current;
+    const replaceAction: TimelineAction = { type: "project/replace", project };
+    let next = reduceTimelineTransaction(current, replaceAction, "authority").next;
+    const selectedSegmentIds = options.selectedSegmentIds;
+    let selectionAction: TimelineAction | null = null;
+    if (selectedSegmentIds !== undefined) {
+      selectionAction = {
+        type: "segment/set-selection",
+        ids: [...selectedSegmentIds],
+      };
+      next = reduceTimelineTransaction(next, selectionAction).next;
+    }
+    // This is the only non-user path allowed to install a server-owned
+    // document. Keep the command shadow and React reducer in the same order.
+    timelineRef.current = next;
+    if (selectionAction) {
+      // Install project + explicit project-scoped selection atomically. Two
+      // separate reducer actions can expose the reused segment IDs from the
+      // previous project to a concurrent committed render.
+      rawTimelineDispatch({
+        type: "history/restore",
+        project: next.project,
+        selected_segment_ids: [...next.selected_segment_ids],
+        active_segment_id: next.active_segment_id,
+        selection_anchor_id: next.selection_anchor_id,
+      });
+    } else {
+      rawTimelineDispatch(replaceAction);
+    }
+    updateProjectSummaryTitle(
+      options.projectId ?? activeProjectIdRef.current,
+      project.title,
+    );
+    if (options.clearHistory ?? true) clearTimelineHistory();
+    return next;
+  }, [clearTimelineHistory, updateProjectSummaryTitle]);
+
+  const dispatchTimelineUi = useCallback((action: TimelineAction): boolean =>
+    dispatchTimeline(action, { history: "skip" }), [dispatchTimeline]);
 
   // Persist the same mechanical correction for timelines loaded from older
   // saves. Without this hydration pass, a legacy mismatch could disable the
@@ -807,8 +1523,176 @@ export default function App() {
   useEffect(() => {
     if (timelineHydrationStatus !== "ready") return;
     if (!autoFitSourceAudioTiming(timeline.project).adjustments.length) return;
-    dispatchTimeline({ type: "project/replace", project: timeline.project });
+    dispatchTimeline(
+      { type: "project/replace", project: timeline.project },
+      { history: "skip" },
+    );
   }, [dispatchTimeline, timeline.project, timelineHydrationStatus]);
+
+  const applyTimelineHistoryReplay = useCallback((
+    replay: TimelineHistoryReplay | null,
+    announcement: string,
+  ) => {
+    if (!replay) return;
+    const current = timelineRef.current;
+    const storedContext = replay.snapshot.context;
+    const currentContext = captureTimelineHistoryContext(current);
+    const restoreSegmentSelection = storedContext?.restore_segment_selection !== false;
+    const context = restoreSegmentSelection && storedContext
+      ? storedContext
+      : currentContext;
+    const sourceFieldKey = captureTimelineTextEditingContext(document.activeElement)?.field_key ?? null;
+    const applied = dispatchTimeline({
+      type: "history/restore",
+      project: replay.snapshot.project,
+      selected_segment_ids: context.selected_segment_ids,
+      active_segment_id: context.active_segment_id,
+      selection_anchor_id: context.selection_anchor_id,
+    }, { history: "replay" });
+    if (!applied) return;
+    commitTimelineHistory(replay.history);
+    setTimelineHistoryAnnouncement((currentAnnouncement) => ({
+      sequence: currentAnnouncement.sequence + 1,
+      message: announcement,
+    }));
+    restoreTimelineTextEditingSelection(storedContext?.text_editing, sourceFieldKey);
+  }, [commitTimelineHistory, dispatchTimeline]);
+
+  const replayTimelineHistory = useCallback((direction: "undo" | "redo") => {
+    const replay = direction === "undo"
+      ? undoTimelineHistory(timelineHistoryRef.current)
+      : redoTimelineHistory(timelineHistoryRef.current);
+    applyTimelineHistoryReplay(
+      replay,
+      replay
+        ? direction === "undo"
+          ? `已撤销：${replay.label}`
+          : `已重做：${replay.label}`
+        : "",
+    );
+  }, [applyTimelineHistoryReplay]);
+
+  const undoTimeline = useCallback(() => {
+    replayTimelineHistory("undo");
+  }, [replayTimelineHistory]);
+
+  const redoTimeline = useCallback(() => {
+    replayTimelineHistory("redo");
+  }, [replayTimelineHistory]);
+
+  const jumpTimelineHistoryCursor = useCallback((cursor: number) => {
+    const replay = jumpTimelineHistory(timelineHistoryRef.current, cursor);
+    applyTimelineHistoryReplay(replay, replay ? `已跳转到：${replay.label}` : "");
+  }, [applyTimelineHistoryReplay]);
+
+  useEffect(() => {
+    const sealHistoryInputSession = () => {
+      const sealed = sealTimelineHistoryCoalescing(timelineHistoryRef.current);
+      if (sealed !== timelineHistoryRef.current) commitTimelineHistory(sealed);
+    };
+    const sealTimelineTextBoundary = (event: Event) => {
+      if (
+        isTimelineHistoryTextTarget(event.target) &&
+        !timelineTextCompositionActive.current
+      ) {
+        timelineTextBeforeInput.current = null;
+        sealHistoryInputSession();
+      }
+    };
+    const sealTimelineTextNavigation = (event: KeyboardEvent) => {
+      if (
+        isTimelineHistoryTextTarget(event.target) &&
+        !timelineTextCompositionActive.current &&
+        !event.isComposing &&
+        event.keyCode !== 229 &&
+        ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)
+      ) {
+        timelineTextBeforeInput.current = null;
+        sealHistoryInputSession();
+      }
+    };
+    const sealNonIncrementalInput = (event: Event) => {
+      if (!isTimelineHistoryTextTarget(event.target)) return;
+      const inputEvent = event as InputEvent;
+      if (timelineTextCompositionActive.current || inputEvent.isComposing) return;
+      const inputType = inputEvent.inputType;
+      if (inputType === "historyUndo" || inputType === "historyRedo") {
+        event.preventDefault();
+        if (inputType === "historyUndo") undoTimeline();
+        else redoTimeline();
+        return;
+      }
+      timelineTextBeforeInput.current = captureTimelineTextEditingContext(event.target);
+      if ([
+        "insertText",
+        "insertCompositionText",
+        "deleteContentBackward",
+        "deleteContentForward",
+      ].includes(inputType)) return;
+      sealHistoryInputSession();
+      window.queueMicrotask(sealHistoryInputSession);
+    };
+    const beginComposition = (event: Event) => {
+      if (!isTimelineHistoryTextTarget(event.target)) return;
+      timelineTextBeforeInput.current = captureTimelineTextEditingContext(event.target);
+      timelineTextCompositionActive.current = true;
+      sealHistoryInputSession();
+    };
+    const endComposition = (event: Event) => {
+      if (!isTimelineHistoryTextTarget(event.target)) return;
+      window.queueMicrotask(() => {
+        timelineTextCompositionActive.current = false;
+        sealHistoryInputSession();
+      });
+    };
+    document.addEventListener("focusin", sealHistoryInputSession);
+    document.addEventListener("pointerdown", sealTimelineTextBoundary);
+    document.addEventListener("keydown", sealTimelineTextNavigation);
+    document.addEventListener("beforeinput", sealNonIncrementalInput);
+    document.addEventListener("compositionstart", beginComposition);
+    document.addEventListener("compositionend", endComposition);
+    return () => {
+      document.removeEventListener("focusin", sealHistoryInputSession);
+      document.removeEventListener("pointerdown", sealTimelineTextBoundary);
+      document.removeEventListener("keydown", sealTimelineTextNavigation);
+      document.removeEventListener("beforeinput", sealNonIncrementalInput);
+      document.removeEventListener("compositionstart", beginComposition);
+      document.removeEventListener("compositionend", endComposition);
+      timelineTextCompositionActive.current = false;
+    };
+  }, [commitTimelineHistory, redoTimeline, undoTimeline]);
+
+  useEffect(() => {
+    const handleTimelineHistoryShortcut = (event: KeyboardEvent) => {
+      if (
+        state.view !== "workspace" ||
+        event.defaultPrevented ||
+        timelineTextCompositionActive.current ||
+        event.isComposing ||
+        event.keyCode === 229 ||
+        event.altKey ||
+        (!event.ctrlKey && !event.metaKey)
+      ) return;
+      const key = event.key.toLowerCase();
+      const undo = key === "z" && !event.shiftKey;
+      const redo = (key === "z" && event.shiftKey) ||
+        (key === "y" && event.ctrlKey && !event.metaKey && !event.shiftKey);
+      if ((!undo && !redo) || shouldKeepNativeUndo(event.target)) return;
+      const projectTextTarget = isTimelineHistoryTextTarget(event.target);
+      if (
+        (undo && !canUndoTimelineHistory(timelineHistoryRef.current)) ||
+        (redo && !canRedoTimelineHistory(timelineHistoryRef.current))
+      ) {
+        if (projectTextTarget) event.preventDefault();
+        return;
+      }
+      event.preventDefault();
+      if (undo) undoTimeline();
+      else redoTimeline();
+    };
+    window.addEventListener("keydown", handleTimelineHistoryShortcut);
+    return () => window.removeEventListener("keydown", handleTimelineHistoryShortcut);
+  }, [redoTimeline, state.view, undoTimeline]);
 
   const loadTasks = useCallback(async (signal?: AbortSignal, queueIfBusy = false) => {
     if (taskListInFlight.current) {
@@ -851,30 +1735,298 @@ export default function App() {
     void loadTasks(undefined, true);
   }, [loadTasks]);
 
+  useEffect(() => {
+    if (timelineHydrationStatus !== "ready") return;
+    const database = activeDatabaseRef.current;
+    const serverRevision = timelineServerRevision.current;
+    if (!database || serverRevision === null) return;
+    const projectId = activeProjectId;
+    const scope = {
+      databaseIdentity: database.active_database_identity,
+      projectId,
+    };
+    // A legacy WAL deliberately remains local until the user resolves it. Its
+    // document must not be advertised as though it were the server revision
+    // fetched during hydration.
+    const knownServerProject = timelineRevisionConflictRef.current?.serverAuthority?.document ??
+      timelineServerProjectRef.current ?? timelineRef.current.project;
+    let channel: TimelineRevisionChannel;
+    channel = createTimelineRevisionChannel(
+      scope,
+      {
+        revision: serverRevision,
+        documentHash: timelineDocumentHash(knownServerProject),
+      },
+      () => {
+        // Asset mutations own the project/document scope until their exact
+        // post-mutation authority read completes. A Broadcast hint received in
+        // that interval must not install an unrelated intermediate document.
+        if (
+          assetDeleteIntent.current || assetDeleteLock.current ||
+          assetUploadLock.current
+        ) return;
+        const requestId = ++timelineRemoteAuthorityRequest.current;
+        const writeGeneration = timelineWriteGeneration.current;
+        void fetchTimelineForProject(projectId).then((authority) => {
+          if (
+            requestId !== timelineRemoteAuthorityRequest.current ||
+            writeGeneration !== timelineWriteGeneration.current ||
+            activeProjectIdRef.current !== projectId ||
+            databaseIdentityStaleRef.current ||
+            storageOperationStatusRef.current !== "idle" ||
+            activeDatabaseRef.current?.active_database_path !== database.active_database_path ||
+            activeDatabaseRef.current?.active_database_identity !== scope.databaseIdentity
+          ) return;
+          const serverProject = normalizeTimelineProject(authority.document);
+          if (!serverProject) throw new Error("服务器返回的时间线结构无效");
+          const currentServerRevision = timelineServerRevision.current;
+          const currentServerProject = timelineServerProjectRef.current;
+          if (currentServerRevision === null || !currentServerProject) return;
+          if (authority.revision < currentServerRevision) return;
+          channel.acceptKnown({
+            revision: authority.revision,
+            documentHash: timelineDocumentHash(serverProject),
+          });
+          // A recovery gate intentionally displays the server document while
+          // durable owned/foreign branches remain untouched. A same-document
+          // broadcast is only a hint here; it is never authority to clear an
+          // owned WAL or overwrite its journal before the user's choice.
+          if (timelineRevisionConflictRef.current?.source === "recovery-branches") return;
+          const currentProject = normalizeTimelineProject(structuredClone(timelineRef.current.project));
+          if (!currentProject) return;
+          if (
+            authority.revision === currentServerRevision &&
+            !timelineProjectsEqual(currentServerProject, serverProject)
+          ) {
+            const existing = timelineRevisionConflictRef.current;
+            if (existing?.resolving) return;
+            saveLocalTimeline(currentProject, database, projectId);
+            setTimelineRevisionConflict({
+              projectId,
+              localProject: currentProject,
+              serverAuthority: { document: serverProject, revision: authority.revision },
+              source: "cas",
+              resolving: false,
+            });
+            setTimelineDirty(true);
+            setToast("服务器对同一修订号返回了不同时间线；已停止自动同步并保留本地状态");
+            return;
+          }
+          const hasLocalChanges = timelinePersistedRevision.current < timelineRevision.current ||
+            timelineSaveRequest.current !== null;
+          if (timelineProjectsEqual(currentProject, serverProject)) {
+            // The authority GET proves that the current local head is already
+            // durable. Invalidate any older PUT still in flight before clearing
+            // its WAL/base so a late 409 cannot manufacture a false conflict.
+            timelineWriteGeneration.current += 1;
+            acceptTimelineServerAuthority({ document: serverProject, revision: authority.revision });
+            timelinePersistedRevision.current = timelineRevision.current;
+            setTimelineDirty(false);
+            clearLocalTimeline();
+            persistTimelineJournal(
+              timelineHistoryRef.current,
+              { document: serverProject, revision: authority.revision },
+              database,
+              projectId,
+            );
+            return;
+          }
+          if (hasLocalChanges && authority.revision !== currentServerRevision) {
+            const existing = timelineRevisionConflictRef.current;
+            if (existing?.resolving) return;
+            saveLocalTimeline(currentProject, database, projectId);
+            setTimelineRevisionConflict({
+              projectId,
+              localProject: currentProject,
+              serverAuthority: { document: serverProject, revision: authority.revision },
+              source: "cas",
+              resolving: false,
+            });
+            setTimelineDirty(true);
+            setToast("其他页面已更新服务器时间线；本地草稿已保留，请选择如何处理冲突");
+            return;
+          }
+          if (hasLocalChanges || timelineRevisionConflictRef.current) return;
+          timelineWriteGeneration.current += 1;
+          acceptTimelineServerAuthority({ document: serverProject, revision: authority.revision });
+          installTimelineAuthority(serverProject);
+          timelinePersistedRevision.current = timelineRevision.current;
+          timelineHadLocal.current = true;
+          setTimelineDirty(false);
+          setTimelinePausedError(null);
+          clearLocalTimeline();
+          invalidateAndRefreshTaskSnapshots();
+        }).catch(() => {
+          // Broadcast is only an invalidation hint. Failed GETs neither replace
+          // the document nor weaken CAS; a later notice/write will retry.
+        });
+      },
+    );
+    timelineRevisionChannelRef.current = channel;
+    return () => {
+      timelineRemoteAuthorityRequest.current += 1;
+      channel.close();
+      if (timelineRevisionChannelRef.current === channel) {
+        timelineRevisionChannelRef.current = null;
+      }
+    };
+  }, [acceptTimelineServerAuthority, activeProjectId, clearLocalTimeline, installTimelineAuthority, invalidateAndRefreshTaskSnapshots, persistTimelineJournal, saveLocalTimeline, setTimelineRevisionConflict, timelineHydrationStatus]);
+
   const loadAssets = useCallback(async (
     signal?: AbortSignal,
     failClosed = false,
+    expectedScope?: AssetAuthorityScope,
   ): Promise<boolean> => {
+    const activeDatabase = activeDatabaseRef.current;
+    const scope = expectedScope ?? (
+      activeDatabase && runtimeSettingsAuthorityReadyRef.current
+        ? {
+            database: { ...activeDatabase },
+            comfyOrigin: authoritativeSettingsRef.current.comfy_url,
+          }
+        : null
+    );
+    const scopeStillCurrent = () => Boolean(
+      scope &&
+      runtimeSettingsAuthorityReadyRef.current &&
+      activeDatabaseRef.current?.active_database_path === scope.database.active_database_path &&
+      activeDatabaseRef.current?.active_database_identity === scope.database.active_database_identity &&
+      authoritativeSettingsRef.current.comfy_url === scope.comfyOrigin
+    );
+    if (!scopeStillCurrent()) {
+      if (failClosed) {
+        dispatchTimelineUi({ type: "assets/replace", assets: [] });
+        throw new Error("素材库所属数据库或 ComfyUI 地址尚未完成权威确认");
+      }
+      return false;
+    }
     const requestId = ++assetListRequest.current;
     try {
       const response = await directorApi.listAssets(undefined, signal);
-      if (signal?.aborted || assetListRequest.current !== requestId) return false;
+      if (
+        signal?.aborted ||
+        assetListRequest.current !== requestId ||
+        !scopeStillCurrent() ||
+        response.active_database_identity !== scope!.database.active_database_identity ||
+        response.comfy_origin !== scope!.comfyOrigin
+      ) {
+        if (failClosed && assetListRequest.current === requestId) {
+          dispatchTimelineUi({ type: "assets/replace", assets: [] });
+          throw new Error("素材库响应不属于当前数据库与 ComfyUI 地址");
+        }
+        return false;
+      }
       const preference = loadAssetLayoutPreference();
-      rawTimelineDispatch({
+      const assets = orderAssetsByPreference(response.assets, preference.order);
+      const nextAssetIds = new Set(assets.map((asset) => asset.id));
+      if (timelineRef.current.assets.some((asset) => !nextAssetIds.has(asset.id))) {
+        clearTimelineHistory();
+      }
+      dispatchTimelineUi({
         type: "assets/replace",
-        assets: orderAssetsByPreference(response.assets, preference.order),
+        assets,
       });
       return true;
     } catch (reason) {
       if (signal?.aborted || assetListRequest.current !== requestId) return false;
       if (failClosed) {
-        rawTimelineDispatch({ type: "assets/replace", assets: [] });
+        dispatchTimelineUi({ type: "assets/replace", assets: [] });
         throw reason;
       }
       // An older backend may not expose the library yet; new uploads still appear.
       return false;
     }
+  }, [clearTimelineHistory, dispatchTimelineUi]);
+
+  const loadAssetTrash = useCallback(async (): Promise<boolean> => {
+    const requestId = ++assetTrashListRequest.current;
+    const databaseIdentity = activeDatabaseRef.current?.active_database_identity ?? null;
+    const comfyOrigin = authoritativeSettingsRef.current.comfy_url;
+    setAssetTrashLoading(true);
+    try {
+      const response = await directorApi.listAssetTrash();
+      if (
+        requestId !== assetTrashListRequest.current ||
+        activeDatabaseRef.current?.active_database_identity !== databaseIdentity ||
+        authoritativeSettingsRef.current.comfy_url !== comfyOrigin ||
+        response.active_database_identity !== databaseIdentity ||
+        response.comfy_origin !== comfyOrigin
+      ) return false;
+      setAssetTrashBatches(response.batches);
+      const visibleBatchIds = new Set(response.batches.map((batch) => batch.batch_id));
+      setAssetTrashConflictBatchIds((current) => new Set(
+        [...current].filter((batchId) => visibleBatchIds.has(batchId)),
+      ));
+      return true;
+    } catch (reason) {
+      if (requestId !== assetTrashListRequest.current) return false;
+      setToast(reason instanceof Error ? reason.message : "读取素材回收站失败");
+      return false;
+    } finally {
+      if (requestId === assetTrashListRequest.current) setAssetTrashLoading(false);
+    }
   }, []);
+
+  const reconcileAmbiguousAssetTrash = useCallback(async (
+    assetIds: readonly string[],
+    expectedDatabase: ActiveDatabaseIdentity,
+    expectedComfyOrigin: string,
+    expectedProjectId: string,
+    expectedProjectSwitchGeneration: number,
+  ): Promise<"committed" | "rejected" | "unknown"> => {
+    const assetRequestId = ++assetListRequest.current;
+    const trashRequestId = ++assetTrashListRequest.current;
+    setAssetTrashLoading(true);
+    try {
+      const [assetResponse, trashResponse] = await Promise.all([
+        directorApi.listAssets(),
+        directorApi.listAssetTrash(),
+      ]);
+      const activeDatabase = activeDatabaseRef.current;
+      if (
+        assetListRequest.current !== assetRequestId ||
+        assetTrashListRequest.current !== trashRequestId ||
+        !activeDatabase ||
+        projectSwitchGeneration.current !== expectedProjectSwitchGeneration ||
+        activeProjectIdRef.current !== expectedProjectId ||
+        activeDatabase.active_database_path !== expectedDatabase.active_database_path ||
+        activeDatabase.active_database_identity !== expectedDatabase.active_database_identity ||
+        authoritativeSettingsRef.current.comfy_url !== expectedComfyOrigin ||
+        assetResponse.active_database_identity !== expectedDatabase.active_database_identity ||
+        assetResponse.comfy_origin !== expectedComfyOrigin ||
+        trashResponse.active_database_identity !== expectedDatabase.active_database_identity ||
+        trashResponse.comfy_origin !== expectedComfyOrigin
+      ) return "unknown";
+
+      const preference = loadAssetLayoutPreference();
+      const assets = orderAssetsByPreference(assetResponse.assets, preference.order);
+      const liveAssetIds = new Set(assets.map((asset) => asset.id));
+      if (timelineRef.current.assets.some((asset) => !liveAssetIds.has(asset.id))) {
+        clearTimelineHistory();
+      }
+      dispatchTimelineUi({ type: "assets/replace", assets });
+      setAssetTrashBatches(trashResponse.batches);
+      const visibleBatchIds = new Set(trashResponse.batches.map((batch) => batch.batch_id));
+      setAssetTrashConflictBatchIds((current) => new Set(
+        [...current].filter((batchId) => visibleBatchIds.has(batchId)),
+      ));
+
+      const trashedAssetIds = new Set(
+        trashResponse.batches.flatMap((batch) => batch.asset_ids),
+      );
+      if (assetIds.every((assetId) => !liveAssetIds.has(assetId) && trashedAssetIds.has(assetId))) {
+        return "committed";
+      }
+      if (assetIds.every((assetId) => liveAssetIds.has(assetId) && !trashedAssetIds.has(assetId))) {
+        return "rejected";
+      }
+      return "unknown";
+    } catch {
+      return "unknown";
+    } finally {
+      if (trashRequestId === assetTrashListRequest.current) setAssetTrashLoading(false);
+    }
+  }, [clearTimelineHistory, dispatchTimelineUi]);
 
   const refreshRuntimeResources = useCallback(async (
     origin: string,
@@ -964,7 +2116,8 @@ export default function App() {
       setLoadingModels(false);
       assetAuthorityRequired.current = true;
       assetListRequest.current += 1;
-      rawTimelineDispatch({ type: "assets/replace", assets: [] });
+      dispatchTimelineUi({ type: "assets/replace", assets: [] });
+      clearTimelineHistory();
       setRuntimeAuthorityRequired(true);
       setCompileReport(null);
       window.queueMicrotask(() => externalRuntimeAuthorityRefreshRef.current());
@@ -1030,7 +2183,7 @@ export default function App() {
       }, RUNTIME_SETTINGS_RETRY_MS);
     }
     return false;
-  }, [invalidateAndRefreshTaskSnapshots, setRuntimeAuthorityRequired]);
+  }, [clearTimelineHistory, dispatchTimelineUi, invalidateAndRefreshTaskSnapshots, setRuntimeAuthorityRequired]);
   runtimeResourceRefreshRef.current = (origin, preserveExisting) =>
     refreshRuntimeResources(origin, preserveExisting);
 
@@ -1145,7 +2298,7 @@ export default function App() {
           if (!assetsReady) throw new Error("新 endpoint 的素材库刷新请求已过期");
         } else {
           assetListRequest.current += 1;
-          rawTimelineDispatch({ type: "assets/replace", assets: [] });
+          dispatchTimelineUi({ type: "assets/replace", assets: [] });
         }
         assetAuthorityRequired.current = false;
         if (runtimeSettingsDesired.current) {
@@ -1199,6 +2352,9 @@ export default function App() {
     if (assetUploadLock.current) {
       throw new Error("正在上传并绑定本地素材，完成前不能切换运行设置");
     }
+    if (timelineRevisionConflict) {
+      throw new Error("服务器时间线存在修订冲突，处理完成前不能修改运行设置");
+    }
     if (timelineSyncRequired) {
       throw new Error("服务器时间线正在自动恢复权威状态，完成前不能修改运行设置");
     }
@@ -1218,7 +2374,8 @@ export default function App() {
     const invalidateAssetAuthority = () => {
       assetAuthorityRequired.current = true;
       assetListRequest.current += 1;
-      rawTimelineDispatch({ type: "assets/replace", assets: [] });
+      dispatchTimelineUi({ type: "assets/replace", assets: [] });
+      clearTimelineHistory();
     };
 
     const operation = (async () => {
@@ -1302,7 +2459,7 @@ export default function App() {
           }
         } else {
           assetListRequest.current += 1;
-          rawTimelineDispatch({ type: "assets/replace", assets: [] });
+          dispatchTimelineUi({ type: "assets/replace", assets: [] });
         }
         assetAuthorityRequired.current = false;
       }
@@ -1323,7 +2480,7 @@ export default function App() {
         setRuntimeSettingsOperationOwner(null);
       }
     }
-  }, [invalidateAndRefreshTaskSnapshots, loadAssets, refreshRuntime, setRuntimeAuthorityRequired, timelineSyncRequired]);
+  }, [clearTimelineHistory, dispatchTimelineUi, invalidateAndRefreshTaskSnapshots, loadAssets, refreshRuntime, setRuntimeAuthorityRequired, timelineRevisionConflict, timelineSyncRequired]);
 
   const drainRuntimeSettings = useCallback(() => {
     if (runtimeSettingsOperation.current || runtimeSettingsAutosaveTimer.current !== null) return;
@@ -1339,7 +2496,7 @@ export default function App() {
     ) return;
     if (
       assetDeleteLock.current || assetDeleteIntent.current || assetUploadLock.current ||
-      timelineSyncRequiredRef.current || runtimeExecutionIntent.current > 0
+      timelineSyncRequiredRef.current || timelineRevisionConflictRef.current || runtimeExecutionIntent.current > 0
     ) {
       if (runtimeSettingsRetryTimer.current === null) {
         runtimeSettingsRetryTimer.current = window.setTimeout(() => {
@@ -1584,6 +2741,7 @@ export default function App() {
       databaseIdentityStaleRef.current ||
       storageRestartRequiredRef.current ||
       timelineSyncRequiredRef.current ||
+      timelineRevisionConflictRef.current ||
       assetDeleteLock.current ||
       assetUploadLock.current ||
       timelinePersistedRevision.current >= timelineRevision.current ||
@@ -1594,31 +2752,122 @@ export default function App() {
 
     const generation = timelineWriteGeneration.current;
     const revision = timelineRevision.current;
+    const projectId = activeProjectIdRef.current;
+    const expectedServerRevision = timelineServerRevision.current;
+    const expectedServerProject = timelineServerProjectRef.current;
+    const database = activeDatabaseRef.current;
+    if (expectedServerRevision === null || !expectedServerProject) {
+      return Promise.reject(new Error("服务器时间线修订号尚未确认，暂不能同步"));
+    }
+    if (!database) {
+      return Promise.reject(new Error("数据库身份尚未确认，暂不能同步时间线"));
+    }
     const snapshot = normalizeTimelineProject(structuredClone(timelineRef.current.project));
     if (!snapshot) return Promise.reject(new Error("时间线结构无效，请检查项目字段"));
 
     let mayDrainImmediately = false;
     let failedRevisionWasSuperseded = false;
+    let observedConflictAuthority: TimelineAuthority | null = null;
     const operation = (async (): Promise<TimelineProject | null> => {
-      const response = await saveTimelineForProject(activeProjectIdRef.current, snapshot);
-      const confirmed = normalizeTimelineProject(response);
+      let response: TimelineAuthority;
+      try {
+        response = await runWithTimelineWriterLock({
+          databaseIdentity: database.active_database_identity,
+          projectId,
+        }, () => saveTimelineForProject(projectId, snapshot, expectedServerRevision));
+      } catch (reason) {
+        if (!(
+          reason instanceof ApiError &&
+          reason.status === 409 &&
+          reason.code === "timeline_revision_conflict"
+        )) throw reason;
+        // A response can be lost after commit and a later retry can then see a
+        // 409. Only an authority GET proving that the submitted snapshot is the
+        // current document converts that ambiguity into an ACK.
+        const authority = await fetchTimelineForProject(projectId);
+        const serverDocument = normalizeTimelineProject(authority.document);
+        if (!serverDocument) throw new Error("服务器返回的时间线结构无效");
+        if (!timelineProjectsEqual(snapshot, serverDocument)) {
+          observedConflictAuthority = {
+            document: serverDocument,
+            revision: authority.revision,
+          };
+          throw reason;
+        }
+        response = {
+          document: serverDocument,
+          revision: authority.revision,
+        };
+      }
+      const confirmed = normalizeTimelineProject(response.document);
       if (!confirmed) throw new Error("服务器返回的时间线结构无效");
       // Exclusive mutations advance the generation. Their authority must never
       // be replaced by a response that started before them.
       if (timelineWriteGeneration.current !== generation) return null;
 
+      // The ACK advances the server base even when a newer local edit already
+      // exists. The next latest-wins write must compare against this revision,
+      // while the older ACK document itself must not replace that newer edit.
+      acceptTimelineServerAuthority({ document: confirmed, revision: response.revision });
+      timelineRevisionChannelRef.current?.publish({
+        revision: response.revision,
+        documentHash: timelineDocumentHash(confirmed),
+      });
       timelinePersistedRevision.current = Math.max(
         timelinePersistedRevision.current,
         revision,
       );
       mayDrainImmediately = true;
       timelineHadLocal.current = true;
-      if (timelineRevision.current !== revision) return null;
+      if (timelineRevision.current !== revision) {
+        // A newer edit already replaced the submitted head. Advance both
+        // durable recovery layers to the ACKed base before the next CAS write;
+        // never clear the newer WAL with the older request's completion.
+        const latest = normalizeTimelineProject(structuredClone(timelineRef.current.project));
+        if (latest) {
+          saveLocalTimeline(latest, database, projectId);
+          if (
+            timelineHistoryRef.current.head &&
+            timelineProjectsEqual(timelineHistoryRef.current.head, latest)
+          ) {
+            persistTimelineJournal(
+              timelineHistoryRef.current,
+              { document: confirmed, revision: response.revision },
+              database,
+              projectId,
+            );
+          }
+        }
+        return null;
+      }
 
-      const replaceAction: TimelineAction = { type: "project/replace", project: confirmed };
-      timelineRef.current = timelineEditorReducer(timelineRef.current, replaceAction);
-      rawTimelineDispatch(replaceAction);
+      let durableHistory = timelineHistoryRef.current;
+      if (!timelineProjectsEqual(snapshot, confirmed)) {
+        // An exact ACK normally echoes the submitted normalized document. A
+        // materially canonicalized response becomes a new authority boundary;
+        // keep history only when its current head can be rebased without
+        // changing segment order or asset-slot identity.
+        const rebased = rebaseTimelineHistoryHead(
+          timelineHistoryRef.current,
+          snapshot,
+          confirmed,
+        );
+        if (rebased) {
+          durableHistory = rebased;
+          commitTimelineHistory(rebased);
+        } else {
+          durableHistory = resetTimelineHistory(timelineHistoryRef.current);
+          clearTimelineHistory();
+        }
+      }
+      installTimelineAuthority(confirmed, { clearHistory: false });
       clearLocalTimeline();
+      persistTimelineJournal(
+        durableHistory,
+        { document: confirmed, revision: response.revision },
+        database,
+        projectId,
+      );
       setTimelineDirty(false);
       setTimelinePausedError(null);
       if (timelineRetryTimer.current !== null) {
@@ -1638,13 +2887,51 @@ export default function App() {
 
     timelineSaveRequest.current = operation;
     timelineSaveRequestRevision.current = revision;
-    void operation.catch((reason) => {
+    void operation.catch(async (reason) => {
       if (
         timelineWriteGeneration.current !== generation ||
         timelineSyncRequiredRef.current ||
         assetDeleteLock.current
       ) return;
       setTimelineDirty(true);
+      if (
+        reason instanceof ApiError &&
+        reason.status === 409 &&
+        reason.code === "timeline_revision_conflict"
+      ) {
+        const localProject = normalizeTimelineProject(structuredClone(timelineRef.current.project));
+        if (!localProject) return;
+        const conflict: TimelineRevisionConflict = {
+          projectId,
+          localProject,
+          serverAuthority: observedConflictAuthority,
+          source: "cas",
+          resolving: false,
+        };
+        setTimelineRevisionConflict(conflict);
+        const activeDatabase = activeDatabaseRef.current;
+        if (activeDatabase) saveLocalTimeline(localProject, activeDatabase, projectId);
+        setToast("服务器时间线已被其他页面修改；已保留本地草稿，请选择如何处理冲突");
+        if (observedConflictAuthority) return;
+        try {
+          const authority = await fetchTimelineForProject(projectId);
+          const serverDocument = normalizeTimelineProject(authority.document);
+          if (
+            !serverDocument ||
+            timelineWriteGeneration.current !== generation ||
+            activeProjectIdRef.current !== projectId ||
+            timelineRevisionConflictRef.current !== conflict
+          ) return;
+          setTimelineRevisionConflict({
+            ...conflict,
+            serverAuthority: { document: serverDocument, revision: authority.revision },
+          });
+        } catch {
+          // Resolution actions perform another authoritative GET. A failed
+          // diagnostic read must not unlock or discard the local WAL.
+        }
+        return;
+      }
       const deterministicClientError = reason instanceof ApiError &&
         reason.status >= 400 && reason.status < 500;
       failedRevisionWasSuperseded = deterministicClientError &&
@@ -1678,6 +2965,7 @@ export default function App() {
         (mayDrainImmediately || failedRevisionWasSuperseded) &&
         timelineWriteGeneration.current === generation &&
         !timelineSyncRequiredRef.current &&
+        !timelineRevisionConflictRef.current &&
         !assetDeleteLock.current &&
         timelinePersistedRevision.current < timelineRevision.current
       ) {
@@ -1685,7 +2973,7 @@ export default function App() {
       }
     });
     return operation;
-  }, [invalidateAndRefreshTaskSnapshots]);
+  }, [acceptTimelineServerAuthority, clearLocalTimeline, clearTimelineHistory, commitTimelineHistory, installTimelineAuthority, invalidateAndRefreshTaskSnapshots, persistTimelineJournal, saveLocalTimeline, setTimelineRevisionConflict]);
 
   const flushTimelineAutosave = useCallback(async (): Promise<TimelineProject> => {
     const generation = timelineWriteGeneration.current;
@@ -1694,6 +2982,9 @@ export default function App() {
       timelineAutosaveTimer.current = null;
     }
     while (timelinePersistedRevision.current < timelineRevision.current) {
+      if (timelineRevisionConflictRef.current) {
+        throw new Error("服务器时间线存在修订冲突，请先选择采用服务器版本或保留本地版本");
+      }
       if (timelineSyncRequiredRef.current) {
         throw new Error("服务器时间线权威状态尚未恢复，暂不能继续");
       }
@@ -1734,14 +3025,40 @@ export default function App() {
 
   useEffect(() => {
     const markDatabaseIdentityStale = () => {
+      timelineHydrationGeneration.current += 1;
+      timelineWriteGeneration.current += 1;
+      timelineJournalGeneration.current += 1;
+      projectSwitchGeneration.current += 1;
+      projectListGeneration.current += 1;
+      timelineRemoteAuthorityRequest.current += 1;
+      // Detach every owner captured under the stale database. Their promises
+      // remain generation-guarded, while the WAL/journal bytes themselves are
+      // preserved as recovery evidence for a later correctly scoped page.
+      timelineSaveRequest.current = null;
+      timelineSaveRequestRevision.current = null;
+      if (timelineAutosaveTimer.current !== null) {
+        window.clearTimeout(timelineAutosaveTimer.current);
+        timelineAutosaveTimer.current = null;
+      }
+      if (timelineRetryTimer.current !== null) {
+        window.clearTimeout(timelineRetryTimer.current);
+        timelineRetryTimer.current = null;
+      }
+      if (timelineAuthorityRetryTimer.current !== null) {
+        window.clearTimeout(timelineAuthorityRetryTimer.current);
+        timelineAuthorityRetryTimer.current = null;
+      }
+      clearTimelineHistory();
       databaseIdentityStaleRef.current = true;
+      timelineServerRevision.current = null;
+      timelineServerProjectRef.current = null;
       timelineHydrationReady.current = false;
       setTimelineHydrationStatus("stale");
       setToast("本页数据库身份已过期；请刷新整个页面后继续");
     };
     window.addEventListener(DATABASE_IDENTITY_STALE_EVENT, markDatabaseIdentityStale);
     return () => window.removeEventListener(DATABASE_IDENTITY_STALE_EVENT, markDatabaseIdentityStale);
-  }, []);
+  }, [clearTimelineHistory]);
 
   const flushRuntimeSettingsForStorageChange = useCallback(async (): Promise<void> => {
     if (!timelineHydrationReady.current || !activeDatabaseRef.current) {
@@ -1829,20 +3146,30 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController();
+    const hydratingProjectId = activeProjectIdRef.current;
+    const hydratingOwnerId = timelineBranchOwnerRef.current;
+    const hydrationGeneration = ++timelineHydrationGeneration.current;
+    const ownsHydration = () => isCurrentTimelineHydration(
+      controller.signal,
+      hydratingProjectId,
+      activeProjectIdRef.current,
+      hydrationGeneration,
+      timelineHydrationGeneration.current,
+    );
     let timelineHydrationRetryTimer: number | null = null;
     let timelineHydrationAttempt = 0;
     taskListOwnerActive.current = true;
     const timelineGeneration = timelineWriteGeneration.current;
-    void refreshRuntime(controller.signal);
+    const runtimeAuthorityOperation = refreshRuntime(controller.signal);
     // StrictMode performs setup -> cleanup -> setup. Queue the second setup
     // behind the first request so its cleanup abort cannot leave the initial
     // task history empty until the next polling interval.
     void loadTasks(controller.signal, true);
-    void loadAssets(controller.signal);
     const installHydratedProject = (
       project: TimelineProject,
       database: { active_database_path: string; active_database_identity: string },
       projectId: string,
+      history: TimelineHistoryState,
     ) => {
       const segmentIds = project.segments.map((segment) => segment.id);
       const restoredSelection = loadTimelineSegmentSelectionPreference(
@@ -1850,45 +3177,90 @@ export default function App() {
         projectId,
         segmentIds,
       );
-      const replaceAction: TimelineAction = { type: "project/replace", project };
-      const restoreSelectionAction: TimelineAction = {
-        type: "segment/set-selection",
-        ids: restoredSelection ?? segmentIds,
-      };
-      timelineRef.current = timelineEditorReducer(
-        timelineEditorReducer(timelineRef.current, replaceAction),
-        restoreSelectionAction,
-      );
-      rawTimelineDispatch(replaceAction);
-      rawTimelineDispatch(restoreSelectionAction);
+      installTimelineAuthority(project, {
+        projectId,
+        selectedSegmentIds: restoredSelection ?? segmentIds,
+        clearHistory: false,
+      });
+      commitTimelineHistory(history);
       restoredSegmentSelectionKey.current =
         `${database.active_database_identity}:${projectId}`;
     };
     const hydrateTimeline = async (): Promise<void> => {
-      if (controller.signal.aborted || timelineHydrationReady.current) return;
+      if (!ownsHydration() || timelineHydrationReady.current) return;
       try {
-        const hydratingProjectId = activeProjectIdRef.current;
         const storage = await directorApi.getStorage(controller.signal);
-        if (controller.signal.aborted) return;
+        if (!ownsHydration()) return;
         const candidateDatabase = {
           active_database_path: storage.active_database_path,
           active_database_identity: storage.active_database_identity,
         };
         const persistedRuntimeSettings = loadPendingRuntimeSettings(candidateDatabase);
-        const pending = loadLocalTimeline(candidateDatabase, hydratingProjectId);
-        let serverProject: TimelineProject | null = null;
-        if (!pending) {
-          const value = await fetchTimelineForProject(hydratingProjectId, controller.signal);
-          if (controller.signal.aborted) return;
-          serverProject = normalizeTimelineProject(value);
-          if (!serverProject) throw new Error("服务器返回的时间线结构无效");
+        const walBranches = listLocalTimelineWalBranches(
+          candidateDatabase,
+          hydratingProjectId,
+          hydratingOwnerId,
+        );
+        const wal = walBranches.owned?.wal ?? null;
+        // A WAL is only evidence until the current CAS authority has been read.
+        // IndexedDB history is classified against that same exact authority.
+        let authority: TimelineAuthority;
+        try {
+          authority = await fetchTimelineForProject(hydratingProjectId, controller.signal);
+        } catch (reason) {
+          if (!ownsHydration()) return;
+          if (!(
+            reason instanceof ApiError &&
+            reason.status === 404 &&
+            hydratingProjectId !== DEFAULT_PROJECT_ID
+          )) throw reason;
+
+          // A missing persisted project is the one bootstrap path that cannot
+          // wait for a successful timeline latch. Bind the membership decision
+          // to the exact database observed before and after the scoped list.
+          const listGeneration = ++projectListGeneration.current;
+          const list = await directorApi.listProjects(controller.signal);
+          if (!ownsHydration() || projectListGeneration.current !== listGeneration) return;
+          const verification = await directorApi.getStorage(controller.signal);
+          if (!ownsHydration() || projectListGeneration.current !== listGeneration) return;
+          if (
+            list.active_database_identity !== candidateDatabase.active_database_identity ||
+            verification.active_database_path !== candidateDatabase.active_database_path ||
+            verification.active_database_identity !== candidateDatabase.active_database_identity
+          ) throw new DatabaseIdentityChangedDuringHydrationError();
+          if (list.projects.some((project) => project.id === hydratingProjectId)) {
+            // GET and list disagreed inside one stable database. Retry instead
+            // of guessing whether creation/deletion won the inter-request race.
+            throw reason;
+          }
+          setProjects(list.projects);
+          restartTimelineHydrationForProject(DEFAULT_PROJECT_ID);
+          return;
         }
+        if (!ownsHydration()) return;
+        const serverProject = normalizeTimelineProject(authority.document);
+        if (!serverProject) throw new Error("服务器返回的时间线结构无效");
+        const persistenceAuthority = {
+          document: serverProject,
+          revision: authority.revision,
+        };
+        const persistenceScope = timelinePersistenceScope(
+          candidateDatabase,
+          hydratingProjectId,
+          hydratingOwnerId,
+        );
+        const [journal, journalBranchList] = await Promise.all([
+          loadTimelineHistoryJournal(persistenceScope, persistenceAuthority),
+          listTimelineHistoryJournalBranches(persistenceScope, persistenceAuthority),
+        ]);
+        if (!ownsHydration()) return;
         const verification = await directorApi.getStorage(controller.signal);
-        if (controller.signal.aborted) return;
+        if (!ownsHydration()) return;
         if (
           verification.active_database_identity !== candidateDatabase.active_database_identity ||
           verification.active_database_path !== candidateDatabase.active_database_path
         ) throw new DatabaseIdentityChangedDuringHydrationError();
+        if (!ownsHydration()) return;
         const latchedIdentity = directorApi.latchDatabaseIdentity(candidateDatabase.active_database_identity);
         if (latchedIdentity !== candidateDatabase.active_database_identity) {
           throw new DatabaseIdentityChangedDuringHydrationError();
@@ -1896,6 +3268,19 @@ export default function App() {
         activeDatabaseRef.current ??= candidateDatabase;
         storageRestartRequiredRef.current = verification.restart_required;
         setStorageRestartRequired(verification.restart_required);
+        // Assets are endpoint- and database-scoped. Wait for both authorities,
+        // then bind the response to their exact snapshots before it may enter
+        // the editor. Timeline hydration itself does not wait on the library.
+        void runtimeAuthorityOperation.then((settings) => {
+          if (!settings || !ownsHydration()) return;
+          return loadAssets(controller.signal, false, {
+            database: candidateDatabase,
+            comfyOrigin: settings.comfy_url,
+          });
+        }).catch(() => {
+          // Asset discovery remains a soft dependency. A mismatched or failed
+          // response stays invisible and a later explicit refresh can retry.
+        });
         if (runtimeSettingsDesired.current) {
           // A same-tab edit made while storage identity was loading is newer
           // than any persisted envelope and becomes the first scoped WAL.
@@ -1913,16 +3298,8 @@ export default function App() {
         if (runtimeSettingsDesired.current) {
           window.queueMicrotask(() => runtimeSettingsDrainRef.current());
         }
-        if (pending) {
-          timelineRevision.current = 1;
-          timelineHadLocal.current = true;
-          installHydratedProject(pending, candidateDatabase, hydratingProjectId);
-          setTimelineDirty(true);
-          timelineHydrationReady.current = true;
-          setTimelineHydrationStatus("ready");
-          return;
-        }
         if (
+          !ownsHydration() ||
           timelineRevision.current > 0 || timelineHadLocal.current ||
           timelineWriteGeneration.current !== timelineGeneration
         ) {
@@ -1931,15 +3308,145 @@ export default function App() {
           // this stale hydration request completed.
           return;
         }
-        const project = serverProject as TimelineProject;
-        installHydratedProject(project, candidateDatabase, hydratingProjectId);
-        setTimelineDirty(false);
+
+        if ("token" in journal && journal.token) {
+          timelineJournalTokens.current.set(
+            timelineJournalTokenMapKey(
+              candidateDatabase,
+              hydratingProjectId,
+              hydratingOwnerId,
+            ),
+            journal.token,
+          );
+        }
+        const durableJournalBranches = journalBranchList.status === "available"
+          ? journalBranchList.branches
+          : [];
+        const recovery = collectTimelineRecoveryBranches(
+          walBranches,
+          durableJournalBranches,
+          persistenceAuthority,
+        );
+        const explicitRecoverySelectionRequired = recovery.pending.length > 1 ||
+          recovery.pending.some(
+          (branch) => branch.ownership !== "owned" || branch.status === "corrupt",
+          );
+        const walResolution = wal
+          ? resolveLocalTimelineWal(wal, persistenceAuthority)
+          : null;
+        let hydratedProject = serverProject;
+        let hydratedHistory = resetTimelineHistory(timelineHistoryRef.current);
+        let hasPendingProject = false;
+        let hydrationConflict: TimelineRevisionConflict | null = null;
+
+        const journalCarriesHistory = journal.status === "restored" ||
+          journal.status === "acknowledged";
+        if (walResolution?.status === "conflict") {
+          hydratedProject = walResolution.local_project;
+          hasPendingProject = true;
+          hydrationConflict = {
+            projectId: hydratingProjectId,
+            localProject: hydratedProject,
+            serverAuthority: persistenceAuthority,
+            source: "cas",
+            resolving: false,
+          };
+          if (journalCarriesHistory && timelineProjectsEqual(journal.project, hydratedProject)) {
+            hydratedHistory = journal.history;
+          }
+        } else if (journal.status === "conflict") {
+          hydratedProject = journal.localProject;
+          if (timelineProjectsEqual(journal.project, hydratedProject)) {
+            hydratedHistory = journal.history;
+          }
+          hasPendingProject = true;
+          hydrationConflict = {
+            projectId: hydratingProjectId,
+            localProject: hydratedProject,
+            serverAuthority: persistenceAuthority,
+            source: "cas",
+            resolving: false,
+          };
+        } else if (walResolution?.status === "replay") {
+          hydratedProject = walResolution.project;
+          hasPendingProject = true;
+          if (journalCarriesHistory && timelineProjectsEqual(journal.project, hydratedProject)) {
+            hydratedHistory = journal.history;
+          }
+        } else if (walResolution?.status === "acknowledged") {
+          if (journalCarriesHistory && timelineProjectsEqual(journal.project, serverProject)) {
+            hydratedHistory = journal.history;
+          }
+        } else if (journalCarriesHistory) {
+          hydratedHistory = journal.history;
+          hydratedProject = journal.project;
+          hasPendingProject = !timelineProjectsEqual(hydratedProject, serverProject);
+        }
+
+        if (explicitRecoverySelectionRequired) {
+          // Foreign branches are never installed merely because they exist.
+          // The server remains visible and the editor stays gated until the
+          // user selects one branch or explicitly continues without deleting it.
+          hydratedProject = serverProject;
+          hydratedHistory = recovery.newestAcknowledgedHistory ??
+            resetTimelineHistory(timelineHistoryRef.current);
+          hasPendingProject = false;
+          hydrationConflict = {
+            projectId: hydratingProjectId,
+            localProject: serverProject,
+            serverAuthority: persistenceAuthority,
+            source: "recovery-branches",
+            resolving: false,
+            recoveryBranches: recovery.pending,
+            selectedRecoveryBranchId: null,
+          };
+        } else if (
+          !hasPendingProject &&
+          !hydrationConflict &&
+          recovery.newestAcknowledgedHistory
+        ) {
+          // An acknowledged history branch cannot cause a PUT: its head is
+          // already the exact server document. Clone only the newest history
+          // into this owner; every foreign record remains untouched.
+          hydratedHistory = recovery.newestAcknowledgedHistory;
+        }
+
+        acceptTimelineServerAuthority(persistenceAuthority);
+        activeTimelineWalRef.current = wal;
+        timelineRevision.current = hasPendingProject ? 1 : 0;
+        timelinePersistedRevision.current = 0;
+        timelineHadLocal.current = hasPendingProject || hydratedHistory.head !== null;
+        installHydratedProject(
+          hydratedProject,
+          candidateDatabase,
+          hydratingProjectId,
+          hydratedHistory,
+        );
+        setTimelineRevisionConflict(hydrationConflict);
+        setTimelineDirty(hasPendingProject);
         timelineHydrationReady.current = true;
         setTimelineHydrationStatus("ready");
+
+        if (wal && walResolution?.status === "acknowledged" && !hydrationConflict) {
+          clearLocalTimeline(wal);
+        } else if (!wal && hasPendingProject && !hydrationConflict) {
+          saveLocalTimeline(hydratedProject, candidateDatabase, hydratingProjectId);
+        }
+        if (!hydrationConflict) {
+          persistTimelineJournal(
+            hydratedHistory,
+            persistenceAuthority,
+            candidateDatabase,
+            hydratingProjectId,
+          );
+        }
       } catch (reason) {
-        if (controller.signal.aborted) return;
+        if (!ownsHydration()) return;
         if (reason instanceof DatabaseIdentityChangedDuringHydrationError) {
+          clearTimelineHistory();
           databaseIdentityStaleRef.current = true;
+          timelineServerRevision.current = null;
+          timelineServerProjectRef.current = null;
           timelineHydrationReady.current = false;
           setTimelineHydrationStatus("stale");
           setToast(reason.message);
@@ -1950,7 +3457,7 @@ export default function App() {
         timelineHydrationAttempt += 1;
         timelineHydrationRetryTimer = window.setTimeout(() => {
           timelineHydrationRetryTimer = null;
-          void hydrateTimeline();
+          if (ownsHydration()) void hydrateTimeline();
         }, delay);
       }
     };
@@ -1960,29 +3467,55 @@ export default function App() {
       if (timelineHydrationRetryTimer !== null) window.clearTimeout(timelineHydrationRetryTimer);
       controller.abort();
     };
-  }, [refreshRuntime, loadTasks, loadAssets]);
+  }, [acceptTimelineServerAuthority, clearLocalTimeline, clearTimelineHistory, commitTimelineHistory, installTimelineAuthority, persistTimelineJournal, refreshRuntime, loadTasks, loadAssets, saveLocalTimeline, setTimelineRevisionConflict, timelineHydrationEpoch]);
 
   useEffect(() => { saveDirectorState(state); }, [state]);
   useEffect(() => {
-    // Load the project list once and reconcile the persisted active-project
-    // preference against it. The default project always exists server-side.
-    let cancelled = false;
-    void directorApi.listProjects().then((list) => {
-      if (cancelled) return;
+    // A normal list is accepted only after timeline hydration has latched the
+    // database. The 404 bootstrap fallback above owns the pre-latch exception.
+    if (timelineHydrationStatus !== "ready") return;
+    const database = activeDatabaseRef.current;
+    if (!database || databaseIdentityStaleRef.current) return;
+    const controller = new AbortController();
+    const projectId = activeProjectIdRef.current;
+    const hydrationGeneration = timelineHydrationGeneration.current;
+    const switchGeneration = projectSwitchGeneration.current;
+    const listGeneration = ++projectListGeneration.current;
+    const ownsList = () => !controller.signal.aborted &&
+      timelineHydrationReady.current &&
+      timelineHydrationStatus === "ready" &&
+      projectListGeneration.current === listGeneration &&
+      timelineHydrationGeneration.current === hydrationGeneration &&
+      projectSwitchGeneration.current === switchGeneration &&
+      activeProjectIdRef.current === projectId &&
+      activeDatabaseRef.current?.active_database_path === database.active_database_path &&
+      activeDatabaseRef.current.active_database_identity === database.active_database_identity &&
+      !databaseIdentityStaleRef.current;
+    void directorApi.listProjects(controller.signal).then((list) => {
+      if (!ownsList()) return;
+      if (list.active_database_identity !== database.active_database_identity) {
+        window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT));
+        return;
+      }
       setProjects(list.projects);
-      const current = activeProjectIdRef.current;
-      if (current !== DEFAULT_PROJECT_ID && !list.projects.some((project) => project.id === current)) {
-        activeProjectIdRef.current = DEFAULT_PROJECT_ID;
-        setActiveProjectIdState(DEFAULT_PROJECT_ID);
-        persistActiveProjectId(DEFAULT_PROJECT_ID);
+      if (
+        projectId !== DEFAULT_PROJECT_ID &&
+        !list.projects.some((project) => project.id === projectId)
+      ) {
+        restartTimelineHydrationForProject(DEFAULT_PROJECT_ID);
       }
     }).catch(() => {
-      // Project list is a soft dependency; the default project remains usable.
+      // The active timeline remains usable when this soft dependency fails.
+      // A later hydration/project transition starts a fresh scoped request.
     });
-    return () => { cancelled = true; };
-  }, []);
+    return () => controller.abort();
+  }, [activeProjectId, restartTimelineHydrationForProject, timelineHydrationStatus]);
   useEffect(() => {
     if (timelineHydrationStatus !== "ready") return;
+    // Project hand-off updates the synchronous owner before React publishes
+    // its matching state. An intermediate render must not apply the previous
+    // project's same-ID selection preference to the new document.
+    if (activeProjectId !== activeProjectIdRef.current) return;
     const activeDatabase = activeDatabaseRef.current;
     if (!activeDatabase) return;
     const projectSegmentIds = timeline.project.segments.map((segment) => segment.id);
@@ -1996,22 +3529,45 @@ export default function App() {
     );
     if (restored === null) return;
     const action: TimelineAction = { type: "segment/set-selection", ids: restored };
-    const currentRunnable = runnableTimelineSegmentIds(timelineRef.current);
-    const next = timelineEditorReducer(timelineRef.current, action);
-    const nextRunnable = runnableTimelineSegmentIds(next);
+    dispatchTimeline(action, { history: "skip" });
+  }, [activeProjectId, dispatchTimeline, timeline.project.segments, timelineHydrationStatus]);
+  useEffect(() => {
     if (
-      currentRunnable.length !== nextRunnable.length ||
-      currentRunnable.some((id, index) => id !== nextRunnable[index])
-    ) {
-      segmentSelectionGeneration.current += 1;
-      setCompileReport(null);
+      timelineHydrationStatus !== "ready" || timelineRevisionConflict ||
+      timelineSyncRequired || timelineServerRevision.current === null ||
+      timelinePersistedRevision.current < timelineRevision.current
+    ) return;
+    // Clean authority installs inside exclusive mutation owners also flow
+    // through this single base mirror, so later WAL writes never reuse an old
+    // document merely because that owner did not participate in hydration.
+    timelineServerProjectRef.current = structuredClone(timeline.project);
+  }, [timeline.project, timelineHydrationStatus, timelineRevisionConflict, timelineSyncRequired]);
+  useEffect(() => {
+    if (timelineHydrationStatus !== "ready") return;
+    if (timelineRevisionConflict || timelineSyncRequired) {
+      // Do not let a queued pre-conflict put replace forensic journal bytes.
+      timelineJournalGeneration.current += 1;
+      return;
     }
-    timelineRef.current = next;
-    rawTimelineDispatch(action);
-  }, [activeProjectId, timeline.project.segments, timelineHydrationStatus]);
+    const database = activeDatabaseRef.current;
+    const revision = timelineServerRevision.current;
+    const baseProject = timelineServerProjectRef.current;
+    if (!database || revision === null || !baseProject) return;
+    if (
+      timelineHistory.head &&
+      !timelineProjectsEqual(timelineHistory.head, timeline.project)
+    ) return;
+    persistTimelineJournal(
+      timelineHistory,
+      { document: baseProject, revision },
+      database,
+      activeProjectId,
+    );
+  }, [activeProjectId, persistTimelineJournal, timeline.project, timelineHistory, timelineHydrationStatus, timelineRevisionConflict, timelineSyncRequired]);
   useEffect(() => {
     if (
       timelineSyncRequired ||
+      timelineRevisionConflict ||
       assetDeleteLock.current ||
       timelinePersistedRevision.current >= timelineRevision.current
     ) return;
@@ -2036,7 +3592,7 @@ export default function App() {
       window.clearTimeout(timer);
       if (timelineAutosaveTimer.current === timer) timelineAutosaveTimer.current = null;
     };
-  }, [timeline.project, timelineRetryNonce, timelineSyncRequired, runTimelineAutosave]);
+  }, [timeline.project, timelineRetryNonce, timelineSyncRequired, timelineRevisionConflict, runTimelineAutosave]);
   useEffect(() => () => {
     if (timelineAutosaveTimer.current !== null) window.clearTimeout(timelineAutosaveTimer.current);
     if (timelineRetryTimer.current !== null) window.clearTimeout(timelineRetryTimer.current);
@@ -2046,6 +3602,7 @@ export default function App() {
     const persistPendingTimeline = () => {
       if (
         !timelineSyncRequiredRef.current &&
+        !timelineRevisionConflictRef.current &&
         timelinePersistedRevision.current < timelineRevision.current
       ) {
         const activeDatabase = activeDatabaseRef.current;
@@ -2098,6 +3655,24 @@ export default function App() {
     return () => document.removeEventListener("keydown", closeFocusedSidebarOnEscape);
   }, [sidebarOpen, setSidebarOpenWithFocus]);
   useEffect(() => { persistUiTheme(theme); }, [theme]);
+
+  useEffect(() => {
+    assetTrashListRequest.current += 1;
+    setAssetTrashBatches([]);
+    setAssetTrashConflictBatchIds(new Set());
+    setAssetTrashPanelOpen(false);
+  }, [state.settings.comfy_url]);
+
+  useEffect(() => {
+    if (state.view === "workspace") return;
+    setTimelineHistoryPanelOpen(false);
+    setAssetTrashPanelOpen(false);
+  }, [state.view]);
+
+  useEffect(() => {
+    setTimelineHistoryPanelOpen(false);
+    setAssetTrashPanelOpen(false);
+  }, [activeProjectId]);
 
   useEffect(() => {
     if (!globalSettingsOpen || state.view !== "workspace") return;
@@ -2169,42 +3744,521 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  const timelineAuthorityScopeStillCurrent = (
+    database: ActiveDatabaseIdentity,
+    projectId: string,
+  ): boolean => {
+    const activeDatabase = activeDatabaseRef.current;
+    return activeProjectIdRef.current === projectId &&
+      !databaseIdentityStaleRef.current &&
+      storageOperationStatusRef.current === "idle" &&
+      activeDatabase?.active_database_path === database.active_database_path &&
+      activeDatabase.active_database_identity === database.active_database_identity;
+  };
+
   const resyncTimeline = async (): Promise<void> => {
-    if (assetDeleteLock.current || assetDeleteIntent.current) {
-      if (timelineAuthorityRetryTimer.current !== null) window.clearTimeout(timelineAuthorityRetryTimer.current);
+    // A CAS conflict is a user-owned branch decision. Automatic authority
+    // recovery must never overwrite its preserved local document.
+    if (timelineRevisionConflictRef.current) return;
+    const scheduleRetry = (delayMs: number) => {
+      if (!timelineSyncRequiredRef.current || timelineRevisionConflictRef.current) return;
+      if (timelineAuthorityRetryTimer.current !== null) {
+        window.clearTimeout(timelineAuthorityRetryTimer.current);
+      }
       timelineAuthorityRetryTimer.current = window.setTimeout(() => {
         timelineAuthorityRetryTimer.current = null;
         void resyncTimeline();
-      }, 500);
+      }, delayMs);
+    };
+    if (assetDeleteLock.current || assetDeleteIntent.current) {
+      scheduleRetry(500);
       return;
     }
+    const projectId = activeProjectIdRef.current;
+    const database = activeDatabaseRef.current;
+    if (!database || !timelineAuthorityScopeStillCurrent(database, projectId)) return;
     const generation = ++timelineWriteGeneration.current;
     try {
-      const authoritative = normalizeTimelineProject(await fetchTimelineForProject(activeProjectIdRef.current));
+      const authority = await fetchTimelineForProject(projectId);
+      const authoritative = normalizeTimelineProject(authority.document);
       if (!authoritative) throw new Error("服务器返回的时间线结构无效");
-      if (timelineWriteGeneration.current !== generation) return;
-      const replaceAction: TimelineAction = { type: "project/replace", project: authoritative };
-      timelineRef.current = timelineEditorReducer(timelineRef.current, replaceAction);
-      rawTimelineDispatch(replaceAction);
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, projectId)
+      ) {
+        // Another authority path won while this GET was in flight. It may not
+        // own this explicit recovery gate (for example a Broadcast hint), so
+        // retry unless that winner already completed the boundary.
+        scheduleRetry(0);
+        return;
+      }
+      acceptTimelineServerAuthority({ document: authoritative, revision: authority.revision });
+      timelineRevisionChannelRef.current?.acceptKnown({
+        revision: authority.revision,
+        documentHash: timelineDocumentHash(authoritative),
+      });
+      installTimelineAuthority(authoritative);
       timelinePersistedRevision.current = timelineRevision.current;
       setTimelineAuthorityRequired(false);
       setTimelineDirty(false);
       setTimelinePausedError(null);
       clearLocalTimeline();
+      persistTimelineJournal(
+        timelineHistoryRef.current,
+        { document: authoritative, revision: authority.revision },
+        database,
+        projectId,
+      );
       if (timelineAuthorityRetryTimer.current !== null) {
         window.clearTimeout(timelineAuthorityRetryTimer.current);
         timelineAuthorityRetryTimer.current = null;
       }
       invalidateAndRefreshTaskSnapshots();
-      if (runtimeSettingsDesired.current) runtimeSettingsDrainRef.current();
+      if (runtimeSettingsDesired.current) {
+        if (runtimeSettingsAutosaveTimer.current !== null) {
+          window.clearTimeout(runtimeSettingsAutosaveTimer.current);
+          runtimeSettingsAutosaveTimer.current = null;
+        }
+        if (runtimeSettingsRetryTimer.current !== null) {
+          window.clearTimeout(runtimeSettingsRetryTimer.current);
+          runtimeSettingsRetryTimer.current = null;
+        }
+        window.queueMicrotask(() => runtimeSettingsDrainRef.current());
+      }
     } catch (reason) {
-      if (timelineWriteGeneration.current !== generation) return;
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, projectId)
+      ) {
+        return;
+      }
       setToast(`${reason instanceof Error ? reason.message : "服务器时间线同步失败"}；正在自动重试`);
-      if (timelineAuthorityRetryTimer.current !== null) window.clearTimeout(timelineAuthorityRetryTimer.current);
-      timelineAuthorityRetryTimer.current = window.setTimeout(() => {
-        timelineAuthorityRetryTimer.current = null;
-        void resyncTimeline();
-      }, 1200);
+      scheduleRetry(1200);
+    }
+  };
+
+  const adoptServerTimelineAfterConflict = async (): Promise<void> => {
+    const conflict = timelineRevisionConflictRef.current;
+    if (!conflict || conflict.resolving || conflict.projectId !== activeProjectIdRef.current) return;
+    const database = activeDatabaseRef.current;
+    if (!database || !timelineAuthorityScopeStillCurrent(database, conflict.projectId)) return;
+    const resolving = { ...conflict, resolving: true };
+    setTimelineRevisionConflict(resolving);
+    const generation = ++timelineWriteGeneration.current;
+    try {
+      // Read again on the click: the diagnostic authority captured when the
+      // conflict appeared may itself already be stale.
+      const authority = await fetchTimelineForProject(conflict.projectId);
+      const serverProject = normalizeTimelineProject(authority.document);
+      if (!serverProject) throw new Error("服务器返回的时间线结构无效");
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      acceptTimelineServerAuthority({ document: serverProject, revision: authority.revision });
+      timelineRevisionChannelRef.current?.acceptKnown({
+        revision: authority.revision,
+        documentHash: timelineDocumentHash(serverProject),
+      });
+      installTimelineAuthority(serverProject);
+      timelinePersistedRevision.current = timelineRevision.current;
+      timelineHadLocal.current = true;
+      setTimelineRevisionConflict(null);
+      setTimelineAuthorityRequired(false);
+      setTimelineDirty(false);
+      setTimelinePausedError(null);
+      clearLocalTimeline();
+      persistTimelineJournal(
+        timelineHistoryRef.current,
+        { document: serverProject, revision: authority.revision },
+        database,
+        conflict.projectId,
+      );
+      invalidateAndRefreshTaskSnapshots();
+      if (runtimeSettingsDesired.current) {
+        if (runtimeSettingsAutosaveTimer.current !== null) {
+          window.clearTimeout(runtimeSettingsAutosaveTimer.current);
+          runtimeSettingsAutosaveTimer.current = null;
+        }
+        if (runtimeSettingsRetryTimer.current !== null) {
+          window.clearTimeout(runtimeSettingsRetryTimer.current);
+          runtimeSettingsRetryTimer.current = null;
+        }
+        window.queueMicrotask(() => runtimeSettingsDrainRef.current());
+      }
+      setToast("已采用服务器时间线，本地冲突草稿已解除");
+    } catch (reason) {
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      setTimelineRevisionConflict({ ...resolving, resolving: false });
+      setToast(`${reason instanceof Error ? reason.message : "读取服务器时间线失败"}；本地草稿仍被保留`);
+    }
+  };
+
+  const selectTimelineRecoveryBranch = (branchId: string): void => {
+    const conflict = timelineRevisionConflictRef.current;
+    if (!conflict || conflict.source !== "recovery-branches" || conflict.resolving) return;
+    if (!conflict.recoveryBranches?.some((branch) => branch.id === branchId)) return;
+    setTimelineRevisionConflict({
+      ...conflict,
+      selectedRecoveryBranchId: branchId,
+    });
+  };
+
+  const continueServerWithRecoveryEvidence = async (): Promise<void> => {
+    const conflict = timelineRevisionConflictRef.current;
+    if (
+      !conflict || conflict.source !== "recovery-branches" || conflict.resolving ||
+      conflict.projectId !== activeProjectIdRef.current
+    ) return;
+    const database = activeDatabaseRef.current;
+    if (!database || !timelineAuthorityScopeStillCurrent(database, conflict.projectId)) return;
+    const resolving = { ...conflict, resolving: true };
+    setTimelineRevisionConflict(resolving);
+    const generation = ++timelineWriteGeneration.current;
+    try {
+      const authority = await fetchTimelineForProject(conflict.projectId);
+      const serverProject = normalizeTimelineProject(authority.document);
+      if (!serverProject) throw new Error("服务器返回的时间线结构无效");
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      const retainedHistory = timelineHistoryRef.current.head &&
+          timelineProjectsEqual(timelineHistoryRef.current.head, serverProject)
+        ? timelineHistoryRef.current
+        : resetTimelineHistory(timelineHistoryRef.current);
+      timelineJournalGeneration.current += 1;
+      timelineBranchOwnerRef.current = createTimelineBranchOwnerId();
+      activeTimelineWalRef.current = null;
+      acceptTimelineServerAuthority({ document: serverProject, revision: authority.revision });
+      installTimelineAuthority(serverProject, { clearHistory: false });
+      commitTimelineHistory(retainedHistory);
+      timelineRevision.current = 0;
+      timelinePersistedRevision.current = 0;
+      timelineHadLocal.current = retainedHistory.head !== null;
+      setTimelineRevisionConflict(null);
+      setTimelineAuthorityRequired(false);
+      setTimelineDirty(false);
+      setTimelinePausedError(null);
+      persistTimelineJournal(
+        retainedHistory,
+        { document: serverProject, revision: authority.revision },
+        database,
+        conflict.projectId,
+      );
+      setToast("已继续使用服务器版本；所有本地恢复记录仍保留，可稍后显式处理");
+    } catch (reason) {
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      setTimelineRevisionConflict({ ...resolving, resolving: false });
+      setToast(`${reason instanceof Error ? reason.message : "读取服务器时间线失败"}；恢复记录仍被保留`);
+    }
+  };
+
+  const restoreSelectedTimelineBranch = async (): Promise<void> => {
+    const conflict = timelineRevisionConflictRef.current;
+    if (
+      !conflict || conflict.source !== "recovery-branches" || conflict.resolving ||
+      conflict.projectId !== activeProjectIdRef.current
+    ) return;
+    const selected = conflict.recoveryBranches?.find(
+      (branch) => branch.id === conflict.selectedRecoveryBranchId,
+    );
+    if (!selected?.project || selected.status === "corrupt") return;
+    const database = activeDatabaseRef.current;
+    if (!database || !timelineAuthorityScopeStillCurrent(database, conflict.projectId)) return;
+    const resolving = { ...conflict, resolving: true };
+    setTimelineRevisionConflict(resolving);
+    const generation = ++timelineWriteGeneration.current;
+    try {
+      const authority = await fetchTimelineForProject(conflict.projectId);
+      const serverProject = normalizeTimelineProject(authority.document);
+      if (!serverProject) throw new Error("服务器返回的时间线结构无效");
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+
+      let recoveryStatus: "replay" | "acknowledged" | "conflict" = "conflict";
+      let baseAuthority: TimelinePersistenceAuthority | null = null;
+      if (selected.walEvidence?.kind === "wal") {
+        const wal = selected.walEvidence.wal;
+        recoveryStatus = resolveLocalTimelineWal(wal, {
+          document: serverProject,
+          revision: authority.revision,
+        }).status;
+        baseAuthority = {
+          document: wal.base_project,
+          revision: wal.base_server_revision,
+        };
+      } else if (
+        selected.journalEvidence &&
+        selected.journalEvidence.status !== "corrupt"
+      ) {
+        const journal = selected.journalEvidence;
+        baseAuthority = {
+          document: journal.confirmedDocument,
+          revision: journal.confirmedRevision,
+        };
+        recoveryStatus = timelineProjectsEqual(serverProject, journal.project)
+          ? "acknowledged"
+          : authority.revision === journal.confirmedRevision &&
+              timelineProjectsEqual(serverProject, journal.confirmedDocument)
+            ? "replay"
+            : "conflict";
+      }
+      if (!baseAuthority) throw new Error("恢复记录缺少可验证的服务器基线");
+
+      const restoredProject = recoveryStatus === "acknowledged"
+        ? serverProject
+        : selected.project;
+      const restoredHistory = selected.history?.head &&
+          timelineProjectsEqual(selected.history.head, restoredProject)
+        ? selected.history
+        : resetTimelineHistory(timelineHistoryRef.current);
+
+      // Clone into a fresh owner so selecting B can never overwrite A, even
+      // when A happened to be the branch previously owned by this realm.
+      timelineJournalGeneration.current += 1;
+      timelineBranchOwnerRef.current = createTimelineBranchOwnerId();
+      activeTimelineWalRef.current = null;
+      acceptTimelineServerAuthority({ document: serverProject, revision: authority.revision });
+      installTimelineAuthority(restoredProject, { clearHistory: false });
+      commitTimelineHistory(restoredHistory);
+      timelineRevision.current = recoveryStatus === "acknowledged" ? 0 : 1;
+      timelinePersistedRevision.current = 0;
+      timelineHadLocal.current = recoveryStatus !== "acknowledged" || restoredHistory.head !== null;
+      setTimelineDirty(recoveryStatus !== "acknowledged");
+      setTimelineAuthorityRequired(false);
+      setTimelinePausedError(null);
+
+      if (recoveryStatus !== "acknowledged") {
+        const clonedWal = saveLocalTimelineWal({
+          database,
+          project_id: conflict.projectId,
+          owner_id: timelineBranchOwnerRef.current,
+          base_server_revision: baseAuthority.revision,
+          base_project: baseAuthority.document,
+          pending_project: restoredProject,
+        });
+        if (!clonedWal) throw new Error("无法建立独立的本地恢复分支");
+        activeTimelineWalRef.current = clonedWal;
+        persistTimelineJournal(
+          restoredHistory,
+          baseAuthority,
+          database,
+          conflict.projectId,
+        );
+      } else {
+        persistTimelineJournal(
+          restoredHistory,
+          { document: serverProject, revision: authority.revision },
+          database,
+          conflict.projectId,
+        );
+      }
+
+      if (recoveryStatus === "conflict") {
+        setTimelineRevisionConflict({
+          projectId: conflict.projectId,
+          localProject: restoredProject,
+          serverAuthority: { document: serverProject, revision: authority.revision },
+          source: "cas",
+          resolving: false,
+        });
+        setToast("所选恢复分支的服务器基线已过期；已保留为本地草稿，请再次确认冲突处理方式");
+      } else {
+        setTimelineRevisionConflict(null);
+        setToast(recoveryStatus === "acknowledged"
+          ? "服务器已包含所选分支；已恢复其撤销历史"
+          : "已恢复所选本地分支，正在按原服务器基线安全同步");
+      }
+    } catch (reason) {
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      setTimelineRevisionConflict({ ...resolving, resolving: false });
+      setToast(`${reason instanceof Error ? reason.message : "恢复本地分支失败"}；原恢复记录未删除`);
+    }
+  };
+
+  const discardTimelineRecoveryBranch = async (branchId: string): Promise<void> => {
+    const conflict = timelineRevisionConflictRef.current;
+    if (
+      !conflict || conflict.source !== "recovery-branches" || conflict.resolving ||
+      conflict.projectId !== activeProjectIdRef.current
+    ) return;
+    const branch = conflict.recoveryBranches?.find((candidate) => candidate.id === branchId);
+    if (!branch) return;
+    const label = branch.project?.title ?? "损坏的恢复记录";
+    if (!window.confirm(`确认永久丢弃恢复记录“${label}”？此操作无法撤销。`)) return;
+    const database = activeDatabaseRef.current;
+    const hydrationGeneration = timelineHydrationGeneration.current;
+    const switchGeneration = projectSwitchGeneration.current;
+    if (!database || !timelineAuthorityScopeStillCurrent(database, conflict.projectId)) return;
+    const operationStillCurrent = () =>
+      hydrationGeneration === timelineHydrationGeneration.current &&
+      switchGeneration === projectSwitchGeneration.current &&
+      timelineAuthorityScopeStillCurrent(database, conflict.projectId);
+    const resolving = { ...conflict, resolving: true };
+    setTimelineRevisionConflict(resolving);
+    const walDeleted = branch.walEvidence
+      ? discardLocalTimelineWalBranch(branch.walEvidence)
+      : true;
+    let journalDeleted = branch.journalEvidence === null;
+    if (branch.journalEvidence && branch.journalEvidence.token) {
+      journalDeleted = await deleteTimelineHistoryJournal(
+        timelinePersistenceScope(
+          database,
+          conflict.projectId,
+          branch.ownerId ?? timelineBranchOwnerRef.current,
+        ),
+        branch.journalEvidence.token,
+      );
+    }
+    if (!operationStillCurrent()) return;
+    if (!walDeleted || !journalDeleted) {
+      setTimelineRevisionConflict({ ...resolving, resolving: false });
+      setToast("恢复记录仅部分完成精确删除，或其中一侧已被其他页面更新；其余证据仍保留，请重试或重新加载");
+      return;
+    }
+    const remaining = conflict.recoveryBranches?.filter((candidate) => candidate.id !== branchId) ?? [];
+    if (remaining.length === 0) {
+      setTimelineRevisionConflict(null);
+      setToast("恢复记录已丢弃；继续使用服务器版本");
+      return;
+    }
+    setTimelineRevisionConflict({
+      ...conflict,
+      resolving: false,
+      recoveryBranches: remaining,
+      selectedRecoveryBranchId: conflict.selectedRecoveryBranchId === branchId
+        ? null
+        : conflict.selectedRecoveryBranchId,
+    });
+    setToast("所选恢复记录已精确丢弃，其他分支保持不变");
+  };
+
+  const keepLocalTimelineAfterConflict = async (): Promise<void> => {
+    const conflict = timelineRevisionConflictRef.current;
+    if (!conflict || conflict.resolving || conflict.projectId !== activeProjectIdRef.current) return;
+    if (!window.confirm("确认以当前本地时间线覆盖服务器版本？服务器在此期间的新修改可能被替换。")) return;
+    const localProject = normalizeTimelineProject(structuredClone(timelineRef.current.project));
+    if (!localProject) {
+      setToast("本地时间线结构无效，无法保留");
+      return;
+    }
+    const database = activeDatabaseRef.current;
+    if (!database || !timelineAuthorityScopeStillCurrent(database, conflict.projectId)) return;
+    const resolving: TimelineRevisionConflict = {
+      ...conflict,
+      localProject,
+      resolving: true,
+    };
+    setTimelineRevisionConflict(resolving);
+    const generation = ++timelineWriteGeneration.current;
+    try {
+      // Rebase the explicit overwrite decision onto the newest observed server
+      // revision, then still use CAS to close the GET/PUT race.
+      const latest = await fetchTimelineForProject(conflict.projectId);
+      const latestDocument = normalizeTimelineProject(latest.document);
+      if (!latestDocument) throw new Error("服务器返回的时间线结构无效");
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      const response = await runWithTimelineWriterLock({
+        databaseIdentity: database.active_database_identity,
+        projectId: conflict.projectId,
+      }, () => saveTimelineForProject(
+        conflict.projectId,
+        localProject,
+        latest.revision,
+      ));
+      const confirmed = normalizeTimelineProject(response.document);
+      if (!confirmed) throw new Error("服务器返回的时间线结构无效");
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      acceptTimelineServerAuthority({ document: confirmed, revision: response.revision });
+      timelineRevisionChannelRef.current?.publish({
+        revision: response.revision,
+        documentHash: timelineDocumentHash(confirmed),
+      });
+      timelinePersistedRevision.current = timelineRevision.current;
+      timelineHadLocal.current = true;
+      let durableHistory = timelineHistoryRef.current;
+      if (!timelineProjectsEqual(localProject, confirmed)) {
+        const rebased = rebaseTimelineHistoryHead(
+          timelineHistoryRef.current,
+          localProject,
+          confirmed,
+        );
+        if (rebased) {
+          durableHistory = rebased;
+          commitTimelineHistory(rebased);
+        } else {
+          durableHistory = resetTimelineHistory(timelineHistoryRef.current);
+          clearTimelineHistory();
+        }
+      }
+      installTimelineAuthority(confirmed, { clearHistory: false });
+      setTimelineRevisionConflict(null);
+      setTimelineAuthorityRequired(false);
+      setTimelineDirty(false);
+      setTimelinePausedError(null);
+      clearLocalTimeline();
+      persistTimelineJournal(
+        durableHistory,
+        { document: confirmed, revision: response.revision },
+        database,
+        conflict.projectId,
+      );
+      invalidateAndRefreshTaskSnapshots();
+      if (runtimeSettingsDesired.current) runtimeSettingsDrainRef.current();
+      setToast("已确认保留本地时间线并写入服务器");
+    } catch (reason) {
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      let serverAuthority = resolving.serverAuthority;
+      if (
+        reason instanceof ApiError &&
+        reason.status === 409 &&
+        reason.code === "timeline_revision_conflict"
+      ) {
+        try {
+          const latest = await fetchTimelineForProject(conflict.projectId);
+          const latestDocument = normalizeTimelineProject(latest.document);
+          if (
+            latestDocument &&
+            timelineWriteGeneration.current === generation &&
+            timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+          ) {
+            serverAuthority = { document: latestDocument, revision: latest.revision };
+          }
+        } catch {
+          // Keep the previous diagnostic authority and the local WAL.
+        }
+      }
+      if (
+        timelineWriteGeneration.current !== generation ||
+        !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
+      ) return;
+      setTimelineRevisionConflict({
+        ...resolving,
+        serverAuthority,
+        resolving: false,
+      });
+      setToast(`${reason instanceof Error ? reason.message : "保留本地时间线失败"}；本地草稿仍被保留`);
     }
   };
 
@@ -2232,6 +4286,7 @@ export default function App() {
       return;
     }
     if (assetDeleteLock.current || assetDeleteIntent.current) { setToast("正在原子解除素材引用，请稍候"); return; }
+    if (timelineRevisionConflict) { setToast("服务器时间线存在修订冲突，请先选择处理方式"); return; }
     if (timelineSyncRequired) { setToast("服务器时间线正在自动恢复同步，暂不能生成"); return; }
     const executionGeneration = runtimeSettingsGeneration.current;
     const clickedSegmentSelectionGeneration = segmentSelectionGeneration.current;
@@ -2336,7 +4391,10 @@ export default function App() {
     }
     if (!rerolled) return config;
     // Keep the disabled fields equal to the exact value sent to the job.
-    dispatchTimeline({ type: "project/replace", project: structuredClone(config) });
+    dispatchTimeline(
+      { type: "project/replace", project: structuredClone(config) },
+      { historyLabel: "更新随机 Seed" },
+    );
     const expected = timelineRevision.current;
     const flushed = await flushTimelineAutosave();
     if (timelineRevision.current !== expected) {
@@ -2366,6 +4424,7 @@ export default function App() {
     }
     if (assetUploadLock.current) { setToast("正在上传并绑定本地素材，完成前不能预检"); return; }
     if (assetDeleteLock.current || assetDeleteIntent.current) { setToast("正在原子解除素材引用，请稍候"); return; }
+    if (timelineRevisionConflict) { setToast("服务器时间线存在修订冲突，请先选择处理方式"); return; }
     if (timelineSyncRequired) { setToast("服务器时间线正在自动恢复权威状态"); return; }
     const clickedSegmentSelectionGeneration = segmentSelectionGeneration.current;
     const clickedProjectId = activeProjectIdRef.current;
@@ -2622,7 +4681,7 @@ export default function App() {
       setToast("生成或预检正在确认当前项目；完成前不能另存历史项目");
       return;
     }
-    if (timelineSyncRequiredRef.current || assetDeleteLock.current || assetDeleteIntent.current || assetUploadLock.current) {
+    if (timelineSyncRequiredRef.current || timelineRevisionConflictRef.current || assetDeleteLock.current || assetDeleteIntent.current || assetUploadLock.current || projectDeleteIntent.current !== null) {
       setToast("当前时间线或素材状态尚未稳定，暂不能另存历史项目");
       return;
     }
@@ -2631,6 +4690,7 @@ export default function App() {
       const snapshot = await directorApi.getTaskProject(id);
       // Restore the historical source as a brand-new project instead of
       // overwriting the one currently being edited.
+      projectListGeneration.current += 1;
       const created = await directorApi.importProject({
         title: snapshot.project.title,
         document: snapshot.project,
@@ -2658,13 +4718,35 @@ export default function App() {
       setToast("运行设置尚未完成权威回读，暂不能导入任务输出");
       return;
     }
+    const operationDatabase = activeDatabaseRef.current;
+    if (!operationDatabase || databaseIdentityStaleRef.current) {
+      setToast("数据库权威状态尚未稳定，暂不能导入任务输出");
+      return;
+    }
+    const operationProjectId = activeProjectIdRef.current;
+    const operationComfyOrigin = authoritativeSettingsRef.current.comfy_url;
     assetUploadLock.current = true;
+    const operationSwitchGeneration = ++projectSwitchGeneration.current;
+    const operationStillCurrent = () =>
+      projectSwitchGeneration.current === operationSwitchGeneration &&
+      activeProjectIdRef.current === operationProjectId &&
+      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path &&
+      activeDatabaseRef.current?.active_database_identity === operationDatabase.active_database_identity &&
+      authoritativeSettingsRef.current.comfy_url === operationComfyOrigin &&
+      !databaseIdentityStaleRef.current;
     setAssetsUploading(true);
     try {
       const asset = await directorApi.importTaskOutput(id, output);
-      rawTimelineDispatch({ type: "assets/add", assets: [asset] });
-      rawTimelineDispatch({ type: "assets/select", id: asset.id });
-      await loadAssets(undefined, true);
+      if (!operationStillCurrent()) {
+        throw new Error("导入完成时项目或素材库权威范围已变化；结果未绑定到当前项目");
+      }
+      dispatchTimelineUi({ type: "assets/add", assets: [asset] });
+      dispatchTimelineUi({ type: "assets/select", id: asset.id });
+      await loadAssets(undefined, true, {
+        database: operationDatabase,
+        comfyOrigin: operationComfyOrigin,
+      });
+      if (!operationStillCurrent()) return;
       setToast(`已把 ${asset.name} 转为 24fps 输入并加入当前素材库`);
     } catch (reason) {
       setToast(reason instanceof Error ? reason.message : "任务输出导入失败");
@@ -2673,6 +4755,7 @@ export default function App() {
       setAssetsUploading(false);
       if (
         !timelineSyncRequiredRef.current &&
+        !timelineRevisionConflictRef.current &&
         timelinePersistedRevision.current < timelineRevision.current
       ) {
         setTimelineRetryNonce((current) => current + 1);
@@ -2734,6 +4817,17 @@ export default function App() {
   };
   const deleteAssets = async (ids: string[]) => {
     if (!ids.length || assetDeleteLock.current || assetDeleteIntent.current) return;
+    const operationDatabase = activeDatabaseRef.current;
+    if (
+      !operationDatabase ||
+      databaseIdentityStaleRef.current ||
+      storageRestartRequiredRef.current ||
+      storageOperationStatusRef.current !== "idle"
+    ) {
+      setToast("数据库权威状态尚未稳定，暂不能从素材库移出");
+      return;
+    }
+    const operationComfyOrigin = authoritativeSettingsRef.current.comfy_url;
     if (runtimeExecutionIntent.current > 0) {
       setToast("生成或预检正在使用当前素材与运行设置；完成后再从素材库移出");
       return;
@@ -2746,11 +4840,23 @@ export default function App() {
       setToast("运行设置尚未完成服务器权威回读；暂不能从素材库移出");
       return;
     }
+    if (timelineRevisionConflict) { setToast("服务器时间线存在修订冲突，请先选择处理方式"); return; }
     if (timelineSyncRequired) { setToast("服务器时间线正在自动恢复同步，暂不能从素材库移出"); return; }
+    const operationProjectId = activeProjectIdRef.current;
     assetDeleteIntent.current = true;
+    const operationSwitchGeneration = ++projectSwitchGeneration.current;
+    const timelineOperationScopeStillCurrent = () =>
+      activeProjectIdRef.current === operationProjectId &&
+      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path &&
+      activeDatabaseRef.current?.active_database_identity === operationDatabase.active_database_identity &&
+      !databaseIdentityStaleRef.current;
+    const assetOperationScopeStillCurrent = () =>
+      timelineOperationScopeStillCurrent() &&
+      authoritativeSettingsRef.current.comfy_url === operationComfyOrigin;
+    const operationStillCurrent = () =>
+      projectSwitchGeneration.current === operationSwitchGeneration &&
+      assetOperationScopeStillCurrent();
     setAssetsDeleting(true);
-    const deleted: string[] = [];
-    const failures: string[] = [];
     let timelineAuthorityRequired = false;
     const prepareCascade = () => {
       if (timelineAuthorityRequired) return;
@@ -2766,83 +4872,120 @@ export default function App() {
       // The continuation runs in the same microtask, so a user edit cannot
       // slip between the exact revision confirmation and this lock.
       const snapshot = await flushTimelineAutosave();
+      if (!operationStillCurrent()) {
+        throw new Error("项目或素材库权威范围已变化，请在同步完成后重试");
+      }
       assetDeleteLock.current = true;
       timelineWriteGeneration.current += 1;
-      for (const id of ids) {
-        const hasLocalUsage = timelineAssetUsages(snapshot, id).length > 0;
-        try {
-          if (hasLocalUsage) {
-            prepareCascade();
-            await directorApi.deleteAssetCascade(id);
-          } else {
-            try {
-              await directorApi.deleteAsset(id);
-            } catch (reason) {
-              const details = reason instanceof ApiError && reason.status === 409 && reason.details && typeof reason.details === "object"
-                ? (reason.details as { detail?: { usages?: unknown } }).detail
-                : undefined;
-              const usages = Array.isArray(details?.usages)
-                ? details.usages.filter((usage): usage is string => typeof usage === "string")
-                : [];
-              if (!usages.length) throw reason;
-              if (!window.confirm(`素材还被其他时间线草稿引用：\n\n${usages.join("\n")}\n\n是否从所有草稿原子解除引用并从素材库移出？ComfyUI 文件会保留。`)) {
-                failures.push(`已跳过素材 ${id}`);
-                continue;
-              }
-              prepareCascade();
-              await directorApi.deleteAssetCascade(id);
-            }
-          }
-          deleted.push(id);
-        } catch (reason) {
-          failures.push(reason instanceof Error ? reason.message : `素材 ${id} 移出失败`);
+      let cascade = ids.some((id) => timelineAssetUsages(snapshot, id).length > 0);
+      if (cascade) prepareCascade();
+      let batch: AssetTrashBatch;
+      try {
+        batch = await directorApi.trashAssets(ids, cascade);
+      } catch (reason) {
+        if (!(reason instanceof ApiError && reason.code === "assets_in_use" && !cascade)) {
+          throw reason;
         }
-      }
-      if (deleted.length || timelineAuthorityRequired) {
-        try {
-          const authoritative = normalizeTimelineProject(await fetchTimelineForProject(activeProjectIdRef.current));
-          if (!authoritative) throw new Error("服务器时间线响应无效");
-          const replaceAction: TimelineAction = { type: "project/replace", project: authoritative };
-          timelineRef.current = timelineEditorReducer(timelineRef.current, replaceAction);
-          rawTimelineDispatch(replaceAction);
-          timelinePersistedRevision.current = timelineRevision.current;
-          setTimelineAuthorityRequired(false);
-          setTimelineDirty(false);
-          setTimelinePausedError(null);
-          timelineHadLocal.current = true;
-          clearLocalTimeline();
-          invalidateAndRefreshTaskSnapshots();
-        } catch {
-          rawTimelineDispatch({ type: "assets/remove", ids: deleted });
-          await loadAssets();
-          if (timelineAuthorityRequired) {
-            // Cascade may have committed. Keep the known-good pre-cascade
-            // snapshot visible, but never persist/edit it as authoritative.
-            setTimelineAuthorityRequired(true);
-            setTimelineDirty(false);
-            timelineHadLocal.current = false;
-            clearLocalTimeline();
-            setToast("素材级联结果无法确认；编辑与生成已锁定，正在自动恢复同步");
-          } else {
-            setToast("素材已从素材库移出，但列表刷新失败；时间线未受影响");
-          }
+        const detail = reason.details && typeof reason.details === "object"
+          ? (reason.details as { detail?: { usages?: unknown } }).detail
+          : undefined;
+        const usages = Array.isArray(detail?.usages)
+          ? detail.usages.filter((usage): usage is string => typeof usage === "string")
+          : [];
+        const usageLines = usages.length ? `\n\n${usages.join("\n")}` : "";
+        if (!window.confirm(`所选素材仍被其他时间线草稿引用：${usageLines}\n\n是否在一个事务中从所有草稿解除引用并移至回收站？ComfyUI 文件会保留。`)) {
+          setToast("已取消移至素材回收站；没有素材或项目被修改");
           return;
         }
+        cascade = true;
+        prepareCascade();
+        batch = await directorApi.trashAssets(ids, true);
       }
-      await loadAssets();
-      setToast(failures.length
-        ? `已从素材库移出 ${deleted.length} 个；${failures[0]}`
-        : `已从素材库移出 ${deleted.length} 个登记；ComfyUI 文件保留`);
+      if (!operationStillCurrent()) {
+        throw new Error("素材移出已提交，但项目权威范围已变化；正在重新核对结果");
+      }
+
+      // Even an unused asset can be referenced by an older history cursor.
+      // The recycle-bin transaction is an explicit project-history boundary.
+      clearTimelineHistory();
+      setAssetTrashBatches((current) => [
+        batch,
+        ...current.filter((candidate) => candidate.batch_id !== batch.batch_id),
+      ]);
+
+      if (cascade) {
+        const authority = await fetchTimelineForProject(operationProjectId);
+        if (!operationStillCurrent()) {
+          throw new Error("素材移出已提交，但项目权威范围已变化；正在重新核对时间线");
+        }
+        const authoritative = normalizeTimelineProject(authority.document);
+        if (!authoritative) throw new Error("服务器时间线响应无效");
+        acceptTimelineServerAuthority({ document: authoritative, revision: authority.revision });
+        timelineRevisionChannelRef.current?.acceptKnown({
+          revision: authority.revision,
+          documentHash: timelineDocumentHash(authoritative),
+        });
+        installTimelineAuthority(authoritative);
+        timelinePersistedRevision.current = timelineRevision.current;
+        setTimelineAuthorityRequired(false);
+        setTimelineDirty(false);
+        setTimelinePausedError(null);
+        timelineHadLocal.current = true;
+        clearLocalTimeline();
+        invalidateAndRefreshTaskSnapshots();
+      } else {
+        dispatchTimelineUi({ type: "assets/remove", ids });
+      }
+      const assetsRefreshed = await loadAssets(undefined, false, {
+        database: operationDatabase,
+        comfyOrigin: operationComfyOrigin,
+      });
+      if (!operationStillCurrent()) return;
+      if (!assetsRefreshed) dispatchTimelineUi({ type: "assets/remove", ids: batch.asset_ids });
+      setToast(assetsRefreshed
+        ? `已将 ${batch.asset_ids.length} 个素材登记移至回收站；ComfyUI 文件保留`
+        : `已将 ${batch.asset_ids.length} 个素材登记移至回收站；列表权威刷新失败，ComfyUI 文件仍保留`);
     } catch (reason) {
-      if (!timelineAuthorityRequired) setTimelineDirty(
-        timelinePersistedRevision.current < timelineRevision.current,
-      );
-      setToast(reason instanceof Error ? reason.message : "素材移出失败");
+      if (!timelineAuthorityRequired) {
+        setTimelineDirty(timelinePersistedRevision.current < timelineRevision.current);
+        const outcome = await reconcileAmbiguousAssetTrash(
+          ids,
+          operationDatabase,
+          operationComfyOrigin,
+          operationProjectId,
+          operationSwitchGeneration,
+        );
+        if (outcome === "committed") {
+          clearTimelineHistory();
+          setToast(`已确认 ${ids.length} 个素材登记移至回收站；先前响应在返回途中丢失，ComfyUI 文件保留`);
+        } else if (outcome === "unknown") {
+          // The POST may have committed even when neither response nor the
+          // follow-up reads are usable. Old cursors and the visible inventory
+          // are no longer safe until a complete same-origin authority refresh.
+          clearTimelineHistory();
+          assetAuthorityRequired.current = true;
+          setRuntimeAuthorityRequired(true);
+          setToast("素材移出结果尚无法确认；已暂停相关操作并正在重新核对素材库");
+          window.queueMicrotask(() => externalRuntimeAuthorityRefreshRef.current());
+          void loadAssetTrash();
+        } else {
+          setToast(reason instanceof Error ? reason.message : "素材移出失败");
+        }
+      } else {
+        await loadAssets(undefined, false, {
+          database: operationDatabase,
+          comfyOrigin: operationComfyOrigin,
+        });
+        setToast(reason instanceof Error ? reason.message : "素材移出失败");
+      }
     } finally {
       assetDeleteLock.current = false;
       assetDeleteIntent.current = false;
       setAssetsDeleting(false);
-      if (timelineSyncRequiredRef.current) void resyncTimeline();
+      if (timelineSyncRequiredRef.current && timelineOperationScopeStillCurrent()) {
+        void resyncTimeline();
+        if (assetOperationScopeStillCurrent()) void loadAssetTrash();
+      }
       else if (runtimeSettingsDesired.current) {
         if (runtimeSettingsRetryTimer.current !== null) {
           window.clearTimeout(runtimeSettingsRetryTimer.current);
@@ -2850,6 +4993,189 @@ export default function App() {
         }
         runtimeSettingsDrainRef.current();
       }
+    }
+  };
+
+  const restoreAssetTrashBatch = async (
+    batch: AssetTrashBatch,
+    mode: AssetTrashRestoreMode,
+  ): Promise<void> => {
+    const restoresReferences = mode === "with_references";
+    if (assetTrashOperationLock.current || assetDeleteLock.current || assetDeleteIntent.current) return;
+    if (
+      databaseIdentityStaleRef.current ||
+      storageRestartRequiredRef.current ||
+      storageOperationStatusRef.current !== "idle"
+    ) {
+      setToast("数据库权威状态尚未稳定，暂不能恢复素材");
+      return;
+    }
+    if (restoresReferences && runtimeExecutionIntent.current > 0) {
+      setToast("生成或预检正在确认当前项目，完成前不能恢复项目引用");
+      return;
+    }
+    if (assetUploadLock.current || runtimeSettingsOperation.current || runtimeSettingsSyncRequiredRef.current) {
+      setToast("素材或运行设置操作仍在进行，请稍候再恢复");
+      return;
+    }
+    if (timelineRevisionConflictRef.current || timelineSyncRequiredRef.current) {
+      setToast("请先完成时间线权威同步或解决修订冲突");
+      return;
+    }
+    const operationDatabase = activeDatabaseRef.current;
+    if (!operationDatabase) {
+      setToast("数据库权威状态尚未稳定，暂不能恢复素材");
+      return;
+    }
+    const operationProjectId = activeProjectIdRef.current;
+    const operationComfyOrigin = authoritativeSettingsRef.current.comfy_url;
+    assetTrashOperationLock.current = batch.batch_id;
+    assetDeleteIntent.current = true;
+    const operationSwitchGeneration = ++projectSwitchGeneration.current;
+    const timelineOperationScopeStillCurrent = () =>
+      activeProjectIdRef.current === operationProjectId &&
+      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path &&
+      activeDatabaseRef.current?.active_database_identity === operationDatabase.active_database_identity &&
+      !databaseIdentityStaleRef.current;
+    const assetOperationScopeStillCurrent = () =>
+      timelineOperationScopeStillCurrent() &&
+      authoritativeSettingsRef.current.comfy_url === operationComfyOrigin;
+    const operationStillCurrent = () =>
+      projectSwitchGeneration.current === operationSwitchGeneration &&
+      assetOperationScopeStillCurrent();
+    setAssetsDeleting(true);
+    setAssetTrashBusyBatchId(batch.batch_id);
+    let authorityBoundary = false;
+    try {
+      if (restoresReferences) {
+        await flushTimelineAutosave();
+        if (!operationStillCurrent()) {
+          throw new Error("项目或素材库权威范围已变化，请在同步完成后重试");
+        }
+        assetDeleteLock.current = true;
+        timelineWriteGeneration.current += 1;
+        authorityBoundary = true;
+        setTimelineAuthorityRequired(true);
+        timelineHadLocal.current = false;
+        clearLocalTimeline();
+      }
+      const restored = await directorApi.restoreAssetTrash(batch.batch_id, mode);
+      if (!operationStillCurrent()) {
+        throw new Error("素材恢复已提交，但项目权威范围已变化；正在重新核对结果");
+      }
+      setAssetTrashConflictBatchIds((current) => {
+        const next = new Set(current);
+        next.delete(batch.batch_id);
+        return next;
+      });
+      if (restoresReferences) {
+        const authority = await fetchTimelineForProject(operationProjectId);
+        if (!operationStillCurrent()) {
+          throw new Error("素材恢复已提交，但项目权威范围已变化；正在重新核对时间线");
+        }
+        const authoritative = normalizeTimelineProject(authority.document);
+        if (!authoritative) throw new Error("服务器时间线响应无效");
+        acceptTimelineServerAuthority({ document: authoritative, revision: authority.revision });
+        timelineRevisionChannelRef.current?.acceptKnown({
+          revision: authority.revision,
+          documentHash: timelineDocumentHash(authoritative),
+        });
+        installTimelineAuthority(authoritative);
+        timelinePersistedRevision.current = timelineRevision.current;
+        setTimelineAuthorityRequired(false);
+        setTimelineDirty(false);
+        setTimelinePausedError(null);
+        timelineHadLocal.current = true;
+        clearLocalTimeline();
+        clearTimelineHistory();
+        invalidateAndRefreshTaskSnapshots();
+        authorityBoundary = false;
+      }
+      const [assetsRefreshed, trashRefreshed] = await Promise.all([
+        loadAssets(undefined, false, {
+          database: operationDatabase,
+          comfyOrigin: operationComfyOrigin,
+        }),
+        loadAssetTrash(),
+      ]);
+      if (!operationStillCurrent()) return;
+      const refreshSuffix = assetsRefreshed && trashRefreshed
+        ? ""
+        : "；恢复已提交，但列表刷新失败，请重试刷新";
+      setToast((restored.restored_references
+        ? `已恢复 ${restored.restored_asset_ids.length} 个素材及其原引用`
+        : `已恢复 ${restored.restored_asset_ids.length} 个素材登记；项目引用未改动`) + refreshSuffix);
+    } catch (reason) {
+      if (
+        restoresReferences &&
+        reason instanceof ApiError &&
+        reason.code === "asset_trash_restore_conflict"
+      ) {
+        // The restore itself is atomic and made no changes, but the conflict
+        // can be evidence that this active project changed elsewhere. Keep the
+        // authority boundary until a fresh GET has installed that revision.
+        setAssetTrashConflictBatchIds((current) => new Set(current).add(batch.batch_id));
+        setToast("项目在移出后已变化，不能安全恢复旧引用；正在同步最新项目，之后可仅恢复素材登记");
+      } else {
+        setToast(reason instanceof Error ? reason.message : "素材恢复失败");
+      }
+    } finally {
+      assetDeleteLock.current = false;
+      assetDeleteIntent.current = false;
+      assetTrashOperationLock.current = null;
+      setAssetsDeleting(false);
+      setAssetTrashBusyBatchId(null);
+      if (
+        (authorityBoundary || timelineSyncRequiredRef.current) &&
+        timelineOperationScopeStillCurrent()
+      ) {
+        void resyncTimeline();
+        if (assetOperationScopeStillCurrent()) {
+          void loadAssets(undefined, false, {
+            database: operationDatabase,
+            comfyOrigin: operationComfyOrigin,
+          });
+          void loadAssetTrash();
+        }
+      } else if (runtimeSettingsDesired.current) {
+        runtimeSettingsDrainRef.current();
+      }
+    }
+  };
+
+  const purgeAssetTrashBatch = async (batch: AssetTrashBatch): Promise<void> => {
+    if (assetTrashOperationLock.current || assetDeleteLock.current || assetDeleteIntent.current) return;
+    if (
+      databaseIdentityStaleRef.current ||
+      storageRestartRequiredRef.current ||
+      storageOperationStatusRef.current !== "idle"
+    ) {
+      setToast("数据库权威状态尚未稳定，暂不能移除恢复记录");
+      return;
+    }
+    if (!window.confirm("仅永久移除 Director 中的恢复记录？此操作不能撤销，但不会删除 ComfyUI 中的文件。")) return;
+    assetTrashOperationLock.current = batch.batch_id;
+    assetDeleteIntent.current = true;
+    projectSwitchGeneration.current += 1;
+    setAssetsDeleting(true);
+    setAssetTrashBusyBatchId(batch.batch_id);
+    try {
+      const result = await directorApi.purgeAssetTrash(batch.batch_id);
+      setAssetTrashConflictBatchIds((current) => {
+        const next = new Set(current);
+        next.delete(batch.batch_id);
+        return next;
+      });
+      await loadAssetTrash();
+      setToast(`已永久移除 ${result.purged_asset_ids.length} 个 Director 恢复记录；ComfyUI 文件保留`);
+    } catch (reason) {
+      setToast(reason instanceof Error ? reason.message : "永久移除恢复记录失败");
+    } finally {
+      assetDeleteIntent.current = false;
+      assetTrashOperationLock.current = null;
+      setAssetsDeleting(false);
+      setAssetTrashBusyBatchId(null);
+      if (runtimeSettingsDesired.current) runtimeSettingsDrainRef.current();
     }
   };
 
@@ -2863,20 +5189,32 @@ export default function App() {
     if (runtimeSettingsOperation.current || runtimeSettingsSyncRequiredRef.current) {
       throw new Error("运行设置尚未完成服务器权威回读，暂不能上传素材");
     }
+    if (timelineRevisionConflict) throw new Error("服务器时间线存在修订冲突，请先选择处理方式");
     if (timelineSyncRequired) throw new Error("服务器时间线正在自动恢复权威状态，暂不能上传素材");
     if (capabilities.connection !== "online" || !isConfiguredComfyUrl(authoritativeSettingsRef.current.comfy_url)) {
       throw new Error("ComfyUI 尚未连接，暂不能上传素材");
     }
 
     const { accepted, unsupported } = classifyDroppedFiles(files);
+    const database = activeDatabaseRef.current;
+    if (!database || databaseIdentityStaleRef.current) {
+      throw new Error("数据库权威状态尚未稳定，暂不能上传素材");
+    }
     const generation = runtimeSettingsGeneration.current;
     const origin = authoritativeSettingsRef.current.comfy_url;
+    const projectId = activeProjectIdRef.current;
+    assetUploadLock.current = true;
+    const projectGeneration = ++projectSwitchGeneration.current;
     const authorityCurrent = () =>
       runtimeSettingsGeneration.current === generation &&
+      projectSwitchGeneration.current === projectGeneration &&
+      activeProjectIdRef.current === projectId &&
+      activeDatabaseRef.current?.active_database_path === database.active_database_path &&
+      activeDatabaseRef.current?.active_database_identity === database.active_database_identity &&
+      !databaseIdentityStaleRef.current &&
       authoritativeSettingsRef.current.comfy_url === origin &&
       (runtimeSettingsDesired.current?.comfy_url ?? runtimeSettingsDraft.comfy_url) === origin &&
       !runtimeSettingsOperation.current;
-    assetUploadLock.current = true;
     setAssetsUploading(true);
     try {
       const result = await uploadClassifiedDroppedFiles(
@@ -2904,6 +5242,7 @@ export default function App() {
       setAssetUploadProgress(null);
       if (
         !timelineSyncRequiredRef.current &&
+        !timelineRevisionConflictRef.current &&
         timelinePersistedRevision.current < timelineRevision.current
       ) {
         setTimelineRetryNonce((current) => current + 1);
@@ -2916,7 +5255,7 @@ export default function App() {
         runtimeSettingsDrainRef.current();
       }
     }
-  }, [capabilities.connection, runtimeSettingsDraft.comfy_url, timelineSyncRequired]);
+  }, [capabilities.connection, runtimeSettingsDraft.comfy_url, timelineRevisionConflict, timelineSyncRequired]);
 
   const activeTasks = state.tasks.filter((task) => ["queued", "preparing", "running", "cancelling"].includes(task.status));
   const activityRank: Record<string, number> = { running: 0, preparing: 1, queued: 2, cancelling: 3 };
@@ -2951,8 +5290,8 @@ export default function App() {
   const timelineHydrated = timelineHydrationStatus === "ready";
   const databaseIdentityStale = timelineHydrationStatus === "stale";
   const storageOperationPending = storageOperationStatus !== "idle";
-  const workspaceRuntimeReady = runtimeReady && !rayLightRecoveryRequired && !rayLightRecoveryPending && timelineHydrated && !storageRestartRequired && !storageOperationPending && !runtimeAuthorityPending && !timelineSyncRequired && !assetsDeleting && !assetsUploading;
-  const workspaceCapabilities: CapabilityReport = !runtimeReady || rayLightRecoveryRequired || rayLightRecoveryPending || storageRestartRequired || storageOperationPending || runtimeAuthorityPending || timelineSyncRequired || assetsDeleting || assetsUploading
+  const workspaceRuntimeReady = runtimeReady && !rayLightRecoveryRequired && !rayLightRecoveryPending && timelineHydrated && !storageRestartRequired && !storageOperationPending && !runtimeAuthorityPending && !timelineSyncRequired && !timelineRevisionConflict && !assetsDeleting && !assetsUploading;
+  const workspaceCapabilities: CapabilityReport = !runtimeReady || rayLightRecoveryRequired || rayLightRecoveryPending || storageRestartRequired || storageOperationPending || runtimeAuthorityPending || timelineSyncRequired || timelineRevisionConflict || assetsDeleting || assetsUploading
     ? {
         ...capabilities,
         connection: "checking",
@@ -2970,6 +5309,8 @@ export default function App() {
           ? "运行设置等待服务器权威回读"
           : timelineSyncRequired
             ? "时间线等待服务器权威回读"
+            : timelineRevisionConflict
+              ? "时间线存在服务器修订冲突"
             : assetsDeleting
               ? "正在原子解除素材引用"
               : "正在上传并绑定本地素材",
@@ -3003,6 +5344,7 @@ export default function App() {
     ...(rayLightRecoveryRequired ? ["旧 RayLight 运行状态引用当前不可见 GPU；请在系统设置确认 ComfyUI 已重启并恢复"] : []),
     ...(rayLightRecoveryPending ? ["正在核对 RayLight 重启恢复结果"] : []),
     ...(timelineSyncRequired ? ["素材级联已提交，但服务器时间线尚未完成权威回读"] : []),
+    ...(timelineRevisionConflict ? ["服务器时间线存在修订冲突，请先选择采用服务器版本或保留本地版本"] : []),
     ...(timelinePausedMessage ? [timelinePausedMessage] : []),
     ...emptySelectionErrors,
     ...(selectedEnabledIds.length ? validateTimelineProject(timeline.project, selectedEnabledIds) : []),
@@ -3015,6 +5357,14 @@ export default function App() {
   ];
   const timelineRunActionsReady = workspaceCapabilities.connection === "online" &&
     selectionTimelineErrors.length === 0 && selectedEnabledIds.length > 0;
+  const timelineHistoryBlocked = state.view !== "workspace" ||
+    !timelineHydrated || databaseIdentityStale || storageRestartRequired ||
+    storageOperationPending || timelineSyncRequired || Boolean(timelineRevisionConflict) || assetsDeleting ||
+    projectSwitchHandoffPending || runtimeEndpointSwitchRequired.current;
+  const nextUndoLabel = timelineHistoryUndoLabel(timelineHistory);
+  const nextRedoLabel = timelineHistoryRedoLabel(timelineHistory);
+  const timelineUndoReady = !timelineHistoryBlocked && canUndoTimelineHistory(timelineHistory);
+  const timelineRedoReady = !timelineHistoryBlocked && canRedoTimelineHistory(timelineHistory);
   const assetUsages = Object.fromEntries(timeline.assets.map((asset) => [
     asset.id,
     timelineAssetUsages(timeline.project, asset.id).map((usage) =>
@@ -3037,63 +5387,219 @@ export default function App() {
       return;
     }
     dispatchTimeline({ type: "project/patch", patch: { title } });
-    // The project list mirrors the timeline title; update it optimistically.
-    setProjects((current) => current.map((project) =>
-      project.id === activeProjectIdRef.current ? { ...project, title } : project,
-    ));
   };
 
   const switchProject = async (targetId: string): Promise<boolean> => {
     // Even choosing the already-active project is meaningful: it cancels an
     // unresolved switch whose response has not taken authority yet.
     const switchGeneration = ++projectSwitchGeneration.current;
+    projectListGeneration.current += 1;
     if (targetId === activeProjectIdRef.current) return true;
+    if (projectDeleteIntent.current !== null && targetId !== DEFAULT_PROJECT_ID) {
+      setToast("项目删除正在确认服务器结果；完成前不能切换项目");
+      return false;
+    }
+    if (timelineRevisionConflictRef.current) {
+      setToast("请先处理当前项目的服务器修订冲突，再切换项目");
+      return false;
+    }
     if (runtimeExecutionIntent.current > 0) {
       setToast("生成或预检正在确认当前项目；完成前不能切换项目");
       return false;
     }
+    if (
+      assetDeleteIntent.current || assetDeleteLock.current ||
+      assetUploadLock.current || assetTrashOperationLock.current !== null
+    ) {
+      setToast("素材库操作正在确认当前项目；完成前不能切换项目");
+      return false;
+    }
+    const database = activeDatabaseRef.current;
+    if (
+      !database || databaseIdentityStaleRef.current ||
+      storageOperationStatusRef.current !== "idle"
+    ) {
+      setToast("数据库权威状态尚未稳定，暂不能切换项目");
+      return false;
+    }
+    const ownsProjectSwitch = () => {
+      const activeDatabase = activeDatabaseRef.current;
+      return projectSwitchGeneration.current === switchGeneration &&
+        !databaseIdentityStaleRef.current &&
+        storageOperationStatusRef.current === "idle" &&
+        !assetDeleteIntent.current &&
+        !assetDeleteLock.current &&
+        !assetUploadLock.current &&
+        assetTrashOperationLock.current === null &&
+        activeDatabase?.active_database_path === database.active_database_path &&
+        activeDatabase.active_database_identity === database.active_database_identity;
+    };
     if (timelineHydrationReady.current) {
       try {
         await flushTimelineAutosave();
-        if (projectSwitchGeneration.current !== switchGeneration) return false;
+        if (!ownsProjectSwitch()) return false;
       } catch (reason) {
-        if (projectSwitchGeneration.current !== switchGeneration) return false;
+        if (!ownsProjectSwitch()) return false;
         setToast(`切换前同步当前项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
         return false;
       }
     }
-    const database = activeDatabaseRef.current;
-    let targetProject: TimelineProject | null = database
-      ? loadLocalTimeline(database, targetId)
-      : null;
-    if (!targetProject) {
-      try {
-        targetProject = normalizeTimelineProject(await fetchTimelineForProject(targetId));
-        if (projectSwitchGeneration.current !== switchGeneration) return false;
-      } catch (reason) {
-        if (projectSwitchGeneration.current !== switchGeneration) return false;
-        setToast(`加载目标项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
-        return false;
-      }
+    let targetAuthority: TimelineAuthority;
+    let serverProject: TimelineProject | null;
+    try {
+      // Always establish the target project's CAS base, even when a scoped WAL
+      // exists. The WAL is inspected only after the second current-project
+      // flush so that its adopted marker cannot be cleared by that ACK.
+      targetAuthority = await fetchTimelineForProject(targetId);
+      serverProject = normalizeTimelineProject(targetAuthority.document);
+      if (!ownsProjectSwitch()) return false;
+    } catch (reason) {
+      if (!ownsProjectSwitch()) return false;
+      setToast(`加载目标项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
+      return false;
     }
-    if (projectSwitchGeneration.current !== switchGeneration) return false;
-    if (!targetProject) { setToast("目标项目时间线结构无效"); return false; }
+    if (!ownsProjectSwitch()) return false;
+    if (!serverProject) { setToast("目标项目时间线结构无效"); return false; }
+    const targetPersistenceAuthority = {
+      document: serverProject,
+      revision: targetAuthority.revision,
+    };
+    await timelineJournalChain.current.catch(() => undefined);
+    if (!ownsProjectSwitch()) return false;
+    const targetPersistenceScope = timelinePersistenceScope(
+      database,
+      targetId,
+      timelineBranchOwnerRef.current,
+    );
+    const [targetJournal, targetJournalBranchList] = await Promise.all([
+      loadTimelineHistoryJournal(targetPersistenceScope, targetPersistenceAuthority),
+      listTimelineHistoryJournalBranches(targetPersistenceScope, targetPersistenceAuthority),
+    ]);
+    if (!ownsProjectSwitch()) return false;
     // The target request may have been pending long enough for another edit
-    // to occur in the current project. Drain again immediately before the
-    // synchronous authority hand-off so that edit cannot be discarded.
+    // to occur in the current project. The async journal read is completed
+    // first; then drain again immediately before the synchronous WAL inspect
+    // and authority hand-off so no edit can be discarded.
     if (timelineHydrationReady.current) {
       try {
         await flushTimelineAutosave();
         if (
-          projectSwitchGeneration.current !== switchGeneration ||
+          !ownsProjectSwitch() ||
           runtimeExecutionIntent.current > 0
         ) return false;
       } catch (reason) {
-        if (projectSwitchGeneration.current !== switchGeneration) return false;
+        if (!ownsProjectSwitch()) return false;
         setToast(`切换前同步当前项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
         return false;
       }
     }
+    // The second flush can enqueue the old project's ACK history while the
+    // target GET/IDB read was pending. Drain it before target hand-off bumps
+    // the shared journal generation, otherwise the last undo entry can be
+    // skipped even though its document reached the server.
+    projectSwitchHandoffIntent.current = switchGeneration;
+    setProjectSwitchHandoffPending(true);
+    try {
+      await timelineJournalChain.current.catch(() => undefined);
+      if (!ownsProjectSwitch()) return false;
+      const targetWalBranches = listLocalTimelineWalBranches(
+      database,
+      targetId,
+      timelineBranchOwnerRef.current,
+    );
+    const targetWal = targetWalBranches?.owned?.wal ?? null;
+    if ("token" in targetJournal && targetJournal.token) {
+      timelineJournalTokens.current.set(
+        timelineJournalTokenMapKey(database, targetId, timelineBranchOwnerRef.current),
+        targetJournal.token,
+      );
+    }
+    const targetRecovery = collectTimelineRecoveryBranches(
+      targetWalBranches,
+      targetJournalBranchList.status === "available"
+        ? targetJournalBranchList.branches
+        : [],
+      targetPersistenceAuthority,
+    );
+    const targetExplicitRecoverySelectionRequired = targetRecovery.pending.length > 1 ||
+      targetRecovery.pending.some(
+      (branch) => branch.ownership !== "owned" || branch.status === "corrupt",
+      );
+    const targetWalResolution = targetWal
+      ? resolveLocalTimelineWal(targetWal, targetPersistenceAuthority)
+      : null;
+    let targetProject = serverProject;
+    let targetHistory = resetTimelineHistory(timelineHistoryRef.current);
+    let targetHasPending = false;
+    let targetConflict: TimelineRevisionConflict | null = null;
+    const targetJournalCarriesHistory = targetJournal.status === "restored" ||
+      targetJournal.status === "acknowledged";
+    if (targetWalResolution?.status === "conflict") {
+      targetProject = targetWalResolution.local_project;
+      targetHasPending = true;
+      targetConflict = {
+        projectId: targetId,
+        localProject: targetProject,
+        serverAuthority: targetPersistenceAuthority,
+        source: "cas",
+        resolving: false,
+      };
+      if (
+        targetJournalCarriesHistory &&
+        timelineProjectsEqual(targetJournal.project, targetProject)
+      ) targetHistory = targetJournal.history;
+    } else if (targetJournal.status === "conflict") {
+      targetProject = targetJournal.localProject;
+      if (timelineProjectsEqual(targetJournal.project, targetProject)) {
+        targetHistory = targetJournal.history;
+      }
+      targetHasPending = true;
+      targetConflict = {
+        projectId: targetId,
+        localProject: targetProject,
+        serverAuthority: targetPersistenceAuthority,
+        source: "cas",
+        resolving: false,
+      };
+    } else if (targetWalResolution?.status === "replay") {
+      targetProject = targetWalResolution.project;
+      targetHasPending = true;
+      if (
+        targetJournalCarriesHistory &&
+        timelineProjectsEqual(targetJournal.project, targetProject)
+      ) targetHistory = targetJournal.history;
+    } else if (targetWalResolution?.status === "acknowledged") {
+      if (
+        targetJournalCarriesHistory &&
+        timelineProjectsEqual(targetJournal.project, serverProject)
+      ) targetHistory = targetJournal.history;
+    } else if (targetJournalCarriesHistory) {
+      targetProject = targetJournal.project;
+      targetHistory = targetJournal.history;
+      targetHasPending = !timelineProjectsEqual(targetProject, serverProject);
+    }
+    if (targetExplicitRecoverySelectionRequired) {
+      targetProject = serverProject;
+      targetHistory = targetRecovery.newestAcknowledgedHistory ??
+        resetTimelineHistory(timelineHistoryRef.current);
+      targetHasPending = false;
+      targetConflict = {
+        projectId: targetId,
+        localProject: serverProject,
+        serverAuthority: targetPersistenceAuthority,
+        source: "recovery-branches",
+        resolving: false,
+        recoveryBranches: targetRecovery.pending,
+        selectedRecoveryBranchId: null,
+      };
+    } else if (
+      !targetHasPending &&
+      !targetConflict &&
+      targetRecovery.newestAcknowledgedHistory
+    ) {
+      targetHistory = targetRecovery.newestAcknowledgedHistory;
+    }
+    if (!ownsProjectSwitch()) return false;
     const targetSegmentIds = targetProject.segments.map((segment) => segment.id);
     const targetSelectionScope = database
       ? `${database.active_database_identity}:${targetId}`
@@ -3101,47 +5607,65 @@ export default function App() {
     const restoredSelection = database
       ? loadTimelineSegmentSelectionPreference(database, targetId, targetSegmentIds)
       : null;
-    const replaceAction: TimelineAction = {
-      type: "project/replace",
-      project: targetProject,
-    };
-    const restoreSelectionAction: TimelineAction = {
-      type: "segment/set-selection",
-      ids: restoredSelection ?? targetSegmentIds,
-    };
-    const nextState = timelineEditorReducer(
-      timelineEditorReducer(timelineRef.current, replaceAction),
-      restoreSelectionAction,
-    );
-    timelineRef.current = nextState;
-    segmentSelectionGeneration.current += 1;
-    rawTimelineDispatch(replaceAction);
-    // A different project starts with its own default selection even when an
-    // imported/cloned timeline happens to reuse segment IDs. Its project-
-    // scoped browser preference, if any, is restored in the same transition.
-    rawTimelineDispatch(restoreSelectionAction);
-    timelineRevision.current = 0;
-    timelinePersistedRevision.current = 0;
-    timelineHadLocal.current = false;
-    timelineWriteGeneration.current += 1;
-    restoredSegmentSelectionKey.current = targetSelectionScope;
-    timelineHydrationReady.current = true;
-    setTimelineHydrationStatus("ready");
-    setTimelineDirty(false);
-    setCompileReport(null);
-    setTimelinePausedError(null);
-    clearLocalTimeline();
     activeProjectIdRef.current = targetId;
     setActiveProjectIdState(targetId);
     persistActiveProjectId(targetId);
+    timelineWriteGeneration.current += 1;
+    acceptTimelineServerAuthority(targetPersistenceAuthority);
+    activeTimelineWalRef.current = targetWal;
+    timelineRevision.current = targetHasPending ? 1 : 0;
+    timelinePersistedRevision.current = 0;
+    timelineHadLocal.current = targetHasPending || targetHistory.head !== null;
+    installTimelineAuthority(targetProject, {
+      projectId: targetId,
+      selectedSegmentIds: restoredSelection ?? targetSegmentIds,
+      clearHistory: false,
+    });
+    commitTimelineHistory(targetHistory);
+    segmentSelectionGeneration.current += 1;
+    restoredSegmentSelectionKey.current = targetSelectionScope;
+    timelineHydrationReady.current = true;
+    setTimelineHydrationStatus("ready");
+    setTimelineDirty(targetHasPending);
+    setCompileReport(null);
+    setTimelinePausedError(null);
+    setTimelineRevisionConflict(targetConflict);
+    if (targetWal && targetWalResolution?.status === "acknowledged" && !targetConflict) {
+      clearLocalTimeline(targetWal);
+    } else if (!targetWal && targetHasPending && !targetConflict && database) {
+      saveLocalTimeline(targetProject, database, targetId);
+    }
+    if (database && !targetConflict) {
+      persistTimelineJournal(
+        targetHistory,
+        targetPersistenceAuthority,
+        database,
+        targetId,
+      );
+    }
     // Refresh the task drawer's current-project comparison for the new project.
     taskListRequest.current += 1;
     void loadTasks(undefined, true);
-    setToast(`已切换到项目“${targetProject.title}”`);
-    return true;
+    setToast(targetConflict
+      ? `已切换到项目“${targetProject.title}”；本地恢复记录与服务器权威不匹配，请选择处理方式`
+      : targetHasPending
+        ? `已切换到项目“${targetProject.title}”；正在恢复并同步本地修改`
+      : `已切换到项目“${targetProject.title}”`);
+      return true;
+    } finally {
+      if (projectSwitchHandoffIntent.current === switchGeneration) {
+        projectSwitchHandoffIntent.current = null;
+        setProjectSwitchHandoffPending(false);
+      }
+    }
   };
 
   const createProject = async (title?: string) => {
+    if (projectDeleteIntent.current !== null) {
+      setToast("项目删除正在确认服务器结果；完成前不能新建项目");
+      return;
+    }
+    projectListGeneration.current += 1;
     if (timelineHydrationReady.current) {
       try {
         await flushTimelineAutosave();
@@ -3161,20 +5685,36 @@ export default function App() {
 
   const deleteProject = async (projectId: string) => {
     if (projectId === DEFAULT_PROJECT_ID) return;
+    if (projectDeleteIntent.current !== null) {
+      setToast("已有项目正在删除，请等待服务器确认");
+      return;
+    }
     if (runtimeExecutionIntent.current > 0) {
       setToast("生成或预检正在确认当前项目；完成前不能删除项目");
       return;
     }
+    projectDeleteIntent.current = projectId;
+    setProjectDeletingId(projectId);
+    projectListGeneration.current += 1;
     try {
       if (
         activeProjectIdRef.current === projectId &&
         !await switchProject(DEFAULT_PROJECT_ID)
       ) return;
       const response = await directorApi.deleteProject(projectId);
+      projectListGeneration.current += 1;
       setProjects((current) => current.filter((project) => project.id !== projectId));
+      if (activeProjectIdRef.current === projectId) {
+        restartTimelineHydrationForProject(DEFAULT_PROJECT_ID);
+      }
       setToast(`已删除项目；${response.orphaned_jobs} 个历史任务已归档为旧任务`);
     } catch (reason) {
       setToast(`删除项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
+    } finally {
+      if (projectDeleteIntent.current === projectId) {
+        projectDeleteIntent.current = null;
+        setProjectDeletingId(null);
+      }
     }
   };
 
@@ -3209,14 +5749,14 @@ export default function App() {
               runtimeSettingsOperation.current ||
               runtimeSettingsSyncRequiredRef.current
             ) return;
-            rawTimelineDispatch({ type: "assets/add", assets });
+            dispatchTimelineUi({ type: "assets/add", assets });
           }}
-          onSelect={(id, additive) => rawTimelineDispatch({ type: "assets/select", id, additive })}
-          onSelectRange={(ids, additive) => rawTimelineDispatch({
+          onSelect={(id, additive) => dispatchTimelineUi({ type: "assets/select", id, additive })}
+          onSelectRange={(ids, additive) => dispatchTimelineUi({
             type: "assets/set-selection", ids, additive,
           })}
-          onMove={(draggedId, targetId) => rawTimelineDispatch({ type: "assets/move", draggedId, targetId })}
-          onGridSize={(size) => rawTimelineDispatch({ type: "assets/grid-size", size })}
+          onMove={(draggedId, targetId) => dispatchTimelineUi({ type: "assets/move", draggedId, targetId })}
+          onGridSize={(size) => dispatchTimelineUi({ type: "assets/grid-size", size })}
           onDelete={(ids) => void deleteAssets(ids)}
           settingsNavigationDisabled={false}
           toggleButtonRef={sidebarBrandToggleRef}
@@ -3227,6 +5767,8 @@ export default function App() {
             const opening = state.view !== "settings";
             if (opening) {
               setGlobalSettingsOpen(false);
+              setTimelineHistoryPanelOpen(false);
+              setAssetTrashPanelOpen(false);
               dispatch({ type: "tasks/panel", open: false });
             }
             dispatch({ type: opening ? "navigate/settings" : "navigate/workspace" });
@@ -3245,6 +5787,10 @@ export default function App() {
               ? "正在恢复当前数据库中保留的修改；完成前当前页面停止修改。"
               : "正在建立数据库存储变更边界；完成前当前页面停止修改。"}</span>
         </div>}
+        {projectSwitchHandoffPending && <div className="timeline-hydration-notice" role="status" aria-live="polite">
+          <Spinner />
+          <span>正在完成项目切换交接；完成前不能编辑当前项目</span>
+        </div>}
         {!timelineHydrated && <div className="timeline-hydration-notice" role="status" aria-live="polite">
           {timelineHydrationStatus !== "stale" && <Spinner />}
           <span>{timelineHydrationStatus === "stale"
@@ -3253,7 +5799,85 @@ export default function App() {
               ? "暂时无法确认数据库或读取服务器时间线，正在自动重试；恢复前编辑已锁定。"
               : "正在从服务器恢复时间线；恢复前编辑已锁定。"}</span>
         </div>}
-        <div className="workspace-surface" {...(state.view === "settings" || !timelineHydrated || storageRestartRequired || storageOperationPending ? { inert: true } : {})}>
+        {timelineRevisionConflict && <div className="timeline-hydration-notice timeline-revision-conflict" role="alert" aria-live="assertive">
+          {timelineRevisionConflict.resolving && <Spinner />}
+          {timelineRevisionConflict.source === "recovery-branches" ? <>
+            <span>检测到其他页面或旧会话留下的时间线恢复分支。当前显示服务器版本；选择前不会重放或写入任何分支。</span>
+            <fieldset disabled={timelineRevisionConflict.resolving}>
+              <legend>可恢复的本地分支（{timelineRevisionConflict.recoveryBranches?.length ?? 0}）</legend>
+              <ul aria-label="时间线恢复分支列表">
+                {timelineRevisionConflict.recoveryBranches?.map((branch) => {
+                  const shortOwner = branch.ownerId
+                    ? branch.ownerId.length > 18
+                      ? `${branch.ownerId.slice(0, 8)}…${branch.ownerId.slice(-6)}`
+                      : branch.ownerId
+                    : "未知 owner";
+                  const statusLabel = branch.status === "replay"
+                    ? "基线匹配，可安全恢复"
+                    : branch.status === "acknowledged"
+                      ? "服务器已包含此版本"
+                      : branch.status === "conflict"
+                        ? "基线已变化，恢复后需再次确认"
+                        : "记录损坏，仅可丢弃";
+                  return <li key={branch.id}>
+                    <label>
+                      <input
+                        type="radio"
+                        name="timeline-recovery-branch"
+                        value={branch.id}
+                        checked={timelineRevisionConflict.selectedRecoveryBranchId === branch.id}
+                        disabled={branch.status === "corrupt" || timelineRevisionConflict.resolving}
+                        onChange={() => selectTimelineRecoveryBranch(branch.id)}
+                      />
+                      <span>{branch.project?.title ?? "损坏的恢复记录"}；{branch.ownership === "owned" ? "当前会话" : branch.ownership === "legacy" ? "旧版证据" : "其他会话"}；{shortOwner}；{statusLabel}{branch.updatedAtMs ? `；${new Date(branch.updatedAtMs).toLocaleString()}` : ""}</span>
+                    </label>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      disabled={timelineRevisionConflict.resolving}
+                      aria-label={`丢弃恢复记录：${branch.project?.title ?? shortOwner}`}
+                      onClick={() => void discardTimelineRecoveryBranch(branch.id)}
+                    >丢弃恢复记录</button>
+                  </li>;
+                })}
+              </ul>
+            </fieldset>
+            <div role="group" aria-label="时间线恢复处理">
+              <button
+                type="button"
+                className="button button--ghost"
+                disabled={timelineRevisionConflict.resolving}
+                onClick={() => void continueServerWithRecoveryEvidence()}
+              >继续服务器并保留记录</button>
+              <button
+                type="button"
+                className="button button--primary"
+                disabled={timelineRevisionConflict.resolving ||
+                  !timelineRevisionConflict.selectedRecoveryBranchId}
+                onClick={() => void restoreSelectedTimelineBranch()}
+              >恢复所选分支</button>
+            </div>
+          </> : <>
+            <span>{timelineRevisionConflict.source === "legacy-wal"
+              ? "检测到未携带服务器修订号的本地恢复草稿。为避免覆盖其他页面的修改，已停止自动同步。请选择采用服务器版本，或确认保留本地版本。"
+              : "服务器时间线已被其他页面修改。本地历史和恢复草稿仍被保留，自动同步已停止。请选择冲突处理方式。"}</span>
+            <div role="group" aria-label="时间线冲突处理">
+              <button
+                type="button"
+                className="button button--ghost"
+                disabled={timelineRevisionConflict.resolving}
+                onClick={() => void adoptServerTimelineAfterConflict()}
+              >采用服务器版本</button>
+              <button
+                type="button"
+                className="button button--primary"
+                disabled={timelineRevisionConflict.resolving}
+                onClick={() => void keepLocalTimelineAfterConflict()}
+              >保留本地版本</button>
+            </div>
+          </>}
+        </div>}
+        <div className="workspace-surface" {...(state.view === "settings" || !timelineHydrated || storageRestartRequired || storageOperationPending || timelineRevisionConflict ? { inert: true } : {})}>
         <header className="topbar topbar--timeline">
           <div className="topbar__identity">
             <div className="topbar__mode topbar__mode--timeline">
@@ -3296,7 +5920,10 @@ export default function App() {
                 className="topbar__project-switcher"
                 aria-label="切换项目"
                 value={activeProjectId}
-                disabled={!timelineHydrated || submitting || compiling}
+                disabled={!timelineHydrated || databaseIdentityStale || storageOperationPending ||
+                  Boolean(timelineRevisionConflict) || submitting || compiling ||
+                  assetsDeleting || assetsUploading || projectSwitchHandoffPending ||
+                  projectDeletingId !== null}
                 onChange={(event) => {
                   const value = event.target.value;
                   if (value === "__new__") void createProject();
@@ -3316,7 +5943,7 @@ export default function App() {
                   type="button"
                   className="topbar__project-delete"
                   aria-label={`删除项目 ${timeline.project.title}`}
-                  disabled={submitting || compiling}
+                  disabled={submitting || compiling || projectDeletingId !== null}
                   onClick={() => {
                     if (window.confirm(`确认删除项目“${timeline.project.title}”？已生成的任务会保留为旧任务。`)) {
                       void deleteProject(activeProjectId);
@@ -3328,11 +5955,76 @@ export default function App() {
           </div>
 
           <div className="topbar__right">
+            <div className="topbar__history-actions" role="group" aria-label="项目编辑历史">
+              <button
+                type="button"
+                aria-label="撤销"
+                aria-keyshortcuts="Control+Z Meta+Z"
+                title={nextUndoLabel ? `撤销：${nextUndoLabel} · Ctrl/Cmd+Z` : "没有可撤销的项目修改"}
+                disabled={!timelineUndoReady}
+                onPointerDown={(event) => event.preventDefault()}
+                onClick={undoTimeline}
+              >
+                <span aria-hidden="true">↶</span>
+              </button>
+              <button
+                type="button"
+                aria-label="重做"
+                aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z Control+Y"
+                title={nextRedoLabel ? `重做：${nextRedoLabel} · Ctrl/Cmd+Shift+Z` : "没有可重做的项目修改"}
+                disabled={!timelineRedoReady}
+                onPointerDown={(event) => event.preventDefault()}
+                onClick={redoTimeline}
+              >
+                <span aria-hidden="true">↷</span>
+              </button>
+            </div>
+            <button
+              ref={timelineHistoryToggleRef}
+              type="button"
+              className="topbar__history-toggle"
+              aria-label="编辑历史"
+              aria-expanded={timelineHistoryPanelOpen}
+              aria-controls={TIMELINE_HISTORY_PANEL_ID}
+              disabled={!timelineHydrated || state.view !== "workspace"}
+              onClick={() => {
+                const opening = !timelineHistoryPanelOpen;
+                if (opening) {
+                  setGlobalSettingsOpen(false);
+                  setAssetTrashPanelOpen(false);
+                  dispatch({ type: "tasks/panel", open: false });
+                }
+                setTimelineHistoryPanelOpen(opening);
+              }}
+            >编辑历史</button>
             <button ref={globalSettingsToggleRef} type="button" className="topbar__global-toggle" aria-label="全局设置" aria-expanded={globalSettingsOpen} aria-controls={GLOBAL_SETTINGS_ID} onClick={() => {
               const opening = !globalSettingsOpen;
-              if (opening) dispatch({ type: "tasks/panel", open: false });
+              if (opening) {
+                setTimelineHistoryPanelOpen(false);
+                setAssetTrashPanelOpen(false);
+                dispatch({ type: "tasks/panel", open: false });
+              }
               setGlobalSettingsOpen(opening);
             }}><span>全局设置</span><i aria-hidden="true" /></button>
+            <button
+              ref={assetTrashToggleRef}
+              type="button"
+              className="topbar__asset-trash-toggle"
+              aria-label="素材回收站"
+              aria-expanded={assetTrashPanelOpen}
+              aria-controls={ASSET_TRASH_PANEL_ID}
+              disabled={!timelineHydrated || state.view !== "workspace"}
+              onClick={() => {
+                const opening = !assetTrashPanelOpen;
+                if (opening) {
+                  setGlobalSettingsOpen(false);
+                  setTimelineHistoryPanelOpen(false);
+                  dispatch({ type: "tasks/panel", open: false });
+                  void loadAssetTrash();
+                }
+                setAssetTrashPanelOpen(opening);
+              }}
+            >素材回收站</button>
             <div className="topbar__run-actions" role="group" aria-label="时间线生成操作">
               <button
                 type="button"
@@ -3366,7 +6058,11 @@ export default function App() {
             <button type="button" className="theme-toggle" aria-label={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}><span aria-hidden="true">{theme === "dark" ? "☀" : "☾"}</span></button>
             <button type="button" id="task-panel-toggle" className="queue-button" aria-label={`任务，${activeTasks.length} 个进行中`} aria-controls="task-drawer" aria-expanded={state.taskPanelOpen} onClick={() => {
               const opening = !state.taskPanelOpen;
-              if (opening) setGlobalSettingsOpen(false);
+              if (opening) {
+                setGlobalSettingsOpen(false);
+                setTimelineHistoryPanelOpen(false);
+                setAssetTrashPanelOpen(false);
+              }
               dispatch({ type: "tasks/panel", open: opening });
             }}><span>任务</span><strong>{activeTasks.length}</strong></button>
           </div>
@@ -3382,10 +6078,46 @@ export default function App() {
               runtimeReady={runtimeSettingsDraftValid && runtimeResourcesOrigin === runtimeSettingsDraft.comfy_url && capabilities.connection === "online" && !rayLightRecoveryRequired}
               modelSaving={runtimeSettingsOperationOwner !== null}
               onClose={() => { setGlobalSettingsOpen(false); window.requestAnimationFrame(() => globalSettingsToggleRef.current?.focus()); }}
-              onChange={(project) => dispatchTimeline({ type: "project/replace", project })}
+              onProjectPatch={(patch) => dispatchTimeline({ type: "project/patch", patch })}
+              onSamplingChange={(family, patch) => dispatchTimeline({
+                type: "project/update-sampling",
+                family,
+                patch,
+              })}
               onRuntimeModelChange={(role, patch) => void updateRuntimeModel(role, patch)}
             />
-            {!workspaceRuntimeReady && <div className="timeline-runtime-notice">{!runtimeSettingsDraftValid ? "系统设置有无效输入，请打开并修正；有效后自动应用。" : runtimeSettingsPausedError ? `服务器拒绝当前系统设置：${runtimeSettingsPausedError}。请打开并修改；有效修改后自动应用。` : rayLightRecoveryRequired ? "旧 RayLight 运行状态引用了当前不可见 GPU；请打开系统设置，确认 ComfyUI 已重启后执行恢复。" : runtimeSettingsSyncRequired ? "运行设置或素材库正在后台自动核对；恢复权威状态前，生成与素材操作保持锁定。" : runtimeSettingsOperationOwner !== null ? "运行设置正在同步并从服务器权威回读；完成前不能生成或操作素材。" : timelineSyncRequired ? "素材操作结果正在自动核对；恢复权威时间线前，编辑与生成保持锁定。" : assetsDeleting ? "正在原子解除素材引用；时间线编辑与生成暂时锁定。" : assetsUploading ? assetUploadProgress ? `${describeUploadProgress(assetUploadProgress)}；完成前暂时锁定同步、预检和生成。` : "正在上传并绑定本地素材；完成前暂时锁定同步、预检和生成。" : capabilities.connection === "offline" ? "ComfyUI 当前离线；编辑内容会在 Director 连接恢复后自动同步，暂时不能生成。" : !runtimeConfigured ? "尚未配置 ComfyUI；请在系统设置填写服务器地址。" : "正在检查 ComfyUI 能力…"}</div>}
+            <TimelineHistoryPanel
+              id={TIMELINE_HISTORY_PANEL_ID}
+              open={timelineHistoryPanelOpen}
+              history={timelineHistory}
+              toggleRef={timelineHistoryToggleRef}
+              onJump={jumpTimelineHistoryCursor}
+              onClose={(restoreFocus) => {
+                setTimelineHistoryPanelOpen(false);
+                if (restoreFocus) {
+                  window.requestAnimationFrame(() => timelineHistoryToggleRef.current?.focus());
+                }
+              }}
+            />
+            <AssetTrashPanel
+              id={ASSET_TRASH_PANEL_ID}
+              open={assetTrashPanelOpen}
+              batches={assetTrashBatches}
+              loading={assetTrashLoading}
+              busyBatchId={assetTrashBusyBatchId}
+              conflictBatchIds={assetTrashConflictBatchIds}
+              toggleRef={assetTrashToggleRef}
+              onRefresh={() => void loadAssetTrash()}
+              onRestore={(batch, mode) => void restoreAssetTrashBatch(batch, mode)}
+              onPurge={(batch) => void purgeAssetTrashBatch(batch)}
+              onClose={(restoreFocus) => {
+                setAssetTrashPanelOpen(false);
+                if (restoreFocus) {
+                  window.requestAnimationFrame(() => assetTrashToggleRef.current?.focus());
+                }
+              }}
+            />
+            {!workspaceRuntimeReady && <div className="timeline-runtime-notice">{!runtimeSettingsDraftValid ? "系统设置有无效输入，请打开并修正；有效后自动应用。" : runtimeSettingsPausedError ? `服务器拒绝当前系统设置：${runtimeSettingsPausedError}。请打开并修改；有效修改后自动应用。` : rayLightRecoveryRequired ? "旧 RayLight 运行状态引用了当前不可见 GPU；请打开系统设置，确认 ComfyUI 已重启后执行恢复。" : runtimeSettingsSyncRequired ? "运行设置或素材库正在后台自动核对；恢复权威状态前，生成与素材操作保持锁定。" : runtimeSettingsOperationOwner !== null ? "运行设置正在同步并从服务器权威回读；完成前不能生成或操作素材。" : timelineRevisionConflict ? "服务器时间线存在修订冲突；本地草稿已保留，请在页面顶部选择处理方式。" : timelineSyncRequired ? "素材操作结果正在自动核对；恢复权威时间线前，编辑与生成保持锁定。" : assetsDeleting ? "正在原子解除素材引用；时间线编辑与生成暂时锁定。" : assetsUploading ? assetUploadProgress ? `${describeUploadProgress(assetUploadProgress)}；完成前暂时锁定同步、预检和生成。` : "正在上传并绑定本地素材；完成前暂时锁定同步、预检和生成。" : capabilities.connection === "offline" ? "ComfyUI 当前离线；编辑内容会在 Director 连接恢复后自动同步，暂时不能生成。" : !runtimeConfigured ? "尚未配置 ComfyUI；请在系统设置填写服务器地址。" : "正在检查 ComfyUI 能力…"}</div>}
             <LongFormTimelineWorkspace
               state={timeline}
               capabilities={workspaceCapabilities}
@@ -3423,7 +6155,7 @@ export default function App() {
                     : null}
             loadingModels={loadingModels}
             syncError={runtimeSettingsPausedError}
-            runtimeEditingDisabled={!timelineHydrated || storageRestartRequired || storageOperationPending || databaseIdentityStale || rayLightRecoveryPending}
+            runtimeEditingDisabled={!timelineHydrated || Boolean(timelineRevisionConflict) || storageRestartRequired || storageOperationPending || databaseIdentityStale || rayLightRecoveryPending}
             storageOperationsDisabled={!timelineHydrated || storageOperationPending || databaseIdentityStale || rayLightRecoveryPending}
             theme={theme}
             onThemeChange={setTheme}
@@ -3456,6 +6188,9 @@ export default function App() {
       </div>
 
       <TaskDrawer id="task-drawer" open={state.taskPanelOpen} tasks={state.tasks} loading={tasksLoading} supportsCancel={capabilities.supports_cancel} deletingTaskIds={deletingTaskIds} clearing={clearingTasks} onClose={() => dispatch({ type: "tasks/panel", open: false })} onRefresh={() => void loadTasks(undefined, true)} onCancel={(id) => cancel(id)} onConfirmComfyRestart={(id) => confirmComfyRestartRecovery(id)} onBulkCancel={cancelMany} onLoadProject={loadTaskProject} onLoadGenerationDetails={(id) => directorApi.getTaskGenerationDetails(id)} onExportDiagnostic={exportTaskDiagnostic} onImportOutput={importTaskOutput} onDelete={(id) => deleteTask(id)} onClearCompleted={() => clearTerminalTasks()} />
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        <span key={timelineHistoryAnnouncement.sequence}>{timelineHistoryAnnouncement.message}</span>
+      </div>
       {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );

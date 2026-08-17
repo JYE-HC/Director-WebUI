@@ -463,6 +463,106 @@ describe("Director REST 契约", () => {
     });
   });
 
+  it("时间线 authority API 严格往返 revision 并发送 expected_revision", async () => {
+    const project = createTimelineProject();
+    const firstAuthority = { document: project, revision: 7 };
+    const secondAuthority = { document: project, revision: 8 };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(firstAuthority))
+      .mockResolvedValueOnce(jsonResponse(secondAuthority))
+      .mockResolvedValueOnce(jsonResponse(firstAuthority))
+      .mockResolvedValueOnce(jsonResponse(secondAuthority));
+
+    await expect(directorApi.getTimelineAuthority()).resolves.toEqual(firstAuthority);
+    await expect(directorApi.updateTimelineAuthority(project, 7))
+      .resolves.toEqual(secondAuthority);
+    await expect(directorApi.getProjectTimelineAuthority("project/one"))
+      .resolves.toEqual(firstAuthority);
+    await expect(directorApi.updateProjectTimelineAuthority("project/one", project, 7))
+      .resolves.toEqual(secondAuthority);
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
+      ["/api/timeline/authority", "GET"],
+      ["/api/timeline/authority", "PUT"],
+      ["/api/projects/project%2Fone/timeline/authority", "GET"],
+      ["/api/projects/project%2Fone/timeline/authority", "PUT"],
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      document: project,
+      expected_revision: 7,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[3][1]?.body))).toEqual({
+      document: project,
+      expected_revision: 7,
+    });
+  });
+
+  it("时间线 authority envelope 拒绝额外字段与非安全 revision", async () => {
+    const project = createTimelineProject();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ document: project, revision: 0, extra: true }))
+      .mockResolvedValueOnce(jsonResponse({ document: project, revision: 1.5 }))
+      .mockResolvedValueOnce(jsonResponse({ document: project, revision: 2 ** 53 }));
+
+    await expect(directorApi.getTimelineAuthority()).rejects.toMatchObject({
+      name: "ApiError",
+      status: 502,
+      message: "时间线权威响应结构无效",
+    });
+    await expect(directorApi.getTimelineAuthority()).rejects.toThrow(
+      "时间线权威响应结构无效",
+    );
+    await expect(directorApi.getTimelineAuthority()).rejects.toThrow(
+      "时间线权威响应结构无效",
+    );
+    expect(() => directorApi.updateTimelineAuthority(project, -1)).toThrow(
+      "时间线 expected revision 必须是非负安全整数",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("时间线 CAS 409 只暴露可恢复冲突码与安全 revision", async () => {
+    const project = createTimelineProject();
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      detail: {
+        code: "timeline_revision_conflict",
+        message: "timeline changed on the server",
+        project_id: "project-1",
+        expected_revision: 4,
+        actual_revision: 5,
+        internal_owner: "secret-owner",
+      },
+    }, 409));
+
+    const conflict = await directorApi.updateProjectTimelineAuthority(
+      "project-1",
+      project,
+      4,
+    ).then(
+      () => { throw new Error("预期时间线 revision 冲突"); },
+      (reason): ApiError => reason as ApiError,
+    );
+
+    expect(conflict).toMatchObject({
+      status: 409,
+      code: "timeline_revision_conflict",
+      details: {
+        detail: {
+          code: "timeline_revision_conflict",
+          message: "timeline changed on the server",
+          project_id: "project-1",
+          expected_revision: 4,
+          actual_revision: 5,
+        },
+      },
+    });
+    expect(JSON.stringify(conflict.details)).not.toContain("secret-owner");
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
+      document: project,
+      expected_revision: 4,
+    });
+  });
+
   it("能力响应缺少安全取消字段时按不支持处理", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({
       connection: "online",
@@ -792,6 +892,109 @@ describe("Director REST 契约", () => {
     expect(new Headers(fetchMock.mock.calls[0][1]?.headers).has("Content-Type")).toBe(false);
   });
 
+  it("素材与回收站列表解析同一 database/origin scope 并兼容旧两键响应", async () => {
+    const identity = "a".repeat(64);
+    const assetValue = {
+      id: "asset-scoped",
+      name: "scoped.png",
+      subfolder: "director-web",
+      type: "input",
+      kind: "image",
+    };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        assets: [assetValue],
+        outputs_preserved: true,
+        active_database_identity: identity,
+        comfy_origin: "http://comfy.test:8188",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        assets: [assetValue],
+        outputs_preserved: true,
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        batches: [],
+        remote_files_preserved: true,
+        active_database_identity: identity,
+        comfy_origin: "http://comfy.test:8188",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        batches: [],
+        remote_files_preserved: true,
+      }));
+
+    await expect(directorApi.listAssets("image")).resolves.toEqual({
+      assets: [assetValue],
+      outputs_preserved: true,
+      active_database_identity: identity,
+      comfy_origin: "http://comfy.test:8188",
+    });
+    await expect(directorApi.listAssets()).resolves.toEqual({
+      assets: [assetValue],
+      outputs_preserved: true,
+    });
+    await expect(directorApi.listAssetTrash()).resolves.toEqual({
+      batches: [],
+      remote_files_preserved: true,
+      active_database_identity: identity,
+      comfy_origin: "http://comfy.test:8188",
+    });
+    await expect(directorApi.listAssetTrash()).resolves.toEqual({
+      batches: [],
+      remote_files_preserved: true,
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/assets?kind=image",
+      "/api/assets",
+      "/api/asset-trash",
+      "/api/asset-trash",
+    ]);
+  });
+
+  it("素材 scope metadata 必须成对、规范且与回收批次 origin 一致", async () => {
+    const identity = "b".repeat(64);
+    const assetValue = {
+      id: "asset-1",
+      name: "one.png",
+      subfolder: "director-web",
+      type: "input",
+      kind: "image",
+    };
+    const batch = {
+      batch_id: "batch-1",
+      comfy_origin: "http://comfy.test:8188",
+      asset_ids: [assetValue.id],
+      assets: [assetValue],
+      cascade: false,
+      unbound_usages: [],
+      unbound_usages_by_asset: { [assetValue.id]: [] },
+      created_at: "2026-08-16T12:00:00Z",
+      remote_files_preserved: true,
+    };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        assets: [assetValue],
+        outputs_preserved: true,
+        active_database_identity: identity,
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        batches: [batch],
+        remote_files_preserved: true,
+        active_database_identity: identity,
+        comfy_origin: "http://other-comfy.test:8188",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        assets: [assetValue],
+        outputs_preserved: true,
+        active_database_identity: "not-a-database-identity",
+        comfy_origin: "http://comfy.test:8188",
+      }));
+
+    await expect(directorApi.listAssets()).rejects.toThrow("素材列表响应结构无效");
+    await expect(directorApi.listAssetTrash()).rejects.toThrow("素材回收站响应结构无效");
+    await expect(directorApi.listAssets()).rejects.toThrow("素材列表响应结构无效");
+  });
+
   it("保留非级联素材删除方法的旧路由契约", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({
       deleted_asset_id: "asset/1",
@@ -835,6 +1038,305 @@ describe("Director REST 契约", () => {
     await expect(directorApi.deleteAssetCascade("asset-1")).rejects.toThrow("素材移出并解除引用响应结构无效");
     await expect(directorApi.deleteAssetCascade("asset-1")).rejects.toThrow("素材移出并解除引用响应结构无效");
     await expect(directorApi.deleteAssetCascade("asset-1")).rejects.toThrow("素材移出并解除引用响应结构无效");
+  });
+
+  it("素材回收站用一次批量请求完成 trash、list、restore 和 purge", async () => {
+    const first = {
+      id: "asset/one",
+      name: "one.png",
+      subfolder: "director-web",
+      type: "input",
+      kind: "image",
+    };
+    const second = {
+      id: "asset-two",
+      name: "two.wav",
+      subfolder: "director-web",
+      type: "input",
+      kind: "audio",
+    };
+    const batch = {
+      batch_id: "batch/one",
+      comfy_origin: "http://comfy.test:8188",
+      asset_ids: [first.id, second.id],
+      assets: [first, second],
+      cascade: true,
+      unbound_usages: ["timeline.segments[0].first_image"],
+      unbound_usages_by_asset: {
+        [first.id]: ["timeline.segments[0].first_image"],
+        [second.id]: [],
+      },
+      created_at: "2026-08-16T12:00:00Z",
+      remote_files_preserved: true,
+    };
+    const restored = {
+      batch_id: batch.batch_id,
+      restored_asset_ids: batch.asset_ids,
+      restored_references: true,
+      mode: "with_references",
+      remote_files_preserved: true,
+    };
+    const purged = {
+      batch_id: batch.batch_id,
+      purged_asset_ids: batch.asset_ids,
+      remote_files_preserved: true,
+    };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(batch))
+      .mockResolvedValueOnce(jsonResponse({
+        batches: [batch],
+        remote_files_preserved: true,
+      }))
+      .mockResolvedValueOnce(jsonResponse(restored))
+      .mockResolvedValueOnce(jsonResponse(purged));
+
+    await expect(
+      directorApi.trashAssets([first.id, second.id], true),
+    ).resolves.toEqual(batch);
+    await expect(directorApi.listAssetTrash()).resolves.toEqual({
+      batches: [batch],
+      remote_files_preserved: true,
+    });
+    await expect(
+      directorApi.restoreAssetTrash(batch.batch_id, "with_references"),
+    ).resolves.toEqual(restored);
+    await expect(directorApi.purgeAssetTrash(batch.batch_id)).resolves.toEqual(purged);
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
+      ["/api/asset-trash", "POST"],
+      ["/api/asset-trash", "GET"],
+      ["/api/asset-trash/batch%2Fone/restore", "POST"],
+      ["/api/asset-trash/batch%2Fone", "DELETE"],
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
+      asset_ids: [first.id, second.id],
+      cascade: true,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+      mode: "with_references",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("素材回收站严格拒绝不自洽 envelope、错误 mode 和非保留远端文件", async () => {
+    const assetValue = {
+      id: "asset-1",
+      name: "one.png",
+      subfolder: "director-web",
+      type: "input",
+      kind: "image",
+    };
+    const batch = {
+      batch_id: "batch-1",
+      comfy_origin: "http://comfy.test:8188",
+      asset_ids: [assetValue.id],
+      assets: [assetValue],
+      cascade: true,
+      unbound_usages: [],
+      unbound_usages_by_asset: { [assetValue.id]: [] },
+      created_at: "2026-08-16T12:00:00Z",
+      remote_files_preserved: true,
+    };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ ...batch, debug: true }))
+      .mockResolvedValueOnce(jsonResponse({
+        ...batch,
+        asset_ids: ["different-asset"],
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        batches: [batch, batch],
+        remote_files_preserved: true,
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        batch_id: "batch-1",
+        restored_asset_ids: ["asset-1"],
+        restored_references: true,
+        mode: "registration_only",
+        remote_files_preserved: true,
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        batch_id: "batch-1",
+        purged_asset_ids: ["asset-1"],
+        remote_files_preserved: false,
+      }));
+
+    await expect(directorApi.trashAssets(["asset-1"], true))
+      .rejects.toThrow("素材回收批次响应结构无效");
+    await expect(directorApi.trashAssets(["asset-1"], true))
+      .rejects.toThrow("素材回收批次响应结构无效");
+    await expect(directorApi.listAssetTrash())
+      .rejects.toThrow("素材回收站响应结构无效");
+    await expect(directorApi.restoreAssetTrash("batch-1", "registration_only"))
+      .rejects.toThrow("素材恢复响应结构无效");
+    await expect(directorApi.purgeAssetTrash("batch-1"))
+      .rejects.toThrow("素材回收批次清理响应结构无效");
+  });
+
+  it("素材回收批量请求在发送前拒绝空、重复和超量 ID", () => {
+    expect(() => directorApi.trashAssets([])).toThrow(
+      "素材回收批次必须包含 1 至 128 个不重复的稳定 ID",
+    );
+    expect(() => directorApi.trashAssets(["same", "same"])).toThrow(
+      "素材回收批次必须包含 1 至 128 个不重复的稳定 ID",
+    );
+    expect(() => directorApi.trashAssets(
+      Array.from({ length: 129 }, (_, index) => `asset-${index}`),
+    )).toThrow("素材回收批次必须包含 1 至 128 个不重复的稳定 ID");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("素材恢复 409 只暴露白名单 owner 冲突和远端文件保留事实", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      detail: {
+        code: "asset_trash_restore_conflict",
+        message: "asset references changed after the trash operation",
+        conflicts: [{
+          owner_kind: "project",
+          owner_id: "project-1",
+          reason: "document_changed,revision_changed",
+          expected_revision: 4,
+          actual_revision: 5,
+        }],
+        remote_files_preserved: true,
+        internal_trace: "secret-detail",
+      },
+      debug_secret: "secret-root",
+    }, 409));
+
+    const error = await directorApi.restoreAssetTrash(
+      "batch-1",
+      "with_references",
+    ).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({
+      status: 409,
+      code: "asset_trash_restore_conflict",
+      details: {
+        detail: {
+          code: "asset_trash_restore_conflict",
+          message: "asset references changed after the trash operation",
+          conflicts: [{
+            owner_kind: "project",
+            owner_id: "project-1",
+            reason: "document_changed,revision_changed",
+            expected_revision: 4,
+            actual_revision: 5,
+          }],
+          remote_files_preserved: true,
+        },
+      },
+    });
+    expect(JSON.stringify((error as ApiError).details)).not.toContain("secret");
+  });
+
+  it("批量素材仍被引用时保留可判定错误码和安全 usage 映射", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      detail: {
+        code: "assets_in_use",
+        message: "one or more assets are still referenced by saved drafts",
+        usages: ["timeline.segments[0].first_image"],
+        usages_by_asset: {
+          "asset-1": ["timeline.segments[0].first_image"],
+          "asset-2": [],
+        },
+        remote_files_preserved: true,
+        database_query: "secret sql",
+      },
+    }, 409));
+
+    const error = await directorApi.trashAssets(["asset-1", "asset-2"])
+      .catch((reason: unknown) => reason);
+
+    expect(error).toMatchObject({
+      status: 409,
+      code: "assets_in_use",
+      details: {
+        detail: {
+          code: "assets_in_use",
+          usages: ["timeline.segments[0].first_image"],
+          usages_by_asset: {
+            "asset-1": ["timeline.segments[0].first_image"],
+            "asset-2": [],
+          },
+          remote_files_preserved: true,
+        },
+      },
+    });
+    expect(JSON.stringify((error as ApiError).details)).not.toContain("secret sql");
+  });
+
+  it("素材上传 endpoint CAS 冲突保留可判定错误码但过滤内部字段", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      detail: {
+        code: "asset_upload_origin_changed",
+        message: "endpoint changed; remote file was preserved",
+        remote_files_preserved: true,
+        old_origin: "secret-old-origin",
+      },
+    }, 409));
+
+    const error = await directorApi.uploadAsset(
+      new File(["image"], "frame.png", { type: "image/png" }),
+      "image",
+    ).catch((reason: unknown) => reason);
+
+    expect(error).toMatchObject({
+      status: 409,
+      code: "asset_upload_origin_changed",
+      message: "endpoint changed; remote file was preserved",
+      details: {
+        detail: {
+          code: "asset_upload_origin_changed",
+          message: "endpoint changed; remote file was preserved",
+          remote_files_preserved: true,
+        },
+      },
+    });
+    expect(JSON.stringify((error as ApiError).details)).not.toContain("secret-old-origin");
+  });
+
+  it("带进度上传也保留 endpoint CAS 冲突码", async () => {
+    class FailedXMLHttpRequest {
+      upload = {
+        onprogress: null as ((event: ProgressEvent) => void) | null,
+        onload: null as (() => void) | null,
+      };
+      status = 409;
+      response: unknown = {
+        detail: {
+          code: "asset_upload_origin_changed",
+          message: "endpoint changed during upload",
+          remote_files_preserved: true,
+        },
+      };
+      responseType = "";
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      open() {}
+      setRequestHeader() {}
+      send() { this.onload?.(); }
+    }
+    vi.stubGlobal("XMLHttpRequest", FailedXMLHttpRequest);
+
+    const error = await directorApi.uploadAsset(
+      new File(["image"], "frame.png", { type: "image/png" }),
+      "image",
+      vi.fn(),
+    ).catch((reason: unknown) => reason);
+
+    expect(error).toMatchObject({
+      status: 409,
+      code: "asset_upload_origin_changed",
+      details: {
+        detail: {
+          code: "asset_upload_origin_changed",
+          message: "endpoint changed during upload",
+          remote_files_preserved: true,
+        },
+      },
+    });
   });
 
   it("HTTP detail 对象只暴露可读 message/usages，不泄漏其他字段", async () => {
@@ -1423,9 +1925,13 @@ describe("Director REST 契约", () => {
       segment_count: 1,
     };
     const project = createTimelineProject();
+    const activeDatabaseIdentity = "a".repeat(64);
 
     fetchMock
-      .mockResolvedValueOnce(jsonResponse({ projects: [summary] }))
+      .mockResolvedValueOnce(jsonResponse({
+        projects: [summary],
+        active_database_identity: activeDatabaseIdentity,
+      }))
       .mockResolvedValueOnce(jsonResponse(summary))
       .mockResolvedValueOnce(jsonResponse(summary))
       .mockResolvedValueOnce(jsonResponse({
@@ -1436,7 +1942,10 @@ describe("Director REST 契约", () => {
       .mockResolvedValueOnce(jsonResponse(project))
       .mockResolvedValueOnce(jsonResponse(project));
 
-    await expect(directorApi.listProjects()).resolves.toEqual({ projects: [summary] });
+    await expect(directorApi.listProjects()).resolves.toEqual({
+      projects: [summary],
+      active_database_identity: activeDatabaseIdentity,
+    });
     await expect(directorApi.createProject("第二部影片")).resolves.toEqual(summary);
     await expect(directorApi.renameProject("project-1", "改名")).resolves.toEqual(summary);
     await expect(directorApi.deleteProject("project-1")).resolves.toEqual({
@@ -1455,6 +1964,24 @@ describe("Director REST 契约", () => {
       ["/api/projects/project-1/timeline", "GET"],
       ["/api/projects/project-1/timeline", "PUT"],
     ]);
+  });
+
+  it("项目列表拒绝缺失、错误或多余的数据库身份元数据", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ projects: [] }))
+      .mockResolvedValueOnce(jsonResponse({
+        projects: [],
+        active_database_identity: "not-a-database-identity",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        projects: [],
+        active_database_identity: "a".repeat(64),
+        extra: true,
+      }));
+
+    await expect(directorApi.listProjects()).rejects.toThrow("项目列表响应结构无效");
+    await expect(directorApi.listProjects()).rejects.toThrow("项目列表响应结构无效");
+    await expect(directorApi.listProjects()).rejects.toThrow("项目列表响应结构无效");
   });
 
   it("导入项目 POST 到 /api/projects/import 并严格解析摘要", async () => {
