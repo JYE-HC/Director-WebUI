@@ -146,13 +146,18 @@ start_director_if_requested() {
     return 1
   }
   ok "Director 已启动"
+  if [[ -n "$(comfyui_seed_url)" ]]; then
+    if seed_comfyui_url_if_unset; then
+      :
+    else
+      warn "ComfyUI 地址预置未完成；请稍后在系统设置中手动填写"
+    fi
+  fi
   if [[ "$IS_WSL" == true ]]; then
     info "Windows 浏览器建议访问：http://localhost:${DIRECTOR_FRONTEND_PORT:-4173}"
   else
     info "浏览器访问：http://127.0.0.1:${DIRECTOR_FRONTEND_PORT:-4173}"
   fi
-  [[ "$COMFYUI_MODE" != skip ]] && info "请在系统设置中填写 ComfyUI 地址：http://${COMFYUI_LISTEN}:${COMFYUI_PORT}"
-  [[ "$COMFYUI_MODE" == skip ]] && info "请在系统设置中填写远程 ComfyUI 地址：$COMFYUI_URL"
   return 0
 }
 
@@ -170,4 +175,63 @@ load_env_file() {
   [[ -f "$ENV_FILE" ]] || return 0
   # shellcheck disable=SC1090
   source "$ENV_FILE"
+}
+
+# One-time convenience on first start: write the installer's ComfyUI address
+# into Director settings only when none is configured. Settings remain the
+# sole authority afterwards; an existing value is never overridden (the
+# "env must not win" contract stays intact).
+comfyui_seed_url() {
+  if [[ "${COMFYUI_MODE:-skip}" == skip ]]; then
+    printf '%s\n' "${DIRECTOR_COMFYUI_URL:-${COMFYUI_URL:-}}"
+  else
+    printf 'http://127.0.0.1:%s\n' "${DIRECTOR_COMFYUI_PORT:-${COMFYUI_PORT:-28188}}"
+  fi
+}
+
+seed_comfyui_url_if_unset() {
+  local url
+  url="$(comfyui_seed_url)"
+  [[ -n "$url" ]] || return 0
+  local py="$SCRIPT_DIR/.venv/bin/python"
+  [[ -x "$py" ]] || return 0
+  local backend_port="${DIRECTOR_PORT:-${DIRECTOR_BACKEND_PORT:-8787}}"
+  "$py" - "http://127.0.0.1:${backend_port}" "$url" <<'PY'
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+backend, url = sys.argv[1], sys.argv[2]
+settings = None
+last_error = None
+for _ in range(20):
+    try:
+        with urllib.request.urlopen(f"{backend}/api/settings", timeout=5) as resp:
+            settings = json.load(resp)
+        break
+    except (OSError, urllib.error.URLError) as exc:
+        last_error = exc
+        time.sleep(0.5)
+if settings is None:
+    print(f"预置 ComfyUI 地址失败：无法连接 Director 后端（{last_error}）", file=sys.stderr)
+    raise SystemExit(1)
+if str(settings.get("comfy_url") or "").strip():
+    raise SystemExit(0)
+settings["comfy_url"] = url
+req = urllib.request.Request(
+    f"{backend}/api/settings",
+    data=json.dumps(settings).encode(),
+    headers={"Content-Type": "application/json"},
+    method="PUT",
+)
+try:
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        resp.read()
+except (OSError, urllib.error.URLError) as exc:
+    print(f"预置 ComfyUI 地址失败：{exc}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"已预置 ComfyUI 地址：{url}")
+PY
 }

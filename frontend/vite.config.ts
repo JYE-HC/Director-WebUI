@@ -26,5 +26,8 @@ export default defineConfig({
     setupFiles: "./src/test/setup.ts",
     css: true,
     globals: true,
+    // Must stay above asyncUtilTimeout (15s) so slow-runner waits report the
+    // Testing Library error instead of a bare Vitest timeout.
+    testTimeout: 20000,
   },
 });

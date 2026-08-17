@@ -191,7 +191,9 @@ cd frontend
 npm ci        # 生产构建：npm run build；开发调试：npm run dev
 ```
 
-Vite 仅监听本机并把 `/api` 代理到后端。首次启动没有写死的 ComfyUI URL；在“系统设置”填写
+Vite 仅监听本机并把 `/api` 代理到后端。首次启动没有写死的 ComfyUI URL：bootstrap 在启动
+Director 后会把安装时确定的地址（本地模式为 `http://127.0.0.1:<端口>`，远程模式为
+`--comfyui-url` 的值）一次性写入空的设置，已有配置绝不覆盖；其余情况下在“系统设置”填写
 有效地址后会自动应用，权威回读完成后应用才读取模型、GPU 与节点能力并开放上传和提交。
 
 数据库默认位于 Director 项目根目录下的 `.data/database/director.sqlite3`，不随启动工作目录
