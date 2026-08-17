@@ -44,8 +44,9 @@ usage() {
   ./bootstrap.sh [install] [选项]     # 自动安装 Linux / WSL2 环境下的 Director Web
   ./bootstrap.sh check [选项]         # 只检查环境，不安装
   ./bootstrap.sh verify [选项]        # 只验证已安装内容
-  ./bootstrap.sh start|stop|restart|status|logs [director.sh 选项]
-  ./bootstrap.sh start-comfyui|stop-comfyui|status-comfyui|logs-comfyui
+  ./bootstrap.sh start|stop|restart|status|logs   # 同时管理 Director 与本地 ComfyUI
+  ./bootstrap.sh start-director|stop-director|restart-director|status-director|logs-director [director.sh 选项]
+  ./bootstrap.sh start-comfyui|stop-comfyui|restart-comfyui|status-comfyui|logs-comfyui
   ./bootstrap.sh reset                # 清空安装状态，不删除 ComfyUI/数据
 
 常用选项：
@@ -78,7 +79,7 @@ EOF
 
 parse_args() {
   case "${1:-}" in
-    start|stop|restart|status|logs|start-comfyui|stop-comfyui|status-comfyui|logs-comfyui)
+    start|stop|restart|status|logs|start-director|stop-director|restart-director|status-director|logs-director|start-comfyui|stop-comfyui|restart-comfyui|status-comfyui|logs-comfyui)
       COMMAND="$1"
       ORIGINAL_ARGS=("${@:2}")
       return 0
@@ -243,9 +244,10 @@ run_install() {
   ok "Director Web 安装流程已完成"
   if [[ "$COMFYUI_MODE" != skip && -n "$COMFYUI_ROOT" ]]; then
     info "ComfyUI：$COMFYUI_ROOT"
-    info "启动 ComfyUI：./bootstrap.sh start-comfyui"
+    info "启动全部服务：./bootstrap.sh start（Director 与本地 ComfyUI）"
+  else
+    info "启动 Director：./bootstrap.sh start"
   fi
-  info "启动 Director：./bootstrap.sh start"
   if [[ "$IS_WSL" == true ]]; then
     info "Windows 浏览器访问：http://localhost:${DIRECTOR_FRONTEND_PORT:-4173}"
     info "WSL 内访问：http://127.0.0.1:${DIRECTOR_FRONTEND_PORT:-4173}"
@@ -318,16 +320,87 @@ run_verify() {
   ok "验证完成"
 }
 
-run_service_command() {
+has_local_comfyui() {
+  [[ "${COMFYUI_MODE:-skip}" != skip ]]
+}
+
+run_combined_service_command() {
+  local py="$SCRIPT_DIR/.venv/bin/python"
+  local supervisor=("$py" "$SCRIPT_DIR/tools/director_supervisor.py")
   case "$COMMAND" in
-    start-comfyui|stop-comfyui|status-comfyui|logs-comfyui)
-      load_env_file
+    start)
+      local rc=0
+      if has_local_comfyui; then
+        [[ -x "$py" ]] || die "后端 Python 尚未安装" 4
+        "${supervisor[@]}" start-comfyui || rc=1
+      fi
+      "$SCRIPT_DIR/director.sh" start "${ORIGINAL_ARGS[@]}" || rc=1
+      return "$rc"
+      ;;
+    stop)
+      local rc=0
+      "$SCRIPT_DIR/director.sh" stop || rc=1
+      if has_local_comfyui; then
+        [[ -x "$py" ]] || die "后端 Python 尚未安装" 4
+        "${supervisor[@]}" stop-comfyui || rc=1
+      fi
+      return "$rc"
+      ;;
+    restart)
+      local rc=0
+      if has_local_comfyui; then
+        [[ -x "$py" ]] || die "后端 Python 尚未安装" 4
+        "${supervisor[@]}" restart-comfyui || rc=1
+      fi
+      "$SCRIPT_DIR/director.sh" restart "${ORIGINAL_ARGS[@]}" || rc=1
+      return "$rc"
+      ;;
+    status)
+      "$SCRIPT_DIR/director.sh" status || true
+      if has_local_comfyui; then
+        [[ -x "$py" ]] || die "后端 Python 尚未安装" 4
+        "${supervisor[@]}" status-comfyui || true
+      fi
+      return 0
+      ;;
+    logs)
+      local target="${ORIGINAL_ARGS[0]:-}"
+      case "$target" in
+        backend|frontend)
+          exec "$SCRIPT_DIR/director.sh" logs "$target" ;;
+        comfyui)
+          [[ -x "$py" ]] || die "后端 Python 尚未安装" 4
+          exec "${supervisor[@]}" logs-comfyui ;;
+        "")
+          local data_dir="$SCRIPT_DIR/data"
+          local files=()
+          [[ -f "$data_dir/director-backend.log" ]] && files+=("$data_dir/director-backend.log")
+          [[ -f "$data_dir/director-frontend.log" ]] && files+=("$data_dir/director-frontend.log")
+          if has_local_comfyui && [[ -f "$data_dir/comfyui.log" ]]; then
+            files+=("$data_dir/comfyui.log")
+          fi
+          ((${#files[@]})) || die "暂无日志文件；服务尚未启动过" 4
+          exec tail -F "${files[@]}"
+          ;;
+        *) die "logs 只接受 backend、frontend 或 comfyui" 64 ;;
+      esac
+      ;;
+  esac
+}
+
+run_service_command() {
+  load_env_file
+  load_state
+  case "$COMMAND" in
+    *-comfyui)
       [[ -x "$SCRIPT_DIR/.venv/bin/python" ]] || die "后端 Python 尚未安装" 4
       exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/tools/director_supervisor.py" "$COMMAND" "${ORIGINAL_ARGS[@]}"
       ;;
+    *-director)
+      exec "$SCRIPT_DIR/director.sh" "${COMMAND%-director}" "${ORIGINAL_ARGS[@]}"
+      ;;
     *)
-      load_env_file
-      exec "$SCRIPT_DIR/director.sh" "$COMMAND" "${ORIGINAL_ARGS[@]}"
+      run_combined_service_command
       ;;
   esac
 }
@@ -357,7 +430,7 @@ main() {
     reset)
       run_reset
       ;;
-    start|stop|restart|status|logs|start-comfyui|stop-comfyui|status-comfyui|logs-comfyui)
+    start|stop|restart|status|logs|start-director|stop-director|restart-director|status-director|logs-director|start-comfyui|stop-comfyui|restart-comfyui|status-comfyui|logs-comfyui)
       run_service_command
       ;;
     -h|--help|help)
