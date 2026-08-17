@@ -1,9 +1,15 @@
 import type { RV2VShotDetectionRequest } from "../api/types";
+import {
+  DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS,
+  type TimelineSegmentCopyOptions,
+} from "./timelineProject";
 
 export const TIMELINE_WORKSPACE_PREFERENCES_KEY =
   "director-web:v1:timeline-workspace-preferences";
 const TIMELINE_SEGMENT_SELECTION_KEY_PREFIX =
   "director-web:v2:timeline-segment-selection";
+export const TIMELINE_SEGMENT_COPY_OPTIONS_KEY =
+  "director-web:v1:timeline-segment-copy-options";
 
 export interface TimelineWorkspacePreferences {
   version: 1;
@@ -121,6 +127,59 @@ export function updateTimelineWorkspacePreferences(
     ...patch,
     version: 1,
   });
+}
+
+function copyOption(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+export function normalizeTimelineSegmentCopyOptions(
+  value: Partial<TimelineSegmentCopyOptions>,
+): TimelineSegmentCopyOptions {
+  const fallback = DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS;
+  const prompt = copyOption(value.prompt, fallback.prompt);
+  const mode = copyOption(value.mode, fallback.mode);
+  return {
+    mode,
+    duration: copyOption(value.duration, fallback.duration),
+    continuity: copyOption(value.continuity, fallback.continuity),
+    audioMode: copyOption(value.audioMode, fallback.audioMode),
+    refImageSize: copyOption(value.refImageSize, fallback.refImageSize),
+    prompt,
+    // Referenced material has no independent meaning in this workflow: its
+    // slots are copied only alongside Prompt and the source generation mode.
+    promptReferences: prompt && mode && copyOption(
+      value.promptReferences,
+      fallback.promptReferences,
+    ),
+  };
+}
+
+export function loadTimelineSegmentCopyOptions(): TimelineSegmentCopyOptions {
+  try {
+    const raw = window.localStorage.getItem(TIMELINE_SEGMENT_COPY_OPTIONS_KEY);
+    if (!raw) return { ...DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS };
+    const value: unknown = JSON.parse(raw);
+    if (!isRecord(value) || value.version !== 1) {
+      return { ...DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS };
+    }
+    return normalizeTimelineSegmentCopyOptions(value);
+  } catch {
+    return { ...DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS };
+  }
+}
+
+export function saveTimelineSegmentCopyOptions(
+  options: TimelineSegmentCopyOptions,
+): void {
+  try {
+    window.localStorage.setItem(TIMELINE_SEGMENT_COPY_OPTIONS_KEY, JSON.stringify({
+      version: 1,
+      ...normalizeTimelineSegmentCopyOptions(options),
+    }));
+  } catch {
+    // The current in-memory options remain usable without browser storage.
+  }
 }
 
 function validDatabase(database: TimelinePreferenceDatabase): boolean {

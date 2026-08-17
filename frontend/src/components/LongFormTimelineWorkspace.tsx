@@ -52,6 +52,7 @@ import {
   timelineSegmentAt,
   updateRef2VASourceRange,
   runnableTimelineSegmentIds,
+  DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS,
   TIMELINE_MODE_META,
   TIMELINE_MODE_ORDER,
   type SegmentAssetTarget,
@@ -60,6 +61,7 @@ import {
   type TimelineEditorState,
   type TimelineGenerationMode,
   type TimelineSegment,
+  type TimelineSegmentCopyOptions,
 } from "../domain/timelineProject";
 import { alignH3Frames } from "../domain/timing";
 import { minimaxH3ReferenceCapacities } from "../domain/h3Capabilities";
@@ -70,7 +72,10 @@ import {
 } from "../domain/promptLimits";
 import { DeferredNumberInput, Field } from "./ui";
 import {
+  loadTimelineSegmentCopyOptions,
   loadTimelineWorkspacePreferences,
+  normalizeTimelineSegmentCopyOptions,
+  saveTimelineSegmentCopyOptions,
   updateTimelineWorkspacePreferences,
 } from "../domain/workspacePreferences";
 
@@ -766,6 +771,26 @@ function validateTokenReferences(segment: TimelineSegment): string[] {
   });
 }
 
+function segmentAudioModeLabel(mode: TimelineSegment["audio_mode"]): string {
+  switch (mode) {
+    case "generate": return "生成音频";
+    case "source": return "保留源音频";
+    case "mute": return "静音";
+  }
+}
+
+function segmentCopyOptionCount(options: TimelineSegmentCopyOptions): number {
+  return [
+    options.mode,
+    options.duration,
+    options.continuity,
+    options.audioMode,
+    options.refImageSize,
+    options.prompt,
+    options.promptReferences,
+  ].filter(Boolean).length;
+}
+
 function SegmentInspector({
   state,
   segment,
@@ -789,6 +814,51 @@ function SegmentInspector({
 }) {
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const [promptPicker, setPromptPicker] = useState<PromptPickerState | null>(null);
+  const [copyOptions, setCopyOptions] = useState(loadTimelineSegmentCopyOptions);
+  const [copyOptionsOpen, setCopyOptionsOpen] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const copyOptionsRootRef = useRef<HTMLDivElement>(null);
+  const copyOptionsButtonRef = useRef<HTMLButtonElement>(null);
+  const updateCopyOptions = (patch: Partial<TimelineSegmentCopyOptions>) => {
+    const next = normalizeTimelineSegmentCopyOptions({ ...copyOptions, ...patch });
+    setCopyOptions(next);
+    saveTimelineSegmentCopyOptions(next);
+  };
+  const restoreDefaultCopyOptions = () => {
+    const next = { ...DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS };
+    setCopyOptions(next);
+    saveTimelineSegmentCopyOptions(next);
+  };
+  useEffect(() => {
+    if (!copyOptionsOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (event.target instanceof Node && !copyOptionsRootRef.current?.contains(event.target)) {
+        setCopyOptionsOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      setCopyOptionsOpen(false);
+      copyOptionsButtonRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+      document.removeEventListener("keydown", closeOnEscape, true);
+    };
+  }, [copyOptionsOpen]);
+  useEffect(() => {
+    setCopyOptionsOpen(false);
+    setCopyFeedback(null);
+  }, [segment.id]);
+  useEffect(() => {
+    if (!copyFeedback) return;
+    const timer = window.setTimeout(() => setCopyFeedback(null), 3_000);
+    return () => window.clearTimeout(timer);
+  }, [copyFeedback]);
   const replace = (next: TimelineSegment) => onDispatch({ type: "segment/replace", segment: next });
   const updateBase = (patch: Partial<Pick<TimelineSegment, "title" | "prompt" | "duration_seconds" | "enabled" | "audio_mode" | "ref_image_size">>) => replace({ ...segment, ...patch } as TimelineSegment);
   const insertToken = (token: string) => {
@@ -819,7 +889,21 @@ function SegmentInspector({
   const recipe = deriveSegmentRecipe(segment);
   const sourceIndex = state.project.segments.findIndex((candidate) => candidate.id === segment.id);
   const followingCount = Math.max(0, state.project.segments.length - sourceIndex - 1);
-  const otherCount = Math.max(0, state.project.segments.length - 1);
+  const selectedTargetCount = state.selected_segment_ids.filter((id) =>
+    id !== segment.id && state.project.segments.some((candidate) => candidate.id === id),
+  ).length;
+  const copyOptionCount = segmentCopyOptionCount(copyOptions);
+  const referenceCount = segmentAssetReferences(segment).length;
+  const applyConfiguration = (scope: "following" | "selected", targetCount: number) => {
+    if (!targetCount || !copyOptionCount) return;
+    onDispatch({
+      type: "segment/apply-config",
+      sourceId: segment.id,
+      scope,
+      options: copyOptions,
+    });
+    setCopyFeedback(`已向 ${targetCount} 个片段应用 ${copyOptionCount} 项设置`);
+  };
   const continuityBoundary = timelineContinuityBoundaries(state.project)
     .find((boundary) => boundary.segment.id === segment.id) ?? null;
   const nativeTimeline = capabilities.native_timeline;
@@ -1014,15 +1098,43 @@ function SegmentInspector({
         <Field label="音频策略" className="field--inline segment-inspector__audio-mode"><select aria-label="音频策略" value={segment.audio_mode} onChange={(event) => updateBase({ audio_mode: event.target.value as TimelineSegment["audio_mode"] })}><option value="generate">生成音频</option><option value="source">保留源音频</option><option value="mute">静音</option></select></Field>
         <Field label="参考图采样尺寸" className="field--inline segment-inspector__ref-image-size"><select aria-label="参考图采样尺寸" value={segment.ref_image_size} onChange={(event) => updateBase({ ref_image_size: event.target.value as TimelineSegment["ref_image_size"] })}><option value="match">match（匹配画布）</option><option value="max">max（最高保真）</option></select></Field>
         <div className="segment-inspector__head-actions">
-          <button type="button" disabled={followingCount === 0} onClick={() => {
-            if (window.confirm(`将当前片段的模式、时长、连续性、提示词和专属素材应用到后续 ${followingCount} 个片段？目标名称、ID 与启用状态会保留。`))
-              onDispatch({ type: "segment/apply-config", sourceId: segment.id, scope: "following" });
-          }}>应用到后续</button>
-          <button type="button" disabled={otherCount === 0} onClick={() => {
-            if (window.confirm(`将当前片段的模式、时长、连续性、提示词和专属素材应用到全部其他 ${otherCount} 个片段？目标名称、ID 与启用状态会保留。`))
-              onDispatch({ type: "segment/apply-config", sourceId: segment.id, scope: "all-other" });
-          }}>应用到全部其他</button>
+          <span className="segment-copy-source" title={`当前从“${segment.title}”复制设置`}>复制来源：<strong>{segment.title}</strong></span>
+          <button type="button" disabled={followingCount === 0 || copyOptionCount === 0} onClick={() => applyConfiguration("following", followingCount)}>应用到后续</button>
+          <button type="button" disabled={selectedTargetCount === 0 || copyOptionCount === 0} onClick={() => applyConfiguration("selected", selectedTargetCount)}>应用到所选（{selectedTargetCount}）</button>
+          <div
+            ref={copyOptionsRootRef}
+            className="segment-copy-options"
+            onBlur={(event) => {
+              if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) {
+                setCopyOptionsOpen(false);
+              }
+            }}
+          >
+            <button
+              ref={copyOptionsButtonRef}
+              className="segment-copy-options__trigger"
+              type="button"
+              aria-label="复制设置"
+              aria-expanded={copyOptionsOpen}
+              aria-controls="segment-copy-options-popover"
+              onClick={() => setCopyOptionsOpen((open) => !open)}
+            ><span>复制 {copyOptionCount} 项</span><span aria-hidden="true">▴</span></button>
+            {copyOptionsOpen && <section id="segment-copy-options-popover" className="segment-copy-options__popover" aria-label="复制设置">
+              <header><strong>从“{segment.title}”复制设置</strong><small>当前编辑片段是复制来源；同时用于两个应用按钮</small></header>
+              <div className="segment-copy-options__fields">
+                <label><input type="checkbox" checked={copyOptions.mode} onChange={(event) => updateCopyOptions({ mode: event.target.checked })} /><span><strong>生成模式</strong><small>{segmentModeLabel(segment.mode)}；跨模式会重置目标素材</small></span></label>
+                <label><input type="checkbox" checked={copyOptions.continuity} onChange={(event) => updateCopyOptions({ continuity: event.target.checked })} /><span><strong>连续性</strong><small>{segment.continuity.enabled ? `开启 · ${segment.continuity.overlap_frames} 帧` : "关闭"}</small></span></label>
+                <label><input type="checkbox" checked={copyOptions.duration} onChange={(event) => updateCopyOptions({ duration: event.target.checked })} /><span><strong>生成时长</strong><small>{segment.duration_seconds.toFixed(2)} 秒</small></span></label>
+                <label><input type="checkbox" checked={copyOptions.audioMode} onChange={(event) => updateCopyOptions({ audioMode: event.target.checked })} /><span><strong>音频策略</strong><small>{segmentAudioModeLabel(segment.audio_mode)}</small></span></label>
+                <label><input type="checkbox" checked={copyOptions.refImageSize} onChange={(event) => updateCopyOptions({ refImageSize: event.target.checked })} /><span><strong>参考图采样尺寸</strong><small>{segment.ref_image_size === "match" ? "match（匹配画布）" : "max（最高保真）"}</small></span></label>
+                <label><input type="checkbox" checked={copyOptions.prompt} onChange={(event) => updateCopyOptions({ prompt: event.target.checked })} /><span><strong>提示词</strong><small>{promptCharacterCount(segment.prompt).toLocaleString()} 个字符</small></span></label>
+                <label className="segment-copy-options__nested"><input type="checkbox" disabled={!copyOptions.prompt || !copyOptions.mode} checked={copyOptions.promptReferences} onChange={(event) => updateCopyOptions({ promptReferences: event.target.checked })} /><span><strong>连同引用素材</strong><small>{referenceCount} 项；需同时复制提示词和生成模式</small></span></label>
+              </div>
+              <footer><button type="button" onClick={restoreDefaultCopyOptions}>恢复默认</button></footer>
+            </section>}
+          </div>
         </div>
+        {copyFeedback && <span className="segment-copy-feedback" role="status" aria-live="polite">{copyFeedback}</span>}
         <span className="segment-inspector__divider" aria-hidden="true" />
         <div className="segment-inspector__timing"><small>项目入点</small><div><strong>{formatClock(segmentStartTime(state.project, segment.id))}</strong><span>{segment.mode === "ref2va" && segment.source_video && alignH3Frames(segment.duration_seconds, state.project.render.fps) > 512 ? `源片时间线 ${segment.duration_seconds.toFixed(2)}s · 待分割` : `请求 ${segment.duration_seconds.toFixed(2)}s → 实际 ${alignedTimelineSegmentDuration(segment, state.project.render.fps).toFixed(4)}s · ${alignH3Frames(segment.duration_seconds, state.project.render.fps)}f`}</span></div></div>
       </header>
@@ -2173,6 +2285,7 @@ export function LongFormTimelineWorkspace({
                 disabled={!runnableSelection.length}
                 onClick={() => onDispatch({ type: "segment/set-enabled", ids: runnableSelection, enabled: false })}
               >禁用所选</button>
+              <output className="timeline-selection-count" aria-live="polite">已选 {selectedSegments.length} 个片段</output>
             </div>
           </div>
           <div className="director-timeline__summary" role="group" aria-label="项目摘要">
@@ -2285,6 +2398,13 @@ export function LongFormTimelineWorkspace({
             const continuityDescriptionId = continuityStatus
               ? `timeline-continuity-boundary-${index}`
               : undefined;
+            const editing = state.active_segment_id === segment.id;
+            const editingDescriptionId = editing
+              ? `timeline-editing-source-${segment.id}`
+              : undefined;
+            const clipDescriptionIds = [continuityDescriptionId, editingDescriptionId]
+              .filter(Boolean)
+              .join(" ") || undefined;
             return (
               <article
                 key={segment.id}
@@ -2362,8 +2482,9 @@ export function LongFormTimelineWorkspace({
                   className="timeline-clip__select-surface"
                   draggable
                   aria-label={`聚焦并选择片段 ${index + 1}：${segment.title}`}
-                  aria-describedby={continuityDescriptionId}
+                  aria-describedby={clipDescriptionIds}
                   aria-pressed={selected}
+                  title="单击设为编辑与复制来源；Ctrl/Cmd 或 Shift 仅调整多选"
                   onClick={(event) => {
                     if (suppressSegmentClickRef.current === segment.id) {
                       suppressSegmentClickRef.current = null;
@@ -2389,6 +2510,10 @@ export function LongFormTimelineWorkspace({
                 />
                 <header>
                   <span>{String(index + 1).padStart(2, "0")}</span><strong>{meta.shortLabel}</strong>
+                  {editing && <>
+                    <span className="timeline-editing-badge" aria-hidden="true">编辑中</span>
+                    <span id={editingDescriptionId} className="sr-only">当前编辑片段，也是复制来源</span>
+                  </>}
                   {continuityStatus && <>
                     <span className={`timeline-clip__continuity is-${continuityStatus.tone}`} title={continuityStatus.description}>{continuityStatus.short}</span>
                     <span id={continuityDescriptionId} className="sr-only">{continuityStatus.description}</span>
@@ -2427,9 +2552,14 @@ export function LongFormTimelineWorkspace({
               type="button"
               className="director-timeline__disabled-select"
               aria-label={`选择停用片段 ${index + 1}：${segment.title}`}
+              aria-describedby={state.active_segment_id === segment.id ? `timeline-editing-source-${segment.id}` : undefined}
               aria-pressed={state.selected_segment_ids.includes(segment.id)}
+              title="单击设为编辑与复制来源；Ctrl/Cmd 或 Shift 仅调整多选"
               onClick={(event) => onDispatch({ type: "segment/select", id: segment.id, additive: event.ctrlKey || event.metaKey, range: event.shiftKey })}
-            ><strong>{segment.title}</strong><small>{TIMELINE_MODE_META[segment.mode].shortLabel}</small></button>
+            ><strong>{segment.title}</strong><small>{TIMELINE_MODE_META[segment.mode].shortLabel}</small>{state.active_segment_id === segment.id && <>
+              <span className="timeline-editing-badge" aria-hidden="true">编辑中</span>
+              <span id={`timeline-editing-source-${segment.id}`} className="sr-only">当前编辑片段，也是复制来源</span>
+            </>}</button>
             <label className="director-timeline__disabled-checkbox" title={state.selected_segment_ids.includes(segment.id) ? "移出多选" : "加入多选"}><input
               type="checkbox"
               aria-label={`多选停用片段 ${index + 1}：${segment.title}`}
@@ -2445,11 +2575,6 @@ export function LongFormTimelineWorkspace({
           </article>)}</div>
         </section>}
       </section>
-
-      {selectedSegments.length > 1 && <section className="segment-inspector segment-inspector--multi" aria-label="批量片段编辑">
-        <div><h2>已选择 {selectedSegments.length} 个片段</h2><p>检查器继续显示当前片段；批量切换模型族只保留名称、提示词、时长与启用状态，专属素材字段会重新初始化。</p></div>
-        <Field label="应用生成模式到所选"><select defaultValue="" onChange={(event) => { if (event.target.value) onDispatch({ type: "segment/set-mode", ids: state.selected_segment_ids, mode: event.target.value as TimelineGenerationMode }); event.currentTarget.value = ""; }}><option value="">选择模式…</option>{TIMELINE_MODE_ORDER.map((mode) => <option key={mode} value={mode}>{segmentModeLabel(mode)}</option>)}</select></Field>
-      </section>}
 
       {activeSegment ? <SegmentInspector
         state={state}

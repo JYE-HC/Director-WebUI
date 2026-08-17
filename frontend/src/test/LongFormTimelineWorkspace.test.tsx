@@ -21,7 +21,10 @@ import {
   type TimelineAction,
   type TimelineEditorState,
 } from "../domain/timelineProject";
-import { loadTimelineWorkspacePreferences } from "../domain/workspacePreferences";
+import {
+  loadTimelineSegmentCopyOptions,
+  loadTimelineWorkspacePreferences,
+} from "../domain/workspacePreferences";
 
 const image: AssetReference = {
   id: "longform-image",
@@ -1266,7 +1269,7 @@ describe("统一时间线关键交互", () => {
     expect(value).not.toContain("subject_definitions:");
   });
 
-  it("应用当前配置到后续要求确认，并保留目标 ID/名称/启用状态", async () => {
+  it("应用当前配置到后续直接执行安全默认项，并保留目标 ID/名称/启用状态", async () => {
     const user = userEvent.setup();
     const state = createTimelineEditorState();
     const source = {
@@ -1276,14 +1279,110 @@ describe("统一时间线关键交互", () => {
       source_video: video,
       reference_images: [{ ...image, slot: 0 }],
     };
-    const target = { ...createTimelineSegment("fl2va", 2), title: "目标保留", enabled: false };
+    const target = { ...createTimelineSegment("fl2va", 2), title: "目标保留", prompt: "目标提示词", enabled: false };
     state.project = { ...state.project, segments: [source, target] };
-    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const confirm = vi.spyOn(window, "confirm");
     render(<Harness initial={state} />);
     await user.click(screen.getByRole("button", { name: "应用到后续" }));
     const copied = readState().project.segments[1];
-    expect(copied).toMatchObject({ id: target.id, title: "目标保留", enabled: false, mode: "ref2va", prompt: "运镜" });
+    expect(confirm).not.toHaveBeenCalled();
+    expect(copied).toMatchObject({
+      id: target.id,
+      title: "目标保留",
+      enabled: false,
+      mode: "ref2va",
+      prompt: "目标提示词",
+      source_video: null,
+    });
     expect(copied).not.toHaveProperty("first_image");
+  });
+
+  it("共享复制设置悬浮窗控制所选目标、联动引用素材并记住选择", async () => {
+    const user = userEvent.setup();
+    const state = createTimelineEditorState();
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      id: state.project.segments[0].id,
+      prompt: "主体 <Picture 1> 与 <Video 1>",
+      source_video: video,
+      reference_images: [{ ...image, slot: 0 }],
+    };
+    const selectedTarget = {
+      ...createTimelineSegment("fl2va", 2),
+      title: "所选目标",
+      prompt: "保留失败",
+      enabled: false,
+    };
+    const unselectedTarget = {
+      ...createTimelineSegment("fl2va", 3),
+      title: "未选目标",
+      prompt: "继续保留",
+    };
+    state.project = { ...state.project, segments: [source, selectedTarget, unselectedTarget] };
+    state.selected_segment_ids = [source.id, selectedTarget.id];
+    state.active_segment_id = source.id;
+    state.selection_anchor_id = source.id;
+    render(<Harness initial={state} />);
+
+    const trigger = screen.getByRole("button", { name: "复制设置" });
+    expect(trigger).toHaveTextContent("复制 5 项");
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    await user.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    const popover = screen.getByRole("region", { name: "复制设置" });
+    expect(popover).toHaveTextContent(`从“${source.title}”复制设置`);
+    expect(popover).toHaveTextContent("当前编辑片段是复制来源");
+    const promptOption = within(popover).getByRole("checkbox", { name: /^提示词/ });
+    const referencesOption = within(popover).getByRole("checkbox", { name: /^连同引用素材/ });
+    expect(referencesOption).toBeDisabled();
+    await user.click(promptOption);
+    expect(referencesOption).toBeEnabled();
+    await user.click(referencesOption);
+    expect(trigger).toHaveTextContent("复制 7 项");
+
+    await user.click(screen.getByRole("button", { name: "应用到所选（1）" }));
+    const copied = readState().project.segments[1];
+    expect(copied).toMatchObject({
+      id: selectedTarget.id,
+      title: "所选目标",
+      enabled: false,
+      mode: "ref2va",
+      prompt: source.prompt,
+      source_video: video,
+      reference_images: [{ ...image, slot: 0 }],
+    });
+    expect(readState().project.segments[2]).toMatchObject({
+      mode: "fl2va",
+      prompt: "继续保留",
+    });
+    expect(loadTimelineSegmentCopyOptions()).toMatchObject({
+      prompt: true,
+      promptReferences: true,
+    });
+
+    await user.click(trigger);
+    await user.click(within(screen.getByRole("region", { name: "复制设置" })).getByRole("button", { name: "恢复默认" }));
+    expect(trigger).toHaveTextContent("复制 5 项");
+    expect(loadTimelineSegmentCopyOptions()).toMatchObject({
+      prompt: false,
+      promptReferences: false,
+    });
+  });
+
+  it("复制设置悬浮窗支持 Escape 回焦和点外关闭", async () => {
+    const user = userEvent.setup();
+    render(<Harness initial={createTimelineEditorState()} />);
+    const trigger = screen.getByRole("button", { name: "复制设置" });
+
+    await user.click(trigger);
+    expect(screen.getByRole("region", { name: "复制设置" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("region", { name: "复制设置" })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+
+    await user.click(trigger);
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("region", { name: "复制设置" })).not.toBeInTheDocument();
   });
 
   it("统一检查器调用智能分镜，按当前源区间连续拆分", async () => {
@@ -1790,6 +1889,9 @@ describe("统一时间线关键交互", () => {
     ]);
     expect(controlbar).toHaveTextContent("片段编辑");
     expect(controlbar).toContainElement(screen.getByRole("button", { name: "应用到后续" }));
+    expect(controlbar).toContainElement(screen.getByRole("button", { name: "应用到所选（0）" }));
+    expect(controlbar).toContainElement(screen.getByRole("button", { name: "复制设置" }));
+    expect(screen.queryByRole("button", { name: "应用到全部其他" })).not.toBeInTheDocument();
     expect(inspector).not.toHaveTextContent("选择模型族并绑定素材；实际生成配方由当前素材自动确定");
     expect(inspector).not.toHaveTextContent("当前配方");
     expect(controlbar).toContainElement(screen.getByText("片段名称"));
@@ -1992,12 +2094,20 @@ describe("统一时间线关键交互", () => {
     });
     expect(within(screen.getByRole("region", { name: "当前片段编辑器" }))
       .getByLabelText("片段名称")).toHaveValue(first.title);
-    const batchInspector = screen.getByRole("region", { name: "批量片段编辑" });
-    expect(batchInspector).toHaveTextContent("已选择 3 个片段");
-    expect(batchInspector).toHaveTextContent("专属素材字段会重新初始化");
+    expect(screen.getByText("已选 3 个片段")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "批量片段编辑" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("应用生成模式到所选")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: `多选片段 2：${second.title}` }));
+    expect(readState()).toMatchObject({
+      selected_segment_ids: [first.id, third.id],
+      active_segment_id: first.id,
+    });
+    expect(within(screen.getByRole("region", { name: "当前片段编辑器" }))
+      .getByLabelText("片段名称")).toHaveValue(first.title);
   });
 
-  it("片段整块复用普通、Ctrl 和 Shift 手势更新同一选择", () => {
+  it("普通点击切换编辑来源，Ctrl 和 Shift 只调整多选目标", () => {
     const state = createTimelineEditorState();
     const first = state.project.segments[0];
     const second = createTimelineSegment("fl2va", 2);
@@ -2008,14 +2118,65 @@ describe("统一时间线关键交互", () => {
     fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
     expect(readState().selected_segment_ids).toEqual([second.id]);
     expect(readState().active_segment_id).toBe(second.id);
+    expect(screen.getByText("编辑中")).toBeInTheDocument();
+    expect(screen.getByTitle(`当前从“${second.title}”复制设置`))
+      .toHaveTextContent(`复制来源：${second.title}`);
 
     fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ }), { ctrlKey: true });
     expect(readState().selected_segment_ids).toEqual([second.id, first.id]);
-    expect(readState().active_segment_id).toBe(first.id);
+    expect(readState().active_segment_id).toBe(second.id);
+    expect(within(screen.getByRole("region", { name: "当前片段编辑器" }))
+      .getByLabelText("片段名称")).toHaveValue(second.title);
 
     fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 3：/ }), { shiftKey: true });
-    expect(readState().selected_segment_ids).toEqual([first.id, second.id, third.id]);
-    expect(readState().active_segment_id).toBe(third.id);
+    expect(readState().selected_segment_ids).toEqual([second.id, third.id]);
+    expect(readState().active_segment_id).toBe(second.id);
+  });
+
+  it("Ctrl 多选不会反转应用到所选的复制方向", () => {
+    const state = createTimelineEditorState();
+    const source = {
+      ...state.project.segments[0],
+      title: "来源片段",
+      duration_seconds: 9,
+    };
+    const target = {
+      ...createTimelineSegment("fl2va", 2),
+      title: "目标片段",
+      duration_seconds: 3,
+    };
+    state.project.segments = [source, target];
+    state.selected_segment_ids = [source.id];
+    state.active_segment_id = source.id;
+    state.selection_anchor_id = source.id;
+    render(<Harness initial={state} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }), {
+      ctrlKey: true,
+    });
+
+    expect(readState()).toMatchObject({
+      selected_segment_ids: [source.id, target.id],
+      active_segment_id: source.id,
+      selection_anchor_id: source.id,
+    });
+    expect(screen.getByTitle("当前从“来源片段”复制设置"))
+      .toHaveTextContent("复制来源：来源片段");
+    expect(screen.getByRole("button", { name: /^聚焦并选择片段 1：/ }))
+      .toHaveAccessibleDescription(/当前编辑片段，也是复制来源/);
+
+    fireEvent.click(screen.getByRole("button", { name: "应用到所选（1）" }));
+
+    expect(readState().project.segments[0]).toMatchObject({
+      id: source.id,
+      title: "来源片段",
+      duration_seconds: 9,
+    });
+    expect(readState().project.segments[1]).toMatchObject({
+      id: target.id,
+      title: "目标片段",
+      duration_seconds: 9,
+    });
   });
 
   it("Shift 范围停留在目标可见轨，不会顺带选中另一轨片段", () => {
@@ -2036,7 +2197,7 @@ describe("统一时间线关键交互", () => {
 
     expect(readState()).toMatchObject({
       selected_segment_ids: [first.id, third.id],
-      active_segment_id: third.id,
+      active_segment_id: first.id,
       selection_anchor_id: first.id,
     });
     expect(screen.getByRole("checkbox", {
@@ -2049,7 +2210,7 @@ describe("统一时间线关键交互", () => {
     });
     expect(readState()).toMatchObject({
       selected_segment_ids: [disabledSecond.id, disabledFourth.id],
-      active_segment_id: disabledFourth.id,
+      active_segment_id: disabledSecond.id,
       selection_anchor_id: disabledSecond.id,
     });
     expect(screen.getByRole("button", { name: /^聚焦并选择片段 3：/ }))

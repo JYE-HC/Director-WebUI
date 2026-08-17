@@ -11,6 +11,8 @@ import {
   createTimelineEditorState,
   createTimelineProject,
   createTimelineSegment,
+  copyTimelineSegmentConfiguration,
+  DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS,
   EMPTY_SIX_SECTION_PROMPT,
   promptSkeleton,
   closestTimelineOutputResolution,
@@ -503,9 +505,17 @@ describe("统一 timeline domain", () => {
     state = timelineEditorReducer(state, { type: "segment/select", id: first });
     expect(runnableTimelineSegmentIds(state)).toEqual([first]);
     expect(state.active_segment_id).toBe(first);
+    state = timelineEditorReducer(state, { type: "segment/select", id: second, additive: true });
+    expect(state.selected_segment_ids).toEqual([first, second]);
+    expect(state.active_segment_id).toBe(first);
+    expect(state.selection_anchor_id).toBe(first);
+    state = timelineEditorReducer(state, { type: "segment/select", id: second, additive: true });
+    expect(state.selected_segment_ids).toEqual([first]);
+    expect(state.active_segment_id).toBe(first);
+    state = timelineEditorReducer(state, { type: "segment/select", id: second, additive: true });
     state = timelineEditorReducer(state, { type: "segment/select", id: third, range: true });
     expect(state.selected_segment_ids).toEqual([first, second, third]);
-    expect(state.active_segment_id).toBe(third);
+    expect(state.active_segment_id).toBe(first);
     expect(runnableTimelineSegmentIds(state)).toEqual([first, second, third]);
     state = timelineEditorReducer(state, { type: "segment/move", draggedId: third, targetId: first });
     expect(state.project.segments.map((segment) => segment.id)).toEqual([third, first, second]);
@@ -527,7 +537,7 @@ describe("统一 timeline domain", () => {
     state = timelineEditorReducer(state, { type: "segment/select", id: third.id, range: true });
     expect(state.selected_segment_ids).toEqual([first.id, third.id]);
     expect(state.selected_segment_ids).not.toContain(disabledSecond.id);
-    expect(state.active_segment_id).toBe(third.id);
+    expect(state.active_segment_id).toBe(first.id);
     expect(state.selection_anchor_id).toBe(first.id);
     expect(runnableTimelineSegmentIds(state)).toEqual([first.id, third.id]);
 
@@ -552,10 +562,12 @@ describe("统一 timeline domain", () => {
     });
     expect(state.selected_segment_ids).toEqual([disabledSecond.id, disabledFourth.id]);
     expect(state.selected_segment_ids).not.toContain(third.id);
+    expect(state.active_segment_id).toBe(disabledSecond.id);
     expect(runnableTimelineSegmentIds(state)).toEqual([]);
 
     state = timelineEditorReducer(state, { type: "segment/select", id: third.id, range: true });
-    expect(state.selected_segment_ids).toEqual([third.id]);
+    expect(state.selected_segment_ids).toEqual([disabledSecond.id, third.id]);
+    expect(state.active_segment_id).toBe(disabledSecond.id);
     expect(state.selection_anchor_id).toBe(third.id);
 
     state = timelineEditorReducer(state, {
@@ -564,7 +576,7 @@ describe("统一 timeline domain", () => {
       additive: true,
       range: true,
     });
-    expect(state.selected_segment_ids).toEqual([third.id, disabledSecond.id]);
+    expect(state.selected_segment_ids).toEqual([disabledSecond.id, third.id]);
     expect(state.active_segment_id).toBe(disabledSecond.id);
     expect(state.selection_anchor_id).toBe(disabledSecond.id);
     expect(runnableTimelineSegmentIds(state)).toEqual([third.id]);
@@ -941,7 +953,7 @@ describe("统一 timeline domain", () => {
     expect(state.selected_segment_ids).toEqual([first]);
     state = timelineEditorReducer(state, { type: "segment/select", id: second, additive: true });
     expect(state.selected_segment_ids).toEqual([first, second]);
-    expect(state.active_segment_id).toBe(second);
+    expect(state.active_segment_id).toBe(first);
 
     state = timelineEditorReducer(state, {
       type: "segment/set-enabled",
@@ -950,7 +962,7 @@ describe("统一 timeline domain", () => {
     });
     expect(runnableTimelineSegmentIds(state)).toEqual([first]);
     expect(state.selected_segment_ids).toEqual([first, second]);
-    expect(state.active_segment_id).toBe(second);
+    expect(state.active_segment_id).toBe(first);
     expect(state.project.segments[1].enabled).toBe(false);
 
     state = timelineEditorReducer(state, {
@@ -1135,11 +1147,170 @@ describe("统一 timeline domain", () => {
     };
     const target = { ...createTimelineSegment("fl2va", 2), title: "保留名称", enabled: false, first_image: image };
     state = { ...state, project: { ...state.project, segments: [source, target] } };
-    state = applyTimelineSegmentConfiguration(state, source.id, "following");
+    state = applyTimelineSegmentConfiguration(state, source.id, "following", {
+      ...DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS,
+      prompt: true,
+      promptReferences: true,
+    });
     expect(state.project.segments[1]).toMatchObject({
       id: target.id, title: "保留名称", enabled: false, mode: "ref2va", prompt: "重绘",
+      source_video: video,
+      reference_images: [{ ...image, slot: 0 }],
     });
     expect(state.project.segments[1]).not.toHaveProperty("first_image");
+  });
+
+  it("应用到所选只更新所选目标并排除来源，选择与焦点保持不变", () => {
+    const state = createTimelineEditorState();
+    const source = { ...state.project.segments[0], duration_seconds: 9 };
+    const selectedTarget = { ...createTimelineSegment("fl2va", 2), duration_seconds: 3, enabled: false };
+    const unselectedTarget = { ...createTimelineSegment("fl2va", 3), duration_seconds: 4 };
+    const initial = {
+      ...state,
+      project: { ...state.project, segments: [source, selectedTarget, unselectedTarget] },
+      selected_segment_ids: [source.id, selectedTarget.id],
+      active_segment_id: source.id,
+      selection_anchor_id: source.id,
+    };
+    const next = applyTimelineSegmentConfiguration(initial, source.id, "selected", {
+      mode: false,
+      duration: true,
+      continuity: false,
+      audioMode: false,
+      refImageSize: false,
+      prompt: false,
+      promptReferences: false,
+    });
+
+    expect(next.project.segments.map((segment) => segment.duration_seconds)).toEqual([9, 9, 4]);
+    expect(next.project.segments[1]).toMatchObject({
+      id: selectedTarget.id,
+      title: selectedTarget.title,
+      enabled: false,
+    });
+    expect(next).toMatchObject({
+      selected_segment_ids: [source.id, selectedTarget.id],
+      active_segment_id: source.id,
+      selection_anchor_id: source.id,
+    });
+  });
+
+  it("提示词可独立逐字节复制并保留目标自身素材绑定", () => {
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      prompt: "主体  <Picture 1>   \n\n  镜头 <Video 1> ",
+      source_video: video,
+      reference_images: [{ ...image, slot: 0 }],
+    };
+    const targetImage = { ...image, id: "target-image", name: "目标图片.png" };
+    const target = {
+      ...createTimelineSegment("ref2va", 2),
+      prompt: "旧提示词",
+      reference_images: [{ ...targetImage, slot: 0 }],
+    };
+    const copied = copyTimelineSegmentConfiguration(source, target, {
+      mode: false,
+      duration: false,
+      continuity: false,
+      audioMode: false,
+      refImageSize: false,
+      prompt: true,
+      promptReferences: false,
+    });
+
+    expect(copied.prompt).toBe(source.prompt);
+    expect(copied).toMatchObject({ reference_images: [{ id: targetImage.id, slot: 0 }] });
+    expect(copied).toMatchObject({ source_video: null });
+  });
+
+  it("连同引用素材复制完整 Ref 布局且不与来源共享数组", () => {
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      prompt: "<Video 1> <Audio 1> <Picture 1>",
+      source_video: video,
+      source_start_seconds: 2,
+      source_duration_seconds: 6,
+      source_audio_as_reference: true,
+      reference_images: [{ ...image, slot: 0 }],
+      reference_audios: [{ ...audio, slot: 0 }],
+    };
+    const target = { ...createTimelineSegment("fl2va", 2), first_image: image };
+    const copied = copyTimelineSegmentConfiguration(source, target, {
+      mode: true,
+      duration: false,
+      continuity: false,
+      audioMode: false,
+      refImageSize: false,
+      prompt: true,
+      promptReferences: true,
+    });
+
+    expect(copied).toMatchObject({
+      mode: "ref2va",
+      prompt: source.prompt,
+      source_video: video,
+      source_start_seconds: 2,
+      source_duration_seconds: 6,
+      source_audio_as_reference: true,
+      reference_images: [{ ...image, slot: 0 }],
+      reference_audios: [{ ...audio, slot: 0 }],
+    });
+    expect(copied).not.toHaveProperty("first_image");
+    if (copied.mode === "ref2va") {
+      expect(copied.reference_images).not.toBe(source.reference_images);
+      expect(copied.reference_audios).not.toBe(source.reference_audios);
+    }
+  });
+
+  it("复制 FL 首帧引用时同步关闭目标连续性", () => {
+    const source = {
+      ...createTimelineSegment("fl2va", 1),
+      prompt: "首帧 <Picture 1>",
+      first_image: image,
+    };
+    const target = {
+      ...createTimelineSegment("fl2va", 2),
+      continuity: { enabled: true as const, overlap_frames: 39 as const },
+    };
+    const copied = copyTimelineSegmentConfiguration(source, target, {
+      mode: true,
+      duration: false,
+      continuity: false,
+      audioMode: false,
+      refImageSize: false,
+      prompt: true,
+      promptReferences: true,
+    });
+    expect(copied).toMatchObject({
+      first_image: image,
+      continuity: { enabled: false, overlap_frames: 39 },
+    });
+  });
+
+  it("没有复制项或引用素材依赖非法时不制造项目写入", () => {
+    const state = createTimelineEditorState();
+    const source = state.project.segments[0];
+    const target = createTimelineSegment("fl2va", 2);
+    const initial = {
+      ...state,
+      project: { ...state.project, segments: [source, target] },
+    };
+    const emptyOptions = {
+      mode: false,
+      duration: false,
+      continuity: false,
+      audioMode: false,
+      refImageSize: false,
+      prompt: false,
+      promptReferences: false,
+    };
+    expect(applyTimelineSegmentConfiguration(initial, source.id, "following", emptyOptions))
+      .toBe(initial);
+    expect(applyTimelineSegmentConfiguration(initial, source.id, "following", {
+      ...emptyOptions,
+      prompt: true,
+      promptReferences: true,
+    })).toBe(initial);
   });
 
   it("引用计数返回稳定片段位置与角色", () => {
