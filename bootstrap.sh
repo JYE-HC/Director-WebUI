@@ -329,12 +329,15 @@ run_combined_service_command() {
   local supervisor=("$py" "$SCRIPT_DIR/tools/director_supervisor.py")
   case "$COMMAND" in
     start)
-      local rc=0
+      local rc=0 director_rc=0
       if has_local_comfyui; then
         [[ -x "$py" ]] || die "后端 Python 尚未安装" 4
         "${supervisor[@]}" start-comfyui || rc=1
       fi
-      "$SCRIPT_DIR/director.sh" start "${ORIGINAL_ARGS[@]}" || rc=1
+      "$SCRIPT_DIR/director.sh" start "${ORIGINAL_ARGS[@]}" || { rc=1; director_rc=1; }
+      if [[ $director_rc -eq 0 ]] && [[ -n "$(comfyui_seed_url)" ]]; then
+        seed_comfyui_url_if_unset || warn "ComfyUI 地址预置未完成；请稍后在系统设置中手动填写"
+      fi
       return "$rc"
       ;;
     stop)
