@@ -921,10 +921,17 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                 const discoveredDevices: DeviceTarget[] = gpus.filter((gpu) => gpu.visible).map((gpu) => `gpu:${gpu.index}` as const);
                 const devices: DeviceTarget[] = [...new Set(["default" as const, ...(meta.allowCpu ? ["cpu" as const] : []), ...discoveredDevices, binding.device])];
                 const availableModels = role === "fl2va" || role === "ref2va" ? diffusionModels : models[role];
-                const filenames = binding.filename && !availableModels.includes(binding.filename) ? [binding.filename, ...availableModels] : availableModels;
+                // An authoritative inventory lists exactly what the endpoint
+                // holds. A stale configured name stays visible only while the
+                // inventory is not authoritative yet (offline/loading), never
+                // as a phantom entry next to the real list.
+                const inventoryAuthoritative = runtimeResourcesReady && !loadingModels;
+                const filenameMissing = Boolean(binding.filename) && !availableModels.includes(binding.filename);
+                const filenames = filenameMissing && !inventoryAuthoritative ? [binding.filename, ...availableModels] : availableModels;
                 const diffusionRole: "fl2va" | "ref2va" | null = role === "fl2va" || role === "ref2va" ? role : null;
                 const diffusion = diffusionRole ? binding as DiffusionModelBinding : null;
-                const loras = diffusion?.lora_name && !models.loras.includes(diffusion.lora_name)
+                const loraMissing = Boolean(diffusion?.lora_name) && !models.loras.includes(diffusion!.lora_name as string);
+                const loras = loraMissing && !inventoryAuthoritative && diffusion?.lora_name
                   ? [diffusion.lora_name, ...models.loras]
                   : models.loras;
                 const resolvedBackend = diffusion ? resolveExecutionBackend(diffusion) : null;
@@ -946,7 +953,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                 return <div className="model-binding-group" key={role}>
                   <div className={`model-row ${diffusion ? "model-row--diffusion" : ""}`}>
                     <div className="model-row__name"><strong>{meta.label}</strong><small>{meta.description}</small></div>
-                    <Field label="模型文件"><select required disabled={!runtimeResourcesReady} aria-label={`${meta.label}模型`} value={binding.filename} onChange={(event) => setModel(role, "filename", event.target.value)}><option value="">请选择模型</option>{filenames.map((filename) => <option key={filename} value={filename}>{filename}</option>)}</select></Field>
+                    <Field label="模型文件"><select required disabled={!runtimeResourcesReady} aria-label={`${meta.label}模型`} value={inventoryAuthoritative && filenameMissing ? "" : binding.filename} onChange={(event) => setModel(role, "filename", event.target.value)}><option value="">请选择模型</option>{filenames.map((filename) => <option key={filename} value={filename}>{filename}</option>)}</select>{inventoryAuthoritative && filenameMissing && <small className="inline-error">已配置的文件不在当前 ComfyUI 模型清单中：{binding.filename}</small>}</Field>
                     <Field label={diffusion ? "标准执行设备" : "运行设备"} hint={diffusion && resolvedBackend === "raylight" ? "RayLight 固定为 default；切回 Standard 后可重新选择逻辑设备。" : diffusion ? "标准原生节点使用此 ComfyUI 逻辑设备。" : undefined}><select required disabled={!runtimeResourcesReady || resolvedBackend === "raylight"} aria-label={`${meta.label}设备`} value={binding.device} onChange={(event) => setModel(role, "device", event.target.value)}>{devices.map((device) => <option key={device} value={device}>{device === "default" ? "default（ComfyUI 自动）" : device}</option>)}</select></Field>
                   </div>
                   {diffusion && diffusionRole && <section className="model-execution-panel" aria-label={`${meta.label}执行拓扑`}>
@@ -973,7 +980,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                   </section>}
                   {diffusion && diffusionRole && <div className="lora-row">
                     <div className="model-row__name"><strong>共享 LoRA</strong><small>{diffusion.lora_name ? "应用到该模型族的所有任务模式" : "不加载 LoRA"}</small></div>
-                    <Field label="LoRA 文件"><select disabled={!runtimeResourcesReady} aria-label={`${meta.label} LoRA`} value={diffusion.lora_name ?? ""} onChange={(event) => setDiffusion(diffusionRole!, { lora_name: event.target.value || null })}><option value="">不使用 LoRA</option>{loras.map((filename) => <option key={filename} value={filename}>{filename}</option>)}</select></Field>
+                    <Field label="LoRA 文件"><select disabled={!runtimeResourcesReady} aria-label={`${meta.label} LoRA`} value={inventoryAuthoritative && loraMissing ? "" : (diffusion.lora_name ?? "")} onChange={(event) => setDiffusion(diffusionRole!, { lora_name: event.target.value || null })}><option value="">不使用 LoRA</option>{loras.map((filename) => <option key={filename} value={filename}>{filename}</option>)}</select>{inventoryAuthoritative && loraMissing && <small className="inline-error">已配置的 LoRA 不在当前 ComfyUI 清单中：{diffusion.lora_name}</small>}</Field>
                     <Field label="模型强度"><DeferredNumberInput aria-label={`${meta.label} LoRA 强度`} min="-10" max="10" step="0.01" disabled={!runtimeResourcesReady || !diffusion.lora_name} value={diffusion.lora_strength} onValueCommit={(value) => setDiffusion(diffusionRole!, { lora_strength: value })} /></Field>
                     {resolvedBackend === "raylight" ? <div className="fixed-runtime-value" aria-label={`${meta.label} LoRA 加载状态`}><span>加载方式</span><strong>RayLoraLoader</strong><small>RayLight 固定使用；切回 Standard 后重新自动探测</small></div> : <Field label="Standard 加载器" hint="默认由 ComfyUI safetensors metadata 自动识别；只有识别失败时才需要显式选择。"><select aria-label={`${meta.label} Standard LoRA 加载器`} disabled={!runtimeResourcesReady || !diffusion.lora_name} value={diffusion.standard_lora_loader_override?.loader ?? ""} onChange={(event) => {
                       const loader = event.target.value as StandardLoraLoader | "";

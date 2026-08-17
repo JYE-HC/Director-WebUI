@@ -605,6 +605,57 @@ describe("共享设置表单", () => {
     }
   });
 
+  it("权威清单不含已配置模型/LoRA 文件时显示占位并明确提示，不出现幻影项", () => {
+    const models: ModelInventory = {
+      fl2va: ["model-a.safetensors"],
+      ref2va: ["model-a.safetensors"],
+      clip: [DEFAULT_SETTINGS.models.clip.filename],
+      video_vae: [DEFAULT_SETTINGS.models.video_vae.filename],
+      audio_vae: [DEFAULT_SETTINGS.models.audio_vae.filename],
+      loras: ["style.safetensors"],
+    };
+    const settings = structuredClone(CONFIGURED_SETTINGS);
+    settings.models.fl2va.lora_name = "missing-lora.safetensors";
+    render(
+      <SettingsPage
+        settings={settings}
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[]}
+        models={models}
+        loadingModels={false}
+        onSaved={confirmConfiguredSettings}
+      />,
+    );
+
+    const fl2vaSelect = screen.getByLabelText("FL2VA 扩散模型模型") as HTMLSelectElement;
+    expect(Array.from(fl2vaSelect.options).map((option) => option.value))
+      .toEqual(["", "model-a.safetensors"]);
+    expect(fl2vaSelect.value).toBe("");
+    const loraSelect = screen.getByLabelText("FL2VA 扩散模型 LoRA") as HTMLSelectElement;
+    expect(Array.from(loraSelect.options).map((option) => option.value))
+      .toEqual(["", "style.safetensors"]);
+    expect(loraSelect.value).toBe("");
+    expect(screen.getAllByText(/不在当前 ComfyUI 模型清单中/)).toHaveLength(2);
+    expect(screen.getByText(/不在当前 ComfyUI 清单中/)).toHaveTextContent("missing-lora.safetensors");
+  });
+
+  it("清单尚未就绪时保留已配置名称且不报缺失", () => {
+    render(
+      <SettingsPage
+        settings={CONFIGURED_SETTINGS}
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[]}
+        models={EMPTY_MODELS}
+        loadingModels={true}
+        onSaved={confirmConfiguredSettings}
+      />,
+    );
+
+    const select = screen.getByLabelText("FL2VA 扩散模型模型") as HTMLSelectElement;
+    expect(select.value).toBe(CONFIGURED_SETTINGS.models.fl2va.filename);
+    expect(screen.queryByText(/不在当前 ComfyUI 模型清单中/)).not.toBeInTheDocument();
+  });
+
   it("两个扩散模型槽从同一清单独立自动同步各自选择", async () => {
     const user = userEvent.setup();
     const models: ModelInventory = {
