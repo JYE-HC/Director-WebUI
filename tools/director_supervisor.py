@@ -306,8 +306,8 @@ def start_director(args: argparse.Namespace) -> int:
         stop_process("backend")
         return 1
 
-    print(f"Director frontend: http://{frontend_host}:{frontend_port}")
-    print(f"Director backend:  http://{backend_host}:{backend_port}")
+    print_service_url("Director 前端", frontend_host, frontend_port)
+    print_service_url("Director 后端", backend_host, backend_port)
     return 0
 
 
@@ -347,6 +347,12 @@ def logs_director(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_service_url(label: str, host: str, port: str) -> None:
+    print(f"{label}监听: http://{host}:{port}")
+    if host in ("0.0.0.0", "::"):
+        print(f"{label}访问: http://127.0.0.1:{port}（0.0.0.0 仅用于监听；跨机器请用服务器实际 IP）")
+
+
 def start_comfyui(args: argparse.Namespace) -> int:
     del args
     if is_running("comfyui"):
@@ -384,7 +390,7 @@ def start_comfyui(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         stop_process("comfyui")
         return 1
-    print(f"ComfyUI: http://{listen}:{port}")
+    print_service_url("ComfyUI", listen, port)
     return 0
 
 

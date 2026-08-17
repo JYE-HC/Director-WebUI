@@ -221,10 +221,13 @@ start_units() {
   unit_is_active "$FRONTEND_UNIT" || die "前端未能保持运行，请查看 $DATA_DIR/director-frontend.log"
 
   printf 'Director 已启动：\n'
-  printf '  前端：http://%s:%s\n' "$FRONTEND_HOST" "$FRONTEND_PORT"
-  printf '  后端：http://%s:%s\n' "$BACKEND_HOST" "$BACKEND_PORT"
-  if [[ "$FRONTEND_HOST" == "0.0.0.0" || "$BACKEND_HOST" == "0.0.0.0" ]]; then
-    printf '提示：0.0.0.0 是监听地址；访问时请使用服务器的实际 IP。\n'
+  printf '  前端监听：http://%s:%s\n' "$FRONTEND_HOST" "$FRONTEND_PORT"
+  printf '  后端监听：http://%s:%s\n' "$BACKEND_HOST" "$BACKEND_PORT"
+  if [[ "$FRONTEND_HOST" == "0.0.0.0" || "$FRONTEND_HOST" == "::" ]]; then
+    printf '  浏览器访问前端：http://127.0.0.1:%s（0.0.0.0 仅用于监听；跨机器请用服务器实际 IP）\n' "$FRONTEND_PORT"
+  fi
+  if [[ "$BACKEND_HOST" == "0.0.0.0" || "$BACKEND_HOST" == "::" ]]; then
+    printf '  后端 API 访问：http://127.0.0.1:%s（0.0.0.0 仅用于监听；跨机器请用服务器实际 IP）\n' "$BACKEND_PORT"
   fi
 }
 
