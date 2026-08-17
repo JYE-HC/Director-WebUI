@@ -232,6 +232,12 @@ run_install() {
   fi
 
   exec > >(tee -a "$SETUP_LOG") 2>&1
+  # Platform detection is read-only, but its results (PKG_UPDATE/PKG_INSTALL
+  # arrays, PROJECT_ON_WINDOWS_FS, …) live only in this process and cannot be
+  # restored from state.env. Re-run it on every install invocation or resumed
+  # steps would see empty package-manager commands.
+  step_detect_platform || exit 1
+  mark_step detect_platform done
   run_chain || exit $?
   section "安装完成"
   ok "Director Web 安装流程已完成"
