@@ -716,7 +716,7 @@ async def test_migrate_copies_consistent_database_updates_bootstrap_and_freezes_
 
     copied = Database(target)
     assert copied.get_timeline().title == "迁移前项目"
-    assert str(copied.get_settings().comfy_url) == "http://comfy.test:8188/"
+    assert str(copied.get_settings().comfy_url) == "http://comfy.test:8188"
     assert Database(source).get_timeline().title == "迁移前项目"
     assert json.loads(config.read_text(encoding="utf-8"))["database_path"] == str(
         target.resolve()
