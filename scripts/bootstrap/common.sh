@@ -185,7 +185,7 @@ run_chain() {
       warn "跳过步骤：$step"
       continue
     fi
-    if step_is_done "$step"; then
+    if step_is_done "$step" && [[ -z "$ONLY_STEP" ]]; then
       ok "步骤已完成，跳过：$step"
       continue
     fi

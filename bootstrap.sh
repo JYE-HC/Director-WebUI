@@ -53,7 +53,7 @@ usage() {
       --dry-run                 只显示检测结果与安装计划
       --resume                  从上次失败步骤继续
       --from STEP               从指定步骤开始
-      --only STEP               只执行指定步骤
+      --only STEP               只执行指定步骤（已完成也强制重跑）
       --skip STEP[,STEP...]     跳过指定步骤
       --no-sudo                 禁止安装系统包；uv/node/ffmpeg 尽量装入项目 .tools
       --node-bin-dir PATH       使用已有 node 与 npm 目录
