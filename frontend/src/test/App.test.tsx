@@ -1377,7 +1377,7 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
-    await user.click(screen.getByRole("button", { name: "采用服务器版本" }));
+    await user.click(await screen.findByRole("button", { name: "采用服务器版本" }));
     await waitFor(() => expect(vi.mocked(directorApi.getTimelineAuthority))
       .toHaveBeenCalledTimes(2));
     act(() => window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT)));
