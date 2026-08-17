@@ -225,6 +225,7 @@ function cloneTimelineTextEditingContext(
 
 function cloneTimelineHistoryContext(
   context: TimelineHistoryContext | undefined,
+  allowCombinedReplayContext = false,
 ): TimelineHistoryContext | undefined {
   if (!context) return undefined;
   const textEditing = cloneTimelineTextEditingContext(context.text_editing);
@@ -239,7 +240,8 @@ function cloneTimelineHistoryContext(
           // Ordinary text entries explicitly opt out of restoring structural
           // selection. A multi-entry jump may intentionally combine the last
           // effective structural context with the last text caret context.
-          restore_segment_selection: context.restore_segment_selection === true,
+          restore_segment_selection:
+            allowCombinedReplayContext && context.restore_segment_selection === true,
           text_editing: textEditing,
         }
       : context.restore_segment_selection === undefined
@@ -251,10 +253,11 @@ function cloneTimelineHistoryContext(
 function cloneTimelineHistorySnapshot(
   project: TimelineProject,
   context: TimelineHistoryContext | undefined,
+  allowCombinedReplayContext = false,
 ): TimelineHistorySnapshot {
   return {
     project: structuredClone(project),
-    context: cloneTimelineHistoryContext(context),
+    context: cloneTimelineHistoryContext(context, allowCombinedReplayContext),
   };
 }
 
@@ -711,6 +714,7 @@ function replayContextAcrossEntries(
   entries: readonly TimelineHistoryEntry[],
   currentCursor: number,
   targetCursor: number,
+  sourceFieldKey: string | null | undefined,
 ): TimelineHistoryContext | undefined {
   const movingBackward = targetCursor < currentCursor;
   const crossedEntries = movingBackward
@@ -722,7 +726,12 @@ function replayContextAcrossEntries(
     const context = movingBackward ? entry.beforeContext : entry.afterContext;
     if (!context) continue;
     if (context.restore_segment_selection !== false) structuralContext = context;
-    if (context.text_editing) textContext = context;
+    if (
+      context.text_editing &&
+      (sourceFieldKey === undefined || context.text_editing.field_key === sourceFieldKey)
+    ) {
+      textContext = context;
+    }
   }
   if (!structuralContext) return textContext;
   if (!textContext?.text_editing) return structuralContext;
@@ -739,6 +748,7 @@ function replayContextAcrossEntries(
 export function jumpTimelineHistory(
   history: TimelineHistoryState,
   targetCursor: number,
+  sourceFieldKey?: string | null,
 ): TimelineHistoryReplay | null {
   const entries = orderedEntries(history);
   if (!Number.isInteger(targetCursor) || targetCursor < 0 || targetCursor > entries.length) {
@@ -749,7 +759,12 @@ export function jumpTimelineHistory(
   const project = projectAtRelativeCursor(history, targetCursor);
   const movingBackward = targetCursor < currentCursor;
   const entry = movingBackward ? entries[targetCursor] : entries[targetCursor - 1];
-  const context = replayContextAcrossEntries(entries, currentCursor, targetCursor);
+  const context = replayContextAcrossEntries(
+    entries,
+    currentCursor,
+    targetCursor,
+    sourceFieldKey,
+  );
   return {
     history: {
       ...history,
@@ -758,7 +773,7 @@ export function jumpTimelineHistory(
       head: structuredClone(project),
       coalescing: null,
     },
-    snapshot: cloneTimelineHistorySnapshot(project, context),
+    snapshot: cloneTimelineHistorySnapshot(project, context, true),
     label: entry.label,
     entryId: entry.id,
     cursor: targetCursor,

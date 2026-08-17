@@ -1581,7 +1581,8 @@ export default function App() {
   }, [replayTimelineHistory]);
 
   const jumpTimelineHistoryCursor = useCallback((cursor: number) => {
-    const replay = jumpTimelineHistory(timelineHistoryRef.current, cursor);
+    const sourceFieldKey = captureTimelineTextEditingContext(document.activeElement)?.field_key ?? null;
+    const replay = jumpTimelineHistory(timelineHistoryRef.current, cursor, sourceFieldKey);
     applyTimelineHistoryReplay(replay, replay ? `已跳转到：${replay.label}` : "");
   }, [applyTimelineHistoryReplay]);
 

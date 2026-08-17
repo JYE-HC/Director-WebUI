@@ -504,6 +504,53 @@ describe("timeline history", () => {
     ));
   });
 
+  it("restores only the focused text field when a jump crosses different editors", () => {
+    const initial = createTimelineProject();
+    const segmentId = initial.segments[0].id;
+    const renamed = titled(initial, "标题已编辑");
+    const prompted = structuredClone(renamed);
+    prompted.segments[0].prompt = "提示词已编辑";
+    const titleField = "project:title";
+    const promptField = `segment:${segmentId}:prompt`;
+    const titleAfter = {
+      field_key: titleField,
+      start: renamed.title.length,
+      end: renamed.title.length,
+      direction: "none" as const,
+    };
+    const promptAfter = {
+      field_key: promptField,
+      start: prompted.segments[0].prompt.length,
+      end: prompted.segments[0].prompt.length,
+      direction: "none" as const,
+    };
+    let history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑标题",
+      before: initial,
+      after: renamed,
+      afterContext: context([segmentId], segmentId, segmentId, {
+        restore_segment_selection: false,
+        text_editing: titleAfter,
+      }),
+    });
+    history = recordTimelineHistory(history, {
+      label: "编辑提示词",
+      before: renamed,
+      after: prompted,
+      afterContext: context([segmentId], segmentId, segmentId, {
+        restore_segment_selection: false,
+        text_editing: promptAfter,
+      }),
+    });
+    history = undoTimelineHistory(undoTimelineHistory(history)!.history)!.history;
+
+    expect(jumpTimelineHistory(history, 2, titleField)?.snapshot.context?.text_editing)
+      .toEqual(titleAfter);
+    expect(jumpTimelineHistory(history, 2, promptField)?.snapshot.context?.text_editing)
+      .toEqual(promptAfter);
+    expect(jumpTimelineHistory(history, 2, null)?.snapshot.context).toBeUndefined();
+  });
+
   it("safely rebases canonical ACKs at the current head and preserves undo/redo", () => {
     const initial = createTimelineProject();
     const client = titled(initial, "客户端标题");
