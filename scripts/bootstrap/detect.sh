@@ -136,9 +136,16 @@ detect_interop() {
 windows_path_to_wsl() {
   local value="$1"
   value="$(printf '%s' "$value" | tr -d '\r')"
-  if command -v wslpath >/dev/null 2>&1 && [[ -n "$value" ]]; then
-    wslpath -u "$value" 2>/dev/null || true
-    return
+  # Users often paste Windows paths wrapped in quotes.
+  value="${value%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  if [[ -n "$value" ]] && command -v wslpath >/dev/null 2>&1; then
+    local converted
+    converted="$(wslpath -u "$value" 2>/dev/null || true)"
+    if [[ -n "$converted" ]]; then
+      printf '%s\n' "$converted"
+      return
+    fi
   fi
   # Fallback for WSL without wslpath: C:\ -> /mnt/c, C:/ -> /mnt/c
   if [[ "$value" =~ ^([A-Za-z]):\\?(.*)$ ]]; then
@@ -147,7 +154,13 @@ windows_path_to_wsl() {
     printf '/mnt/%s/%s\n' "$drive" "${rest#/}"
     return
   fi
-  printf '%s\n' "$value"
+  # Already a WSL/Linux absolute path.
+  if [[ "$value" == /* ]]; then
+    printf '%s\n' "$value"
+    return
+  fi
+  # Unconvertible input fails closed (empty output); never echo a raw Windows
+  # path back as if it were a WSL path.
 }
 
 project_dirname() {

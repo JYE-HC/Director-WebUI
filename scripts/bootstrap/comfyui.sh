@@ -81,7 +81,14 @@ step_select_comfyui_mode() {
 
     if [[ "$WINDOWS_MODEL_SHARING_ENABLED" == true ]]; then
       WINDOWS_COMFYUI_WSL_ROOT="$(windows_path_to_wsl "$WINDOWS_COMFYUI_ROOT")"
-      [[ -n "$WINDOWS_COMFYUI_WSL_ROOT" ]] || { error "Windows 路径转换失败"; return 1; }
+      [[ -n "$WINDOWS_COMFYUI_WSL_ROOT" ]] || {
+        error "Windows 路径转换失败：$WINDOWS_COMFYUI_ROOT（请去掉引号，使用盘符路径或 /mnt/<盘符> 路径）"
+        return 1
+      }
+      [[ -d "$WINDOWS_COMFYUI_WSL_ROOT" ]] || {
+        error "转换后的 WSL 路径不存在：$WINDOWS_COMFYUI_WSL_ROOT（请确认 Windows 路径拼写与盘符挂载）"
+        return 1
+      }
       ok "Windows ComfyUI WSL 路径：$WINDOWS_COMFYUI_WSL_ROOT"
     fi
   fi
