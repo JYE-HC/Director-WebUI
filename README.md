@@ -143,9 +143,12 @@ Windows 侧 ComfyUI 的模型目录。
 `install.sh` 完成。安装器会校验本发布包、ComfyUI Git 能力、Python/CUDA/Ray 环境、Node、ffmpeg
 和 custom node 冲突；它不会执行 `git pull`、切换 ComfyUI commit、修补 ComfyUI 核心、下载模型
 或自动重启 ComfyUI。与实测 ComfyUI commit 相同或属于它的后继版本均可安装；本地改动只提示
-统计信息，不会展示文件名，也不会阻止安装。若已有同名但内容不同的节点，安装会停止；只有在
-ComfyUI 已停止时，才可显式使用 `--replace-node raylight --replace-node ComfyUI-MiniMax-H3-Turbo
---confirm-comfyui-stopped`。旧目录会保存在 ComfyUI 根下的 `.director-backups/`，不会被删除。
+统计信息，不会展示文件名，也不会阻止安装。若已有同名但内容不同的节点，交互终端会当场询问：
+备份并替换（需先停止 ComfyUI）、复用现有内容（写入 `.director-keep` 标记，未经 Director
+兼容性校验，不兼容时生成会明确报错）或中止安装；非交互模式（`-y`/`--dry-run`/`check`）保持
+失败封闭并打印当前入口下完整可执行的替换命令（`--replace-node <名称> --confirm-comfyui-stopped`，
+bootstrap 下为 `./bootstrap.sh --only install_director ...`）。旧目录会保存在 ComfyUI 根下的
+`.director-backups/`，不会被删除。
 
 标准单卡链只使用 ComfyUI core/官方 extras。两张及以上 GPU 才会使用仓库内的 Director 定制
 RayLight；`ComfyUI-MiniMax-H3-Turbo` 只在选择旧版专用 Turbo LoRA 时使用。不要安装旧
