@@ -235,6 +235,53 @@ is_replace_allowed() {
   [[ "${REPLACE_NODES[$1]:-false}" == true ]]
 }
 
+# Only `install` may prompt; `check` stays read-only and non-interactive runs
+# must never guess on the user's behalf.
+INSTALL_INTERACTIVE=false
+
+resolve_node_conflict_interactively() {
+  local name="$1" target="$2" choice answer
+  warn "$name：已有内容与本发布不同（$target）"
+  while true; do
+    printf '%s\n' "请选择处理方式：" >&2
+    printf '%s\n' "  1) 备份并替换为本发布内容（推荐；旧目录移入 .director-backups/）" >&2
+    printf '%s\n' "  2) 复用现有内容（保留不动；未经 Director 兼容性校验，不兼容时生成会明确报错）" >&2
+    printf '%s\n' "  3) 中止安装" >&2
+    printf '请选择 [1]: ' >&2
+    read -re choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1)
+        while true; do
+          printf '替换前必须停止 ComfyUI。ComfyUI 已停止？ [y/N]: ' >&2
+          read -re answer
+          answer="${answer:-n}"
+          case "${answer,,}" in
+            y|yes)
+              REPLACE_NODES["$name"]=true
+              CONFIRM_STOPPED=true
+              warn "$name：将备份并替换已有不同内容"
+              return 0
+              ;;
+            n|no)
+              warn "请先停止 ComfyUI 再继续（可执行 ./bootstrap.sh stop-comfyui）"
+              return 1
+              ;;
+            *) warn "请输入 y 或 n" ;;
+          esac
+        done
+        ;;
+      2)
+        "$COMFYUI_PYTHON" "$SCRIPT_DIR/tools/release_installer.py" mark-keep "$name" "$target" || return 1
+        NODE_STATUS["$name"]="kept"
+        return 0
+        ;;
+      3) return 1 ;;
+      *) warn "请输入 1-3" ;;
+    esac
+  done
+}
+
 check_node_collisions() {
   local name target status safety=0
   for name in "${NODE_NAMES[@]}"; do
@@ -244,6 +291,9 @@ check_node_collisions() {
     case "$status" in
       absent) pass "$name：尚未安装" ;;
       same) pass "$name：已是本发布内容（无需改动）" ;;
+      kept)
+        warn "$name：已按此前选择复用现有内容（未经 Director 兼容性校验；删除 $target/.director-keep 可重新选择）"
+        ;;
       symlink)
         fail "$name：目标是符号链接，安装器拒绝修改"
         safety=1
@@ -256,6 +306,11 @@ check_node_collisions() {
             fail "$name：替换前必须加 --confirm-comfyui-stopped"
             safety=1
           fi
+        elif [[ "$INSTALL_INTERACTIVE" == true && "$ASSUME_YES" == false && "$DRY_RUN" == false ]]; then
+          resolve_node_conflict_interactively "$name" "$target" || {
+            fail "$name：已有内容不同，未选择处理方式"
+            safety=1
+          }
         else
           fail "$name：已有内容不同；默认不覆盖。确认替换请执行：./install.sh install --comfyui-root \"$COMFYUI_ROOT\" --replace-node $name --confirm-comfyui-stopped（经 bootstrap 安装则用 ./bootstrap.sh --only install_director --replace-node $name --confirm-comfyui-stopped；旧目录会备份保留，不会被删除）"
           safety=1
@@ -299,7 +354,7 @@ confirm_install() {
   printf '\n即将安装 Director 依赖、构建前端，并把 bundled 节点发布到：\n  %s/custom_nodes\n' "$COMFYUI_ROOT"
   printf '不会修改 ComfyUI core，也不会重启 ComfyUI。继续？ [y/N] '
   local answer
-  read -r answer
+  read -re answer
   [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]]
 }
 
@@ -368,7 +423,7 @@ publish_nodes() {
   trap 'rollback_nodes; cleanup_stage' EXIT
 
   for name in "${NODE_NAMES[@]}"; do
-    [[ "${NODE_STATUS[$name]}" == same ]] && continue
+    [[ "${NODE_STATUS[$name]}" == same || "${NODE_STATUS[$name]}" == kept ]] && continue
     source="$SCRIPT_DIR/custom_nodes/$name"
     staged="$STAGE_BASE/$name"
     mkdir -- "$staged"
@@ -382,7 +437,7 @@ publish_nodes() {
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   ROLLBACK_NEEDED=true
   for name in "${NODE_NAMES[@]}"; do
-    [[ "${NODE_STATUS[$name]}" == same ]] && continue
+    [[ "${NODE_STATUS[$name]}" == same || "${NODE_STATUS[$name]}" == kept ]] && continue
     target="$COMFYUI_ROOT/custom_nodes/$name"
     backup=""
     if [[ "${NODE_STATUS[$name]}" == conflict ]]; then
@@ -424,6 +479,8 @@ run_verify() {
       "$name" "$COMFYUI_ROOT/custom_nodes/$name")"
     if [[ "$status" == same ]]; then
       pass "$name 安装内容校验通过"
+    elif [[ "$status" == kept ]]; then
+      warn "$name 复用现有内容（未经 Director 兼容性校验）"
     else
       fail "$name 安装内容不匹配（状态：$status）"
       incompatible=1
@@ -442,6 +499,7 @@ run_verify() {
 
 run_install() {
   local check_code=0
+  INSTALL_INTERACTIVE=true
   run_readonly_checks preinstall || check_code=$?
   ((check_code == 0)) || return "$check_code"
   if [[ "$DRY_RUN" == true ]]; then

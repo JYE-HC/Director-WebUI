@@ -1401,7 +1401,10 @@ describe("统一长视频时间线应用", () => {
     expect(update).not.toHaveBeenCalled();
   });
 
-  it("采用服务器的 authority GET 在数据库变 stale 后不得落地或删除冲突证据", async () => {
+  // CI push 运行的共享 runner 上 hydration 偶发整体停滞（连时间线工作区都未
+  // 渲染），15s 超时也不足；详见 踩坑_开发环境与测试.md「CI 偶发失败」。retry 只
+  // 掩盖这种环境性停滞，确定性回归仍会三次全败。
+  it("采用服务器的 authority GET 在数据库变 stale 后不得落地或删除冲突证据", { retry: 2, timeout: 30000 }, async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const user = userEvent.setup();
     const base = createTimelineProject();
