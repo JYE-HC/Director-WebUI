@@ -180,8 +180,18 @@ start_units() {
   [[ -d "$FRONTEND_DIR/node_modules" ]] || \
     die "前端依赖不存在，请先在 frontend 目录执行 npm ci"
 
+  # start is idempotent: both units active is the desired end state, not an
+  # error. A partially present pair still requires restart to stay explicit.
+  if unit_is_loaded "$BACKEND_UNIT" && unit_is_active "$BACKEND_UNIT" && \
+     unit_is_loaded "$FRONTEND_UNIT" && unit_is_active "$FRONTEND_UNIT"; then
+    printf 'Director 前后端已在运行，无需启动：\n'
+    local visit_host="$FRONTEND_HOST"
+    [[ "$visit_host" == "0.0.0.0" || "$visit_host" == "::" ]] && visit_host="127.0.0.1"
+    printf '  浏览器输入 http://%s:%s 访问 Director-WebUI\n' "$visit_host" "$FRONTEND_PORT"
+    return 0
+  fi
   if unit_is_loaded "$BACKEND_UNIT" || unit_is_loaded "$FRONTEND_UNIT"; then
-    die "Director 服务已经存在；请使用 restart，或先执行 stop"
+    die "Director 服务处于部分运行状态；请使用 restart，或先执行 stop"
   fi
 
   mkdir -p "$DATA_DIR"

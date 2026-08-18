@@ -218,10 +218,12 @@ def tail_text(name: str, lines: int = 20) -> str:
 
 def start_director(args: argparse.Namespace) -> int:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    for name in ("backend", "frontend"):
-        if is_running(name):
-            print(f"{name} is already running")
-            return 1
+    # start is idempotent: "already running" is the desired end state, and a
+    # partially running pair gets only its missing half spawned.
+    running = {name: is_running(name) for name in ("backend", "frontend")}
+    if all(running.values()):
+        print("Director 前后端已在运行，无需启动")
+        return 0
 
     backend_bin = Path(env("DIRECTOR_BACKEND_BIN", str(PROJECT_ROOT / ".venv" / "bin" / "director-web")))
     if not backend_bin.exists():
@@ -260,51 +262,64 @@ def start_director(args: argparse.Namespace) -> int:
     except ValueError:
         print(f"invalid Director port: backend={backend_port} frontend={frontend_port}", file=sys.stderr)
         return 1
-    if not port_is_available(backend_host, backend_port_number):
+    # Port checks apply only to the services we are about to spawn; a service
+    # that is already running holds its own port legitimately.
+    if not running["backend"] and not port_is_available(backend_host, backend_port_number):
         print(f"backend port is already in use: {backend_host}:{backend_port}", file=sys.stderr)
         return 1
-    if not port_is_available(frontend_host, frontend_port_number):
+    if not running["frontend"] and not port_is_available(frontend_host, frontend_port_number):
         print(f"frontend port is already in use: {frontend_host}:{frontend_port}", file=sys.stderr)
         return 1
     api_origin = f"http://127.0.0.1:{backend_port}"
 
-    print(f"starting backend on {backend_host}:{backend_port}")
-    backend_pid = _spawn(
-        [str(backend_bin)],
-        name="backend",
-        cwd=PROJECT_ROOT,
-        extra_env={
-            "DIRECTOR_HOST": backend_host,
-            "DIRECTOR_PORT": backend_port,
-            "DIRECTOR_TMPDIR": env("DIRECTOR_TMPDIR"),
-        },
-    )
-    try:
-        _wait_healthy("backend", backend_pid)
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        stop_process("backend")
-        return 1
+    spawned: list[str] = []
+    if not running["backend"]:
+        print(f"starting backend on {backend_host}:{backend_port}")
+        backend_pid = _spawn(
+            [str(backend_bin)],
+            name="backend",
+            cwd=PROJECT_ROOT,
+            extra_env={
+                "DIRECTOR_HOST": backend_host,
+                "DIRECTOR_PORT": backend_port,
+                "DIRECTOR_TMPDIR": env("DIRECTOR_TMPDIR"),
+            },
+        )
+        try:
+            _wait_healthy("backend", backend_pid)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            stop_process("backend")
+            return 1
+        spawned.append("backend")
+    else:
+        print("backend 已在运行，跳过启动")
 
-    print(f"starting frontend on {frontend_host}:{frontend_port}")
-    frontend_pid = _spawn(
-        [str(node), str(vite_entry)],
-        name="frontend",
-        cwd=frontend_dir,
-        extra_env={
-            "DIRECTOR_FRONTEND_HOST": frontend_host,
-            "DIRECTOR_FRONTEND_PORT": frontend_port,
-            "DIRECTOR_API_ORIGIN": api_origin,
-            "DIRECTOR_TMPDIR": env("DIRECTOR_TMPDIR"),
-        },
-    )
-    try:
-        _wait_healthy("frontend", frontend_pid)
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        stop_process("frontend")
-        stop_process("backend")
-        return 1
+    if not running["frontend"]:
+        print(f"starting frontend on {frontend_host}:{frontend_port}")
+        frontend_pid = _spawn(
+            [str(node), str(vite_entry)],
+            name="frontend",
+            cwd=frontend_dir,
+            extra_env={
+                "DIRECTOR_FRONTEND_HOST": frontend_host,
+                "DIRECTOR_FRONTEND_PORT": frontend_port,
+                "DIRECTOR_API_ORIGIN": api_origin,
+                "DIRECTOR_TMPDIR": env("DIRECTOR_TMPDIR"),
+            },
+        )
+        try:
+            _wait_healthy("frontend", frontend_pid)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            stop_process("frontend")
+            # Roll back only what this invocation spawned; a backend that was
+            # already running before us must stay untouched.
+            for name in spawned:
+                stop_process(name)
+            return 1
+    else:
+        print("frontend 已在运行，跳过启动")
 
     print_service_url("Director-WebUI", frontend_host, frontend_port)
     print(f"Director 后端 API 监听: http://{backend_host}:{backend_port}")
@@ -360,8 +375,8 @@ def print_service_url(label: str, host: str, port: str) -> None:
 def start_comfyui(args: argparse.Namespace) -> int:
     del args
     if is_running("comfyui"):
-        print("comfyui is already running")
-        return 1
+        print("comfyui 已在运行，无需重复启动")
+        return 0
     root = env("DIRECTOR_COMFYUI_ROOT")
     if not root:
         print("DIRECTOR_COMFYUI_ROOT is not configured; run ./bootstrap.sh install first", file=sys.stderr)
