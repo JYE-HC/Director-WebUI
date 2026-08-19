@@ -87,6 +87,7 @@ export interface RuntimeSettings {
   client_id: string;
   memory_policy: MemoryPolicy;
   raylight_residency_policy: RayLightResidencyPolicy;
+  multi_gpu_enabled: boolean;
   models: SettingsModels;
 }
 
@@ -586,6 +587,7 @@ export const DEFAULT_SETTINGS: RuntimeSettings = {
   client_id: "director-web",
   memory_policy: "keep_resident",
   raylight_residency_policy: "keep_until_switch",
+  multi_gpu_enabled: false,
   models: {
     fl2va: {
       filename: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
@@ -734,6 +736,8 @@ export function sanitizeRuntimeSettings(value: unknown): RuntimeSettings {
     ].includes(String(value.raylight_residency_policy))
       ? value.raylight_residency_policy as RayLightResidencyPolicy
       : "keep_until_switch";
+  // Boolean intent flag; anything but an explicit true means disabled.
+  const multiGpuEnabled = value.multi_gpu_enabled === true;
   const models = isRecord(value.models) ? value.models : {};
 
   const normalizeModel = <K extends ModelRole>(role: K, allowCpu: boolean) => {
@@ -806,6 +810,7 @@ export function sanitizeRuntimeSettings(value: unknown): RuntimeSettings {
     client_id: clientId,
     memory_policy: memoryPolicy,
     raylight_residency_policy: raylightResidencyPolicy,
+    multi_gpu_enabled: multiGpuEnabled,
     models: {
       fl2va: normalizeModel("fl2va", true) as DiffusionModelBinding,
       ref2va: normalizeModel("ref2va", true) as DiffusionModelBinding,
@@ -843,3 +848,32 @@ export const EMPTY_RAYLIGHT_RUNTIME_STATUS: RayLightRuntimeStatus = {
   tainted: false,
   recovery_token: null,
 };
+
+/** Exact GET /api/raylight/setup payload (multi-GPU capability and install). */
+export type RayLightInstallState = "idle" | "running" | "needs_restart" | "failed";
+
+export interface RayLightInstallSnapshot {
+  state: RayLightInstallState;
+  log_tail: string[];
+  returncode: number | null;
+  error: string | null;
+  started_at: number | null;
+}
+
+export interface RayLightSetupStatus {
+  enabled: boolean;
+  platform_supported: boolean;
+  dependencies_installed: boolean;
+  requirements_available: boolean;
+  install: RayLightInstallSnapshot;
+}
+
+/** Exact GET /api/media/setup payload (ffmpeg/ffprobe capability and install). */
+export interface MediaToolsStatus {
+  ffmpeg_available: boolean;
+  ffprobe_available: boolean;
+  ffmpeg_path: string | null;
+  encoders_ok: boolean;
+  ready: boolean;
+  install: RayLightInstallSnapshot;
+}

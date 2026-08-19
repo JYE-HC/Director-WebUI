@@ -7,7 +7,10 @@ const frontendHost = process.env.DIRECTOR_FRONTEND_HOST || "127.0.0.1";
 const frontendPort = Number(process.env.DIRECTOR_FRONTEND_PORT || "4173");
 const apiOrigin = process.env.DIRECTOR_API_ORIGIN || "http://127.0.0.1:8787";
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  // Built assets are served by the ComfyUI plugin under /director/; a
+  // relative base keeps the same dist usable from any mount point.
+  base: command === "build" ? "./" : "/",
   plugins: [react()],
   server: {
     host: frontendHost,
@@ -30,4 +33,4 @@ export default defineConfig({
     // Testing Library error instead of a bare Vitest timeout.
     testTimeout: 20000,
   },
-});
+}));
