@@ -32,6 +32,7 @@ import {
   MINIMAX_H3_PROMPT_MAX_CHARACTERS,
   promptCharacterCount,
 } from "./promptLimits";
+import { isStoragePath } from "./storagePath";
 
 export type AssetGridSize = "small" | "medium" | "large";
 
@@ -3325,11 +3326,7 @@ function quarantineObsoleteTimelineStorage(): void {
 }
 
 function isActiveDatabaseIdentity(value: unknown): value is string {
-  return typeof value === "string" &&
-    value.length > 1 &&
-    value.length <= 4096 &&
-    value.startsWith("/") &&
-    !/[\u0000-\u001f\u007f]/.test(value);
+  return isStoragePath(value);
 }
 
 export interface TimelineWalDatabaseIdentity {

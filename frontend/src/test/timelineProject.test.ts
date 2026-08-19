@@ -2379,6 +2379,21 @@ describe("统一 timeline domain", () => {
     expect(localStorage.getItem(key)).toBe(raw);
   });
 
+  it("Windows 盘符数据库身份的 WAL 正常读写", () => {
+    localStorage.clear();
+    const windowsDatabase = {
+      active_database_path: "D:\\ComfyUI\\user\\directordeck\\database\\directordeck.sqlite3",
+    };
+    const base = createTimelineProject();
+    const pending = { ...structuredClone(base), title: "Windows 待同步" };
+    const wal = writeTimelineWal(base, pending, 7, "default", windowsDatabase, "tab-windows");
+
+    expect(wal).not.toBeNull();
+    expect(loadLocalTimelineWal(windowsDatabase, "default", "tab-windows")).toEqual(wal);
+    clearLocalTimelineWal(wal!);
+    expect(loadLocalTimelineWal(windowsDatabase, "default", "tab-windows")).toBeNull();
+  });
+
   it("损坏 hash 或 widened 项目失败封闭且原 bytes 保留为可见证据", () => {
     localStorage.clear();
     const base = createTimelineProject();

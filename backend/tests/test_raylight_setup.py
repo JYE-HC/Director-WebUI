@@ -183,3 +183,43 @@ async def test_setup_install_and_cancel_flow(
     await asyncio.wait_for(_wait_for_task(manager), timeout=10)
     status = await client.get("/api/raylight/setup")
     assert status.json()["install"]["state"] == "idle"
+
+
+async def test_constraint_file_survives_until_pip_executes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The torch constraint file must still exist while pip runs.
+
+    Regression: ``_run`` used to unlink the constraint file as soon as
+    ``_build_command`` returned, so pip received a ``--constraint`` pointing
+    at a deleted file and failed with "Could not open requirements file".
+    This test keeps the real ``_build_command`` and stubs only ``_execute``.
+    """
+    real_version = raylight_setup.importlib.metadata.version
+
+    def fake_version(distribution: str) -> str:
+        if distribution == "torch":
+            return "9.9.9"
+        return real_version(distribution)
+
+    monkeypatch.setattr(raylight_setup.importlib.metadata, "version", fake_version)
+
+    manager = RayLightInstallManager()
+    captured: dict[str, object] = {}
+
+    async def fake_execute(self: RayLightInstallManager, command: list[str]) -> None:
+        constraint = Path(command[command.index("--constraint") + 1])
+        captured["constraint"] = constraint
+        captured["exists_during_execute"] = constraint.exists()
+        if constraint.exists():
+            captured["content"] = constraint.read_text(encoding="utf-8")
+        manager.state = "needs_restart"
+        manager.returncode = 0
+
+    monkeypatch.setattr(RayLightInstallManager, "_execute", fake_execute)
+    await manager._run(Path("/tmp/fake-requirements.txt"), ["fake-pip", "install"])
+
+    assert captured["exists_during_execute"] is True
+    assert captured["content"] == "torch==9.9.9\n"
+    # The temp constraint file is still cleaned up once the install finishes.
+    assert not captured["constraint"].exists()

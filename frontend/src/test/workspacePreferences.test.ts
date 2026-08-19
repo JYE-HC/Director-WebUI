@@ -195,4 +195,14 @@ describe("时间线工作区浏览器偏好", () => {
     );
     expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project)).toBeNull();
   });
+
+  it("Windows 盘符数据库路径的分段选择偏好正常读写", () => {
+    const windowsDatabase = {
+      active_database_path: "D:\\ComfyUI\\user\\directordeck\\database\\directordeck.sqlite3",
+    };
+    const project = ["first", "second", "disabled"];
+    saveTimelineSegmentSelectionPreference(windowsDatabase, PROJECT_ID, project, ["second"]);
+    expect(loadTimelineSegmentSelectionPreference(windowsDatabase, PROJECT_ID, project))
+      .toEqual(["second"]);
+  });
 });

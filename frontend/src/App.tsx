@@ -41,6 +41,7 @@ import {
   type DroppedUploadResult,
 } from "./domain/assetDrag";
 import { randomSafeSeed } from "./domain/modes";
+import { isStoragePath } from "./domain/storagePath";
 import { persistUiTheme, readUiTheme } from "./domain/theme";
 import {
   loadTimelineSegmentSelectionPreference,
@@ -544,8 +545,7 @@ function quarantineUnboundRuntimeSettings(): void {
 }
 
 function validActiveDatabasePath(value: unknown): value is string {
-  return typeof value === "string" && value.length > 1 && value.length <= 4096 &&
-    value.startsWith("/") && !/[\u0000-\u001f\u007f]/.test(value);
+  return isStoragePath(value);
 }
 
 interface ActiveDatabaseIdentity {

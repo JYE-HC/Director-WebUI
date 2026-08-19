@@ -1500,6 +1500,25 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull());
   });
 
+  it("Windows 盘符数据库身份的同库 RuntimeSettings WAL 正常自动同步并清除", async () => {
+    const windowsDatabase = {
+      active_database_path: "D:\\ComfyUI\\user\\directordeck\\database\\directordeck.sqlite3",
+    };
+    const windowsSettings = { ...CONFIGURED_SETTINGS, client_id: "windows-database-pending" };
+    saveRuntimeSettingsWal(windowsSettings, windowsDatabase);
+    mockCommonRequests();
+    vi.mocked(directorApi.getStorage).mockResolvedValue(windowsDatabase);
+    vi.mocked(directorApi.getSettingsAuthority)
+      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
+      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
+      .mockResolvedValue(runtimeAuthority(windowsSettings));
+    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(windowsSettings);
+
+    render(<App />);
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(windowsSettings));
+    await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull());
+  });
+
   it("顶栏项目名可用键盘进入编辑，并实时同步且不显示任何保存控件", async () => {
     const user = userEvent.setup();
     mockCommonRequests();

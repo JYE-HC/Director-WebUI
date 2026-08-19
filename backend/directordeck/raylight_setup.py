@@ -168,6 +168,10 @@ class RayLightInstallManager:
                     handle.write(f"torch=={torch_version}\n")
                 constraint_path = Path(raw_path)
             command = self._build_command(requirements_path, constraint_path, installer)
+            # The constraint file must outlive the pip subprocess; deleting it
+            # before ``_execute`` finishes leaves pip with a ``--constraint``
+            # pointing at a missing file.
+            await self._execute(command)
         except Exception as exc:  # noqa: BLE001 - surfaced in the status payload
             self.state = "failed"
             self.error = f"{type(exc).__name__}: {exc}"
@@ -176,7 +180,6 @@ class RayLightInstallManager:
         finally:
             if constraint_path is not None:
                 constraint_path.unlink(missing_ok=True)
-        await self._execute(command)
 
     async def _execute(self, command: list[str]) -> None:
         try:
