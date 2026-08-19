@@ -830,6 +830,8 @@ class Database:
             # Re-running this pass is idempotent through source_child_id.
             self._backfill_segment_takes_in_connection(db)
 
+        self._converge_pinned_comfy_url()
+
     @staticmethod
     def _exact_segment_take_output(child: dict[str, Any]) -> dict[str, str] | None:
         segment_ids = child.get("segment_ids")
@@ -1054,6 +1056,34 @@ class Database:
         if self.pinned_comfy_url is None:
             return settings
         return settings.model_copy(update={"comfy_url": self.pinned_comfy_url})
+
+    def _converge_pinned_comfy_url(self) -> None:
+        """Persist the pinned ComfyUI address over a stale stored value.
+
+        Runs at the end of ``initialize()`` — after every migration, before
+        the app serves — so a host ``--port`` change cannot leave the raw
+        stored origin disagreeing with the pinned value transaction-level
+        origin checks compare against (an upload was once rejected as a
+        phantom endpoint switch).  The staleness check deliberately reads the
+        raw stored document: the pinned read-path override always reports
+        equality and would never converge the row (this is also why the old
+        HTTP seeder went silent).  The write goes through ``put_settings``,
+        making convergence exactly one ordinary server-side settings write
+        with the usual revision/authority-token semantics.  Standalone
+        (unpinned) databases are never written here.
+        """
+        if self.pinned_comfy_url is None:
+            return
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT document FROM settings WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("settings row is missing")
+        stored = json.loads(row["document"]).get("comfy_url")
+        if stored == self.pinned_comfy_url:
+            return
+        self.put_settings(self.get_settings())
 
     def get_settings_authority(self) -> tuple[RuntimeSettings, str]:
         with self.connect() as db:

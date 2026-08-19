@@ -115,6 +115,68 @@ async def test_pinned_comfy_url_put_response_matches_authoritative_get(
     assert put.content == get.content
 
 
+def _stored_settings_row(database: Database) -> tuple[dict, int]:
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT document, revision FROM settings WHERE singleton = 1"
+        ).fetchone()
+    return json.loads(row["document"]), int(row["revision"])
+
+
+def test_pinned_database_initialize_converges_a_stale_stored_comfy_url(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "director.sqlite3"
+    unpinned = Database(path)
+    unpinned.initialize()
+    unpinned.put_settings(default_settings("http://127.0.0.1:8188"))
+    _, revision_before = _stored_settings_row(unpinned)
+
+    # Simulates a host --port change: the stored row predates the new pinned
+    # value. Startup convergence must rewrite it once, through the ordinary
+    # settings write path (revision +1), so transaction-level origin checks
+    # stop disagreeing with the pinned read path.
+    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
+    database.initialize()
+
+    document, revision_after = _stored_settings_row(database)
+    assert document["comfy_url"] == PINNED_LOOPBACK_URL
+    assert revision_after == revision_before + 1
+    assert database.get_settings().comfy_url == PINNED_LOOPBACK_URL
+
+
+def test_pinned_database_initialize_does_not_rewrite_a_converged_comfy_url(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "director.sqlite3"
+    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
+    database.initialize()
+    document_before, revision_before = _stored_settings_row(database)
+    assert document_before["comfy_url"] == PINNED_LOOPBACK_URL
+
+    database.initialize()
+
+    document_after, revision_after = _stored_settings_row(database)
+    assert revision_after == revision_before
+    assert document_after == document_before
+
+
+def test_standalone_database_initialize_preserves_the_stored_comfy_url(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "director.sqlite3"
+    database = Database(path)
+    database.initialize()
+    database.put_settings(default_settings("http://127.0.0.1:8188"))
+    _, revision_before = _stored_settings_row(database)
+
+    database.initialize()
+
+    document, revision_after = _stored_settings_row(database)
+    assert document["comfy_url"] == "http://127.0.0.1:8188"
+    assert revision_after == revision_before
+
+
 async def test_standalone_put_comfy_url_persists_the_user_value(
     tmp_path: Path,
 ) -> None:
