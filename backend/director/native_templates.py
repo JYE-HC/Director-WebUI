@@ -1696,6 +1696,12 @@ def compile_native_timeline(
         family = segment.mode
         binding = getattr(settings.models, family)
         backend = resolve_execution_backend(binding)
+        if backend == "raylight" and not settings.multi_gpu_enabled:
+            raise NativeTemplateError(
+                "multi-GPU inference is disabled; enable it in system settings "
+                "(installs the RayLight components and requires a restart) or "
+                f"reduce {family}.raylight.gpu_select to a single GPU"
+            )
         if backend == "raylight" and binding.device != "default":
             raise NativeTemplateError(
                 f"{family}.device must be 'default' when RayLight is enabled; "

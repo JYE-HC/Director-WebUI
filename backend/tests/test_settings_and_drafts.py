@@ -395,6 +395,7 @@ def test_initialize_migrates_legacy_negative_prompts_and_new_defaults(tmp_path) 
 def _fl_raylight_settings(*, residency_policy: str) -> RuntimeSettings:
     document = default_settings("http://comfy.test:8188").model_dump(mode="json")
     document["raylight_residency_policy"] = residency_policy
+    document["multi_gpu_enabled"] = True
     document["models"]["fl2va"].update(
         {
             "backend": "raylight",

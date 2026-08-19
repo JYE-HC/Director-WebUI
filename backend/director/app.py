@@ -50,12 +50,22 @@ from .database import (
     TimelineRevisionExhausted,
 )
 from .instance_lock import DirectorInstanceLock
+from .public_url import public_api_url, set_public_api_prefix
+from .raylight_setup import (
+    RayLightInstallConflict,
+    RayLightInstallManager,
+    RayLightInstallUnavailable,
+    default_requirements_path as raylight_default_requirements_path,
+    dependencies_installed as raylight_dependencies_installed,
+    platform_supported as raylight_platform_supported,
+)
 from .media import (
     MediaToolError,
     assemble_video_bytes,
     create_24fps_proxy_file,
     detect_shots_bytes,
 )
+from .media_setup import FFmpegInstallManager, ensure_media_tools_on_path, media_tools_status
 from .native_templates import (
     ModelFamily,
     NativeCompileResult,
@@ -806,7 +816,7 @@ def _segment_results(
             {
                 "segment_id": segment_id,
                 "child_id": str(child["id"]),
-                "output_url": (
+                "output_url": public_api_url(
                     f"/api/jobs/{quote(str(job['id']), safe='')}/segment-output"
                     f"?segment_id={quote(segment_id, safe='')}"
                 ),
@@ -1073,7 +1083,10 @@ def _job_read(
     current_snapshot: bool = False,
     current_project: bool = False,
 ) -> JobRead:
-    outputs = [f"/api/jobs/{job['id']}/outputs/{index}" for index, _ in enumerate(job["outputs"])]
+    outputs = [
+        public_api_url(f"/api/jobs/{job['id']}/outputs/{index}")
+        for index, _ in enumerate(job["outputs"])
+    ]
     output_files = [_output_file_location(output) for output in job["outputs"]]
     segment_results = _segment_results(job, current_snapshot=current_snapshot)
     visible_output_files = set(output_files)
@@ -1104,7 +1117,7 @@ def _job_read(
             "error_summary": _job_error_summary(job),
             "segment_results": segment_results,
             "live_preview_url": (
-                f"/api/jobs/{quote(str(job['id']), safe='')}/live-preview"
+                public_api_url(f"/api/jobs/{quote(str(job['id']), safe='')}/live-preview")
                 if live_preview_available and job["status"] not in _TERMINAL_STATUSES
                 else None
             ),
@@ -5811,7 +5824,10 @@ def create_app(
     comfy_factory: ComfyFactory | None = None,
     storage_config_path: str | Path | None = None,
     legacy_database_path: str | Path | None = None,
+    public_api_prefix: str = "",
+    raylight_requirements_path: str | Path | None = None,
 ) -> FastAPI:
+    set_public_api_prefix(public_api_prefix)
     storage = StorageController.resolve(
         database_path,
         storage_config_path=storage_config_path,
@@ -6024,6 +6040,7 @@ def create_app(
         # process must not migrate SQLite, claim recovery rows, or contact
         # ComfyUI before startup fails with an actionable owner diagnostic.
         instance_lock.acquire()
+        ensure_media_tools_on_path()
         try:
             async with managed_lifespan(app):
                 yield
@@ -6045,6 +6062,13 @@ def create_app(
     app.state.comfy_factory = comfy_factory or default_comfy_factory
     app.state.progress_manager = progress_manager
     app.state.live_preview_cache = live_preview_cache
+    app.state.raylight_install_manager = RayLightInstallManager()
+    app.state.ffmpeg_install_manager = FFmpegInstallManager()
+    app.state.raylight_requirements_path = (
+        Path(raylight_requirements_path)
+        if raylight_requirements_path is not None
+        else raylight_default_requirements_path()
+    )
     app.state.reconcile_wake_event = reconcile_wake_event
     app.state.prompt_terminal_events = prompt_terminal_events
     app.state.task_change_event = task_change_event
@@ -6476,6 +6500,71 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         _assert_runtime_authority(request, authority)
         return models
+
+    @app.get("/api/media/setup")
+    async def get_media_setup(request: Request) -> dict[str, Any]:
+        status = media_tools_status()
+        status["install"] = request.app.state.ffmpeg_install_manager.snapshot()
+        return status
+
+    @app.post("/api/media/ffmpeg/install")
+    async def post_media_ffmpeg_install(request: Request) -> dict[str, Any]:
+        manager = request.app.state.ffmpeg_install_manager
+        try:
+            await manager.start_install()
+        except RayLightInstallUnavailable as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RayLightInstallConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return manager.snapshot()
+
+    @app.post("/api/media/ffmpeg/cancel")
+    async def post_media_ffmpeg_cancel(request: Request) -> dict[str, Any]:
+        manager = request.app.state.ffmpeg_install_manager
+        await manager.cancel()
+        return manager.snapshot()
+
+    @app.get("/api/raylight/setup")
+    async def get_raylight_setup(request: Request) -> dict[str, Any]:
+        requirements_path = request.app.state.raylight_requirements_path
+        settings = _db(request).get_settings()
+        return {
+            "enabled": settings.multi_gpu_enabled,
+            "platform_supported": raylight_platform_supported(),
+            "dependencies_installed": raylight_dependencies_installed(),
+            "requirements_available": (
+                requirements_path is not None and requirements_path.is_file()
+            ),
+            "install": request.app.state.raylight_install_manager.snapshot(),
+        }
+
+    @app.post("/api/raylight/setup/install")
+    async def post_raylight_setup_install(request: Request) -> dict[str, Any]:
+        if not raylight_platform_supported():
+            raise HTTPException(
+                status_code=400,
+                detail="multi-GPU inference requires Linux on this release",
+            )
+        requirements_path = request.app.state.raylight_requirements_path
+        if requirements_path is None or not requirements_path.is_file():
+            raise HTTPException(
+                status_code=400,
+                detail="RayLight requirements file is not available in this installation",
+            )
+        manager = request.app.state.raylight_install_manager
+        try:
+            await manager.start(requirements_path)
+        except RayLightInstallUnavailable as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RayLightInstallConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return manager.snapshot()
+
+    @app.post("/api/raylight/setup/cancel")
+    async def post_raylight_setup_cancel(request: Request) -> dict[str, Any]:
+        manager = request.app.state.raylight_install_manager
+        await manager.cancel()
+        return manager.snapshot()
 
     @app.get(
         "/api/raylight/runtime",
@@ -7275,7 +7364,7 @@ def create_app(
                     "id": asset_id,
                     "filename": name,
                     "path": path,
-                    "preview_url": f"/api/assets/{asset_id}/preview",
+                    "preview_url": public_api_url(f"/api/assets/{asset_id}/preview"),
                     "content_hash": content_hash,
                     "metadata": (
                         metadata.model_dump(mode="json")

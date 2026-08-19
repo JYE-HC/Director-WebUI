@@ -111,6 +111,8 @@ def _settings(
     *, fl_backend: str = "standard", ref_backend: str = "standard"
 ) -> RuntimeSettings:
     value = default_settings("http://comfy.test:8188").model_dump(mode="json")
+    if "raylight" in (fl_backend, ref_backend):
+        value["multi_gpu_enabled"] = True
     for family, backend in (("fl2va", fl_backend), ("ref2va", ref_backend)):
         raylight = backend == "raylight"
         value["models"][family]["backend"] = backend
@@ -877,6 +879,7 @@ def test_auto_backend_and_explicit_standard_device_are_fail_closed() -> None:
     assert selector["inputs"]["device"] == "gpu:3"
 
     raw = one_gpu.model_dump(mode="json")
+    raw["multi_gpu_enabled"] = True
     raw["models"]["fl2va"]["raylight"].update(
         gpu_select=[0, 1], ulysses_degree=2
     )
@@ -889,6 +892,25 @@ def test_auto_backend_and_explicit_standard_device_are_fail_closed() -> None:
     available.remove("RayUNETLoader")
     with pytest.raises(NativeTemplateError, match="RayUNETLoader"):
         validate_native_capabilities(raylight, available)
+
+
+def test_raylight_pool_requires_multi_gpu_enabled() -> None:
+    raw = default_settings("http://comfy.test:8188").model_dump(mode="json")
+    raw["models"]["fl2va"]["raylight"].update(
+        gpu_select=[0, 1], ulysses_degree=2
+    )
+    with pytest.raises(
+        NativeTemplateError, match="multi-GPU inference is disabled"
+    ):
+        compile_native_timeline(
+            _draft("t2v"), RuntimeSettings.model_validate(raw), "job-gated"
+        )
+
+    raw["multi_gpu_enabled"] = True
+    enabled = compile_native_timeline(
+        _draft("t2v"), RuntimeSettings.model_validate(raw), "job-gated-enabled"
+    )
+    assert enabled.workflows[0].backend == "raylight"
 
 
 def test_runtime_capability_check_rejects_same_name_custom_node_override() -> None:
