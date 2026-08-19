@@ -8,7 +8,6 @@ interface SidebarProps {
   activeMode: GenerationMode;
   view: AppView;
   connection: CapabilityReport["connection"];
-  runtimeConfigured: boolean;
   onModeSelect: (mode: GenerationMode) => void;
   onSettingsSelect: () => void;
 }
@@ -18,24 +17,17 @@ export function Sidebar({
   activeMode,
   view,
   connection,
-  runtimeConfigured,
   onModeSelect,
   onSettingsSelect,
 }: SidebarProps) {
   const runtimeLabel = connection === "offline"
     ? "ComfyUI 离线"
-    : !runtimeConfigured
-      ? "ComfyUI 尚未配置"
-      : connection === "online"
-        ? "ComfyUI 已连接"
-        : connection === "checking"
-          ? "正在检测 ComfyUI"
-          : "等待 ComfyUI 状态";
-  const statusState = connection === "offline"
-    ? "offline"
-    : runtimeConfigured
-      ? connection
-      : "unknown";
+    : connection === "online"
+      ? "ComfyUI 已连接"
+      : connection === "checking"
+        ? "正在检测 ComfyUI"
+        : "等待 ComfyUI 状态";
+  const statusState = connection === "offline" ? "offline" : connection;
   return (
     <aside id={id} className="sidebar">
       <div className="brand">

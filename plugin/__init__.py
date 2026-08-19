@@ -4,15 +4,13 @@ Embeds the Director Web backend (FastAPI) into the ComfyUI process:
 
 - runs the Director backend with uvicorn on a daemon thread bound to
   127.0.0.1 (internal loopback only, never user facing);
-- serves the built frontend from ``dist/`` under ``/director/``;
-- reverse-proxies ``/director/api/*`` to the internal backend with fully
+- serves the built frontend from ``dist/`` under ``/directordeck/``;
+- reverse-proxies ``/directordeck/api/*`` to the internal backend with fully
   streamed request/response bodies (SSE, Range media, large uploads);
-- exposes ``/director/status`` for the menu extension and the SPA to learn
+- exposes ``/directordeck/status`` for the menu extension and the SPA to learn
   backend state without touching the proxy;
-- pins ``comfy_url`` to this ComfyUI instance's loopback address: the backend
-  settings layer forces every read/write to that value, and a startup seeder
-  additionally converges the stored row (reseeds stale loopback values after
-  ``--port`` changes);
+- injects this ComfyUI instance's loopback address into the backend at
+  construction; the ComfyUI address is not a setting and is never persisted;
 - registers the bundled MiniMax-H3-Turbo nodes unconditionally and the
   bundled Director-fork RayLight nodes behind a platform/dependency/conflict
   gate (multi-GPU is opt-in, see docs).
@@ -133,7 +131,7 @@ def _load_bundled_nodes() -> None:
         try:
             count = _load_node_pack(turbo_dir, "director_deck_minimax_h3_turbo")
             LOGGER.info("Director: registered %d MiniMax-H3-Turbo nodes", count)
-        except Exception as exc:  # noqa: BLE001 - recorded for /director/status
+        except Exception as exc:  # noqa: BLE001 - recorded for /directordeck/status
             _state.nodes_error = f"MiniMax-H3-Turbo: {type(exc).__name__}: {exc}"
             LOGGER.exception("Director: failed to load bundled MiniMax-H3-Turbo nodes")
 
@@ -161,7 +159,7 @@ def _load_bundled_nodes() -> None:
         count = _load_node_pack(raylight_dir, "director_deck_raylight")
         _state.raylight = "registered"
         LOGGER.info("Director: registered %d RayLight nodes", count)
-    except Exception as exc:  # noqa: BLE001 - recorded for /director/status
+    except Exception as exc:  # noqa: BLE001 - recorded for /directordeck/status
         _state.raylight = "load_failed"
         _state.raylight_detail = f"{type(exc).__name__}: {exc}"
         LOGGER.exception("Director: failed to load bundled RayLight nodes")
@@ -183,13 +181,13 @@ def _internal_port() -> int:
     raise RuntimeError("DirectorDeck: no free loopback port for the backend")
 
 
-def _database_locations() -> tuple[Path, Path]:
-    """Database lives under ComfyUI's user dir, never inside the plugin dir."""
+def _database_location() -> Path:
+    """The database lives under ComfyUI's user dir, never in the plugin dir."""
     import folder_paths
 
-    db_dir = Path(folder_paths.get_user_directory()) / "director" / "database"
+    db_dir = Path(folder_paths.get_user_directory()) / "directordeck" / "database"
     db_dir.mkdir(parents=True, exist_ok=True)
-    return db_dir / "director.sqlite3", db_dir / "storage.json"
+    return db_dir / "directordeck.sqlite3"
 
 
 def _comfyui_loopback_url() -> str:
@@ -231,21 +229,21 @@ def _comfyui_version_check() -> str | None:
     return None
 
 
-def _run_backend(database_path: Path, storage_config_path: Path) -> None:
+def _run_backend(database_path: Path) -> None:
     try:
         if str(_BACKEND_PATH) not in sys.path:
             sys.path.insert(0, str(_BACKEND_PATH))
         import uvicorn
 
-        from director.app import create_app
-        from director.instance_lock import (
+        from directordeck.app import create_app
+        from directordeck.instance_lock import (
             DirectorInstanceLock,
             DirectorInstanceLockError,
         )
 
         # Probe the single-instance lock ourselves: uvicorn converts a
         # lifespan startup failure into SystemExit, which would hide the
-        # actionable owner diagnostic from /director/status.
+        # actionable owner diagnostic from /directordeck/status.
         probe = DirectorInstanceLock(database_path)
         try:
             probe.acquire()
@@ -259,13 +257,9 @@ def _run_backend(database_path: Path, storage_config_path: Path) -> None:
 
         app = create_app(
             database_path=database_path,
-            storage_config_path=storage_config_path,
-            public_api_prefix="/director",
+            comfy_url=_comfyui_loopback_url(),
+            public_api_prefix="/directordeck",
             raylight_requirements_path=_PLUGIN_ROOT / "requirements-raylight.txt",
-            # Embedded mode hard-pins comfy_url to this ComfyUI instance's
-            # loopback address: the settings layer overrides every read and
-            # normalizes every write, so the address is not user-configurable.
-            pinned_comfy_url=_comfyui_loopback_url(),
         )
         _state.version = app.version
         port = _internal_port()
@@ -285,7 +279,7 @@ def _run_backend(database_path: Path, storage_config_path: Path) -> None:
             loop.run_until_complete(server.serve())
         finally:
             loop.close()
-    except BaseException as exc:  # noqa: BLE001 - surfaced via /director/status
+    except BaseException as exc:  # noqa: BLE001 - surfaced via /directordeck/status
         _state.status = "failed"
         _state.error = f"{type(exc).__name__}: {exc}"
         LOGGER.exception("Director backend failed to start")
@@ -294,69 +288,6 @@ def _run_backend(database_path: Path, storage_config_path: Path) -> None:
         # serve() returned without an exception but the ready flag may never
         # have been set (e.g. early shutdown).
         _state.status = "failed" if _state.error else "stopped"
-
-
-_LOOPBACK_ORIGIN_PREFIXES = (
-    "http://127.0.0.1",
-    "https://127.0.0.1",
-    "http://localhost",
-    "https://localhost",
-    "http://[::1]",
-    "https://[::1]",
-)
-
-
-def _seed_comfy_url() -> None:
-    """Point ``comfy_url`` at this ComfyUI instance's loopback address.
-
-    Seeds when unset and reseeds a stale loopback value (e.g. after the
-    user restarts ComfyUI with a different ``--port``).  Non-loopback
-    values are user-authored and stay authoritative.
-    """
-    import json
-    import time
-    import urllib.error
-    import urllib.request
-
-    deadline = time.monotonic() + 60.0
-    while time.monotonic() < deadline:
-        if _state.status != "starting":
-            break
-        server = _state.server
-        if server is not None and server.started:
-            break
-        time.sleep(0.25)
-    if _state.status != "starting" or _state.port is None:
-        return
-    base = f"http://127.0.0.1:{_state.port}"
-    try:
-        with urllib.request.urlopen(f"{base}/api/settings", timeout=5) as resp:
-            settings = json.load(resp)
-    except (OSError, urllib.error.URLError, ValueError) as exc:
-        LOGGER.warning("Director: could not read settings for comfy_url seeding: %s", exc)
-        return
-    desired = _comfyui_loopback_url()
-    current = str(settings.get("comfy_url") or "").strip()
-    if current == desired:
-        return
-    if current and not current.startswith(_LOOPBACK_ORIGIN_PREFIXES):
-        return
-    settings["comfy_url"] = desired
-    request = urllib.request.Request(
-        f"{base}/api/settings",
-        data=json.dumps(settings).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="PUT",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=10):
-            pass
-        if current:
-            LOGGER.info("Director: comfy_url reseeded %s -> %s", current, desired)
-        else:
-            LOGGER.info("Director: comfy_url seeded to %s", desired)
-    except (OSError, urllib.error.URLError) as exc:
-        LOGGER.warning("Director: comfy_url seeding failed: %s", exc)
 
 
 def _shutdown_backend() -> None:
@@ -375,17 +306,16 @@ def _start_backend() -> None:
         _state.error = version_error
         LOGGER.error("Director backend cannot start: %s", version_error)
         return
-    database_path, storage_config_path = _database_locations()
+    database_path = _database_location()
     _state.database_path = str(database_path)
     thread = threading.Thread(
         target=_run_backend,
-        args=(database_path, storage_config_path),
-        name="director-backend",
+        args=(database_path,),
+        name="directordeck-backend",
         daemon=True,
     )
     _state.thread = thread
     thread.start()
-    threading.Thread(target=_seed_comfy_url, name="director-seed", daemon=True).start()
     atexit.register(_shutdown_backend)
 
 
@@ -416,7 +346,7 @@ def _register_routes() -> None:
     prompt_server.app.on_shutdown.append(_on_comfy_shutdown)
     routes = prompt_server.routes
 
-    @routes.get("/director/status")
+    @routes.get("/directordeck/status")
     async def _director_status(_request: web.Request) -> web.Response:
         if _state.status == "starting" and _state.server is not None and _state.server.started:
             _state.status = "ready"
@@ -426,7 +356,7 @@ def _register_routes() -> None:
                 "error": _state.error,
                 "version": _state.version,
                 "database_path": _state.database_path,
-                "comfy_url_seed": _comfyui_loopback_url(),
+                "comfy_url": _comfyui_loopback_url(),
                 "raylight": {
                     "status": _state.raylight,
                     "detail": _state.raylight_detail,
@@ -435,20 +365,20 @@ def _register_routes() -> None:
             }
         )
 
-    @routes.get("/director")
+    @routes.get("/directordeck")
     async def _director_root(_request: web.Request) -> web.Response:
-        raise web.HTTPFound("/director/")
+        raise web.HTTPFound("/directordeck/")
 
-    @routes.route("*", "/director/api/{tail:.*}")
+    @routes.route("*", "/directordeck/api/{tail:.*}")
     async def _director_api_proxy(request: web.Request) -> web.StreamResponse:
         if _state.status == "failed":
             return web.json_response(
-                {"error": "director_backend_failed", "detail": _state.error}, status=503
+                {"error": "directordeck_backend_failed", "detail": _state.error}, status=503
             )
         server = _state.server
         if server is None or not server.started or _state.port is None:
             return web.json_response(
-                {"error": "director_backend_starting"}, status=503
+                {"error": "directordeck_backend_starting"}, status=503
             )
         session = await _get_proxy_session()
         tail = request.match_info["tail"]
@@ -471,7 +401,7 @@ def _register_routes() -> None:
             )
         except OSError as exc:
             return web.json_response(
-                {"error": "director_backend_unreachable", "detail": str(exc)}, status=502
+                {"error": "directordeck_backend_unreachable", "detail": str(exc)}, status=502
             )
         response_headers = {
             name: value
@@ -494,16 +424,16 @@ def _register_routes() -> None:
     if _DIST_DIR.is_dir():
         index_file = _DIST_DIR / "index.html"
 
-        @routes.get("/director/")
+        @routes.get("/directordeck/")
         async def _director_index(_request: web.Request) -> web.Response:
             if not index_file.is_file():
                 raise web.HTTPNotFound
             return web.FileResponse(index_file)
 
         # Root-level dist files (favicon, manifest, …). Single-segment only;
-        # /director/status, /director/api/* and /director/assets/* are all
+        # /directordeck/status, /directordeck/api/* and /directordeck/assets/* are all
         # registered before this fallback and win their matches.
-        @routes.get("/director/{filename:[^/]+}")
+        @routes.get("/directordeck/{filename:[^/]+}")
         async def _director_dist_file(request: web.Request) -> web.Response:
             candidate = (_DIST_DIR / request.match_info["filename"]).resolve()
             if candidate.parent != _DIST_DIR or not candidate.is_file():
@@ -513,7 +443,7 @@ def _register_routes() -> None:
         assets_dir = _DIST_DIR / "assets"
         if assets_dir.is_dir():
             prompt_server.app.add_routes(
-                [web.static("/director/assets/", str(assets_dir), show_index=False)]
+                [web.static("/directordeck/assets/", str(assets_dir), show_index=False)]
             )
     else:
         LOGGER.warning("Director: frontend dist not found at %s", _DIST_DIR)

@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 import httpx
 
-from .schemas import AssetKind, RuntimeSettings
+from .schemas import AssetKind
 
 
 class ComfyError(RuntimeError):
@@ -416,7 +416,7 @@ class ComfyClient:
         async with self._http(timeout=300) as client:
             # ComfyUI's standard upload endpoint stores arbitrary input media;
             # the historical Director chunk route is intentionally not used.
-            data = {"type": "input", "subfolder": "director-web"}
+            data = {"type": "input", "subfolder": "directordeck"}
             if isinstance(content, Path):
                 with content.open("rb") as stream:
                     response = await client.post(
@@ -665,5 +665,5 @@ class ComfyClient:
             raise
 
 
-def default_comfy_factory(settings: RuntimeSettings) -> ComfyClient:
-    return ComfyClient(str(settings.comfy_url))
+def default_comfy_factory(comfy_url: str) -> ComfyClient:
+    return ComfyClient(comfy_url)

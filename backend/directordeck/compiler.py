@@ -775,7 +775,7 @@ def _unified_cache_key(
     family = segment.mode
     payload = {
         # Timeline v4 also moved media policies onto each segment.
-        "schema": "director-web-segment-cache-v4",
+        "schema": "directordeck-segment-cache-v4",
         "segment": segment.model_dump(mode="json"),
         "render": draft.render.model_dump(mode="json"),
         # Cache identity follows the exact family branch used by this segment;
@@ -787,7 +787,6 @@ def _unified_cache_key(
         "clip": settings.models.clip.model_dump(mode="json"),
         "video_vae": settings.models.video_vae.model_dump(mode="json"),
         "audio_vae": settings.models.audio_vae.model_dump(mode="json"),
-        "comfy_origin": str(settings.comfy_url).rstrip("/"),
         "predecessor_cache_key": predecessor_cache_key,
         # Continuity phase alignment may trim and rewrite this segment after
         # observing the next segment. Include that boundary in the physical

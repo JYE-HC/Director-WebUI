@@ -9,7 +9,7 @@ plugin repository:
     ├── __init__.py        # plugin entry (from plugin/)
     ├── pyproject.toml     # registry manifest (from plugin/)
     ├── web/               # WEB_DIRECTORY sidebar extension (from plugin/)
-    ├── backend/director/  # Director backend package (from backend/)
+    ├── backend/directordeck/  # Director backend package (from backend/)
     └── dist/              # built frontend (from frontend/dist, run npm build first)
 """
 
@@ -45,7 +45,7 @@ def assemble() -> None:
     )
     shutil.copytree(PROJECT_ROOT / "plugin" / "web", BUILD_DIR / "web", ignore=IGNORE)
     shutil.copytree(
-        PROJECT_ROOT / "backend" / "director", BUILD_DIR / "backend" / "director",
+        PROJECT_ROOT / "backend" / "directordeck", BUILD_DIR / "backend" / "directordeck",
         ignore=IGNORE,
     )
     shutil.copytree(dist_src, BUILD_DIR / "dist", ignore=IGNORE)

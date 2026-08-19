@@ -6,8 +6,8 @@ import types
 
 import pytest
 
-import director.media_setup as media_setup
-from director.media_setup import (
+import directordeck.media_setup as media_setup
+from directordeck.media_setup import (
     FFmpegInstallManager,
     ensure_media_tools_on_path,
     media_tools_status,
@@ -89,7 +89,7 @@ async def test_ffmpeg_install_success_reports_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "director.raylight_setup._select_installer",
+        "directordeck.raylight_setup._select_installer",
         lambda: [sys.executable, "-c", "pass"],
     )
     manager = FFmpegInstallManager()
@@ -113,7 +113,7 @@ async def test_media_install_endpoint_flow(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "director.raylight_setup._select_installer",
+        "directordeck.raylight_setup._select_installer",
         lambda: [sys.executable, "-c", "pass"],
     )
     started = await client.post("/api/media/ffmpeg/install")

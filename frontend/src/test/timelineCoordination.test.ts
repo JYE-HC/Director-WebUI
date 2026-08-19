@@ -5,7 +5,7 @@ import {
 } from "../state/timelineCoordination";
 
 const scope = {
-  databaseIdentity: "a".repeat(64),
+  databasePath: "/srv/directordeck/data/directordeck.sqlite3".repeat(64),
   projectId: "project-private-name",
 };
 

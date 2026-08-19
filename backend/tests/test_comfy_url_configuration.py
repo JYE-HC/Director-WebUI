@@ -1,325 +1,53 @@
+"""Embedded-mode contract: the ComfyUI address is injected, never a setting.
+
+The plugin passes the host instance's loopback URL to ``create_app``. The
+persisted settings document has no URL field, the connection test probes the
+injected address, and there is no standalone/unconfigured state.
+"""
+
 from __future__ import annotations
 
-import json
-import sqlite3
 from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
-from director.app import create_app
-from director.comfy import ComfyError
-from director.database import Database
-from director.schemas import default_settings
+from directordeck.app import create_app
+from directordeck.comfy import ComfyError
+from directordeck.schemas import RuntimeSettings, default_settings
 
-from .conftest import runnable_draft, runtime_authority_headers
+from .conftest import TEST_COMFY_URL, runtime_authority_headers
 
 
-def test_default_settings_has_an_explicit_empty_comfy_url() -> None:
+def test_runtime_settings_have_no_comfy_url_field() -> None:
     settings = default_settings()
 
-    assert settings.comfy_url == ""
-    assert settings.model_dump(mode="json")["comfy_url"] == ""
+    assert "comfy_url" not in settings.model_dump(mode="json")
+    # Pre-plugin documents carrying a URL are rejected outright; the era's
+    # local databases were deleted with the transition.
     with pytest.raises(ValidationError):
-        default_settings("ftp://comfy.test:8188")
-
-
-def test_comfy_url_is_persisted_verbatim(tmp_path: Path) -> None:
-    app = create_app(database_path=tmp_path / "director.sqlite3")
-    app.state.database.initialize()
-
-    for url in (
-        "http://127.0.0.1:28188",
-        "http://127.0.0.1:28188/",
-        "https://comfy.example.com:8443/base/",
-    ):
-        app.state.database.put_settings(default_settings(url))
-        assert app.state.database.get_settings().comfy_url == url
-
-
-def test_fresh_database_ignores_env_and_restart_preserves_saved_url(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = tmp_path / "director.sqlite3"
-    monkeypatch.setenv("DIRECTOR_COMFYUI_URL", "http://env-must-not-win.test:8188")
-
-    first_app = create_app(database_path=path)
-    first_app.state.database.initialize()
-    assert first_app.state.database.get_settings().comfy_url == ""
-
-    first_app.state.database.put_settings(default_settings("http://saved-comfy.test:8188"))
-    restarted_app = create_app(database_path=path)
-    restarted_app.state.database.initialize()
-
-    assert (
-        str(restarted_app.state.database.get_settings().comfy_url).rstrip("/")
-        == "http://saved-comfy.test:8188"
-    )
-
-
-PINNED_LOOPBACK_URL = "http://127.0.0.1:28181"
-
-
-def test_pinned_comfy_url_overrides_reads_and_normalizes_writes(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "director.sqlite3"
-    unpinned = Database(path)
-    unpinned.initialize()
-    unpinned.put_settings(default_settings("http://stale-loopback.test:8188"))
-
-    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
-    # A stale value stored before the plugin pinned the address is overridden
-    # on every public read path.
-    assert database.get_settings().comfy_url == PINNED_LOOPBACK_URL
-    settings, _authority = database.get_settings_authority()
-    assert settings.comfy_url == PINNED_LOOPBACK_URL
-
-    # Writes normalize to the pinned value before persisting, and the
-    # normalized document is what the write path returns.
-    returned = database.put_settings(default_settings("http://user-typed.test:9000"))
-    assert returned.comfy_url == PINNED_LOOPBACK_URL
-    assert database.get_settings().comfy_url == PINNED_LOOPBACK_URL
-    with database.connect() as db:
-        row = db.execute(
-            "SELECT document FROM settings WHERE singleton = 1"
-        ).fetchone()
-    assert json.loads(row["document"])["comfy_url"] == PINNED_LOOPBACK_URL
-
-
-async def test_pinned_comfy_url_put_response_matches_authoritative_get(
-    tmp_path: Path,
-) -> None:
-    app = create_app(
-        database_path=tmp_path / "director.sqlite3",
-        pinned_comfy_url=PINNED_LOOPBACK_URL,
-    )
-    app.state.database.initialize()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
-        base_url="http://testserver",
-    ) as client:
-        put = await client.put(
-            "/api/settings",
-            json=default_settings("http://elsewhere.test:9000").model_dump(mode="json"),
-        )
-        assert put.status_code == 200, put.text
-        get = await client.get("/api/settings")
-        assert get.status_code == 200
-
-    assert put.json()["comfy_url"] == PINNED_LOOPBACK_URL
-    # The browser compares its PUT draft with the authoritative GET
-    # byte-for-byte; the normalized PUT response must match it exactly or the
-    # latest-wins queue retries forever.
-    assert put.content == get.content
-
-
-def _stored_settings_row(database: Database) -> tuple[dict, int]:
-    with database.connect() as db:
-        row = db.execute(
-            "SELECT document, revision FROM settings WHERE singleton = 1"
-        ).fetchone()
-    return json.loads(row["document"]), int(row["revision"])
-
-
-def test_pinned_database_initialize_converges_a_stale_stored_comfy_url(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "director.sqlite3"
-    unpinned = Database(path)
-    unpinned.initialize()
-    unpinned.put_settings(default_settings("http://127.0.0.1:8188"))
-    _, revision_before = _stored_settings_row(unpinned)
-
-    # Simulates a host --port change: the stored row predates the new pinned
-    # value. Startup convergence must rewrite it once, through the ordinary
-    # settings write path (revision +1), so transaction-level origin checks
-    # stop disagreeing with the pinned read path.
-    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
-    database.initialize()
-
-    document, revision_after = _stored_settings_row(database)
-    assert document["comfy_url"] == PINNED_LOOPBACK_URL
-    assert revision_after == revision_before + 1
-    assert database.get_settings().comfy_url == PINNED_LOOPBACK_URL
-
-
-def test_pinned_database_initialize_does_not_rewrite_a_converged_comfy_url(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "director.sqlite3"
-    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
-    database.initialize()
-    document_before, revision_before = _stored_settings_row(database)
-    assert document_before["comfy_url"] == PINNED_LOOPBACK_URL
-
-    database.initialize()
-
-    document_after, revision_after = _stored_settings_row(database)
-    assert revision_after == revision_before
-    assert document_after == document_before
-
-
-def test_standalone_database_initialize_preserves_the_stored_comfy_url(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "director.sqlite3"
-    database = Database(path)
-    database.initialize()
-    database.put_settings(default_settings("http://127.0.0.1:8188"))
-    _, revision_before = _stored_settings_row(database)
-
-    database.initialize()
-
-    document, revision_after = _stored_settings_row(database)
-    assert document["comfy_url"] == "http://127.0.0.1:8188"
-    assert revision_after == revision_before
-
-
-def _insert_asset(database: Database, asset_id: str, origin: str) -> None:
-    with database.connect() as db:
-        db.execute(
-            "INSERT INTO assets(id, document, created_at, comfy_origin) "
-            "VALUES(?, ?, ?, ?)",
-            (asset_id, json.dumps({"name": f"{asset_id}.png"}), "now", origin),
+        RuntimeSettings.model_validate(
+            {
+                **settings.model_dump(mode="json"),
+                "comfy_url": "http://127.0.0.1:8188",
+            }
         )
 
 
-def _insert_segment_take(database: Database, take_id: str, origin: str) -> None:
-    with database.connect() as db:
-        db.execute(
-            "INSERT INTO segment_takes(id, segment_id, content_fingerprint, "
-            "comfy_origin, output_descriptor, has_audio, source_job_id, "
-            "source_child_id, completed_at, created_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                take_id,
-                f"segment-{take_id}",
-                "fingerprint",
-                origin,
-                "{}",
-                0,
-                "job-1",
-                f"child-{take_id}",
-                "now",
-                "now",
-            ),
-        )
-
-
-def _comfy_origins(database: Database, table: str) -> dict[str, str]:
-    with database.connect() as db:
-        rows = db.execute(f'SELECT id, comfy_origin FROM "{table}"').fetchall()
-    return {str(row["id"]): str(row["comfy_origin"]) for row in rows}
-
-
-def test_pinned_initialize_migrates_loopback_origins_without_touching_settings(
-    tmp_path: Path,
+async def test_injected_comfy_url_reaches_the_client_factory(
+    tmp_path: Path, fake_comfy
 ) -> None:
-    path = tmp_path / "director.sqlite3"
-    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
-    database.initialize()
-    _, revision_before = _stored_settings_row(database)
+    seen_urls: list[str] = []
 
-    # The settings row already converged, but origin-scoped rows from an
-    # earlier listen address (or the 0.1.1 pinning era) are still stale.
-    stale_origin = "http://127.0.0.1:8188"
-    remote_origin = "http://remote-comfy.test:9000"
-    _insert_asset(database, "asset-stale", stale_origin)
-    _insert_asset(database, "asset-remote", remote_origin)
-    _insert_segment_take(database, "take-stale", stale_origin)
-    _insert_segment_take(database, "take-remote", remote_origin)
-
-    database.initialize()
-
-    # Embedded databases belong to one ComfyUI installation, so every
-    # loopback origin is an old address of this same host and follows the
-    # pinned value; a genuinely remote origin stays untouched. Migration
-    # alone must not write the settings row.
-    assert _comfy_origins(database, "assets") == {
-        "asset-stale": PINNED_LOOPBACK_URL,
-        "asset-remote": remote_origin,
-    }
-    assert _comfy_origins(database, "segment_takes") == {
-        "take-stale": PINNED_LOOPBACK_URL,
-        "take-remote": remote_origin,
-    }
-    document, revision_after = _stored_settings_row(database)
-    assert document["comfy_url"] == PINNED_LOOPBACK_URL
-    assert revision_after == revision_before
-
-
-def test_pinned_initialize_migrates_origins_and_converges_settings(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "director.sqlite3"
-    unpinned = Database(path)
-    unpinned.initialize()
-    unpinned.put_settings(default_settings("http://127.0.0.1:8188"))
-    _insert_asset(unpinned, "asset-stale", "http://127.0.0.1:8188")
-    _insert_segment_take(unpinned, "take-stale", "http://127.0.0.1:8188")
-
-    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
-    database.initialize()
-
-    assert _comfy_origins(database, "assets")["asset-stale"] == PINNED_LOOPBACK_URL
-    assert _comfy_origins(database, "segment_takes")["take-stale"] == PINNED_LOOPBACK_URL
-    document, _revision = _stored_settings_row(database)
-    assert document["comfy_url"] == PINNED_LOOPBACK_URL
-
-
-def test_standalone_initialize_preserves_origin_rows(tmp_path: Path) -> None:
-    path = tmp_path / "director.sqlite3"
-    database = Database(path)
-    database.initialize()
-    database.put_settings(default_settings("http://127.0.0.1:8188"))
-    _insert_asset(database, "asset-stale", "http://127.0.0.1:8188")
-    _insert_segment_take(database, "take-stale", "http://127.0.0.1:8188")
-    _, revision_before = _stored_settings_row(database)
-
-    database.initialize()
-
-    assert _comfy_origins(database, "assets")["asset-stale"] == "http://127.0.0.1:8188"
-    assert _comfy_origins(database, "segment_takes")["take-stale"] == "http://127.0.0.1:8188"
-    document, revision_after = _stored_settings_row(database)
-    assert document["comfy_url"] == "http://127.0.0.1:8188"
-    assert revision_after == revision_before
-
-
-async def test_standalone_put_comfy_url_persists_the_user_value(
-    tmp_path: Path,
-) -> None:
-    app = create_app(database_path=tmp_path / "director.sqlite3")
-    app.state.database.initialize()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
-        base_url="http://testserver",
-    ) as client:
-        put = await client.put(
-            "/api/settings",
-            json=default_settings("http://user-comfy.test:9000").model_dump(mode="json"),
-        )
-        assert put.status_code == 200, put.text
-        get = await client.get("/api/settings")
-        assert get.status_code == 200
-
-    assert put.json()["comfy_url"] == "http://user-comfy.test:9000"
-    assert get.json()["comfy_url"] == "http://user-comfy.test:9000"
-
-
-async def test_unconfigured_runtime_does_not_construct_a_client_or_leave_an_orphan_job(
-    tmp_path: Path,
-) -> None:
-    factory_calls: list[object] = []
-
-    def forbidden_factory(settings):
-        factory_calls.append(settings)
-        raise AssertionError("an unconfigured runtime must not construct a ComfyUI client")
+    def recording_factory(comfy_url: str):
+        seen_urls.append(comfy_url)
+        return fake_comfy
 
     app = create_app(
-        database_path=tmp_path / "director.sqlite3",
-        comfy_factory=forbidden_factory,
+        database_path=tmp_path / "directordeck.sqlite3",
+        comfy_url=TEST_COMFY_URL,
+        comfy_factory=recording_factory,
     )
     app.state.database.initialize()
     async with httpx.AsyncClient(
@@ -329,58 +57,26 @@ async def test_unconfigured_runtime_does_not_construct_a_client_or_leave_an_orph
         headers = await runtime_authority_headers(client)
         capabilities = await client.get("/api/capabilities", headers=headers)
         assert capabilities.status_code == 200
-        assert capabilities.json()["connection"] == "offline"
-        assert "尚未配置" in capabilities.json()["message"]
+        assert capabilities.json()["connection"] == "online"
+        settings = await client.get("/api/settings")
 
-        for endpoint in (
-            "/api/models",
-            "/api/gpus",
-            "/api/system_stats",
-        ):
-            response = await client.get(
-                endpoint,
-                headers=headers if endpoint != "/api/system_stats" else None,
-            )
-            assert response.status_code == 409, (endpoint, response.text)
-            assert "尚未配置" in response.text
-
-        # Raw ComfyUI queue/history contain executable prompt graphs and are
-        # deliberately not exposed by Director's browser API.
-        for endpoint in ("/api/queue", "/api/history", "/api/history/prompt-1"):
-            assert (await client.get(endpoint)).status_code == 404
-
-        upload = await client.post(
-            "/api/assets",
-            data={"kind": "image"},
-            files={"file": ("frame.png", b"\x89PNG\r\n\x1a\n", "image/png")},
-        )
-        assert upload.status_code == 409
-
-        submitted = await client.post(
-            "/api/jobs",
-            json={"mode": "t2v", "config": runnable_draft("t2v")},
-        )
-        assert submitted.status_code == 409
-        job_list = (await client.get("/api/jobs")).json()
-        assert job_list["jobs"] == []
-        assert job_list["total"] == 0
-        assert job_list["summary"]["total"] == 0
-
-    assert factory_calls == []
-    assert app.state.database.list_jobs() == []
+    assert seen_urls == [TEST_COMFY_URL]
+    assert settings.status_code == 200
+    assert "comfy_url" not in settings.json()
 
 
-async def test_connection_probe_uses_temporary_url_without_persisting_it(
+async def test_connection_test_probes_the_injected_address(
     tmp_path: Path, fake_comfy
 ) -> None:
     seen_urls: list[str] = []
 
-    def recording_factory(settings):
-        seen_urls.append(str(settings.comfy_url).rstrip("/"))
+    def recording_factory(comfy_url: str):
+        seen_urls.append(comfy_url)
         return fake_comfy
 
     app = create_app(
-        database_path=tmp_path / "director.sqlite3",
+        database_path=tmp_path / "directordeck.sqlite3",
+        comfy_url=TEST_COMFY_URL,
         comfy_factory=recording_factory,
     )
     app.state.database.initialize()
@@ -388,53 +84,16 @@ async def test_connection_probe_uses_temporary_url_without_persisting_it(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
         base_url="http://testserver",
     ) as client:
-        tested = await client.post(
-            "/api/capabilities", json={"comfy_url": "http://probe-comfy.test:8188"}
-        )
-        persisted = await client.get("/api/settings")
+        # The request body no longer carries a URL; the probe always targets
+        # the embedded host instance.
+        tested = await client.post("/api/capabilities")
 
     assert tested.status_code == 200
     assert tested.json()["ok"] is True
-    assert seen_urls == ["http://probe-comfy.test:8188"]
-    assert persisted.json()["comfy_url"] == ""
+    assert seen_urls == [TEST_COMFY_URL]
 
 
-async def test_connection_probe_treats_missing_nodes_as_reachable_without_persisting(
-    tmp_path: Path, fake_comfy
-) -> None:
-    async def capabilities_with_missing_nodes():
-        return {
-            "connection": "online",
-            "missing_nodes": ["MissingNativeNode"],
-            "latency_ms": 2.5,
-        }
-
-    fake_comfy.capabilities = capabilities_with_missing_nodes
-    app = create_app(
-        database_path=tmp_path / "director.sqlite3",
-        comfy_factory=lambda _settings: fake_comfy,
-    )
-    app.state.database.initialize()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
-        base_url="http://testserver",
-    ) as client:
-        tested = await client.post(
-            "/api/capabilities",
-            json={"comfy_url": "http://reachable-comfy.test:8188"},
-        )
-        persisted = await client.get("/api/settings")
-
-    assert tested.status_code == 200
-    assert tested.json() == {
-        "ok": True,
-        "latency_ms": 2.5,
-        "message": "连接成功，但缺少节点: MissingNativeNode",
-    }
-    assert persisted.json()["comfy_url"] == ""
-
-
-async def test_connection_probe_reports_transport_failure_without_persisting(
+async def test_connection_test_reports_transport_failure(
     tmp_path: Path, fake_comfy
 ) -> None:
     async def unreachable_capabilities():
@@ -442,56 +101,42 @@ async def test_connection_probe_reports_transport_failure_without_persisting(
 
     fake_comfy.capabilities = unreachable_capabilities
     app = create_app(
-        database_path=tmp_path / "director.sqlite3",
-        comfy_factory=lambda _settings: fake_comfy,
+        database_path=tmp_path / "directordeck.sqlite3",
+        comfy_url=TEST_COMFY_URL,
+        comfy_factory=lambda _comfy_url: fake_comfy,
     )
     app.state.database.initialize()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
         base_url="http://testserver",
     ) as client:
-        tested = await client.post(
-            "/api/capabilities",
-            json={"comfy_url": "http://offline-comfy.test:8188"},
-        )
-        persisted = await client.get("/api/settings")
+        tested = await client.post("/api/capabilities")
 
     assert tested.status_code == 200
     assert tested.json() == {"ok": False, "message": "连接被拒绝"}
-    assert persisted.json()["comfy_url"] == ""
 
 
-def test_empty_settings_do_not_backfill_a_legacy_asset_origin(tmp_path: Path) -> None:
-    path = tmp_path / "legacy-empty.sqlite3"
-    document = {
-        "name": "legacy.png",
-        "subfolder": "director-web",
-        "type": "input",
-        "kind": "image",
-        "id": "legacy-asset",
-    }
-    with sqlite3.connect(path) as db:
-        db.executescript(
-            """
-            CREATE TABLE settings(singleton INTEGER PRIMARY KEY, document TEXT NOT NULL, updated_at TEXT NOT NULL);
-            CREATE TABLE assets(id TEXT PRIMARY KEY, document TEXT NOT NULL, created_at TEXT NOT NULL);
-            """
+async def test_settings_put_response_matches_authoritative_get(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        database_path=tmp_path / "directordeck.sqlite3",
+        comfy_url=TEST_COMFY_URL,
+    )
+    app.state.database.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
+        base_url="http://testserver",
+    ) as client:
+        put = await client.put(
+            "/api/settings",
+            json=default_settings().model_dump(mode="json"),
         )
-        db.execute(
-            "INSERT INTO settings VALUES(1, ?, 'then')",
-            (default_settings().model_dump_json(),),
-        )
-        db.execute(
-            "INSERT INTO assets VALUES('legacy-asset', ?, 'then')",
-            (json.dumps(document),),
-        )
+        assert put.status_code == 200, put.text
+        get = await client.get("/api/settings")
+        assert get.status_code == 200
 
-    database = Database(path)
-    database.initialize()
-    with database.connect() as db:
-        row = db.execute(
-            "SELECT comfy_origin FROM assets WHERE id = 'legacy-asset'"
-        ).fetchone()
-
-    assert row is not None
-    assert row["comfy_origin"] is None
+    # The browser compares its PUT draft with the authoritative GET
+    # byte-for-byte; any silent server-side rewrite becomes an infinite
+    # latest-wins retry loop.
+    assert put.content == get.content

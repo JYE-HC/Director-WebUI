@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import os
 import re
 import sqlite3
@@ -40,20 +39,6 @@ from .schemas import (
     validate_timeline_draft,
 )
 
-logger = logging.getLogger(__name__)
-
-# Loopback origin shapes an embedded plugin database may hold from earlier
-# listen addresses of its own host ComfyUI instance.  Anything else is a
-# genuinely remote endpoint from the standalone era and must stay put.
-_LOOPBACK_ORIGIN_PREFIXES = (
-    "http://127.0.0.1",
-    "https://127.0.0.1",
-    "http://localhost",
-    "https://localhost",
-    "http://[::1]",
-    "https://[::1]",
-)
-
 
 class TimelineRevisionConflict(RuntimeError):
     """A conditional timeline write was based on an obsolete server revision."""
@@ -82,36 +67,6 @@ class TimelineRevisionExhausted(OverflowError):
         )
         self.project_id = project_id
         self.revision = revision
-
-
-class TimelineComfyOriginConflict(RuntimeError):
-    """A timeline write captured a ComfyUI endpoint that is no longer active."""
-
-    def __init__(
-        self,
-        project_id: str,
-        expected_origin: str,
-        actual_origin: str,
-    ) -> None:
-        super().__init__(
-            f"timeline ComfyUI origin conflict for {project_id}: "
-            f"expected '{expected_origin}', actual '{actual_origin}'"
-        )
-        self.project_id = project_id
-        self.expected_origin = expected_origin
-        self.actual_origin = actual_origin
-
-
-class AssetTrashOriginConflict(RuntimeError):
-    """A recycle-bin mutation crossed the active ComfyUI origin boundary."""
-
-    def __init__(self, expected_origin: str, actual_origin: str) -> None:
-        super().__init__(
-            "asset operation crossed a ComfyUI origin boundary: "
-            f"expected '{expected_origin}', actual '{actual_origin}'"
-        )
-        self.expected_origin = expected_origin
-        self.actual_origin = actual_origin
 
 
 class AssetTrashInUse(RuntimeError):
@@ -313,14 +268,8 @@ class Database:
     )
     _CONFIRMED_COMFY_RESTART_STAGE = "cancelled_after_confirmed_comfy_restart"
 
-    def __init__(
-        self, path: str | Path, pinned_comfy_url: str | None = None
-    ) -> None:
+    def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        # Plugin-embedded mode pins the live ComfyUI address to the host
-        # instance's loopback origin.  ``None`` (standalone) leaves every
-        # read/write path byte-for-byte identical to an unpinned database.
-        self.pinned_comfy_url = pinned_comfy_url
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -401,13 +350,11 @@ class Database:
                     id TEXT PRIMARY KEY,
                     document TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    comfy_origin TEXT,
                     trashed_at TEXT,
                     trash_batch_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS asset_trash_batches (
                     id TEXT PRIMARY KEY,
-                    comfy_origin TEXT NOT NULL,
                     asset_ids TEXT NOT NULL,
                     cascade INTEGER NOT NULL CHECK (cascade IN (0, 1)),
                     unbound_usages TEXT NOT NULL,
@@ -475,7 +422,6 @@ class Database:
                     id TEXT PRIMARY KEY,
                     segment_id TEXT NOT NULL,
                     content_fingerprint TEXT NOT NULL,
-                    comfy_origin TEXT NOT NULL,
                     project_id TEXT,
                     output_descriptor TEXT NOT NULL,
                     has_audio INTEGER NOT NULL CHECK (has_audio IN (0, 1)),
@@ -487,14 +433,13 @@ class Database:
                 CREATE INDEX IF NOT EXISTS segment_takes_lookup_idx
                     ON segment_takes(
                         segment_id,
-                        comfy_origin,
                         content_fingerprint,
                         has_audio,
                         completed_at DESC,
                         id DESC
                     );
                 CREATE TABLE IF NOT EXISTS raylight_runtime_state (
-                    comfy_origin TEXT PRIMARY KEY,
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     descriptor TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -565,32 +510,25 @@ class Database:
                 "INSERT OR IGNORE INTO settings(singleton, document, updated_at) VALUES(1, ?, ?)",
                 (settings.model_dump_json(), now),
             )
-            # ``comfy_origin`` was added after the initial schema shipped.  Old
-            # assets necessarily belonged to the then-active ComfyUI endpoint,
-            # so backfill them from the persisted settings document.  Keeping
-            # the origin outside the client-echoed asset JSON makes it an
-            # immutable server-side authority.
             asset_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(assets)").fetchall()
             }
-            if "comfy_origin" not in asset_columns:
-                db.execute("ALTER TABLE assets ADD COLUMN comfy_origin TEXT")
             if "trashed_at" not in asset_columns:
                 db.execute("ALTER TABLE assets ADD COLUMN trashed_at TEXT")
             if "trash_batch_id" not in asset_columns:
                 db.execute("ALTER TABLE assets ADD COLUMN trash_batch_id TEXT")
             db.execute(
-                "CREATE INDEX IF NOT EXISTS assets_live_origin_idx "
-                "ON assets(comfy_origin, trashed_at, created_at DESC, id DESC)"
+                "CREATE INDEX IF NOT EXISTS assets_live_idx "
+                "ON assets(trashed_at, created_at DESC, id DESC)"
             )
             db.execute(
                 "CREATE INDEX IF NOT EXISTS assets_trash_batch_idx "
                 "ON assets(trash_batch_id) WHERE trash_batch_id IS NOT NULL"
             )
             db.execute(
-                "CREATE INDEX IF NOT EXISTS asset_trash_batches_origin_idx "
-                "ON asset_trash_batches(comfy_origin, created_at DESC, id DESC)"
+                "CREATE INDEX IF NOT EXISTS asset_trash_batches_created_idx "
+                "ON asset_trash_batches(created_at DESC, id DESC)"
             )
             settings_row = db.execute(
                 "SELECT document FROM settings WHERE singleton = 1"
@@ -623,22 +561,26 @@ class Database:
                 if isinstance(raylight, dict):
                     raylight["fsdp"] = False
                     raylight["cpu_offload"] = False
-            persisted_settings = canonicalize_live_runtime_settings(
-                RuntimeSettings.model_validate(raw_settings)
-            )
+            try:
+                persisted_settings = canonicalize_live_runtime_settings(
+                    RuntimeSettings.model_validate(raw_settings)
+                )
+            except ValidationError as exc:
+                # The plugin era deliberately keeps no compatibility reader for
+                # pre-plugin documents (e.g. a stored ``comfy_url`` fails
+                # extra=forbid). Fail with an actionable message instead of a
+                # bare schema dump.
+                raise RuntimeError(
+                    f"Director database at {self.path} uses an obsolete "
+                    "settings document; delete the database (or the whole "
+                    "ComfyUI user/directordeck directory) and restart ComfyUI"
+                ) from exc
             normalized_settings = persisted_settings.model_dump(mode="json")
             if json.loads(settings_row["document"]) != normalized_settings:
                 db.execute(
                     "UPDATE settings SET document = ?, updated_at = ?, "
                     "revision = revision + 1 WHERE singleton = 1",
                     (json.dumps(normalized_settings, ensure_ascii=False), now),
-                )
-            persisted_origin = self.canonical_comfy_origin(persisted_settings.comfy_url)
-            if persisted_origin:
-                db.execute(
-                    "UPDATE assets SET comfy_origin = ? "
-                    "WHERE comfy_origin IS NULL OR comfy_origin = ''",
-                    (persisted_origin,),
                 )
             for mode in MODE_ORDER:
                 db.execute(
@@ -845,8 +787,6 @@ class Database:
             # Re-running this pass is idempotent through source_child_id.
             self._backfill_segment_takes_in_connection(db)
 
-        self._converge_pinned_comfy_url()
-
     @staticmethod
     def _exact_segment_take_output(child: dict[str, Any]) -> dict[str, str] | None:
         segment_ids = child.get("segment_ids")
@@ -882,7 +822,6 @@ class Database:
     ) -> None:
         row = db.execute(
             "SELECT job_children.*, jobs.config_snapshot AS parent_config_snapshot, "
-            "jobs.settings_snapshot AS parent_settings_snapshot, "
             "jobs.project_id AS parent_project_id "
             "FROM job_children JOIN jobs ON jobs.id = job_children.job_id "
             "WHERE job_children.id = ? AND job_children.status = 'succeeded'",
@@ -896,7 +835,6 @@ class Database:
             if output is None:
                 return
             config_snapshot = json.loads(row["parent_config_snapshot"])
-            settings_snapshot = json.loads(row["parent_settings_snapshot"])
             timeline_document = (
                 config_snapshot.get("timeline")
                 if isinstance(config_snapshot, dict)
@@ -911,14 +849,6 @@ class Database:
             ]
             if len(matches) != 1:
                 return
-            raw_origin = (
-                settings_snapshot.get("comfy_url")
-                if isinstance(settings_snapshot, dict)
-                else None
-            )
-            comfy_origin = self.canonical_comfy_origin(raw_origin or "")
-            if not comfy_origin:
-                return
             content_fingerprint = timeline_segment_take_fingerprint(
                 timeline, matches[0]
             )
@@ -932,13 +862,12 @@ class Database:
         )
         db.execute(
             "INSERT OR IGNORE INTO segment_takes("
-            "id, segment_id, content_fingerprint, comfy_origin, project_id, "
+            "id, segment_id, content_fingerprint, project_id, "
             "output_descriptor, has_audio, source_job_id, source_child_id, "
-            "completed_at, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "completed_at, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(source_child_id) DO UPDATE SET "
             "segment_id = excluded.segment_id, "
             "content_fingerprint = excluded.content_fingerprint, "
-            "comfy_origin = excluded.comfy_origin, "
             "project_id = excluded.project_id, "
             "output_descriptor = excluded.output_descriptor, "
             "has_audio = excluded.has_audio, "
@@ -948,7 +877,6 @@ class Database:
                 str(uuid.uuid4()),
                 segment_id,
                 content_fingerprint,
-                comfy_origin,
                 row["parent_project_id"],
                 json.dumps(output, ensure_ascii=False, sort_keys=True),
                 int(matches[0].audio_mode != "mute"),
@@ -989,11 +917,10 @@ class Database:
         segment_id: str,
         content_fingerprint: str,
         *,
-        comfy_origin: str,
         require_audio: bool = False,
         project_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Return the newest exact reusable take for the active endpoint.
+        """Return the newest exact reusable take for the segment.
 
         A non-null ``project_id`` scopes the lookup to one project so two
         projects sharing a segment identity can never reuse each other's
@@ -1001,12 +928,9 @@ class Database:
         unscoped behavior.
         """
 
-        origin = self.canonical_comfy_origin(comfy_origin)
-        if not origin:
-            return None
         audio_clause = " AND has_audio = 1" if require_audio else ""
         project_clause = ""
-        parameters: tuple[Any, ...] = (segment_id, content_fingerprint, origin)
+        parameters: tuple[Any, ...] = (segment_id, content_fingerprint)
         if project_id is not None:
             # NULL-project_id rows predate project scoping (legacy six-mode
             # submissions) and are treated as belonging to every project's
@@ -1016,7 +940,7 @@ class Database:
         with self.connect() as db:
             row = db.execute(
                 "SELECT * FROM segment_takes WHERE segment_id = ? "
-                "AND content_fingerprint = ? AND comfy_origin = ?"
+                "AND content_fingerprint = ?"
                 f"{audio_clause}{project_clause} ORDER BY completed_at DESC, id DESC "
                 "LIMIT 1",
                 parameters,
@@ -1027,13 +951,9 @@ class Database:
         self,
         segment_id: str,
         *,
-        comfy_origin: str,
         content_fingerprint: str | None = None,
         project_id: str | None = None,
     ) -> bool:
-        origin = self.canonical_comfy_origin(comfy_origin)
-        if not origin:
-            return False
         fingerprint_clause = (
             " AND content_fingerprint = ?"
             if content_fingerprint is not None
@@ -1044,128 +964,18 @@ class Database:
             if project_id is not None
             else ""
         )
-        parameters: tuple[Any, ...] = (segment_id, origin)
+        parameters: tuple[Any, ...] = (segment_id,)
         if content_fingerprint is not None:
             parameters = (*parameters, content_fingerprint)
         if project_id is not None:
             parameters = (*parameters, project_id)
         with self.connect() as db:
             row = db.execute(
-                "SELECT 1 FROM segment_takes WHERE segment_id = ? "
-                f"AND comfy_origin = ?{fingerprint_clause}{project_clause} LIMIT 1",
+                "SELECT 1 FROM segment_takes WHERE segment_id = ?"
+                f"{fingerprint_clause}{project_clause} LIMIT 1",
                 parameters,
             ).fetchone()
         return row is not None
-
-    def _apply_pinned_comfy_url(self, settings: RuntimeSettings) -> RuntimeSettings:
-        """Force the live ComfyUI address to the pinned host loopback value.
-
-        The pinned value is well-formed by construction (the plugin derives it
-        from the host ComfyUI listen settings), so it is applied verbatim
-        without revalidation.  The pinned value is part of the returned live
-        document on both the read and write paths: the browser compares its
-        PUT draft with the authoritative GET byte-for-byte, and any silent
-        server-side rewrite becomes an infinite latest-wins retry loop.
-        Historical job ``settings_snapshot`` payloads never pass through here.
-        """
-        if self.pinned_comfy_url is None:
-            return settings
-        return settings.model_copy(update={"comfy_url": self.pinned_comfy_url})
-
-    def _converge_pinned_comfy_url(self) -> None:
-        """Persist the pinned ComfyUI address over a stale stored value.
-
-        Runs at the end of ``initialize()`` — after every migration, before
-        the app serves — so a host ``--port`` change cannot leave the raw
-        stored origin disagreeing with the pinned value transaction-level
-        origin checks compare against (an upload was once rejected as a
-        phantom endpoint switch).  The staleness check deliberately reads the
-        raw stored document: the pinned read-path override always reports
-        equality and would never converge the row (this is also why the old
-        HTTP seeder went silent).  The write goes through ``put_settings``,
-        making convergence exactly one ordinary server-side settings write
-        with the usual revision/authority-token semantics.  Standalone
-        (unpinned) databases are never written here.
-        """
-        if self.pinned_comfy_url is None:
-            return
-        # Origin rows move first: a crash between the migration and the
-        # settings write is safe because the stale-settings branch below then
-        # still fires on the next start and the migration is idempotent.
-        self._migrate_loopback_comfy_origins()
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT document FROM settings WHERE singleton = 1"
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("settings row is missing")
-        stored = json.loads(row["document"]).get("comfy_url")
-        if stored == self.pinned_comfy_url:
-            return
-        self.put_settings(self.get_settings())
-
-    def _migrate_loopback_comfy_origins(self) -> None:
-        """Re-home loopback ``comfy_origin`` rows to the pinned host origin.
-
-        An embedded database belongs to exactly one ComfyUI installation (it
-        lives in that instance's user directory and the referenced files live
-        in its input directory), so every loopback-shaped origin is merely an
-        older listen address of this same host — port or IP changes must not
-        orphan scoped rows.  Runs on every pinned ``initialize()`` rather than
-        only when the stored settings converge: a database can hold legacy
-        origin rows while its settings row already matches the pinned value.
-        Non-loopback origins may name real remote endpoints from the
-        standalone era and are never touched.
-        """
-        if self.pinned_comfy_url is None:
-            return
-        target = self.canonical_comfy_origin(self.pinned_comfy_url)
-        if not target:
-            return
-        migrated: dict[str, int] = {}
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            # Discover scoped tables by column name instead of keeping a list:
-            # any future table carrying ``comfy_origin`` is covered for free.
-            tables = []
-            for table_row in db.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall():
-                table = str(table_row["name"])
-                columns = db.execute(
-                    f'PRAGMA table_info("{table}")'
-                ).fetchall()
-                if any(str(column["name"]) == "comfy_origin" for column in columns):
-                    tables.append(table)
-            for table in tables:
-                values = [
-                    str(row["comfy_origin"])
-                    for row in db.execute(
-                        f'SELECT DISTINCT comfy_origin FROM "{table}" '
-                        "WHERE comfy_origin IS NOT NULL"
-                    ).fetchall()
-                ]
-                for value in values:
-                    if value == target or not value.startswith(
-                        _LOOPBACK_ORIGIN_PREFIXES
-                    ):
-                        continue
-                    # OR IGNORE keeps a same-instance A->B->A port flap from
-                    # aborting startup: raylight_runtime_state keys on the
-                    # origin, and the fresher target row wins the conflict.
-                    cursor = db.execute(
-                        f'UPDATE OR IGNORE "{table}" SET comfy_origin = ? '
-                        "WHERE comfy_origin = ?",
-                        (target, value),
-                    )
-                    if cursor.rowcount:
-                        migrated[table] = migrated.get(table, 0) + cursor.rowcount
-        if migrated:
-            logger.info(
-                "migrated loopback comfy_origin rows to %s: %s",
-                target,
-                ", ".join(f"{table}={count}" for table, count in sorted(migrated.items())),
-            )
 
     def get_settings_authority(self) -> tuple[RuntimeSettings, str]:
         with self.connect() as db:
@@ -1174,10 +984,8 @@ class Database:
             ).fetchone()
         if row is None:
             raise RuntimeError("settings row is missing")
-        settings = self._apply_pinned_comfy_url(
-            canonicalize_live_runtime_settings(
-                RuntimeSettings.model_validate_json(row["document"])
-            )
+        settings = canonicalize_live_runtime_settings(
+            RuntimeSettings.model_validate_json(row["document"])
         )
         authority = hashlib.sha256(
             (
@@ -1192,9 +1000,7 @@ class Database:
         return self.get_settings_authority()[0]
 
     def put_settings(self, settings: RuntimeSettings) -> RuntimeSettings:
-        settings = self._apply_pinned_comfy_url(
-            canonicalize_live_runtime_settings(settings)
-        )
+        settings = canonicalize_live_runtime_settings(settings)
         with self.connect() as db:
             db.execute(
                 "UPDATE settings SET document = ?, updated_at = ?, "
@@ -1203,17 +1009,11 @@ class Database:
             )
         return settings
 
-    def get_raylight_runtime_state(
-        self, comfy_origin: str
-    ) -> dict[str, Any] | None:
-        origin = self.canonical_comfy_origin(comfy_origin)
-        if not origin:
-            return None
+    def get_raylight_runtime_state(self) -> dict[str, Any] | None:
         with self.connect() as db:
             row = db.execute(
                 "SELECT descriptor FROM raylight_runtime_state "
-                "WHERE comfy_origin = ?",
-                (origin,),
+                "WHERE singleton = 1"
             ).fetchone()
         if row is None:
             return None
@@ -1326,23 +1126,17 @@ class Database:
             result["legacy_unknown"] = True
         return result
 
-    def put_raylight_runtime_state(
-        self, comfy_origin: str, state: dict[str, Any]
-    ) -> None:
-        origin = self.canonical_comfy_origin(comfy_origin)
-        if not origin:
-            raise ValueError("RayLight runtime state requires a ComfyUI origin")
+    def put_raylight_runtime_state(self, state: dict[str, Any]) -> None:
         normalized = self._decode_raylight_runtime_state(
             json.dumps(state, ensure_ascii=False, sort_keys=True)
         )
         with self.connect() as db:
             db.execute(
                 "INSERT INTO raylight_runtime_state"
-                "(comfy_origin, descriptor, updated_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(comfy_origin) DO UPDATE SET "
+                "(singleton, descriptor, updated_at) VALUES(1, ?, ?) "
+                "ON CONFLICT(singleton) DO UPDATE SET "
                 "descriptor = excluded.descriptor, updated_at = excluded.updated_at",
                 (
-                    origin,
                     json.dumps(normalized, ensure_ascii=False, sort_keys=True),
                     utc_now(),
                 ),
@@ -1350,7 +1144,6 @@ class Database:
 
     def settle_raylight_runtime_prompt(
         self,
-        comfy_origin: str,
         prompt_id: str,
         *,
         succeeded: bool,
@@ -1368,15 +1161,13 @@ class Database:
         cancellations stay tainted until an explicit barrier succeeds.
         """
 
-        origin = self.canonical_comfy_origin(comfy_origin)
-        if not origin or not prompt_id:
+        if not prompt_id:
             return False
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT descriptor FROM raylight_runtime_state "
-                "WHERE comfy_origin = ?",
-                (origin,),
+                "WHERE singleton = 1"
             ).fetchone()
             if row is None:
                 return False
@@ -1409,11 +1200,10 @@ class Database:
                 }
             db.execute(
                 "UPDATE raylight_runtime_state SET descriptor = ?, updated_at = ? "
-                "WHERE comfy_origin = ?",
+                "WHERE singleton = 1",
                 (
                     json.dumps(state, ensure_ascii=False, sort_keys=True),
                     utc_now(),
-                    origin,
                 ),
             )
         return True
@@ -1541,18 +1331,10 @@ class Database:
             # the no-longer-observable tail and taint the runtime.  The next
             # dispatcher must therefore issue the normal safety barrier before
             # submitting compatible work.
-            raw_settings = json.loads(str(parent["settings_snapshot"]))
-            raw_origin = (
-                raw_settings.get("comfy_url")
-                if isinstance(raw_settings, dict)
-                else None
-            )
-            comfy_origin = self.canonical_comfy_origin(raw_origin or "")
-            if comfy_origin and target_prompt_ids:
+            if target_prompt_ids:
                 runtime_row = db.execute(
                     "SELECT descriptor FROM raylight_runtime_state "
-                    "WHERE comfy_origin = ?",
-                    (comfy_origin,),
+                    "WHERE singleton = 1"
                 ).fetchone()
                 if runtime_row is not None:
                     runtime_state = self._decode_raylight_runtime_state(
@@ -1567,7 +1349,7 @@ class Database:
                         runtime_state.pop("tail_terminal_certificate", None)
                         db.execute(
                             "UPDATE raylight_runtime_state SET descriptor = ?, "
-                            "updated_at = ? WHERE comfy_origin = ?",
+                            "updated_at = ? WHERE singleton = 1",
                             (
                                 json.dumps(
                                     runtime_state,
@@ -1575,7 +1357,6 @@ class Database:
                                     sort_keys=True,
                                 ),
                                 now,
-                                comfy_origin,
                             ),
                         )
 
@@ -1588,7 +1369,6 @@ class Database:
 
     def confirm_raylight_runtime_restart(
         self,
-        comfy_origin: str,
         *,
         expected_epoch: int,
         expected_runtime_state: dict[str, Any],
@@ -1603,9 +1383,6 @@ class Database:
         monotonic so the next pool cannot reuse killed ComfyUI cache entries.
         """
 
-        origin = self.canonical_comfy_origin(comfy_origin)
-        if not origin:
-            raise ValueError("RayLight runtime recovery requires a ComfyUI origin")
         if expected_epoch < 0 or visible_gpu_count < 0:
             raise ValueError("RayLight runtime recovery inputs are invalid")
         expected_state = self._decode_raylight_runtime_state(
@@ -1617,19 +1394,6 @@ class Database:
         )
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            settings_row = db.execute(
-                "SELECT document FROM settings WHERE singleton = 1"
-            ).fetchone()
-            if settings_row is None:
-                raise RuntimeError("settings row is missing during RayLight recovery")
-            current_settings = canonicalize_live_runtime_settings(
-                RuntimeSettings.model_validate_json(settings_row["document"])
-            )
-            if self.canonical_comfy_origin(current_settings.comfy_url) != origin:
-                raise ValueError(
-                    "ComfyUI endpoint changed before RayLight recovery completed"
-                )
-
             active_parent = db.execute(
                 "SELECT id FROM jobs "
                 "WHERE status NOT IN ('succeeded', 'failed', 'cancelled') LIMIT 1"
@@ -1645,8 +1409,7 @@ class Database:
 
             row = db.execute(
                 "SELECT descriptor FROM raylight_runtime_state "
-                "WHERE comfy_origin = ?",
-                (origin,),
+                "WHERE singleton = 1"
             ).fetchone()
             if row is None:
                 raise ValueError("RayLight runtime state no longer exists")
@@ -1689,11 +1452,10 @@ class Database:
                 backup_published = True
                 db.execute(
                     "UPDATE raylight_runtime_state SET descriptor = ?, updated_at = ? "
-                    "WHERE comfy_origin = ?",
+                    "WHERE singleton = 1",
                     (
                         json.dumps(recovered, ensure_ascii=False, sort_keys=True),
                         utc_now(),
-                        origin,
                     ),
                 )
                 # Once COMMIT begins its outcome is intrinsically ambiguous:
@@ -1735,8 +1497,6 @@ class Database:
         self,
         mode: GenerationMode,
         draft: ModeDraft,
-        *,
-        comfy_origin: str,
     ) -> ModeDraft:
         """Validate every asset and save the legacy draft in one write transaction.
 
@@ -1750,7 +1510,6 @@ class Database:
             self._validate_asset_iterator_in_connection(
                 db,
                 iter_draft_assets(draft),
-                comfy_origin=comfy_origin,
             )
             db.execute(
                 "UPDATE mode_drafts SET document = ?, updated_at = ? WHERE mode = ?",
@@ -1810,8 +1569,6 @@ class Database:
     def validate_and_put_timeline(
         self,
         timeline: UnifiedTimelineDraft,
-        *,
-        comfy_origin: str,
     ) -> UnifiedTimelineDraft:
         """Validate assets and save the unified timeline under one write lock."""
 
@@ -1820,7 +1577,6 @@ class Database:
             self._validate_asset_iterator_in_connection(
                 db,
                 iter_timeline_assets(timeline),
-                comfy_origin=comfy_origin,
             )
             db.execute(
                 "UPDATE unified_timeline SET document = ?, updated_at = ?, "
@@ -1834,17 +1590,11 @@ class Database:
         timeline: UnifiedTimelineDraft,
         *,
         expected_revision: int,
-        comfy_origin: str,
     ) -> tuple[UnifiedTimelineDraft, int]:
         """CAS-replace the default timeline under the asset-validation lock."""
 
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._assert_timeline_comfy_origin_in_connection(
-                db,
-                project_id=self.LEGACY_DEFAULT_PROJECT_ID,
-                expected_comfy_origin=comfy_origin,
-            )
             row = db.execute(
                 "SELECT revision FROM unified_timeline WHERE singleton = 1"
             ).fetchone()
@@ -1859,7 +1609,6 @@ class Database:
             self._validate_asset_iterator_in_connection(
                 db,
                 iter_timeline_assets(timeline),
-                comfy_origin=comfy_origin,
             )
             cursor = db.execute(
                 "UPDATE unified_timeline SET document = ?, updated_at = ?, "
@@ -2110,15 +1859,11 @@ class Database:
         self,
         project_id: str,
         timeline: UnifiedTimelineDraft,
-        *,
-        comfy_origin: str,
     ) -> UnifiedTimelineDraft:
         """Validate assets and save one project's timeline under one write lock."""
 
         if self._is_legacy_project_id(project_id):
-            return self.validate_and_put_timeline(
-                timeline, comfy_origin=comfy_origin
-            )
+            return self.validate_and_put_timeline(timeline)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if (
@@ -2131,7 +1876,6 @@ class Database:
             self._validate_asset_iterator_in_connection(
                 db,
                 iter_timeline_assets(timeline),
-                comfy_origin=comfy_origin,
             )
             db.execute(
                 "UPDATE projects SET document = ?, title = ?, updated_at = ?, "
@@ -2146,7 +1890,6 @@ class Database:
         timeline: UnifiedTimelineDraft,
         *,
         expected_revision: int,
-        comfy_origin: str,
     ) -> tuple[UnifiedTimelineDraft, int]:
         """CAS-replace one project timeline under the asset-validation lock."""
 
@@ -2154,7 +1897,6 @@ class Database:
             return self.validate_and_put_timeline_authority(
                 timeline,
                 expected_revision=expected_revision,
-                comfy_origin=comfy_origin,
             )
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2164,11 +1906,6 @@ class Database:
             ).fetchone()
             if row is None:
                 raise KeyError(project_id)
-            self._assert_timeline_comfy_origin_in_connection(
-                db,
-                project_id=project_id,
-                expected_comfy_origin=comfy_origin,
-            )
             current_revision = int(row["revision"])
             self._assert_expected_timeline_revision(
                 project_id=project_id,
@@ -2178,7 +1915,6 @@ class Database:
             self._validate_asset_iterator_in_connection(
                 db,
                 iter_timeline_assets(timeline),
-                comfy_origin=comfy_origin,
             )
             cursor = db.execute(
                 "UPDATE projects SET document = ?, title = ?, updated_at = ?, "
@@ -2196,152 +1932,50 @@ class Database:
         return timeline, current_revision + 1
 
     @staticmethod
-    def canonical_comfy_origin(value: Any) -> str:
-        return str(value).rstrip("/")
-
-    @staticmethod
     def _document_digest(document: str) -> str:
         return hashlib.sha256(document.encode("utf-8")).hexdigest()
-
-    def _current_comfy_origin_in_connection(
-        self,
-        db: sqlite3.Connection,
-    ) -> str:
-        row = db.execute(
-            "SELECT document FROM settings WHERE singleton = 1"
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("settings row is missing")
-        settings = canonicalize_live_runtime_settings(
-            RuntimeSettings.model_validate_json(row["document"])
-        )
-        return self.canonical_comfy_origin(settings.comfy_url)
-
-    def _assert_timeline_comfy_origin_in_connection(
-        self,
-        db: sqlite3.Connection,
-        *,
-        project_id: str,
-        expected_comfy_origin: str,
-    ) -> str:
-        # An unconfigured endpoint is a valid authority snapshot for a draft
-        # without assets. It must still compare exactly so an empty -> A or
-        # A -> empty switch cannot cross this timeline transaction.
-        expected = self.canonical_comfy_origin(expected_comfy_origin)
-        actual = self._current_comfy_origin_in_connection(db)
-        if actual != expected:
-            raise TimelineComfyOriginConflict(project_id, expected, actual)
-        return actual
-
-    def _assert_current_comfy_origin_in_connection(
-        self,
-        db: sqlite3.Connection,
-        *,
-        expected_comfy_origin: str,
-    ) -> str:
-        expected = self.canonical_comfy_origin(expected_comfy_origin)
-        if not expected:
-            raise ValueError("active ComfyUI origin is required")
-        actual = self._current_comfy_origin_in_connection(db)
-        if actual != expected:
-            raise AssetTrashOriginConflict(expected, actual)
-        return actual
 
     def put_asset(
         self,
         asset_id: str,
         document: dict[str, Any],
-        *,
-        comfy_origin: str,
     ) -> None:
-        origin = self.canonical_comfy_origin(comfy_origin)
-        if not origin:
-            raise ValueError("asset ComfyUI origin is required")
         with self.connect() as db:
             db.execute(
-                "INSERT INTO assets(id, document, created_at, comfy_origin) VALUES(?, ?, ?, ?)",
-                (asset_id, json.dumps(document, ensure_ascii=False), utc_now(), origin),
+                "INSERT INTO assets(id, document, created_at) VALUES(?, ?, ?)",
+                (asset_id, json.dumps(document, ensure_ascii=False), utc_now()),
             )
-
-    def put_asset_if_current_origin(
-        self,
-        asset_id: str,
-        document: dict[str, Any],
-        *,
-        expected_comfy_origin: str,
-    ) -> bool:
-        """Insert an imported asset only while the live endpoint is unchanged.
-
-        The settings comparison and asset insert share one SQLite write lock,
-        closing the upload-time check/insert race during endpoint switches.
-        """
-
-        expected = self.canonical_comfy_origin(expected_comfy_origin)
-        if not expected:
-            raise ValueError("asset ComfyUI origin is required")
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT document FROM settings WHERE singleton = 1"
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("settings row is missing")
-            current = canonicalize_live_runtime_settings(
-                RuntimeSettings.model_validate_json(row["document"])
-            )
-            if self.canonical_comfy_origin(current.comfy_url) != expected:
-                return False
-            db.execute(
-                "INSERT INTO assets(id, document, created_at, comfy_origin) VALUES(?, ?, ?, ?)",
-                (
-                    asset_id,
-                    json.dumps(document, ensure_ascii=False),
-                    utc_now(),
-                    expected,
-                ),
-            )
-        return True
 
     def get_asset(self, asset_id: str) -> dict[str, Any] | None:
         record = self.get_asset_record(asset_id)
-        return record[0] if record is not None else None
+        return record if record is not None else None
 
     def get_asset_record(
         self,
         asset_id: str,
         *,
         include_trashed: bool = False,
-    ) -> tuple[dict[str, Any], str] | None:
+    ) -> dict[str, Any] | None:
         live_clause = "" if include_trashed else " AND trashed_at IS NULL"
         with self.connect() as db:
             row = db.execute(
-                "SELECT document, comfy_origin FROM assets WHERE id = ?"
+                "SELECT document FROM assets WHERE id = ?"
                 + live_clause,
                 (asset_id,),
             ).fetchone()
         if row is None:
             return None
-        origin = self.canonical_comfy_origin(row["comfy_origin"] or "")
-        if not origin:
-            raise RuntimeError(f"stored asset '{asset_id}' has no ComfyUI origin")
-        return json.loads(row["document"]), origin
+        return json.loads(row["document"])
 
     def list_assets(
         self,
         *,
-        comfy_origin: str,
         kind: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List only assets registered against the active ComfyUI endpoint."""
-
-        origin = self.canonical_comfy_origin(comfy_origin)
-        if not origin:
-            raise ValueError("active ComfyUI origin is required")
         with self.connect() as db:
             rows = db.execute(
-                "SELECT document FROM assets WHERE comfy_origin = ? "
-                "AND trashed_at IS NULL ORDER BY created_at DESC, id DESC",
-                (origin,),
+                "SELECT document FROM assets WHERE trashed_at IS NULL "
+                "ORDER BY created_at DESC, id DESC",
             ).fetchall()
         assets: list[dict[str, Any]] = []
         for row in rows:
@@ -2368,7 +2002,6 @@ class Database:
             raise RuntimeError(f"asset trash batch '{row['id']}' is invalid")
         return {
             "batch_id": str(row["id"]),
-            "comfy_origin": str(row["comfy_origin"]),
             "asset_ids": list(asset_ids),
             "cascade": bool(row["cascade"]),
             "unbound_usages_by_asset": {
@@ -2407,22 +2040,13 @@ class Database:
         ]
         return batch
 
-    def list_asset_trash_batches(
-        self,
-        *,
-        comfy_origin: str,
-    ) -> list[dict[str, Any]]:
-        origin = self.canonical_comfy_origin(comfy_origin)
+    def list_asset_trash_batches(self) -> list[dict[str, Any]]:
         with self.connect() as db:
             db.execute("BEGIN")
-            self._assert_current_comfy_origin_in_connection(
-                db, expected_comfy_origin=origin
-            )
             rows = db.execute(
-                "SELECT id, comfy_origin, asset_ids, cascade, unbound_usages, "
-                "created_at FROM asset_trash_batches WHERE comfy_origin = ? "
+                "SELECT id, asset_ids, cascade, unbound_usages, "
+                "created_at FROM asset_trash_batches "
                 "ORDER BY created_at DESC, id DESC",
-                (origin,),
             ).fetchall()
             return [self._trash_batch_read_in_connection(db, row) for row in rows]
 
@@ -2690,7 +2314,6 @@ class Database:
         asset_ids: list[str],
         *,
         cascade: bool,
-        expected_comfy_origin: str,
     ) -> dict[str, Any]:
         """Atomically tombstone one user-intent batch and save its inverse bundle."""
 
@@ -2708,15 +2331,11 @@ class Database:
         if len(normalized_ids) > 128:
             raise ValueError("at most 128 assets may be trashed together")
 
-        origin = self.canonical_comfy_origin(expected_comfy_origin)
         placeholders = ",".join("?" for _ in normalized_ids)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._assert_current_comfy_origin_in_connection(
-                db, expected_comfy_origin=origin
-            )
             asset_rows = db.execute(
-                "SELECT id, document, comfy_origin, trashed_at FROM assets "
+                "SELECT id, document, trashed_at FROM assets "
                 f"WHERE id IN ({placeholders})",
                 tuple(normalized_ids),
             ).fetchall()
@@ -2725,11 +2344,6 @@ class Database:
                 row = rows_by_id.get(asset_id)
                 if row is None or row["trashed_at"] is not None:
                     raise KeyError(asset_id)
-                stored_origin = self.canonical_comfy_origin(
-                    row["comfy_origin"] or ""
-                )
-                if stored_origin != origin:
-                    raise AssetTrashOriginConflict(origin, stored_origin)
                 AssetReference.model_validate_json(row["document"])
 
             target_ids = set(normalized_ids)
@@ -2758,11 +2372,10 @@ class Database:
             now = utc_now()
             db.execute(
                 "INSERT INTO asset_trash_batches("
-                "id, comfy_origin, asset_ids, cascade, unbound_usages, created_at"
-                ") VALUES(?, ?, ?, ?, ?, ?)",
+                "id, asset_ids, cascade, unbound_usages, created_at"
+                ") VALUES(?, ?, ?, ?, ?)",
                 (
                     batch_id,
-                    origin,
                     json.dumps(normalized_ids, ensure_ascii=False),
                     int(cascade),
                     json.dumps(usages_by_asset, ensure_ascii=False),
@@ -2847,7 +2460,7 @@ class Database:
                     "asset trash update did not affect every requested registration"
                 )
             batch_row = db.execute(
-                "SELECT id, comfy_origin, asset_ids, cascade, unbound_usages, "
+                "SELECT id, asset_ids, cascade, unbound_usages, "
                 "created_at FROM asset_trash_batches WHERE id = ?",
                 (batch_id,),
             ).fetchone()
@@ -2860,19 +2473,15 @@ class Database:
         asset_id: str,
         *,
         cascade: bool = False,
-        expected_comfy_origin: str | None = None,
     ) -> list[str]:
         """Compatibility wrapper around the recoverable single-asset trash path."""
 
-        record = self.get_asset_record(asset_id)
-        if record is None:
+        if self.get_asset_record(asset_id) is None:
             raise KeyError(asset_id)
-        origin = expected_comfy_origin or record[1]
         try:
             batch = self.trash_assets(
                 [asset_id],
                 cascade=cascade,
-                expected_comfy_origin=origin,
             )
         except AssetTrashInUse as exc:
             return exc.usages
@@ -2882,19 +2491,14 @@ class Database:
         self,
         db: sqlite3.Connection,
         batch_id: str,
-        *,
-        comfy_origin: str,
     ) -> tuple[sqlite3.Row, dict[str, Any]]:
         row = db.execute(
-            "SELECT id, comfy_origin, asset_ids, cascade, unbound_usages, "
+            "SELECT id, asset_ids, cascade, unbound_usages, "
             "created_at FROM asset_trash_batches WHERE id = ?",
             (batch_id,),
         ).fetchone()
         if row is None:
             raise KeyError(batch_id)
-        stored_origin = self.canonical_comfy_origin(row["comfy_origin"])
-        if stored_origin != comfy_origin:
-            raise AssetTrashOriginConflict(comfy_origin, stored_origin)
         return row, self._trash_batch_read_in_connection(db, row)
 
     @staticmethod
@@ -2935,18 +2539,13 @@ class Database:
         batch_id: str,
         *,
         mode: str,
-        expected_comfy_origin: str,
     ) -> dict[str, Any]:
         if mode not in {"registration_only", "with_references"}:
             raise ValueError("unknown asset trash restore mode")
-        origin = self.canonical_comfy_origin(expected_comfy_origin)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._assert_current_comfy_origin_in_connection(
-                db, expected_comfy_origin=origin
-            )
             _row, batch = self._require_asset_trash_batch_in_connection(
-                db, batch_id, comfy_origin=origin
+                db, batch_id
             )
             changes = db.execute(
                 "SELECT owner_kind, owner_id, before_document, after_digest, "
@@ -3005,7 +2604,7 @@ class Database:
 
             placeholders = ",".join("?" for _ in batch["asset_ids"])
             rows = db.execute(
-                "SELECT id, comfy_origin, trashed_at, trash_batch_id FROM assets "
+                "SELECT id, trashed_at, trash_batch_id FROM assets "
                 f"WHERE id IN ({placeholders})",
                 tuple(batch["asset_ids"]),
             ).fetchall()
@@ -3016,8 +2615,6 @@ class Database:
                     asset_row is None
                     or asset_row["trashed_at"] is None
                     or asset_row["trash_batch_id"] != batch_id
-                    or self.canonical_comfy_origin(asset_row["comfy_origin"] or "")
-                    != origin
                 ):
                     conflicts.append(
                         {
@@ -3053,7 +2650,6 @@ class Database:
                             self._validate_asset_iterator_in_connection(
                                 db,
                                 iter_draft_assets(restored),
-                                comfy_origin=origin,
                             )
                         else:
                             restored = validate_timeline_draft(
@@ -3062,7 +2658,6 @@ class Database:
                             self._validate_asset_iterator_in_connection(
                                 db,
                                 iter_timeline_assets(restored),
-                                comfy_origin=origin,
                             )
                     except (ValidationError, ValueError, RuntimeError) as exc:
                         raise AssetTrashRestoreConflict(
@@ -3124,24 +2719,18 @@ class Database:
     def purge_asset_trash_batch(
         self,
         batch_id: str,
-        *,
-        expected_comfy_origin: str,
     ) -> dict[str, Any]:
         """Forget Director registrations and recovery data, never remote files."""
 
-        origin = self.canonical_comfy_origin(expected_comfy_origin)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._assert_current_comfy_origin_in_connection(
-                db, expected_comfy_origin=origin
-            )
             _row, batch = self._require_asset_trash_batch_in_connection(
-                db, batch_id, comfy_origin=origin
+                db, batch_id
             )
             cursor = db.execute(
                 "DELETE FROM assets WHERE trash_batch_id = ? "
-                "AND trashed_at IS NOT NULL AND comfy_origin = ?",
-                (batch_id, origin),
+                "AND trashed_at IS NOT NULL",
+                (batch_id,),
             )
             if cursor.rowcount != len(batch["asset_ids"]):
                 raise AssetTrashRestoreConflict(
@@ -3163,7 +2752,7 @@ class Database:
                 "purged_asset_ids": list(batch["asset_ids"]),
             }
 
-    def validate_draft_assets(self, draft: ModeDraft, *, comfy_origin: str) -> None:
+    def validate_draft_assets(self, draft: ModeDraft) -> None:
         """Verify draft media against immutable upload records.
 
         Timeline compilation derives its ComfyUI path only from ``name`` and
@@ -3172,15 +2761,12 @@ class Database:
         ``POST /api/assets`` rather than from client-controlled JSON.
         """
 
-        self._validate_asset_iterator(
-            iter_draft_assets(draft), comfy_origin=comfy_origin
-        )
+        self._validate_asset_iterator(iter_draft_assets(draft))
 
     def validate_timeline_assets(
         self,
         draft: UnifiedTimelineDraft,
         *,
-        comfy_origin: str,
         segment_ids: list[str] | None = None,
     ) -> None:
         self._validate_asset_iterator(
@@ -3188,44 +2774,30 @@ class Database:
                 draft,
                 segment_ids=set(segment_ids) if segment_ids is not None else None,
             ),
-            comfy_origin=comfy_origin,
         )
 
     def _validate_asset_iterator(
         self,
         references: Any,
-        *,
-        comfy_origin: str,
     ) -> None:
         with self.connect() as db:
-            self._validate_asset_iterator_in_connection(
-                db, references, comfy_origin=comfy_origin
-            )
+            self._validate_asset_iterator_in_connection(db, references)
 
     def _validate_asset_iterator_in_connection(
         self,
         db: sqlite3.Connection,
         references: Any,
-        *,
-        comfy_origin: str,
     ) -> None:
         """Validate references using the caller's transaction and connection."""
 
-        expected_origin = self.canonical_comfy_origin(comfy_origin)
         for location, reference in references:
             row = db.execute(
-                "SELECT document, comfy_origin FROM assets WHERE id = ? "
+                "SELECT document FROM assets WHERE id = ? "
                 "AND trashed_at IS NULL",
                 (reference.id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"{location}: asset id '{reference.id}' is not registered")
-            stored_origin = self.canonical_comfy_origin(row["comfy_origin"] or "")
-            if stored_origin != expected_origin:
-                raise ValueError(
-                    f"{location}: asset id '{reference.id}' belongs to ComfyUI "
-                    f"'{stored_origin}', not the active endpoint '{expected_origin}'"
-                )
             try:
                 stored = AssetReference.model_validate_json(row["document"])
             except (ValidationError, ValueError) as exc:

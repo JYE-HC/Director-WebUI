@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type CSSProperties } from "react";
-import { ApiError, DATABASE_IDENTITY_STALE_EVENT, detectEmbeddedComfyUi, directorApi, taskEventsUrl } from "./api/client";
+import { ApiError, directorApi, taskEventsUrl } from "./api/client";
 import {
   EMPTY_CAPABILITIES,
   EMPTY_MODELS,
-  canonicalComfyOrigin,
-  isConfiguredComfyUrl,
   rayLightResidencyPolicyAfterBindingChange,
   resolveExecutionBackend,
   sanitizeRuntimeSettings,
@@ -120,16 +118,16 @@ import {
   type TimelinePersistenceScope,
 } from "./state/timelinePersistence";
 
-const SIDEBAR_OPEN_KEY = "director-web:sidebar-open";
-const SIDEBAR_WIDTH_KEY = "director-web:sidebar-expanded-width";
+const SIDEBAR_OPEN_KEY = "directordeck:sidebar-open";
+const SIDEBAR_WIDTH_KEY = "directordeck:sidebar-expanded-width";
 const SIDEBAR_MOBILE_MAX = 760;
 const GLOBAL_SETTINGS_ID = "timeline-global-settings";
 const TIMELINE_HISTORY_PANEL_ID = "timeline-history-panel";
 const ASSET_TRASH_PANEL_ID = "asset-trash-panel";
-export const UNBOUND_RUNTIME_SETTINGS_PENDING_KEY = "director-web:runtime-settings-pending";
-export const QUARANTINED_UNBOUND_RUNTIME_SETTINGS_PENDING_KEY = "director-web:runtime-settings-pending-quarantine";
-export const RUNTIME_SETTINGS_PENDING_KEY = "director-web:v2:runtime-settings-pending";
-export const QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY = "director-web:v2:runtime-settings-pending-quarantine";
+export const UNBOUND_RUNTIME_SETTINGS_PENDING_KEY = "directordeck:runtime-settings-pending";
+export const QUARANTINED_UNBOUND_RUNTIME_SETTINGS_PENDING_KEY = "directordeck:runtime-settings-pending-quarantine";
+export const RUNTIME_SETTINGS_PENDING_KEY = "directordeck:v2:runtime-settings-pending";
+export const QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY = "directordeck:v2:runtime-settings-pending-quarantine";
 const RUNTIME_SETTINGS_PENDING_FORMAT = "director-pending-runtime-settings";
 const LEGACY_RUNTIME_SETTINGS_PENDING_VERSION = 1;
 const RUNTIME_SETTINGS_PENDING_VERSION = 2;
@@ -452,18 +450,10 @@ function waitForRayLightRecoveryWindow(
 }
 
 type RuntimeSettingsOperationOwner = "settings-page" | DiffusionModelRole | "resync";
-type StorageOperationStatus = "idle" | "submitting" | "reconciling" | "recovering";
 
 let runtimeSettingsWalOwnerCache: string | null = null;
 let adoptedRuntimeSettingsWalRaw: string | null = null;
 let latestRuntimeSettingsWalRaw: string | null = null;
-
-class RuntimeEndpointTimelineBoundaryError extends Error {
-  constructor(reason: unknown) {
-    super(reason instanceof Error ? reason.message : "切换地址前无法确认最新时间线");
-    this.name = "RuntimeEndpointTimelineBoundaryError";
-  }
-}
 
 class RuntimeSettingsSupersededError extends Error {
   constructor() {
@@ -560,14 +550,12 @@ function validActiveDatabasePath(value: unknown): value is string {
 
 interface ActiveDatabaseIdentity {
   active_database_path: string;
-  active_database_identity: string;
 }
 
 const INITIAL_TIMELINE_BRANCH_OWNER_ID = getTimelineBranchOwnerId();
 
 interface AssetAuthorityScope {
   database: ActiveDatabaseIdentity;
-  comfyOrigin: string;
 }
 
 function timelinePersistenceScope(
@@ -577,7 +565,6 @@ function timelinePersistenceScope(
 ): TimelinePersistenceScope {
   return {
     databasePath: database.active_database_path,
-    databaseIdentity: database.active_database_identity,
     projectId,
     ownerId,
   };
@@ -588,7 +575,7 @@ function timelineJournalTokenMapKey(
   projectId: string,
   ownerId: string = INITIAL_TIMELINE_BRANCH_OWNER_ID,
 ): string {
-  return `${database.active_database_identity}:${projectId}:${ownerId}`;
+  return `${database.active_database_path}:${projectId}:${ownerId}`;
 }
 
 function isCurrentTimelineHydration(
@@ -604,8 +591,7 @@ function isCurrentTimelineHydration(
 }
 
 function validActiveDatabaseIdentity(value: ActiveDatabaseIdentity): boolean {
-  return validActiveDatabasePath(value.active_database_path) &&
-    /^[0-9a-f]{64}$/.test(value.active_database_identity);
+  return validActiveDatabasePath(value.active_database_path);
 }
 
 function validRuntimeSettingsWalOwner(value: unknown): value is string {
@@ -631,17 +617,15 @@ function parseRuntimeSettingsWalEnvelope(raw: string): {
     const envelope = parsed as Record<string, unknown>;
     const keys = Object.keys(envelope).sort().join("|");
     const legacy = envelope.version === LEGACY_RUNTIME_SETTINGS_PENDING_VERSION &&
-      keys === "active_database_identity|active_database_path|format|pending|settings|version|written_at_ms";
+      keys === "active_database_path|format|pending|settings|version|written_at_ms";
     const owned = envelope.version === RUNTIME_SETTINGS_PENDING_VERSION &&
-      keys === "active_database_identity|active_database_path|format|owner_id|pending|settings|version|written_at_ms" &&
+      keys === "active_database_path|format|owner_id|pending|settings|version|written_at_ms" &&
       validRuntimeSettingsWalOwner(envelope.owner_id);
     if (
       (!legacy && !owned) ||
       envelope.format !== RUNTIME_SETTINGS_PENDING_FORMAT ||
       envelope.pending !== true ||
       !validActiveDatabasePath(envelope.active_database_path) ||
-      typeof envelope.active_database_identity !== "string" ||
-      !/^[0-9a-f]{64}$/.test(envelope.active_database_identity) ||
       !Number.isSafeInteger(envelope.written_at_ms) ||
       (envelope.written_at_ms as number) <= 0 ||
       typeof envelope.settings !== "object" || envelope.settings === null || Array.isArray(envelope.settings)
@@ -662,8 +646,7 @@ function runtimeSettingsWalOwnedByCurrentTab(
   const parsed = parseRuntimeSettingsWalEnvelope(raw);
   return parsed?.envelope.version === RUNTIME_SETTINGS_PENDING_VERSION &&
     parsed.envelope.owner_id === owner &&
-    parsed.envelope.active_database_path === database.active_database_path &&
-    parsed.envelope.active_database_identity === database.active_database_identity;
+    parsed.envelope.active_database_path === database.active_database_path;
 }
 
 function loadPendingRuntimeSettings(database: ActiveDatabaseIdentity): RuntimeSettings | null {
@@ -675,8 +658,7 @@ function loadPendingRuntimeSettings(database: ActiveDatabaseIdentity): RuntimeSe
     const parsed = parseRuntimeSettingsWalEnvelope(raw);
     if (
       !parsed ||
-      parsed.envelope.active_database_path !== database.active_database_path ||
-      parsed.envelope.active_database_identity !== database.active_database_identity
+      parsed.envelope.active_database_path !== database.active_database_path
     ) throw new Error("invalid runtime settings WAL envelope");
     adoptedRuntimeSettingsWalRaw = raw;
     return parsed.settings;
@@ -700,7 +682,6 @@ function savePendingRuntimeSettings(settings: RuntimeSettings, database: ActiveD
       owner_id: owner,
       pending: true,
       active_database_path: database.active_database_path,
-      active_database_identity: database.active_database_identity,
       written_at_ms: Date.now(),
       settings,
     });
@@ -795,7 +776,7 @@ function runtimeTimelineValidation(
   return errors;
 }
 
-const ACTIVE_PROJECT_ID_STORAGE_KEY = "director-web:v1:active-project-id";
+const ACTIVE_PROJECT_ID_STORAGE_KEY = "directordeck:v1:active-project-id";
 
 function loadActiveProjectId(): string {
   try {
@@ -875,7 +856,7 @@ export default function App() {
   const [rayLightRuntimeStatus, setRayLightRuntimeStatus] = useState<RayLightRuntimeStatus | null>(null);
   const [rayLightRecoveryPending, setRayLightRecoveryPending] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
-  const [runtimeResourcesOrigin, setRuntimeResourcesOrigin] = useState<string | null>(null);
+  const [runtimeResourcesReady, setRuntimeResourcesReady] = useState(false);
   const [runtimeSettingsOperationOwner, setRuntimeSettingsOperationOwner] = useState<RuntimeSettingsOperationOwner | null>(null);
   const [runtimeSettingsSyncRequired, setRuntimeSettingsSyncRequired] = useState(false);
   const [runtimeSettingsDraft, setRuntimeSettingsDraft] = useState<RuntimeSettings>(() => state.settings);
@@ -887,8 +868,6 @@ export default function App() {
     "loading" | "retrying" | "stale" | "ready"
   >("loading");
   const [timelineHydrationEpoch, setTimelineHydrationEpoch] = useState(0);
-  const [storageRestartRequired, setStorageRestartRequired] = useState(false);
-  const [storageOperationStatus, setStorageOperationStatus] = useState<StorageOperationStatus>("idle");
   const [timelinePausedError, setTimelinePausedError] = useState<{
     revision: number;
     message: string;
@@ -919,9 +898,6 @@ export default function App() {
   const [projectTitleEditing, setProjectTitleEditing] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState("");
   const [theme, setTheme] = useState(readUiTheme);
-  // Until the one-shot probe settles the SPA assumes standalone mode, so the
-  // ComfyUI address field stays editable; a positive probe locks it.
-  const [embeddedComfyUi, setEmbeddedComfyUi] = useState(false);
   const [deletingTaskIds, setDeletingTaskIds] = useState<ReadonlySet<string>>(() => new Set());
   const [clearingTasks, setClearingTasks] = useState(false);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -932,14 +908,14 @@ export default function App() {
   const runtimeRequest = useRef(0);
   const runtimeResourceRequest = useRef(0);
   const runtimeResourceRetryTimer = useRef<number | null>(null);
-  const runtimeResourceRefreshRef = useRef<(origin: string, preserveExisting: boolean) => Promise<boolean>>(
+  const runtimeResourceRefreshRef = useRef<(preserveExisting: boolean) => Promise<boolean>>(
     async () => false,
   );
   const externalRuntimeAuthorityRefreshRef = useRef<() => void>(() => undefined);
   const externalRuntimeAuthorityOperationRef = useRef<Promise<void> | null>(null);
   const externalRuntimeAuthorityControllerRef = useRef<AbortController | null>(null);
   const externalRuntimeAuthorityRetryTimer = useRef<number | null>(null);
-  const runtimeResourcesOriginRef = useRef<string | null>(null);
+  const runtimeResourcesReadyRef = useRef(false);
   const runtimeResourcesAuthorityTokenRef = useRef<string | null>(null);
   const rayLightRuntimeStatusRef = useRef<RayLightRuntimeStatus | null>(null);
   const rayLightRecoveryOperationRef = useRef<Promise<void> | null>(null);
@@ -955,7 +931,6 @@ export default function App() {
   const runtimeSettingsGeneration = useRef(0);
   const runtimeSettingsSyncRequiredRef = useRef(false);
   const runtimeSettingsAuthorityReadyRef = useRef(false);
-  const runtimeEndpointSwitchRequired = useRef(false);
   const runtimeExecutionIntent = useRef(0);
   const authoritativeSettingsRef = useRef(state.settings);
   const authoritativeSettingsTokenRef = useRef<string | null>(null);
@@ -984,10 +959,6 @@ export default function App() {
   const timelineHydrationGeneration = useRef(0);
   const timelineHydrationReady = useRef(false);
   const activeDatabaseRef = useRef<ActiveDatabaseIdentity | null>(null);
-  const storageRestartRequiredRef = useRef(false);
-  const storageOperationStatusRef = useRef<StorageOperationStatus>("idle");
-  const storageAuthorityControllerRef = useRef<AbortController | null>(null);
-  const storageRecoveryInProgress = useRef(false);
   const databaseIdentityStaleRef = useRef(false);
   const segmentSelectionGeneration = useRef(0);
   const restoredSegmentSelectionKey = useRef<string | null>(null);
@@ -1166,11 +1137,6 @@ export default function App() {
     setTimelineRevisionConflictState(conflict);
   }, []);
 
-  const setStorageOperationLock = useCallback((status: StorageOperationStatus) => {
-    storageOperationStatusRef.current = status;
-    setStorageOperationStatus(status);
-  }, []);
-
   const restartTimelineHydrationForProject = useCallback((projectId: string) => {
     if (projectId === activeProjectIdRef.current) return;
 
@@ -1232,100 +1198,6 @@ export default function App() {
     setTimelineHydrationEpoch((current) => current + 1);
   }, [clearTimelineHistory, saveLocalTimeline, setTimelineAuthorityRequired, setTimelineRevisionConflict]);
 
-  const acceptStorageConfiguration = useCallback((configuration: StorageConfiguration): boolean => {
-    const activeDatabase = activeDatabaseRef.current;
-    if (
-      !activeDatabase ||
-      configuration.active_database_path !== activeDatabase.active_database_path ||
-      configuration.active_database_identity !== activeDatabase.active_database_identity
-    ) {
-      clearTimelineHistory();
-      assetTrashListRequest.current += 1;
-      setAssetTrashBatches([]);
-      setAssetTrashConflictBatchIds(new Set());
-      setAssetTrashPanelOpen(false);
-      databaseIdentityStaleRef.current = true;
-      timelineServerRevision.current = null;
-      timelineServerProjectRef.current = null;
-      timelineHydrationReady.current = false;
-      setTimelineHydrationStatus("stale");
-      setToast("Director 后端数据库已变化；请刷新整个页面后继续");
-      return false;
-    }
-    if (configuration.restart_required) {
-      clearTimelineHistory();
-      assetTrashListRequest.current += 1;
-      setAssetTrashBatches([]);
-      setAssetTrashConflictBatchIds(new Set());
-      setAssetTrashPanelOpen(false);
-    }
-    storageRestartRequiredRef.current = configuration.restart_required;
-    setStorageRestartRequired(configuration.restart_required);
-    setStorageOperationLock("idle");
-    return true;
-  }, [clearTimelineHistory, setStorageOperationLock]);
-
-  const beginStorageOperation = useCallback(() => {
-    storageAuthorityControllerRef.current?.abort();
-    storageAuthorityControllerRef.current = null;
-    projectSwitchGeneration.current += 1;
-    setStorageOperationLock("submitting");
-  }, [setStorageOperationLock]);
-
-  const abortStorageOperation = useCallback(() => {
-    storageAuthorityControllerRef.current?.abort();
-    storageAuthorityControllerRef.current = null;
-    setStorageOperationLock("idle");
-  }, [setStorageOperationLock]);
-
-  const reconcileUncertainStorageOperation = useCallback(async (): Promise<StorageConfiguration> => {
-    storageAuthorityControllerRef.current?.abort();
-    const controller = new AbortController();
-    storageAuthorityControllerRef.current = controller;
-    setStorageOperationLock("reconciling");
-    try {
-      for (;;) {
-        try {
-          const configuration = await directorApi.getStorage(controller.signal);
-          if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
-          if (!acceptStorageConfiguration(configuration)) {
-            throw new DatabaseIdentityChangedDuringHydrationError();
-          }
-          return configuration;
-        } catch (reason) {
-          if (
-            controller.signal.aborted ||
-            databaseIdentityStaleRef.current ||
-            reason instanceof DatabaseIdentityChangedDuringHydrationError
-          ) throw reason;
-          await new Promise<void>((resolve, reject) => {
-            const timer = window.setTimeout(resolve, STORAGE_AUTHORITY_RETRY_MS);
-            controller.signal.addEventListener("abort", () => {
-              window.clearTimeout(timer);
-              reject(new DOMException("Aborted", "AbortError"));
-            }, { once: true });
-          });
-        }
-      }
-    } finally {
-      if (storageAuthorityControllerRef.current === controller) {
-        storageAuthorityControllerRef.current = null;
-      }
-    }
-  }, [acceptStorageConfiguration, setStorageOperationLock]);
-
-  useEffect(() => () => storageAuthorityControllerRef.current?.abort(), []);
-
-  useEffect(() => {
-    let cancelled = false;
-    void detectEmbeddedComfyUi().then((embedded) => {
-      if (!cancelled && embedded) setEmbeddedComfyUi(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   const dispatchTimeline = useCallback((
     action: TimelineAction,
     options: TimelineDispatchOptions = {},
@@ -1339,18 +1211,6 @@ export default function App() {
     );
     const next = transaction.next;
     const projectChanged = transaction.documentChanged;
-    if (databaseIdentityStaleRef.current && projectChanged) {
-      setToast("本页数据库身份已过期；请刷新整个页面后继续");
-      return false;
-    }
-    if (storageOperationStatusRef.current !== "idle" && projectChanged) {
-      setToast("数据库操作结果尚未确认；确认完成前不能继续修改");
-      return false;
-    }
-    if (storageRestartRequiredRef.current && projectChanged) {
-      setToast("数据库切换正在等待重启；刷新页面前不能继续修改");
-      return false;
-    }
     if (!timelineHydrationReady.current && projectChanged) {
       setToast("正在从服务器恢复时间线；恢复完成前暂不能编辑");
       return false;
@@ -1359,10 +1219,8 @@ export default function App() {
       setToast("正在完成项目切换交接；完成前不能编辑当前项目");
       return false;
     }
-    if ((assetDeleteLock.current || assetDeleteIntent.current || timelineSyncRequiredRef.current || timelineRevisionConflictRef.current || runtimeEndpointSwitchRequired.current) && projectChanged) {
-      setToast(runtimeEndpointSwitchRequired.current
-        ? "正在切换 ComfyUI 地址；最新时间线确认并完成新地址核对前暂不能编辑"
-        : assetDeleteIntent.current
+    if ((assetDeleteLock.current || assetDeleteIntent.current || timelineSyncRequiredRef.current || timelineRevisionConflictRef.current) && projectChanged) {
+      setToast(assetDeleteIntent.current
           ? "正在建立素材移出的原子边界；完成后再编辑时间线"
         : timelineRevisionConflictRef.current
           ? "检测到服务器时间线已被其他页面修改；请先选择采用服务器版本或保留本地版本"
@@ -1462,7 +1320,7 @@ export default function App() {
     }
     const activeDatabase = activeDatabaseRef.current;
     const selectionPreferenceScope = activeDatabase
-      ? `${activeDatabase.active_database_identity}:${activeProjectIdRef.current}`
+      ? `${activeDatabase.active_database_path}:${activeProjectIdRef.current}`
       : null;
     if (
       activeDatabase &&
@@ -1768,7 +1626,7 @@ export default function App() {
     if (!database || serverRevision === null) return;
     const projectId = activeProjectId;
     const scope = {
-      databaseIdentity: database.active_database_identity,
+      databasePath: database.active_database_path,
       projectId,
     };
     // A legacy WAL deliberately remains local until the user resolves it. Its
@@ -1798,10 +1656,7 @@ export default function App() {
             requestId !== timelineRemoteAuthorityRequest.current ||
             writeGeneration !== timelineWriteGeneration.current ||
             activeProjectIdRef.current !== projectId ||
-            databaseIdentityStaleRef.current ||
-            storageOperationStatusRef.current !== "idle" ||
-            activeDatabaseRef.current?.active_database_path !== database.active_database_path ||
-            activeDatabaseRef.current?.active_database_identity !== scope.databaseIdentity
+            activeDatabaseRef.current?.active_database_path !== scope.databasePath
           ) return;
           const serverProject = normalizeTimelineProject(authority.document);
           if (!serverProject) throw new Error("服务器返回的时间线结构无效");
@@ -1906,24 +1761,18 @@ export default function App() {
     const activeDatabase = activeDatabaseRef.current;
     const scope = expectedScope ?? (
       activeDatabase && runtimeSettingsAuthorityReadyRef.current
-        ? {
-            database: { ...activeDatabase },
-            comfyOrigin: authoritativeSettingsRef.current.comfy_url,
-          }
+        ? { database: { ...activeDatabase } }
         : null
     );
-    const scopeComfyOrigin = scope ? canonicalComfyOrigin(scope.comfyOrigin) : null;
     const scopeStillCurrent = () => Boolean(
       scope &&
       runtimeSettingsAuthorityReadyRef.current &&
-      activeDatabaseRef.current?.active_database_path === scope.database.active_database_path &&
-      activeDatabaseRef.current?.active_database_identity === scope.database.active_database_identity &&
-      canonicalComfyOrigin(authoritativeSettingsRef.current.comfy_url) === scopeComfyOrigin
+      activeDatabaseRef.current?.active_database_path === scope.database.active_database_path
     );
     if (!scopeStillCurrent()) {
       if (failClosed) {
         dispatchTimelineUi({ type: "assets/replace", assets: [] });
-        throw new Error("素材库所属数据库或 ComfyUI 地址尚未完成权威确认");
+        throw new Error("素材库尚未完成权威确认");
       }
       return false;
     }
@@ -1933,13 +1782,11 @@ export default function App() {
       if (
         signal?.aborted ||
         assetListRequest.current !== requestId ||
-        !scopeStillCurrent() ||
-        response.active_database_identity !== scope!.database.active_database_identity ||
-        response.comfy_origin !== scopeComfyOrigin
+        !scopeStillCurrent()
       ) {
         if (failClosed && assetListRequest.current === requestId) {
           dispatchTimelineUi({ type: "assets/replace", assets: [] });
-          throw new Error("素材库响应不属于当前数据库与 ComfyUI 地址");
+          throw new Error("素材库响应已过期");
         }
         return false;
       }
@@ -1967,18 +1814,10 @@ export default function App() {
 
   const loadAssetTrash = useCallback(async (): Promise<boolean> => {
     const requestId = ++assetTrashListRequest.current;
-    const databaseIdentity = activeDatabaseRef.current?.active_database_identity ?? null;
-    const comfyOrigin = canonicalComfyOrigin(authoritativeSettingsRef.current.comfy_url);
     setAssetTrashLoading(true);
     try {
       const response = await directorApi.listAssetTrash();
-      if (
-        requestId !== assetTrashListRequest.current ||
-        activeDatabaseRef.current?.active_database_identity !== databaseIdentity ||
-        canonicalComfyOrigin(authoritativeSettingsRef.current.comfy_url) !== comfyOrigin ||
-        response.active_database_identity !== databaseIdentity ||
-        response.comfy_origin !== comfyOrigin
-      ) return false;
+      if (requestId !== assetTrashListRequest.current) return false;
       setAssetTrashBatches(response.batches);
       const visibleBatchIds = new Set(response.batches.map((batch) => batch.batch_id));
       setAssetTrashConflictBatchIds((current) => new Set(
@@ -1997,7 +1836,6 @@ export default function App() {
   const reconcileAmbiguousAssetTrash = useCallback(async (
     assetIds: readonly string[],
     expectedDatabase: ActiveDatabaseIdentity,
-    expectedComfyOrigin: string,
     expectedProjectId: string,
     expectedProjectSwitchGeneration: number,
   ): Promise<"committed" | "rejected" | "unknown"> => {
@@ -2016,13 +1854,7 @@ export default function App() {
         !activeDatabase ||
         projectSwitchGeneration.current !== expectedProjectSwitchGeneration ||
         activeProjectIdRef.current !== expectedProjectId ||
-        activeDatabase.active_database_path !== expectedDatabase.active_database_path ||
-        activeDatabase.active_database_identity !== expectedDatabase.active_database_identity ||
-        authoritativeSettingsRef.current.comfy_url !== expectedComfyOrigin ||
-        assetResponse.active_database_identity !== expectedDatabase.active_database_identity ||
-        assetResponse.comfy_origin !== canonicalComfyOrigin(expectedComfyOrigin) ||
-        trashResponse.active_database_identity !== expectedDatabase.active_database_identity ||
-        trashResponse.comfy_origin !== canonicalComfyOrigin(expectedComfyOrigin)
+        activeDatabase.active_database_path !== expectedDatabase.active_database_path
       ) return "unknown";
 
       const preference = loadAssetLayoutPreference();
@@ -2056,7 +1888,6 @@ export default function App() {
   }, [clearTimelineHistory, dispatchTimelineUi]);
 
   const refreshRuntimeResources = useCallback(async (
-    origin: string,
     preserveExisting: boolean,
     signal?: AbortSignal,
     scheduleBackgroundRetry = true,
@@ -2097,8 +1928,7 @@ export default function App() {
     ]);
     if (
       signal?.aborted ||
-      runtimeResourceRequest.current !== requestId ||
-      authoritativeSettingsRef.current.comfy_url !== origin
+      runtimeResourceRequest.current !== requestId
     ) return false;
 
     const finalAuthority = finalAuthorityResult.status === "fulfilled"
@@ -2107,6 +1937,10 @@ export default function App() {
           token: finalAuthorityResult.value.authority_token,
         }
       : null;
+    // A concurrent settings write anywhere (this page, another tab, or the
+    // server itself) invalidates this in-flight resource batch: its four
+    // endpoints resolved their inputs from the pre-write authority. The
+    // App-owned reconciliation adopts the newer authority instead.
     const authorityChanged = Boolean(
       initialAuthority && finalAuthority &&
       initialAuthority.token !== finalAuthority.token
@@ -2117,27 +1951,16 @@ export default function App() {
         !sameRuntimeSettings(authoritativeSettingsRef.current, initialAuthority.settings)
       )
     );
-    if (
-      authorityChanged ||
-      browserAuthorityChanged ||
-      (initialAuthority && initialAuthority.settings.comfy_url !== origin) ||
-      (finalAuthority && finalAuthority.settings.comfy_url !== origin)
-    ) {
-      // Every resource endpoint resolves its ComfyUI client from the current
-      // server settings. A concurrent tab may therefore switch A -> B while
-      // this page still names A. Never label B's responses as A: invalidate all
-      // endpoint-scoped authorities immediately and let the App-owned settings
-      // reconciliation adopt B together with its asset library.
+    if (authorityChanged || browserAuthorityChanged) {
       runtimeResourceRequest.current += 1;
       runtimeSettingsAuthorityReadyRef.current = false;
       authoritativeSettingsTokenRef.current = null;
-      runtimeEndpointSwitchRequired.current = true;
-      runtimeResourcesOriginRef.current = null;
+      runtimeResourcesReadyRef.current = false;
       runtimeResourcesAuthorityTokenRef.current = null;
-      setRuntimeResourcesOrigin(null);
+      setRuntimeResourcesReady(false);
       rayLightRuntimeStatusRef.current = null;
       setRayLightRuntimeStatus(null);
-      setCapabilities({ ...EMPTY_CAPABILITIES, connection: "checking", message: "ComfyUI endpoint 已在服务器端变化，正在重新核对" });
+      setCapabilities({ ...EMPTY_CAPABILITIES, connection: "checking", message: "运行设置已在服务器端变化，正在重新核对" });
       setGpus([]);
       setModels(EMPTY_MODELS);
       setLoadingModels(false);
@@ -2162,8 +1985,6 @@ export default function App() {
     const complete = initialAuthority !== null &&
       finalAuthority !== null &&
       initialAuthority.token === finalAuthority.token &&
-      initialAuthority.settings.comfy_url === origin &&
-      finalAuthority.settings.comfy_url === origin &&
       capabilityResult.status === "fulfilled" &&
       capabilityResult.value.connection === "online" &&
       gpuResult.status === "fulfilled" &&
@@ -2177,13 +1998,12 @@ export default function App() {
       rayLightRuntimeStatusRef.current = rayLightRuntimeResult.value;
       setRayLightRuntimeStatus(rayLightRuntimeResult.value);
       setLoadingModels(false);
-      runtimeResourcesOriginRef.current = origin;
+      runtimeResourcesReadyRef.current = true;
       runtimeResourcesAuthorityTokenRef.current = initialAuthority!.token;
-      setRuntimeResourcesOrigin(origin);
+      setRuntimeResourcesReady(true);
       if (runtimeSettingsDesired.current) {
         window.queueMicrotask(() => runtimeSettingsDrainRef.current());
       } else if (runtimeSettingsSyncRequiredRef.current && !assetAuthorityRequired.current) {
-        runtimeEndpointSwitchRequired.current = false;
         if (runtimeSettingsDraftValidRef.current) {
           setRuntimeAuthorityRequired(false);
           invalidateAndRefreshTaskSnapshots();
@@ -2205,32 +2025,22 @@ export default function App() {
     if (scheduleBackgroundRetry) {
       runtimeResourceRetryTimer.current = window.setTimeout(() => {
         runtimeResourceRetryTimer.current = null;
-        if (authoritativeSettingsRef.current.comfy_url !== origin) return;
-        void runtimeResourceRefreshRef.current(origin, runtimeResourcesOriginRef.current === origin);
+        void runtimeResourceRefreshRef.current(runtimeResourcesReadyRef.current);
       }, RUNTIME_SETTINGS_RETRY_MS);
     }
     return false;
   }, [clearTimelineHistory, dispatchTimelineUi, invalidateAndRefreshTaskSnapshots, setRuntimeAuthorityRequired]);
-  runtimeResourceRefreshRef.current = (origin, preserveExisting) =>
-    refreshRuntimeResources(origin, preserveExisting);
+  runtimeResourceRefreshRef.current = (preserveExisting) =>
+    refreshRuntimeResources(preserveExisting);
 
-  const refreshAuthoritativeResourcesAfterConnectionTest = useCallback((testedOrigin: string) => {
-    const authoritativeOrigin = authoritativeSettingsRef.current.comfy_url;
-    if (
-      testedOrigin !== authoritativeOrigin ||
-      !isConfiguredComfyUrl(authoritativeOrigin) ||
-      runtimeEndpointSwitchRequired.current
-    ) return;
-    // The probe only establishes reachability for its URL snapshot. App owns
+  const refreshAuthoritativeResourcesAfterConnectionTest = useCallback(() => {
+    // A successful probe re-confirms the single embedded host. App owns
     // resource authority and refreshes all four inventories in one
-    // latest-wins generation; a partial same-origin failure preserves the
-    // previously confirmed snapshot.
+    // latest-wins generation; a partial failure preserves the previously
+    // confirmed snapshot.
     setRuntimeAuthorityRequired(true);
     setCompileReport(null);
-    void refreshRuntimeResources(
-      authoritativeOrigin,
-      runtimeResourcesOriginRef.current === authoritativeOrigin,
-    );
+    void refreshRuntimeResources(runtimeResourcesReadyRef.current);
   }, [refreshRuntimeResources, setRuntimeAuthorityRequired]);
 
   const refreshRuntime = useCallback(async (
@@ -2274,27 +2084,8 @@ export default function App() {
     dispatch({ type: "settings/replace", settings });
     if (!runtimeSettingsDesired.current && runtimeSettingsDraftValidRef.current) setRuntimeSettingsDraft(settings);
     if (runtimeSettingsDesired.current) window.queueMicrotask(() => runtimeSettingsDrainRef.current());
-    if (!isConfiguredComfyUrl(settings.comfy_url)) {
-      runtimeResourceRequest.current += 1;
-      if (runtimeResourceRetryTimer.current !== null) {
-        window.clearTimeout(runtimeResourceRetryTimer.current);
-        runtimeResourceRetryTimer.current = null;
-      }
-      runtimeResourcesOriginRef.current = null;
-      runtimeResourcesAuthorityTokenRef.current = null;
-      setRuntimeResourcesOrigin(null);
-      setCapabilities({
-        ...EMPTY_CAPABILITIES,
-        connection: "unknown",
-        message: "尚未配置 ComfyUI 地址",
-      });
-      rayLightRuntimeStatusRef.current = null;
-      setRayLightRuntimeStatus(null);
-      return settings;
-    }
     await refreshRuntimeResources(
-      settings.comfy_url,
-      preserveResources && runtimeResourcesOriginRef.current === settings.comfy_url,
+      preserveResources && runtimeResourcesReadyRef.current,
       signal,
       true,
       authoritySnapshot,
@@ -2316,22 +2107,16 @@ export default function App() {
         const settings = await refreshRuntime(controller.signal, false);
         throwIfAborted(controller.signal);
         if (!settings) throw new Error("无法读取服务器权威运行设置");
-        if (isConfiguredComfyUrl(settings.comfy_url)) {
-          if (runtimeResourcesOriginRef.current !== settings.comfy_url) {
-            throw new Error("新 endpoint 的运行资源尚未完成同源核对");
-          }
-          const assetsReady = await loadAssets(controller.signal, true);
-          throwIfAborted(controller.signal);
-          if (!assetsReady) throw new Error("新 endpoint 的素材库刷新请求已过期");
-        } else {
-          assetListRequest.current += 1;
-          dispatchTimelineUi({ type: "assets/replace", assets: [] });
+        if (!runtimeResourcesReadyRef.current) {
+          throw new Error("运行资源尚未完成核对");
         }
+        const assetsReady = await loadAssets(controller.signal, true);
+        throwIfAborted(controller.signal);
+        if (!assetsReady) throw new Error("素材库刷新请求已过期");
         assetAuthorityRequired.current = false;
         if (runtimeSettingsDesired.current) {
           window.queueMicrotask(() => runtimeSettingsDrainRef.current());
         } else {
-          runtimeEndpointSwitchRequired.current = false;
           if (runtimeSettingsDraftValidRef.current) {
             setRuntimeAuthorityRequired(false);
             invalidateAndRefreshTaskSnapshots();
@@ -2364,14 +2149,8 @@ export default function App() {
     owner: RuntimeSettingsOperationOwner,
     nextSettings?: RuntimeSettings,
   ): Promise<RuntimeSettings> => {
-    if (databaseIdentityStaleRef.current) {
-      throw new Error("本页数据库身份已过期，请刷新整个页面");
-    }
     if (rayLightRecoveryPendingRef.current) {
       throw new Error("RayLight 重启恢复正在核对，不能修改运行设置");
-    }
-    if (storageRestartRequiredRef.current) {
-      throw new Error("数据库切换正在等待重启，不能继续修改运行设置");
     }
     if (assetDeleteLock.current || assetDeleteIntent.current) {
       throw new Error("正在原子解除素材引用，完成前不能切换运行设置");
@@ -2389,11 +2168,7 @@ export default function App() {
     const normalized = nextSettings
       ? sanitizeRuntimeSettings(structuredClone(nextSettings))
       : null;
-    const previousAuthority = authoritativeSettingsRef.current;
-    const requestedEndpointChange = normalized !== null &&
-      normalized.comfy_url !== previousAuthority.comfy_url;
     const generation = ++runtimeSettingsGeneration.current;
-    if (requestedEndpointChange) runtimeEndpointSwitchRequired.current = true;
 
     setRuntimeSettingsOperationOwner(owner);
     setRuntimeAuthorityRequired(true);
@@ -2406,45 +2181,7 @@ export default function App() {
     };
 
     const operation = (async () => {
-      if (requestedEndpointChange) {
-        // Endpoint authority is an exclusive boundary with the timeline. An A
-        // timeline response must be fully confirmed before any B settings PUT
-        // can clear A's assets or change compilation authority.
-        try {
-          await flushTimelineAutosaveRef.current();
-        } catch (reason) {
-          // The timeline itself must remain editable so a deterministic 4xx
-          // can be corrected. Generation stays fail-closed through the runtime
-          // sync flag, while the endpoint edit remains queued for the next
-          // successful timeline autosave.
-          runtimeEndpointSwitchRequired.current = false;
-          throw new RuntimeEndpointTimelineBoundaryError(reason);
-        }
-        if (
-          !runtimeSettingsDesired.current || !normalized ||
-          !sameRuntimeSettings(runtimeSettingsDesired.current, normalized)
-        ) {
-          runtimeEndpointSwitchRequired.current = false;
-          throw new RuntimeSettingsSupersededError();
-        }
-        runtimeRequest.current += 1;
-        runtimeResourceRequest.current += 1;
-        if (runtimeResourceRetryTimer.current !== null) {
-          window.clearTimeout(runtimeResourceRetryTimer.current);
-          runtimeResourceRetryTimer.current = null;
-        }
-        runtimeResourcesOriginRef.current = null;
-        runtimeResourcesAuthorityTokenRef.current = null;
-        authoritativeSettingsTokenRef.current = null;
-        setRuntimeResourcesOrigin(null);
-        setCapabilities({ ...EMPTY_CAPABILITIES, connection: "checking", message: "等待服务器权威运行设置" });
-        setGpus([]);
-        setModels(EMPTY_MODELS);
-        rayLightRuntimeStatusRef.current = null;
-        setRayLightRuntimeStatus(null);
-        setLoadingModels(false);
-        invalidateAssetAuthority();
-      } else if (assetAuthorityRequired.current) {
+      if (assetAuthorityRequired.current) {
         invalidateAssetAuthority();
       }
 
@@ -2461,7 +2198,7 @@ export default function App() {
         }
       }
 
-      const confirmed = await refreshRuntime(undefined, !requestedEndpointChange);
+      const confirmed = await refreshRuntime(undefined, true);
       if (!confirmed) {
         if (writeError instanceof ApiError && writeError.status >= 400 && writeError.status < 500) {
           throw writeError;
@@ -2473,20 +2210,12 @@ export default function App() {
         throw new Error("运行设置回读已被更新操作取代");
       }
 
-      if (confirmed.comfy_url !== previousAuthority.comfy_url && !assetAuthorityRequired.current) {
-        invalidateAssetAuthority();
-      }
       if (assetAuthorityRequired.current) {
-        if (isConfiguredComfyUrl(confirmed.comfy_url)) {
-          try {
-            const refreshed = await loadAssets(undefined, true);
-            if (!refreshed) throw new Error("素材库刷新请求已过期");
-          } catch {
-            throw new Error("运行设置已确认，但新 ComfyUI 对应的素材库无法权威刷新；旧素材已清空，生成保持锁定");
-          }
-        } else {
-          assetListRequest.current += 1;
-          dispatchTimelineUi({ type: "assets/replace", assets: [] });
+        try {
+          const refreshed = await loadAssets(undefined, true);
+          if (!refreshed) throw new Error("素材库刷新请求已过期");
+        } catch {
+          throw new Error("运行设置已确认，但素材库无法权威刷新；旧素材已清空，生成保持锁定");
         }
         assetAuthorityRequired.current = false;
       }
@@ -2511,8 +2240,6 @@ export default function App() {
 
   const drainRuntimeSettings = useCallback(() => {
     if (runtimeSettingsOperation.current || runtimeSettingsAutosaveTimer.current !== null) return;
-    if (databaseIdentityStaleRef.current) return;
-    if (storageRestartRequiredRef.current) return;
     if (rayLightRecoveryPendingRef.current) return;
     if (!activeDatabaseRef.current || !runtimeSettingsAuthorityReadyRef.current) return;
     const desired = runtimeSettingsDesired.current;
@@ -2533,10 +2260,8 @@ export default function App() {
       }
       return;
     }
-    const desiredResourcesReady = !isConfiguredComfyUrl(desired.comfy_url) || (
-      runtimeResourcesOriginRef.current === desired.comfy_url &&
-      runtimeResourcesAuthorityTokenRef.current === authoritativeSettingsTokenRef.current
-    );
+    const desiredResourcesReady = runtimeResourcesReadyRef.current &&
+      runtimeResourcesAuthorityTokenRef.current === authoritativeSettingsTokenRef.current;
     if (
       sameRuntimeSettings(desired, authoritativeSettingsRef.current) &&
       !assetAuthorityRequired.current &&
@@ -2546,10 +2271,9 @@ export default function App() {
       runtimeSettingsPausedDesiredRef.current = null;
       clearPendingRuntimeSettings();
       setRuntimeSettingsDraft(desired);
-      runtimeEndpointSwitchRequired.current = false;
       setRuntimeAuthorityRequired(false);
       invalidateAndRefreshTaskSnapshots();
-      if (!storageRecoveryInProgress.current && timelinePersistedRevision.current < timelineRevision.current) {
+      if (timelinePersistedRevision.current < timelineRevision.current) {
         setTimelineRetryNonce((current) => current + 1);
       }
       return;
@@ -2563,8 +2287,8 @@ export default function App() {
       runtimeSettingsPausedDesiredRef.current = null;
       clearPendingRuntimeSettings();
       setRuntimeSettingsDraft(desired);
-      void runtimeResourceRefreshRef.current(desired.comfy_url, false);
-      if (!storageRecoveryInProgress.current && timelinePersistedRevision.current < timelineRevision.current) {
+      void runtimeResourceRefreshRef.current(false);
+      if (timelinePersistedRevision.current < timelineRevision.current) {
         setTimelineRetryNonce((current) => current + 1);
       }
       return;
@@ -2575,10 +2299,8 @@ export default function App() {
     let drainNewerImmediately = false;
     const operation = reconcileRuntimeSettings(owner, snapshot);
     void operation.then((confirmed) => {
-      const confirmedResourcesReady = !isConfiguredComfyUrl(confirmed.comfy_url) || (
-        runtimeResourcesOriginRef.current === confirmed.comfy_url &&
-        runtimeResourcesAuthorityTokenRef.current === authoritativeSettingsTokenRef.current
-      );
+      const confirmedResourcesReady = runtimeResourcesReadyRef.current &&
+        runtimeResourcesAuthorityTokenRef.current === authoritativeSettingsTokenRef.current;
       if (
         runtimeSettingsDesired.current &&
         sameRuntimeSettings(runtimeSettingsDesired.current, snapshot) &&
@@ -2590,11 +2312,10 @@ export default function App() {
         setRuntimeSettingsDraft(confirmed);
         setRuntimeSettingsPausedError(null);
         if (confirmedResourcesReady) {
-          runtimeEndpointSwitchRequired.current = false;
           setRuntimeAuthorityRequired(false);
           invalidateAndRefreshTaskSnapshots();
         }
-        if (!storageRecoveryInProgress.current && timelinePersistedRevision.current < timelineRevision.current) {
+        if (timelinePersistedRevision.current < timelineRevision.current) {
           setTimelineRetryNonce((current) => current + 1);
         }
       } else if (
@@ -2602,13 +2323,6 @@ export default function App() {
         !sameRuntimeSettings(runtimeSettingsDesired.current, snapshot)
       ) {
         drainNewerImmediately = true;
-      } else if (
-        !runtimeSettingsDesired.current &&
-        !runtimeSettingsDraftValidRef.current &&
-        !assetAuthorityRequired.current &&
-        confirmedResourcesReady
-      ) {
-        runtimeEndpointSwitchRequired.current = false;
       }
     }).catch((reason) => {
       // Desired stays in the WAL. A failed or ambiguous PUT/GET must remain
@@ -2619,25 +2333,13 @@ export default function App() {
       drainNewerImmediately = superseded;
       const deterministicClientError = reason instanceof ApiError &&
         reason.status >= 400 && reason.status < 500;
-      const waitingForTimelineBoundary = reason instanceof RuntimeEndpointTimelineBoundaryError;
-      if (!superseded && deterministicClientError && !waitingForTimelineBoundary) {
+      if (!superseded && deterministicClientError) {
         runtimeSettingsPausedDesiredRef.current = structuredClone(snapshot);
         setRuntimeSettingsPausedError(reason instanceof Error ? reason.message : "服务器拒绝当前系统设置");
       }
-      if (
-        !superseded && deterministicClientError &&
-        authoritativeSettingsRef.current.comfy_url !== snapshot.comfy_url &&
-        !assetAuthorityRequired.current
-      ) {
-        // The endpoint PUT was rejected and the authoritative readback still
-        // names the old endpoint. No cross-endpoint boundary remains in
-        // progress, so timeline correction must not stay frozen; runtime sync
-        // and the persistent 4xx notice continue to block generation.
-        runtimeEndpointSwitchRequired.current = false;
-      }
       setToast(reason instanceof Error ? reason.message : "运行设置自动同步失败");
       if (
-        !superseded && !explicitlySuperseded && !deterministicClientError && !waitingForTimelineBoundary &&
+        !superseded && !explicitlySuperseded && !deterministicClientError &&
         runtimeSettingsRetryTimer.current === null
       ) {
         runtimeSettingsRetryTimer.current = window.setTimeout(() => {
@@ -2657,17 +2359,8 @@ export default function App() {
     owner: RuntimeSettingsOperationOwner,
     nextSettings: RuntimeSettings,
   ): Promise<RuntimeSettings> => {
-    if (databaseIdentityStaleRef.current) {
-      return Promise.reject(new Error("本页数据库身份已过期，请刷新整个页面"));
-    }
     if (rayLightRecoveryPendingRef.current) {
       return Promise.reject(new Error("RayLight 重启恢复正在核对，不能修改运行设置"));
-    }
-    if (storageRestartRequiredRef.current) {
-      return Promise.reject(new Error("数据库切换正在等待重启，不能继续修改运行设置"));
-    }
-    if (storageOperationStatusRef.current !== "idle") {
-      return Promise.reject(new Error("数据库操作结果尚未确认，不能继续修改运行设置"));
     }
     const normalized = sanitizeRuntimeSettings(structuredClone(nextSettings));
     runtimeSettingsDesired.current = normalized;
@@ -2675,11 +2368,6 @@ export default function App() {
     runtimeSettingsDesiredOwner.current = owner;
     setRuntimeSettingsDraft(normalized);
     setRuntimeSettingsPausedError(null);
-    if (
-      runtimeExecutionIntent.current === 0 &&
-      (normalized.comfy_url !== authoritativeSettingsRef.current.comfy_url ||
-        runtimeEndpointSwitchRequired.current)
-    ) runtimeEndpointSwitchRequired.current = true;
     runtimeSettingsDraftValidRef.current = true;
     setRuntimeSettingsDraftValid(true);
     setRuntimeAuthorityRequired(true);
@@ -2709,11 +2397,6 @@ export default function App() {
     runtimeSettingsDraftValidRef.current = valid;
     setRuntimeSettingsDraftValid(valid);
     if (valid) return;
-    // A merely invalid endpoint draft has not crossed an authority boundary:
-    // keep generation fail-closed, but do not freeze timeline correction. Only
-    // an endpoint operation that has already begun retains the exclusive gate.
-    runtimeEndpointSwitchRequired.current = runtimeEndpointSwitchRequired.current &&
-      runtimeSettingsOperation.current !== null;
     // A newer invalid intermediate draft supersedes an older desired snapshot
     // that has not started yet. Keep execution locked until the draft becomes
     // valid; never silently apply the older value after the user cleared it.
@@ -2766,7 +2449,6 @@ export default function App() {
     if (timelineSaveRequest.current) return timelineSaveRequest.current;
     if (
       databaseIdentityStaleRef.current ||
-      storageRestartRequiredRef.current ||
       timelineSyncRequiredRef.current ||
       timelineRevisionConflictRef.current ||
       assetDeleteLock.current ||
@@ -2799,7 +2481,7 @@ export default function App() {
       let response: TimelineAuthority;
       try {
         response = await runWithTimelineWriterLock({
-          databaseIdentity: database.active_database_identity,
+          databasePath: database.active_database_path,
           projectId,
         }, () => saveTimelineForProject(projectId, snapshot, expectedServerRevision));
       } catch (reason) {
@@ -3050,126 +2732,6 @@ export default function App() {
   }, [runTimelineAutosave]);
   flushTimelineAutosaveRef.current = flushTimelineAutosave;
 
-  useEffect(() => {
-    const markDatabaseIdentityStale = () => {
-      timelineHydrationGeneration.current += 1;
-      timelineWriteGeneration.current += 1;
-      timelineJournalGeneration.current += 1;
-      projectSwitchGeneration.current += 1;
-      projectListGeneration.current += 1;
-      timelineRemoteAuthorityRequest.current += 1;
-      // Detach every owner captured under the stale database. Their promises
-      // remain generation-guarded, while the WAL/journal bytes themselves are
-      // preserved as recovery evidence for a later correctly scoped page.
-      timelineSaveRequest.current = null;
-      timelineSaveRequestRevision.current = null;
-      if (timelineAutosaveTimer.current !== null) {
-        window.clearTimeout(timelineAutosaveTimer.current);
-        timelineAutosaveTimer.current = null;
-      }
-      if (timelineRetryTimer.current !== null) {
-        window.clearTimeout(timelineRetryTimer.current);
-        timelineRetryTimer.current = null;
-      }
-      if (timelineAuthorityRetryTimer.current !== null) {
-        window.clearTimeout(timelineAuthorityRetryTimer.current);
-        timelineAuthorityRetryTimer.current = null;
-      }
-      clearTimelineHistory();
-      databaseIdentityStaleRef.current = true;
-      timelineServerRevision.current = null;
-      timelineServerProjectRef.current = null;
-      timelineHydrationReady.current = false;
-      setTimelineHydrationStatus("stale");
-      setToast("本页数据库身份已过期；请刷新整个页面后继续");
-    };
-    window.addEventListener(DATABASE_IDENTITY_STALE_EVENT, markDatabaseIdentityStale);
-    return () => window.removeEventListener(DATABASE_IDENTITY_STALE_EVENT, markDatabaseIdentityStale);
-  }, [clearTimelineHistory]);
-
-  const flushRuntimeSettingsForStorageChange = useCallback(async (): Promise<void> => {
-    if (!timelineHydrationReady.current || !activeDatabaseRef.current) {
-      throw new Error("数据库身份与时间线仍在恢复，暂不能修改存储位置");
-    }
-    if (!runtimeSettingsAuthorityReadyRef.current) {
-      throw new Error("运行设置尚未完成服务器权威读取，暂不能修改存储位置");
-    }
-    if (!runtimeSettingsDraftValidRef.current) {
-      throw new Error("运行设置仍有无效输入，修正并同步后才能修改存储位置");
-    }
-
-    // Drain the exact latest desired document. The existing drain owns all
-    // PUT + authoritative-GET reconciliation; this loop merely removes its
-    // debounce and awaits the operation instead of allowing a storage switch
-    // to race it.
-    for (;;) {
-      if (runtimeSettingsAutosaveTimer.current !== null) {
-        window.clearTimeout(runtimeSettingsAutosaveTimer.current);
-        runtimeSettingsAutosaveTimer.current = null;
-      }
-      if (runtimeSettingsRetryTimer.current !== null) {
-        window.clearTimeout(runtimeSettingsRetryTimer.current);
-        runtimeSettingsRetryTimer.current = null;
-      }
-      const paused = runtimeSettingsPausedDesiredRef.current;
-      if (
-        paused && runtimeSettingsDesired.current &&
-        sameRuntimeSettings(paused, runtimeSettingsDesired.current)
-      ) throw new Error("服务器拒绝当前运行设置，请先修正后再修改存储位置");
-
-      const inFlight = runtimeSettingsOperation.current;
-      if (inFlight) {
-        await inFlight;
-        await Promise.resolve();
-        continue;
-      }
-      if (runtimeSettingsDesired.current) {
-        runtimeSettingsDrainRef.current();
-        const started = runtimeSettingsOperation.current;
-        if (started) {
-          await started;
-          await Promise.resolve();
-          continue;
-        }
-        if (!runtimeSettingsDesired.current) continue;
-        throw new Error("运行设置当前无法同步，未执行数据库操作");
-      }
-
-      // Even without a pending write, perform one final authoritative GET so
-      // a stale browser settings mirror can never cross the storage boundary.
-      const confirmed = await refreshRuntime(undefined, true);
-      if (!confirmed || !runtimeSettingsAuthorityReadyRef.current) {
-        throw new Error("无法从服务器确认当前运行设置，未执行数据库操作");
-      }
-      if (!runtimeSettingsDesired.current && !runtimeSettingsOperation.current) return;
-    }
-  }, [refreshRuntime]);
-
-  const prepareStorageChange = useCallback(async (): Promise<void> => {
-    // Check hydration before draining anything. SettingsPage performs its own
-    // GET /storage and can otherwise become clickable before App has inspected
-    // a database-scoped timeline WAL.
-    if (!timelineHydrationReady.current || !activeDatabaseRef.current) {
-      throw new Error("数据库身份与时间线仍在恢复，暂不能修改存储位置");
-    }
-    if (rayLightRecoveryPendingRef.current) {
-      throw new Error("RayLight 重启恢复正在核对，暂不能修改数据库存储");
-    }
-    if (
-      storageRestartRequiredRef.current &&
-      (runtimeSettingsDesired.current || runtimeSettingsOperation.current ||
-        timelinePersistedRevision.current < timelineRevision.current)
-    ) {
-      throw new Error("当前页已有待同步修改且后端正在等待重启；请刷新页面后处理");
-    }
-    await flushRuntimeSettingsForStorageChange();
-    if (!timelineHydrationReady.current) {
-      throw new Error("时间线仍在恢复，未执行数据库操作");
-    }
-    await flushTimelineAutosave();
-    clearPendingRuntimeSettings();
-    clearLocalTimeline();
-  }, [flushRuntimeSettingsForStorageChange, flushTimelineAutosave]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -3194,7 +2756,7 @@ export default function App() {
     void loadTasks(controller.signal, true);
     const installHydratedProject = (
       project: TimelineProject,
-      database: { active_database_path: string; active_database_identity: string },
+      database: { active_database_path: string },
       projectId: string,
       history: TimelineHistoryState,
     ) => {
@@ -3211,7 +2773,7 @@ export default function App() {
       });
       commitTimelineHistory(history);
       restoredSegmentSelectionKey.current =
-        `${database.active_database_identity}:${projectId}`;
+        `${database.active_database_path}:${projectId}`;
     };
     const hydrateTimeline = async (): Promise<void> => {
       if (!ownsHydration() || timelineHydrationReady.current) return;
@@ -3220,7 +2782,6 @@ export default function App() {
         if (!ownsHydration()) return;
         const candidateDatabase = {
           active_database_path: storage.active_database_path,
-          active_database_identity: storage.active_database_identity,
         };
         const persistedRuntimeSettings = loadPendingRuntimeSettings(candidateDatabase);
         const walBranches = listLocalTimelineWalBranches(
@@ -3251,9 +2812,7 @@ export default function App() {
           const verification = await directorApi.getStorage(controller.signal);
           if (!ownsHydration() || projectListGeneration.current !== listGeneration) return;
           if (
-            list.active_database_identity !== candidateDatabase.active_database_identity ||
-            verification.active_database_path !== candidateDatabase.active_database_path ||
-            verification.active_database_identity !== candidateDatabase.active_database_identity
+            verification.active_database_path !== candidateDatabase.active_database_path
           ) throw new DatabaseIdentityChangedDuringHydrationError();
           if (list.projects.some((project) => project.id === hydratingProjectId)) {
             // GET and list disagreed inside one stable database. Retry instead
@@ -3284,29 +2843,20 @@ export default function App() {
         const verification = await directorApi.getStorage(controller.signal);
         if (!ownsHydration()) return;
         if (
-          verification.active_database_identity !== candidateDatabase.active_database_identity ||
           verification.active_database_path !== candidateDatabase.active_database_path
         ) throw new DatabaseIdentityChangedDuringHydrationError();
         if (!ownsHydration()) return;
-        const latchedIdentity = directorApi.latchDatabaseIdentity(candidateDatabase.active_database_identity);
-        if (latchedIdentity !== candidateDatabase.active_database_identity) {
-          throw new DatabaseIdentityChangedDuringHydrationError();
-        }
         activeDatabaseRef.current ??= candidateDatabase;
-        storageRestartRequiredRef.current = verification.restart_required;
-        setStorageRestartRequired(verification.restart_required);
-        // Assets are endpoint- and database-scoped. Wait for both authorities,
-        // then bind the response to their exact snapshots before it may enter
-        // the editor. Timeline hydration itself does not wait on the library.
+        // Assets are database-scoped. Timeline hydration itself does not wait
+        // on the library.
         void runtimeAuthorityOperation.then((settings) => {
           if (!settings || !ownsHydration()) return;
           return loadAssets(controller.signal, false, {
             database: candidateDatabase,
-            comfyOrigin: settings.comfy_url,
           });
         }).catch(() => {
-          // Asset discovery remains a soft dependency. A mismatched or failed
-          // response stays invisible and a later explicit refresh can retry.
+          // Asset discovery remains a soft dependency. A failed response stays
+          // invisible and a later explicit refresh can retry.
         });
         if (runtimeSettingsDesired.current) {
           // A same-tab edit made while storage identity was loading is newer
@@ -3502,7 +3052,7 @@ export default function App() {
     // database. The 404 bootstrap fallback above owns the pre-latch exception.
     if (timelineHydrationStatus !== "ready") return;
     const database = activeDatabaseRef.current;
-    if (!database || databaseIdentityStaleRef.current) return;
+    if (!database) return;
     const controller = new AbortController();
     const projectId = activeProjectIdRef.current;
     const hydrationGeneration = timelineHydrationGeneration.current;
@@ -3515,15 +3065,9 @@ export default function App() {
       timelineHydrationGeneration.current === hydrationGeneration &&
       projectSwitchGeneration.current === switchGeneration &&
       activeProjectIdRef.current === projectId &&
-      activeDatabaseRef.current?.active_database_path === database.active_database_path &&
-      activeDatabaseRef.current.active_database_identity === database.active_database_identity &&
-      !databaseIdentityStaleRef.current;
+      activeDatabaseRef.current?.active_database_path === database.active_database_path;
     void directorApi.listProjects(controller.signal).then((list) => {
       if (!ownsList()) return;
-      if (list.active_database_identity !== database.active_database_identity) {
-        window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT));
-        return;
-      }
       setProjects(list.projects);
       if (
         projectId !== DEFAULT_PROJECT_ID &&
@@ -3546,7 +3090,7 @@ export default function App() {
     const activeDatabase = activeDatabaseRef.current;
     if (!activeDatabase) return;
     const projectSegmentIds = timeline.project.segments.map((segment) => segment.id);
-    const restoreKey = `${activeDatabase.active_database_identity}:${activeProjectId}`;
+    const restoreKey = `${activeDatabase.active_database_path}:${activeProjectId}`;
     if (restoredSegmentSelectionKey.current === restoreKey) return;
     restoredSegmentSelectionKey.current = restoreKey;
     const restored = loadTimelineSegmentSelectionPreference(
@@ -3684,13 +3228,6 @@ export default function App() {
   useEffect(() => { persistUiTheme(theme); }, [theme]);
 
   useEffect(() => {
-    assetTrashListRequest.current += 1;
-    setAssetTrashBatches([]);
-    setAssetTrashConflictBatchIds(new Set());
-    setAssetTrashPanelOpen(false);
-  }, [state.settings.comfy_url]);
-
-  useEffect(() => {
     if (state.view === "workspace") return;
     setTimelineHistoryPanelOpen(false);
     setAssetTrashPanelOpen(false);
@@ -3778,9 +3315,7 @@ export default function App() {
     const activeDatabase = activeDatabaseRef.current;
     return activeProjectIdRef.current === projectId &&
       !databaseIdentityStaleRef.current &&
-      storageOperationStatusRef.current === "idle" &&
-      activeDatabase?.active_database_path === database.active_database_path &&
-      activeDatabase.active_database_identity === database.active_database_identity;
+      activeDatabase?.active_database_path === database.active_database_path;
   };
 
   const resyncTimeline = async (): Promise<void> => {
@@ -4201,7 +3736,7 @@ export default function App() {
         !timelineAuthorityScopeStillCurrent(database, conflict.projectId)
       ) return;
       const response = await runWithTimelineWriterLock({
-        databaseIdentity: database.active_database_identity,
+        databasePath: database.active_database_path,
         projectId: conflict.projectId,
       }, () => saveTimelineForProject(
         conflict.projectId,
@@ -4293,7 +3828,7 @@ export default function App() {
     if (submitting) return;
     if (
       rayLightRecoveryPendingRef.current ||
-      runtimeResourcesOriginRef.current !== authoritativeSettingsRef.current.comfy_url ||
+      !runtimeResourcesReadyRef.current ||
       !rayLightRuntimeStatusRef.current ||
       rayLightRuntimeStatusRef.current.recovery_required
     ) {
@@ -4434,7 +3969,7 @@ export default function App() {
     if (compiling) return;
     if (
       rayLightRecoveryPendingRef.current ||
-      runtimeResourcesOriginRef.current !== authoritativeSettingsRef.current.comfy_url ||
+      !runtimeResourcesReadyRef.current ||
       !rayLightRuntimeStatusRef.current ||
       rayLightRuntimeStatusRef.current.recovery_required
     ) {
@@ -4568,11 +4103,9 @@ export default function App() {
     if (rayLightRecoveryOperationRef.current) {
       return rayLightRecoveryOperationRef.current;
     }
-    const origin = authoritativeSettingsRef.current.comfy_url;
     const expected = rayLightRuntimeStatusRef.current;
     if (
-      !isConfiguredComfyUrl(origin) ||
-      runtimeResourcesOriginRef.current !== origin ||
+      !runtimeResourcesReadyRef.current ||
       !expected?.recovery_required ||
       !expected.recovery_token
     ) return Promise.reject(new Error("RayLight 恢复状态已变化，请刷新系统设置后重试"));
@@ -4583,11 +4116,9 @@ export default function App() {
     ) {
       return Promise.reject(new Error("运行设置仍在同步，请完成后再恢复 RayLight"));
     }
-    if (
-      databaseIdentityStaleRef.current ||
-      storageRestartRequiredRef.current ||
-      storageOperationStatusRef.current !== "idle"
-    ) return Promise.reject(new Error("数据库状态尚未稳定，暂不能恢复 RayLight"));
+    if (databaseIdentityStaleRef.current) {
+      return Promise.reject(new Error("数据库状态尚未稳定，暂不能恢复 RayLight"));
+    }
     const expectedRecoveryToken = expected.recovery_token;
     const controller = new AbortController();
     rayLightRecoveryControllerRef.current = controller;
@@ -4602,17 +4133,14 @@ export default function App() {
       try {
         for (;;) {
           await waitForRayLightRecoveryWindow(0, controller.signal);
-          if (
-            authoritativeSettingsRef.current.comfy_url !== origin ||
-            databaseIdentityStaleRef.current ||
-            storageOperationStatusRef.current !== "idle"
-          ) throw new Error("恢复核对期间 endpoint 或数据库状态发生变化");
+          if (databaseIdentityStaleRef.current) {
+            throw new Error("恢复核对期间数据库状态发生变化");
+          }
 
           let deterministicFailure = false;
           let postError: unknown = null;
           try {
             await directorApi.confirmRayLightRuntimeRecovery(
-              origin,
               expected.epoch,
               expectedRecoveryToken,
               controller.signal,
@@ -4638,7 +4166,6 @@ export default function App() {
           // workspace. Only a fresh, complete four-resource authority snapshot
           // for the same endpoint can certify that the ledger is clean.
           const refreshed = await refreshRuntimeResources(
-            origin,
             true,
             controller.signal,
             false,
@@ -4647,8 +4174,7 @@ export default function App() {
           const verified = rayLightRuntimeStatusRef.current;
           if (
             refreshed &&
-            authoritativeSettingsRef.current.comfy_url === origin &&
-            runtimeResourcesOriginRef.current === origin &&
+            runtimeResourcesReadyRef.current &&
             verified &&
             !verified.recovery_required
           ) {
@@ -4746,21 +4272,17 @@ export default function App() {
       return;
     }
     const operationDatabase = activeDatabaseRef.current;
-    if (!operationDatabase || databaseIdentityStaleRef.current) {
+    if (!operationDatabase) {
       setToast("数据库权威状态尚未稳定，暂不能导入任务输出");
       return;
     }
     const operationProjectId = activeProjectIdRef.current;
-    const operationComfyOrigin = authoritativeSettingsRef.current.comfy_url;
     assetUploadLock.current = true;
     const operationSwitchGeneration = ++projectSwitchGeneration.current;
     const operationStillCurrent = () =>
       projectSwitchGeneration.current === operationSwitchGeneration &&
       activeProjectIdRef.current === operationProjectId &&
-      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path &&
-      activeDatabaseRef.current?.active_database_identity === operationDatabase.active_database_identity &&
-      authoritativeSettingsRef.current.comfy_url === operationComfyOrigin &&
-      !databaseIdentityStaleRef.current;
+      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path;
     setAssetsUploading(true);
     try {
       const asset = await directorApi.importTaskOutput(id, output);
@@ -4771,7 +4293,6 @@ export default function App() {
       dispatchTimelineUi({ type: "assets/select", id: asset.id });
       await loadAssets(undefined, true, {
         database: operationDatabase,
-        comfyOrigin: operationComfyOrigin,
       });
       if (!operationStillCurrent()) return;
       setToast(`已把 ${asset.name} 转为 24fps 输入并加入当前素材库`);
@@ -4845,16 +4366,10 @@ export default function App() {
   const deleteAssets = async (ids: string[]) => {
     if (!ids.length || assetDeleteLock.current || assetDeleteIntent.current) return;
     const operationDatabase = activeDatabaseRef.current;
-    if (
-      !operationDatabase ||
-      databaseIdentityStaleRef.current ||
-      storageRestartRequiredRef.current ||
-      storageOperationStatusRef.current !== "idle"
-    ) {
+    if (!operationDatabase) {
       setToast("数据库权威状态尚未稳定，暂不能从素材库移出");
       return;
     }
-    const operationComfyOrigin = authoritativeSettingsRef.current.comfy_url;
     if (runtimeExecutionIntent.current > 0) {
       setToast("生成或预检正在使用当前素材与运行设置；完成后再从素材库移出");
       return;
@@ -4874,12 +4389,8 @@ export default function App() {
     const operationSwitchGeneration = ++projectSwitchGeneration.current;
     const timelineOperationScopeStillCurrent = () =>
       activeProjectIdRef.current === operationProjectId &&
-      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path &&
-      activeDatabaseRef.current?.active_database_identity === operationDatabase.active_database_identity &&
-      !databaseIdentityStaleRef.current;
-    const assetOperationScopeStillCurrent = () =>
-      timelineOperationScopeStillCurrent() &&
-      authoritativeSettingsRef.current.comfy_url === operationComfyOrigin;
+      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path;
+    const assetOperationScopeStillCurrent = timelineOperationScopeStillCurrent;
     const operationStillCurrent = () =>
       projectSwitchGeneration.current === operationSwitchGeneration &&
       assetOperationScopeStillCurrent();
@@ -4965,7 +4476,6 @@ export default function App() {
       }
       const assetsRefreshed = await loadAssets(undefined, false, {
         database: operationDatabase,
-        comfyOrigin: operationComfyOrigin,
       });
       if (!operationStillCurrent()) return;
       if (!assetsRefreshed) dispatchTimelineUi({ type: "assets/remove", ids: batch.asset_ids });
@@ -4978,7 +4488,6 @@ export default function App() {
         const outcome = await reconcileAmbiguousAssetTrash(
           ids,
           operationDatabase,
-          operationComfyOrigin,
           operationProjectId,
           operationSwitchGeneration,
         );
@@ -5001,7 +4510,6 @@ export default function App() {
       } else {
         await loadAssets(undefined, false, {
           database: operationDatabase,
-          comfyOrigin: operationComfyOrigin,
         });
         setToast(reason instanceof Error ? reason.message : "素材移出失败");
       }
@@ -5029,11 +4537,7 @@ export default function App() {
   ): Promise<void> => {
     const restoresReferences = mode === "with_references";
     if (assetTrashOperationLock.current || assetDeleteLock.current || assetDeleteIntent.current) return;
-    if (
-      databaseIdentityStaleRef.current ||
-      storageRestartRequiredRef.current ||
-      storageOperationStatusRef.current !== "idle"
-    ) {
+    if (databaseIdentityStaleRef.current) {
       setToast("数据库权威状态尚未稳定，暂不能恢复素材");
       return;
     }
@@ -5055,18 +4559,13 @@ export default function App() {
       return;
     }
     const operationProjectId = activeProjectIdRef.current;
-    const operationComfyOrigin = authoritativeSettingsRef.current.comfy_url;
     assetTrashOperationLock.current = batch.batch_id;
     assetDeleteIntent.current = true;
     const operationSwitchGeneration = ++projectSwitchGeneration.current;
     const timelineOperationScopeStillCurrent = () =>
       activeProjectIdRef.current === operationProjectId &&
-      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path &&
-      activeDatabaseRef.current?.active_database_identity === operationDatabase.active_database_identity &&
-      !databaseIdentityStaleRef.current;
-    const assetOperationScopeStillCurrent = () =>
-      timelineOperationScopeStillCurrent() &&
-      authoritativeSettingsRef.current.comfy_url === operationComfyOrigin;
+      activeDatabaseRef.current?.active_database_path === operationDatabase.active_database_path;
+    const assetOperationScopeStillCurrent = timelineOperationScopeStillCurrent;
     const operationStillCurrent = () =>
       projectSwitchGeneration.current === operationSwitchGeneration &&
       assetOperationScopeStillCurrent();
@@ -5121,7 +4620,6 @@ export default function App() {
       const [assetsRefreshed, trashRefreshed] = await Promise.all([
         loadAssets(undefined, false, {
           database: operationDatabase,
-          comfyOrigin: operationComfyOrigin,
         }),
         loadAssetTrash(),
       ]);
@@ -5160,8 +4658,7 @@ export default function App() {
         if (assetOperationScopeStillCurrent()) {
           void loadAssets(undefined, false, {
             database: operationDatabase,
-            comfyOrigin: operationComfyOrigin,
-          });
+            });
           void loadAssetTrash();
         }
       } else if (runtimeSettingsDesired.current) {
@@ -5172,11 +4669,7 @@ export default function App() {
 
   const purgeAssetTrashBatch = async (batch: AssetTrashBatch): Promise<void> => {
     if (assetTrashOperationLock.current || assetDeleteLock.current || assetDeleteIntent.current) return;
-    if (
-      databaseIdentityStaleRef.current ||
-      storageRestartRequiredRef.current ||
-      storageOperationStatusRef.current !== "idle"
-    ) {
+    if (databaseIdentityStaleRef.current) {
       setToast("数据库权威状态尚未稳定，暂不能移除恢复记录");
       return;
     }
@@ -5218,7 +4711,7 @@ export default function App() {
     }
     if (timelineRevisionConflict) throw new Error("服务器时间线存在修订冲突，请先选择处理方式");
     if (timelineSyncRequired) throw new Error("服务器时间线正在自动恢复权威状态，暂不能上传素材");
-    if (capabilities.connection !== "online" || !isConfiguredComfyUrl(authoritativeSettingsRef.current.comfy_url)) {
+    if (capabilities.connection !== "online") {
       throw new Error("ComfyUI 尚未连接，暂不能上传素材");
     }
 
@@ -5228,7 +4721,6 @@ export default function App() {
       throw new Error("数据库权威状态尚未稳定，暂不能上传素材");
     }
     const generation = runtimeSettingsGeneration.current;
-    const origin = authoritativeSettingsRef.current.comfy_url;
     const projectId = activeProjectIdRef.current;
     assetUploadLock.current = true;
     const projectGeneration = ++projectSwitchGeneration.current;
@@ -5237,10 +4729,7 @@ export default function App() {
       projectSwitchGeneration.current === projectGeneration &&
       activeProjectIdRef.current === projectId &&
       activeDatabaseRef.current?.active_database_path === database.active_database_path &&
-      activeDatabaseRef.current?.active_database_identity === database.active_database_identity &&
       !databaseIdentityStaleRef.current &&
-      authoritativeSettingsRef.current.comfy_url === origin &&
-      (runtimeSettingsDesired.current?.comfy_url ?? runtimeSettingsDraft.comfy_url) === origin &&
       !runtimeSettingsOperation.current;
     setAssetsUploading(true);
     try {
@@ -5282,7 +4771,7 @@ export default function App() {
         runtimeSettingsDrainRef.current();
       }
     }
-  }, [capabilities.connection, runtimeSettingsDraft.comfy_url, timelineRevisionConflict, timelineSyncRequired]);
+  }, [capabilities.connection, timelineRevisionConflict, timelineSyncRequired]);
 
   const activeTasks = state.tasks.filter((task) => ["queued", "preparing", "running", "cancelling"].includes(task.status));
   const activityRank: Record<string, number> = { running: 0, preparing: 1, queued: 2, cancelling: 3 };
@@ -5308,30 +4797,24 @@ export default function App() {
       };
     }
   }
-  const runtimeConfigured = isConfiguredComfyUrl(state.settings.comfy_url);
-  const runtimeReady = runtimeConfigured && capabilities.connection === "online" &&
-    runtimeResourcesOrigin === state.settings.comfy_url && rayLightRuntimeStatus !== null;
+  const runtimeReady = capabilities.connection === "online" &&
+    runtimeResourcesReady && rayLightRuntimeStatus !== null;
   const rayLightRecoveryRequired = runtimeReady &&
     rayLightRuntimeStatus?.recovery_required === true;
   const runtimeAuthorityPending = runtimeSettingsOperationOwner !== null || runtimeSettingsSyncRequired;
   const timelineHydrated = timelineHydrationStatus === "ready";
   const databaseIdentityStale = timelineHydrationStatus === "stale";
-  const storageOperationPending = storageOperationStatus !== "idle";
-  const workspaceRuntimeReady = runtimeReady && !rayLightRecoveryRequired && !rayLightRecoveryPending && timelineHydrated && !storageRestartRequired && !storageOperationPending && !runtimeAuthorityPending && !timelineSyncRequired && !timelineRevisionConflict && !assetsDeleting && !assetsUploading;
-  const workspaceCapabilities: CapabilityReport = !runtimeReady || rayLightRecoveryRequired || rayLightRecoveryPending || storageRestartRequired || storageOperationPending || runtimeAuthorityPending || timelineSyncRequired || timelineRevisionConflict || assetsDeleting || assetsUploading
+  const workspaceRuntimeReady = runtimeReady && !rayLightRecoveryRequired && !rayLightRecoveryPending && timelineHydrated && !runtimeAuthorityPending && !timelineSyncRequired && !timelineRevisionConflict && !assetsDeleting && !assetsUploading;
+  const workspaceCapabilities: CapabilityReport = !runtimeReady || rayLightRecoveryRequired || rayLightRecoveryPending || runtimeAuthorityPending || timelineSyncRequired || timelineRevisionConflict || assetsDeleting || assetsUploading
     ? {
         ...capabilities,
         connection: "checking",
         message: !runtimeReady
-          ? "ComfyUI 运行资源等待同源权威核对"
+          ? "ComfyUI 运行资源等待权威核对"
           : rayLightRecoveryRequired
           ? "旧 RayLight 运行状态等待重启确认"
           : rayLightRecoveryPending
             ? "正在核对 RayLight 重启恢复结果"
-          : storageRestartRequired
-          ? "数据库切换正在等待重启"
-          : storageOperationPending
-            ? "数据库操作结果等待权威确认"
           : runtimeAuthorityPending
           ? "运行设置等待服务器权威回读"
           : timelineSyncRequired
@@ -5364,10 +4847,8 @@ export default function App() {
       : ["请至少选择一个要生成的片段"];
   const selectionTimelineErrors = [
     ...(!timelineHydrated ? [databaseIdentityStale ? "本页数据库身份已过期，请刷新整个页面" : "正在从服务器恢复时间线"] : []),
-    ...(storageRestartRequired ? ["数据库切换正在等待重启"] : []),
-    ...(storageOperationPending ? ["数据库操作结果尚未完成权威确认"] : []),
     ...(runtimeAuthorityPending ? ["运行设置尚未完成服务器权威回读"] : []),
-    ...(!runtimeReady ? ["ComfyUI 与 RayLight 运行资源尚未完成同源权威核对"] : []),
+    ...(!runtimeReady ? ["ComfyUI 与 RayLight 运行资源尚未完成权威核对"] : []),
     ...(rayLightRecoveryRequired ? ["旧 RayLight 运行状态引用当前不可见 GPU；请在系统设置确认 ComfyUI 已重启并恢复"] : []),
     ...(rayLightRecoveryPending ? ["正在核对 RayLight 重启恢复结果"] : []),
     ...(timelineSyncRequired ? ["素材级联已提交，但服务器时间线尚未完成权威回读"] : []),
@@ -5385,9 +4866,9 @@ export default function App() {
   const timelineRunActionsReady = workspaceCapabilities.connection === "online" &&
     selectionTimelineErrors.length === 0 && selectedEnabledIds.length > 0;
   const timelineHistoryBlocked = state.view !== "workspace" ||
-    !timelineHydrated || databaseIdentityStale || storageRestartRequired ||
-    storageOperationPending || timelineSyncRequired || Boolean(timelineRevisionConflict) || assetsDeleting ||
-    projectSwitchHandoffPending || runtimeEndpointSwitchRequired.current;
+    !timelineHydrated || databaseIdentityStale ||
+    timelineSyncRequired || Boolean(timelineRevisionConflict) || assetsDeleting ||
+    projectSwitchHandoffPending;
   const nextUndoLabel = timelineHistoryUndoLabel(timelineHistory);
   const nextRedoLabel = timelineHistoryRedoLabel(timelineHistory);
   const timelineUndoReady = !timelineHistoryBlocked && canUndoTimelineHistory(timelineHistory);
@@ -5397,7 +4878,6 @@ export default function App() {
     timelineAssetUsages(timeline.project, asset.id).map((usage) =>
       `${usage.segment_index + 1} · ${usage.segment_title} · ${usage.role}`),
   ]));
-  const renderedAssetOrigin = state.settings.comfy_url;
   const beginProjectTitleEdit = () => {
     setProjectTitleDraft(timeline.project.title);
     setProjectTitleEditing(true);
@@ -5442,10 +4922,7 @@ export default function App() {
       return false;
     }
     const database = activeDatabaseRef.current;
-    if (
-      !database || databaseIdentityStaleRef.current ||
-      storageOperationStatusRef.current !== "idle"
-    ) {
+    if (!database || databaseIdentityStaleRef.current) {
       setToast("数据库权威状态尚未稳定，暂不能切换项目");
       return false;
     }
@@ -5453,13 +4930,11 @@ export default function App() {
       const activeDatabase = activeDatabaseRef.current;
       return projectSwitchGeneration.current === switchGeneration &&
         !databaseIdentityStaleRef.current &&
-        storageOperationStatusRef.current === "idle" &&
         !assetDeleteIntent.current &&
         !assetDeleteLock.current &&
         !assetUploadLock.current &&
         assetTrashOperationLock.current === null &&
-        activeDatabase?.active_database_path === database.active_database_path &&
-        activeDatabase.active_database_identity === database.active_database_identity;
+        activeDatabase?.active_database_path === database.active_database_path;
     };
     if (timelineHydrationReady.current) {
       try {
@@ -5629,7 +5104,7 @@ export default function App() {
     if (!ownsProjectSwitch()) return false;
     const targetSegmentIds = targetProject.segments.map((segment) => segment.id);
     const targetSelectionScope = database
-      ? `${database.active_database_identity}:${targetId}`
+      ? `${database.active_database_path}:${targetId}`
       : null;
     const restoredSelection = database
       ? loadTimelineSegmentSelectionPreference(database, targetId, targetSegmentIds)
@@ -5762,17 +5237,13 @@ export default function App() {
           gridSize={timeline.asset_grid_size}
           runtimeEnabled={workspaceRuntimeReady}
           connection={capabilities.connection}
-          runtimeConfigured={runtimeConfigured}
           settingsActive={state.view === "settings"}
           deleting={assetsDeleting}
           assetUsages={assetUsages}
           onUploadFiles={uploadWorkspaceFiles}
           onUploaded={(assets) => {
-            // An upload started before an endpoint switch may finish after the
-            // new asset list is authoritative. Never merge that old-origin
-            // response into the new workspace library.
+            // An upload may finish while a settings resync owns the library.
             if (
-              renderedAssetOrigin !== authoritativeSettingsRef.current.comfy_url ||
               runtimeSettingsOperation.current ||
               runtimeSettingsSyncRequiredRef.current
             ) return;
@@ -5803,17 +5274,6 @@ export default function App() {
         />
 
       <div className="app-main">
-        {storageRestartRequired && <div className="timeline-hydration-notice" role="status" aria-live="polite">
-          <span>数据库路径已变更；当前页面停止修改。请重启 Director 并刷新页面后继续。</span>
-        </div>}
-        {storageOperationPending && <div className="timeline-hydration-notice" role="status" aria-live="polite">
-          {storageOperationStatus === "reconciling" && <Spinner />}
-          <span>{storageOperationStatus === "reconciling"
-            ? "数据库操作响应尚未确认，正在自动核对服务器状态；确认前当前页面停止修改。"
-            : storageOperationStatus === "recovering"
-              ? "正在恢复当前数据库中保留的修改；完成前当前页面停止修改。"
-              : "正在建立数据库存储变更边界；完成前当前页面停止修改。"}</span>
-        </div>}
         {projectSwitchHandoffPending && <div className="timeline-hydration-notice" role="status" aria-live="polite">
           <Spinner />
           <span>正在完成项目切换交接；完成前不能编辑当前项目</span>
@@ -5904,7 +5364,7 @@ export default function App() {
             </div>
           </>}
         </div>}
-        <div className="workspace-surface" {...(state.view === "settings" || !timelineHydrated || storageRestartRequired || storageOperationPending || timelineRevisionConflict ? { inert: true } : {})}>
+        <div className="workspace-surface" {...(state.view === "settings" || !timelineHydrated || timelineRevisionConflict ? { inert: true } : {})}>
         <header className="topbar topbar--timeline">
           <div className="topbar__identity">
             <div className="topbar__mode topbar__mode--timeline">
@@ -5947,7 +5407,7 @@ export default function App() {
                 className="topbar__project-switcher"
                 aria-label="切换项目"
                 value={activeProjectId}
-                disabled={!timelineHydrated || databaseIdentityStale || storageOperationPending ||
+                disabled={!timelineHydrated || databaseIdentityStale ||
                   Boolean(timelineRevisionConflict) || submitting || compiling ||
                   assetsDeleting || assetsUploading || projectSwitchHandoffPending ||
                   projectDeletingId !== null}
@@ -6102,7 +5562,7 @@ export default function App() {
               project={timeline.project}
               settings={runtimeSettingsDraft}
               models={models}
-              runtimeReady={runtimeSettingsDraftValid && runtimeResourcesOrigin === runtimeSettingsDraft.comfy_url && capabilities.connection === "online" && !rayLightRecoveryRequired}
+              runtimeReady={runtimeSettingsDraftValid && runtimeResourcesReady && capabilities.connection === "online" && !rayLightRecoveryRequired}
               modelSaving={runtimeSettingsOperationOwner !== null}
               onClose={() => { setGlobalSettingsOpen(false); window.requestAnimationFrame(() => globalSettingsToggleRef.current?.focus()); }}
               onProjectPatch={(patch) => dispatchTimeline({ type: "project/patch", patch })}
@@ -6144,7 +5604,7 @@ export default function App() {
                 }
               }}
             />
-            {!workspaceRuntimeReady && <div className="timeline-runtime-notice">{!runtimeSettingsDraftValid ? "系统设置有无效输入，请打开并修正；有效后自动应用。" : runtimeSettingsPausedError ? `服务器拒绝当前系统设置：${runtimeSettingsPausedError}。请打开并修改；有效修改后自动应用。` : rayLightRecoveryRequired ? "旧 RayLight 运行状态引用了当前不可见 GPU；请打开系统设置，确认 ComfyUI 已重启后执行恢复。" : runtimeSettingsSyncRequired ? "运行设置或素材库正在后台自动核对；恢复权威状态前，生成与素材操作保持锁定。" : runtimeSettingsOperationOwner !== null ? "运行设置正在同步并从服务器权威回读；完成前不能生成或操作素材。" : timelineRevisionConflict ? "服务器时间线存在修订冲突；本地草稿已保留，请在页面顶部选择处理方式。" : timelineSyncRequired ? "素材操作结果正在自动核对；恢复权威时间线前，编辑与生成保持锁定。" : assetsDeleting ? "正在原子解除素材引用；时间线编辑与生成暂时锁定。" : assetsUploading ? assetUploadProgress ? `${describeUploadProgress(assetUploadProgress)}；完成前暂时锁定同步、预检和生成。` : "正在上传并绑定本地素材；完成前暂时锁定同步、预检和生成。" : capabilities.connection === "offline" ? "ComfyUI 当前离线；编辑内容会在 Director 连接恢复后自动同步，暂时不能生成。" : !runtimeConfigured ? "尚未配置 ComfyUI；请在系统设置填写服务器地址。" : "正在检查 ComfyUI 能力…"}</div>}
+            {!workspaceRuntimeReady && <div className="timeline-runtime-notice">{!runtimeSettingsDraftValid ? "系统设置有无效输入，请打开并修正；有效后自动应用。" : runtimeSettingsPausedError ? `服务器拒绝当前系统设置：${runtimeSettingsPausedError}。请打开并修改；有效修改后自动应用。` : rayLightRecoveryRequired ? "旧 RayLight 运行状态引用了当前不可见 GPU；请打开系统设置，确认 ComfyUI 已重启后执行恢复。" : runtimeSettingsSyncRequired ? "运行设置或素材库正在后台自动核对；恢复权威状态前，生成与素材操作保持锁定。" : runtimeSettingsOperationOwner !== null ? "运行设置正在同步并从服务器权威回读；完成前不能生成或操作素材。" : timelineRevisionConflict ? "服务器时间线存在修订冲突；本地草稿已保留，请在页面顶部选择处理方式。" : timelineSyncRequired ? "素材操作结果正在自动核对；恢复权威时间线前，编辑与生成保持锁定。" : assetsDeleting ? "正在原子解除素材引用；时间线编辑与生成暂时锁定。" : assetsUploading ? assetUploadProgress ? `${describeUploadProgress(assetUploadProgress)}；完成前暂时锁定同步、预检和生成。` : "正在上传并绑定本地素材；完成前暂时锁定同步、预检和生成。" : capabilities.connection === "offline" ? "ComfyUI 当前离线；编辑内容会在 Director 连接恢复后自动同步，暂时不能生成。" : "正在检查 ComfyUI 能力…"}</div>}
             <LongFormTimelineWorkspace
               state={timeline}
               capabilities={workspaceCapabilities}
@@ -6164,47 +5624,27 @@ export default function App() {
             overlay
             settings={runtimeSettingsDraft}
             confirmedSettings={state.settings}
-            resourcesOrigin={runtimeResourcesOrigin}
-            embeddedComfyUi={embeddedComfyUi}
+            resourcesReady={runtimeResourcesReady}
             capabilities={capabilities}
             gpus={gpus}
             models={models}
             rayLightRuntimeStatus={rayLightRuntimeStatus}
             rayLightRecoveryPending={rayLightRecoveryPending}
-            rayLightRecoveryDisabled={runtimeAuthorityPending || storageOperationPending || databaseIdentityStale || activeTasks.length > 0}
+            rayLightRecoveryDisabled={runtimeAuthorityPending || databaseIdentityStale || activeTasks.length > 0}
             rayLightRecoveryBlockedReason={runtimeAuthorityPending
               ? "运行设置仍在同步"
-              : storageOperationPending
-                ? "数据库操作结果仍在核对"
-                : databaseIdentityStale
-                  ? "本页数据库身份已过期"
-                  : activeTasks.length > 0
-                    ? "仍有 Director 任务未结束"
-                    : null}
+              : databaseIdentityStale
+                ? "本页数据库身份已过期"
+                : activeTasks.length > 0
+                  ? "仍有 Director 任务未结束"
+                  : null}
             loadingModels={loadingModels}
             syncError={runtimeSettingsPausedError}
-            runtimeEditingDisabled={!timelineHydrated || Boolean(timelineRevisionConflict) || storageRestartRequired || storageOperationPending || databaseIdentityStale || rayLightRecoveryPending}
-            storageOperationsDisabled={!timelineHydrated || storageOperationPending || databaseIdentityStale || rayLightRecoveryPending}
+            runtimeEditingDisabled={!timelineHydrated || Boolean(timelineRevisionConflict) || databaseIdentityStale || rayLightRecoveryPending}
             theme={theme}
             onThemeChange={setTheme}
             onDraftChange={updateRuntimeSettingsDraft}
             onSaved={(next) => queueRuntimeSettings("settings-page", next)}
-            onBeforeStorageChange={prepareStorageChange}
-            onStorageOperationStarted={beginStorageOperation}
-            onStorageOperationAborted={abortStorageOperation}
-            onStorageOperationUncertain={reconcileUncertainStorageOperation}
-            onStorageConfigurationChanged={acceptStorageConfiguration}
-            onStorageSwitchCancelled={async () => {
-              storageRecoveryInProgress.current = true;
-              setStorageOperationLock("recovering");
-              try {
-                await flushRuntimeSettingsForStorageChange();
-                await flushTimelineAutosave();
-              } finally {
-                storageRecoveryInProgress.current = false;
-                setStorageOperationLock("idle");
-              }
-            }}
             onConnectionTestSucceeded={refreshAuthoritativeResourcesAfterConnectionTest}
             onConfirmRayLightRuntimeRecovery={confirmRayLightRuntimeRecovery}
             onRequestClose={(restoreFocus = true) => {

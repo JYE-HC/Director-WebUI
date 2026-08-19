@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from director.comfy import ComfyClient, ComfyError
+from directordeck.comfy import ComfyClient, ComfyError
 
 
 async def test_comfy_submit_requests_only_server_owned_metadata_previews() -> None:

@@ -25,7 +25,7 @@ function asset(id: string, kind: "image" | "audio" | "video"): AssetReference {
   return {
     id,
     name: `${id}.${kind === "image" ? "png" : kind === "audio" ? "wav" : "mp4"}`,
-    subfolder: "director-web",
+    subfolder: "directordeck",
     type: "input",
     kind,
     ...(kind === "video" ? { metadata } : {}),

@@ -11,7 +11,6 @@ import {
 
 const DATABASE = {
   active_database_path: "/srv/director/data/director.sqlite3",
-  active_database_identity: "a".repeat(64),
 };
 const PROJECT_ID = "project-a";
 
@@ -174,12 +173,10 @@ describe("时间线工作区浏览器偏好", () => {
     expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, ["replacement"]))
       .toBeNull();
     expect(loadTimelineSegmentSelectionPreference({
-      ...DATABASE,
       active_database_path: "/srv/director/other.sqlite3",
     }, PROJECT_ID, project)).toBeNull();
     expect(loadTimelineSegmentSelectionPreference({
-      ...DATABASE,
-      active_database_identity: "b".repeat(64),
+      active_database_path: "",
     }, PROJECT_ID, project)).toBeNull();
     expect(loadTimelineSegmentSelectionPreference(DATABASE, "project-b", project)).toBeNull();
   });
@@ -187,13 +184,13 @@ describe("时间线工作区浏览器偏好", () => {
   it("隔离旧运行选择 key 与损坏的 v2 envelope", () => {
     const project = ["first", "disabled"];
     localStorage.setItem(
-      `director-web:v1:timeline-run-selection:${DATABASE.active_database_identity}`,
+      `directordeck:v1:timeline-run-selection:${DATABASE.active_database_path}`,
       JSON.stringify({ version: 1, selected_segment_ids: ["first"] }),
     );
     expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project)).toBeNull();
 
     localStorage.setItem(
-      `director-web:v2:timeline-segment-selection:${DATABASE.active_database_identity}:${PROJECT_ID}`,
+      `directordeck:v2:timeline-segment-selection:${DATABASE.active_database_path}:${PROJECT_ID}`,
       JSON.stringify({ version: 1 }),
     );
     expect(loadTimelineSegmentSelectionPreference(DATABASE, PROJECT_ID, project)).toBeNull();

@@ -6,10 +6,10 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 
-import director.app as director_app_module
-from director.compiler import timeline_segment_take_fingerprint
-from director.database import Database
-from director.schemas import UnifiedTimelineDraft, default_settings, default_timeline_draft
+import directordeck.app as director_app_module
+from directordeck.compiler import timeline_segment_take_fingerprint
+from directordeck.database import Database
+from directordeck.schemas import UnifiedTimelineDraft, default_settings, default_timeline_draft
 
 from .conftest import asset, wait_for_submission_tasks
 
@@ -63,14 +63,13 @@ def _seed_successful_take(
     timeline: UnifiedTimelineDraft,
     segment_id: str,
     *,
-    origin: str = "http://comfy.test:8188",
     filename: str | None = None,
     completed_at: str = "2026-08-13T12:00:00+00:00",
     duplicate_output: bool = False,
 ) -> tuple[str, str]:
     job_id = str(uuid.uuid4())
     child_id = str(uuid.uuid4())
-    settings = default_settings(origin)
+    settings = default_settings()
     database.create_job(
         {
             "id": job_id,
@@ -231,7 +230,6 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
     take = database.find_latest_segment_take(
         "root",
         fingerprint,
-        comfy_origin="http://comfy.test:8188/",
         require_audio=True,
     )
     assert take is not None
@@ -250,7 +248,7 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
         completed_at="2026-08-13T13:00:00+00:00",
     )
     newest = database.find_latest_segment_take(
-        "root", fingerprint, comfy_origin="http://comfy.test:8188"
+        "root", fingerprint,
     )
     assert newest is not None
     assert newest["output"]["filename"] == "newer-root.mp4"
@@ -269,7 +267,7 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
             ("2026-08-13T13:00:00+00:00",),
         ).fetchall()
     newest = database.find_latest_segment_take(
-        "root", fingerprint, comfy_origin="http://comfy.test:8188"
+        "root", fingerprint,
     )
     assert newest is not None
     assert newest["id"] == tied[0][0]
@@ -278,11 +276,11 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
         assert db.execute("PRAGMA foreign_key_list(segment_takes)").fetchall() == []
         db.execute("DELETE FROM segment_takes")
     assert database.find_latest_segment_take(
-        "root", fingerprint, comfy_origin="http://comfy.test:8188"
+        "root", fingerprint,
     ) is None
     database.initialize()
     assert database.find_latest_segment_take(
-        "root", fingerprint, comfy_origin="http://comfy.test:8188"
+        "root", fingerprint,
     ) is not None
 
     # Upgrade an already-registered authored-content row in place; the unique
@@ -295,12 +293,12 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
         )
     database.initialize()
     assert database.find_latest_segment_take(
-        "root", fingerprint, comfy_origin="http://comfy.test:8188"
+        "root", fingerprint,
     ) is not None
 
     assert database.delete_job_if_status(job_id, "succeeded") is True
     preserved = database.find_latest_segment_take(
-        "root", fingerprint, comfy_origin="http://comfy.test:8188"
+        "root", fingerprint,
     )
     assert preserved is not None
     with sqlite3.connect(database.path) as db:
@@ -308,9 +306,6 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
             "SELECT COUNT(*) FROM segment_takes WHERE source_child_id = ?",
             (child_id,),
         ).fetchone()[0] == 1
-    assert database.find_latest_segment_take(
-        "root", fingerprint, comfy_origin="http://other.test:8188"
-    ) is None
 
 
 def test_mute_take_is_visual_only_and_ambiguous_success_is_not_registered(
@@ -322,12 +317,11 @@ def test_mute_take_is_visual_only_and_ambiguous_success_is_not_registered(
     _seed_successful_take(database, mute_timeline, "mute-root")
     fingerprint = _take_fingerprint(mute_timeline)
     assert database.find_latest_segment_take(
-        "mute-root", fingerprint, comfy_origin="http://comfy.test:8188"
+        "mute-root", fingerprint,
     ) is not None
     assert database.find_latest_segment_take(
         "mute-root",
         fingerprint,
-        comfy_origin="http://comfy.test:8188",
         require_audio=True,
     ) is None
 
@@ -336,7 +330,7 @@ def test_mute_take_is_visual_only_and_ambiguous_success_is_not_registered(
         database, bad_timeline, "ambiguous", duplicate_output=True
     )
     assert database.has_segment_take(
-        "ambiguous", comfy_origin="http://comfy.test:8188"
+        "ambiguous",
     ) is False
 
 
@@ -428,7 +422,6 @@ async def test_historical_take_survives_recipe_family_prompt_and_reference_chang
     database.put_asset(
         reference["id"],
         {key: value for key, value in reference.items() if key != "slot"},
-        comfy_origin="http://comfy.test:8188",
     )
     edited_predecessor = {
         "id": stable_id,
@@ -590,7 +583,6 @@ async def test_historical_then_same_run_chain_waits_only_for_new_middle_take(
     middle_take = database.find_latest_segment_take(
         "chain-b",
         timeline_segment_take_fingerprint(authored, middle_segment),
-        comfy_origin="http://comfy.test:8188",
         require_audio=True,
     )
     assert middle_take is not None
@@ -630,13 +622,11 @@ async def test_historical_resolution_uses_current_direct_predecessor_after_reord
     first_take = database.find_latest_segment_take(
         "order-a",
         _take_fingerprint(_timeline(first)),
-        comfy_origin="http://comfy.test:8188",
         require_audio=True,
     )
     other_take = database.find_latest_segment_take(
         "order-x",
         _take_fingerprint(_timeline(other)),
-        comfy_origin="http://comfy.test:8188",
         require_audio=True,
     )
     assert first_take is not None and other_take is not None

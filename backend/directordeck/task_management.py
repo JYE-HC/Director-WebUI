@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from .comfy import ComfyClientProtocol
 from .media import create_24fps_proxy_bytes
 from .public_url import public_api_url
-from .schemas import AssetReference, RuntimeSettings, UnifiedTimelineDraft
+from .schemas import AssetReference, UnifiedTimelineDraft
 
 
 class AssetRegistry(Protocol):
@@ -24,21 +24,7 @@ class AssetRegistry(Protocol):
         self,
         asset_id: str,
         document: dict[str, Any],
-        *,
-        comfy_origin: str,
     ) -> None: ...
-
-    def put_asset_if_current_origin(
-        self,
-        asset_id: str,
-        document: dict[str, Any],
-        *,
-        expected_comfy_origin: str,
-    ) -> bool: ...
-
-
-ComfyFactory = Callable[[RuntimeSettings], ComfyClientProtocol]
-SettingsReader = Callable[[], RuntimeSettings]
 
 
 class TaskManagementError(ValueError):
@@ -55,16 +41,6 @@ _VIDEO_EXTENSIONS = frozenset(
 )
 _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._\-()\u4e00-\u9fff]+")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
-
-
-def canonical_comfy_origin(value: Any) -> str:
-    origin = str(value).strip().rstrip("/")
-    if not origin:
-        raise TaskManagementError(
-            "ComfyUI 地址尚未配置，无法导入生成结果",
-            status_code=409,
-        )
-    return origin
 
 
 def _safe_filename(value: str) -> str:
@@ -193,19 +169,17 @@ def resolve_job_output(
 async def import_job_output_as_asset(
     *,
     registry: AssetRegistry,
-    comfy_factory: ComfyFactory,
+    client: ComfyClientProtocol,
     job: Mapping[str, Any],
-    target_settings: RuntimeSettings,
-    current_settings: SettingsReader | None = None,
     output_index: int | None = None,
     segment_id: str | None = None,
 ) -> AssetReference:
-    """Copy one job-owned output into the active ComfyUI input library.
+    """Copy one job-owned output into the host ComfyUI input library.
 
-    Source reads are bound to the immutable job settings snapshot. The target
-    is the current live settings origin. Even when both origins match, bytes
-    pass through the normal 24fps proxy and input-upload contract; an output
-    path is never re-labelled as a trusted input asset.
+    The embedded backend talks to exactly one ComfyUI instance, so the source
+    read and the target upload share that single client. Even so, bytes pass
+    through the normal 24fps proxy and input-upload contract; an output path
+    is never re-labelled as a trusted input asset.
     """
 
     output = resolve_job_output(
@@ -213,17 +187,8 @@ async def import_job_output_as_asset(
         output_index=output_index,
         segment_id=segment_id,
     )
-    try:
-        source_settings = RuntimeSettings.model_validate(job.get("settings_snapshot"))
-    except ValueError as exc:
-        raise TaskManagementError(
-            "任务缺少有效的 ComfyUI 设置快照，无法读取生成结果",
-            status_code=409,
-        ) from exc
-    canonical_comfy_origin(source_settings.comfy_url)
-    target_origin = canonical_comfy_origin(target_settings.comfy_url)
 
-    upstream = await comfy_factory(source_settings).view(output)
+    upstream = await client.view(output)
     content = upstream.content
     if not content:
         raise TaskManagementError("生成结果为空，无法加入素材库", status_code=502)
@@ -246,7 +211,7 @@ async def import_job_output_as_asset(
             status_code=413,
         )
     upload_name = f"{Path(_safe_filename(output['filename'])).stem}_24fps.mp4"
-    uploaded = await comfy_factory(target_settings).upload(
+    uploaded = await client.upload(
         upload_name,
         proxy.content,
         "video/mp4",
@@ -297,22 +262,5 @@ async def import_job_output_as_asset(
             status_code=502,
         ) from exc
     document = asset.model_dump(mode="json")
-    if current_settings is not None:
-        current_origin = canonical_comfy_origin(current_settings().comfy_url)
-        if current_origin != target_origin:
-            # The old target may now contain an unregistered upload, but it
-            # must not be returned as a usable asset after authority changed.
-            raise TaskManagementError(
-                "导入期间 ComfyUI 地址已变更，结果未加入当前素材库，请重试",
-                status_code=409,
-            )
-    if not registry.put_asset_if_current_origin(
-        asset_id,
-        document,
-        expected_comfy_origin=target_origin,
-    ):
-        raise TaskManagementError(
-            "导入期间 ComfyUI 地址已变更，结果未加入当前素材库，请重试",
-            status_code=409,
-        )
+    registry.put_asset(asset_id, document)
     return asset

@@ -10,9 +10,9 @@ import httpx
 import pytest
 from starlette.requests import Request
 
-import director.app as director_app_module
-import director.native_templates as native_templates_module
-from director.app import (
+import directordeck.app as director_app_module
+import directordeck.native_templates as native_templates_module
+from directordeck.app import (
     _await_raylight_transition,
     _refresh_raylight_runtime_tail,
     _recover_interrupted_submission,
@@ -20,16 +20,16 @@ from director.app import (
     _sync_timeline_job,
     create_app,
 )
-from director.comfy import ComfyError
-from director.database import Database
-from director.media import VideoProxy
-from director.native_templates import (
+from directordeck.comfy import ComfyError
+from directordeck.database import Database
+from directordeck.media import VideoProxy
+from directordeck.native_templates import (
     bind_raylight_runtime_epoch,
     compile_native_timeline,
     raylight_runtime_descriptor,
 )
-from director.progress import ComfyExecutionEvent, ComfyReconcileHint
-from director.schemas import (
+from directordeck.progress import ComfyExecutionEvent, ComfyReconcileHint
+from directordeck.schemas import (
     RuntimeSettings,
     UnifiedTimelineDraft,
     VideoMetadata,
@@ -221,7 +221,7 @@ def test_per_segment_units_are_safe_ordered_and_reuse_stable_loader_nodes() -> N
             _segment("reference", "r2v"),
         )
     )
-    settings = default_settings("http://comfy.test:8188")
+    settings = default_settings()
 
     result = compile_native_timeline(draft, settings, "job-stable")
 
@@ -1752,7 +1752,7 @@ async def test_reconciler_rotates_exceptional_parents_past_bounded_batch(
     app = client.director_app
     app.state.reconcile_batch_size = 4
     app.state.reconcile_interval_seconds = 0.001
-    monkeypatch.setattr("director.app._sync_timeline_job", poison_then_observe)
+    monkeypatch.setattr("directordeck.app._sync_timeline_job", poison_then_observe)
     monkeypatch.setattr(app.state.progress_manager, "ensure", Mock())
     monkeypatch.setattr(app.state.progress_manager, "close", AsyncMock())
 
@@ -2239,8 +2239,9 @@ async def test_restart_reconciler_resumes_full_timeline_assembly(
     )
 
     restarted = create_app(
+        comfy_url="http://comfy.test:8188",
         database_path=database.path,
-        comfy_factory=lambda _settings: fake_comfy,
+        comfy_factory=lambda _comfy_url: fake_comfy,
     )
     restarted.state.reconcile_interval_seconds = 0.01
     monkeypatch.setattr(restarted.state.progress_manager, "ensure", Mock())
@@ -2251,7 +2252,7 @@ async def test_restart_reconciler_resumes_full_timeline_assembly(
         metadata=VideoMetadata.model_validate(VIDEO_METADATA),
     )
     assemble = Mock(return_value=assembled)
-    monkeypatch.setattr("director.app.assemble_video_bytes", assemble)
+    monkeypatch.setattr("directordeck.app.assemble_video_bytes", assemble)
 
     async with restarted.router.lifespan_context(restarted):
         for _ in range(100):
@@ -2306,12 +2307,13 @@ async def test_runtime_recovery_never_cancels_live_preflight_or_submit(
     tmp_path, fake_comfy, monkeypatch
 ) -> None:
     app = create_app(
+        comfy_url="http://comfy.test:8188",
         database_path=tmp_path / "live-submit.sqlite3",
-        comfy_factory=lambda _settings: fake_comfy,
+        comfy_factory=lambda _comfy_url: fake_comfy,
     )
     database = app.state.database
     database.initialize()
-    database.put_settings(default_settings("http://comfy.test:8188"))
+    database.put_settings(default_settings())
     app.state.reconcile_interval_seconds = 0.01
     monkeypatch.setattr(app.state.progress_manager, "ensure", Mock())
     monkeypatch.setattr(app.state.progress_manager, "close", AsyncMock())
@@ -2369,12 +2371,13 @@ async def test_lifespan_recovers_interrupted_submission_and_empty_parent(
     tmp_path, fake_comfy, monkeypatch
 ) -> None:
     app = create_app(
+        comfy_url="http://comfy.test:8188",
         database_path=tmp_path / "restart.sqlite3",
-        comfy_factory=lambda _settings: fake_comfy,
+        comfy_factory=lambda _comfy_url: fake_comfy,
     )
     database = app.state.database
     database.initialize()
-    settings = default_settings("http://comfy.test:8188")
+    settings = default_settings()
     database.put_settings(settings)
     now = utc_now()
     timeline = _timeline(_segment("bound"), _segment("not-submitted"))
@@ -2515,12 +2518,13 @@ async def test_lifespan_yields_before_128_child_black_hole_restart_cancellation(
     tmp_path, fake_comfy, monkeypatch
 ) -> None:
     app = create_app(
+        comfy_url="http://comfy.test:8188",
         database_path=tmp_path / "restart-black-hole.sqlite3",
-        comfy_factory=lambda _settings: fake_comfy,
+        comfy_factory=lambda _comfy_url: fake_comfy,
     )
     database = app.state.database
     database.initialize()
-    settings = default_settings("http://comfy.test:8188")
+    settings = default_settings()
     database.put_settings(settings)
     now = utc_now()
     segments = [_segment(f"restart-{index:03d}") for index in range(128)]
@@ -2609,12 +2613,13 @@ async def test_restart_cancel_false_does_not_lose_a_late_prompt_side_effect(
     tmp_path, fake_comfy, monkeypatch
 ) -> None:
     app = create_app(
+        comfy_url="http://comfy.test:8188",
         database_path=tmp_path / "restart-late-prompt.sqlite3",
-        comfy_factory=lambda _settings: fake_comfy,
+        comfy_factory=lambda _comfy_url: fake_comfy,
     )
     database = app.state.database
     database.initialize()
-    settings = default_settings("http://comfy.test:8188")
+    settings = default_settings()
     database.put_settings(settings)
     now = utc_now()
     timeline = _timeline(_segment("late"))
@@ -2847,11 +2852,9 @@ async def test_confirm_comfy_restart_atomically_ends_only_restart_recovery(
         error="old recovery error",
     )
 
-    origin = database.canonical_comfy_origin("http://comfy.test:8188")
+    origin = "http://comfy.test:8188"
     current_descriptor = {"family": "fl2va", "runtime_namespace": "kept-e7"}
-    database.put_raylight_runtime_state(
-        origin,
-        {
+    database.put_raylight_runtime_state({
             "version": 2,
             "epoch": 7,
             "current": current_descriptor,
@@ -2893,7 +2896,7 @@ async def test_confirm_comfy_restart_atomically_ends_only_restart_recovery(
         == "cancelled_after_confirmed_comfy_restart"
     )
     assert stored_recovery["error"] is None
-    runtime = database.get_raylight_runtime_state(origin)
+    runtime = database.get_raylight_runtime_state()
     assert runtime is not None
     assert runtime["epoch"] == 7
     assert runtime["current"] == current_descriptor
@@ -2979,35 +2982,6 @@ async def test_confirm_comfy_restart_requires_strict_certificate_and_owner(
     assert missing_prompt.status_code == 409
     assert "invalid restart-recovery" in missing_prompt.json()["detail"]
 
-    # Malformed audit data encountered after the guarded lifecycle UPDATEs
-    # must roll the whole BEGIN IMMEDIATE transaction back.
-    database.update_job_child(child["id"], prompt_id="strict-recovery-prompt")
-    with database.connect() as db:
-        original_settings = db.execute(
-            "SELECT settings_snapshot FROM jobs WHERE id = ?", (parent_id,)
-        ).fetchone()["settings_snapshot"]
-        db.execute(
-            "UPDATE jobs SET settings_snapshot = '{' WHERE id = ?", (parent_id,)
-        )
-    malformed_audit = await client.post(
-        f"/api/jobs/{parent_id}/recovery/confirm-comfy-restart",
-        json={"confirmation": "comfyui_process_restarted"},
-    )
-    assert malformed_audit.status_code == 409
-    with database.connect() as db:
-        raw_parent = db.execute(
-            "SELECT status FROM jobs WHERE id = ?", (parent_id,)
-        ).fetchone()
-        raw_child = db.execute(
-            "SELECT status FROM job_children WHERE id = ?", (child["id"],)
-        ).fetchone()
-        assert raw_parent["status"] == "cancelling"
-        assert raw_child["status"] == "cancelling"
-        db.execute(
-            "UPDATE jobs SET settings_snapshot = ? WHERE id = ?",
-            (original_settings, parent_id),
-        )
-
     database.update_job(
         parent_id,
         status="succeeded",
@@ -3063,7 +3037,7 @@ async def test_confirm_comfy_restart_rejects_live_director_dispatcher(
 
 
 def _raylight_settings_document() -> dict:
-    document = default_settings("http://comfy.test:8188").model_dump(mode="json")
+    document = default_settings().model_dump(mode="json")
     document["multi_gpu_enabled"] = True
     for family in ("fl2va", "ref2va"):
         document["models"][family].update(
@@ -3083,7 +3057,7 @@ def _raylight_settings_document() -> dict:
     return document
 
 
-def _install_stale_eight_gpu_runtime(client, fake_comfy) -> tuple[str, dict]:
+def _install_stale_eight_gpu_runtime(client, fake_comfy) -> dict:
     database = client.director_app.state.database
     old_document = _raylight_settings_document()
     for family in ("fl2va", "ref2va"):
@@ -3104,7 +3078,6 @@ def _install_stale_eight_gpu_runtime(client, fake_comfy) -> tuple[str, dict]:
         bind_raylight_runtime_epoch(unit, 36)
     )
     assert descriptor is not None
-    origin = database.canonical_comfy_origin(old_settings.comfy_url)
     state = {
         "version": 2,
         "epoch": 36,
@@ -3113,7 +3086,7 @@ def _install_stale_eight_gpu_runtime(client, fake_comfy) -> tuple[str, dict]:
         "tail_action": "shutdown",
         "tainted": True,
     }
-    database.put_raylight_runtime_state(origin, state)
+    database.put_raylight_runtime_state(state)
     current_document = _raylight_settings_document()
     for family in ("fl2va", "ref2va"):
         current_document["models"][family]["raylight"].update(
@@ -3142,13 +3115,13 @@ def _install_stale_eight_gpu_runtime(client, fake_comfy) -> tuple[str, dict]:
         },
         "outputs": {},
     }
-    return origin, state
+    return state
 
 
 async def test_stale_raylight_gpu_runtime_is_reported_and_never_submitted(
     client, fake_comfy
 ) -> None:
-    origin, before = _install_stale_eight_gpu_runtime(client, fake_comfy)
+    before = _install_stale_eight_gpu_runtime(client, fake_comfy)
 
     status = await client.get(
         "/api/raylight/runtime",
@@ -3178,13 +3151,13 @@ async def test_stale_raylight_gpu_runtime_is_reported_and_never_submitted(
     )
     assert rejected.json()["detail"]["invalid_gpu_indexes"] == [4, 5, 6, 7]
     assert fake_comfy.prompts == []
-    assert client.director_app.state.database.get_raylight_runtime_state(origin) == before
+    assert client.director_app.state.database.get_raylight_runtime_state() == before
 
 
 async def test_raylight_gpu_visibility_change_between_preflights_blocks_old_barrier(
     client, fake_comfy, monkeypatch
 ) -> None:
-    origin, before = _install_stale_eight_gpu_runtime(client, fake_comfy)
+    before = _install_stale_eight_gpu_runtime(client, fake_comfy)
     stats_calls = 0
 
     async def changing_system_stats() -> dict:
@@ -3222,7 +3195,7 @@ async def test_raylight_gpu_visibility_change_between_preflights_blocks_old_barr
     assert '"recovery_token":' in str(parent["error"])
     assert stats_calls >= 2
     assert fake_comfy.prompts == []
-    after = client.director_app.state.database.get_raylight_runtime_state(origin)
+    after = client.director_app.state.database.get_raylight_runtime_state()
     assert after is not None
     assert after["epoch"] == before["epoch"]
     assert after["current"] == before["current"]
@@ -3234,7 +3207,7 @@ async def test_raylight_gpu_visibility_change_between_preflights_blocks_old_barr
 async def test_confirmed_raylight_restart_recovery_preserves_epoch_and_builds_new_pool(
     client, fake_comfy
 ) -> None:
-    origin, before = _install_stale_eight_gpu_runtime(client, fake_comfy)
+    before = _install_stale_eight_gpu_runtime(client, fake_comfy)
     database = client.director_app.state.database
     blocked_status = (
         await client.get(
@@ -3247,7 +3220,6 @@ async def test_confirmed_raylight_restart_recovery_preserves_epoch_and_builds_ne
         "/api/raylight/runtime/recovery/confirm-comfy-restart",
         json={
             "confirmation": "comfyui_process_restarted",
-            "expected_comfy_origin": "http://comfy.test:8188",
             "expected_epoch": 36,
             "expected_recovery_token": blocked_status["recovery_token"],
         },
@@ -3263,7 +3235,7 @@ async def test_confirmed_raylight_restart_recovery_preserves_epoch_and_builds_ne
         "tainted": False,
         "recovery_token": None,
     }
-    assert database.get_raylight_runtime_state(origin) == {
+    assert database.get_raylight_runtime_state() == {
         "version": 2,
         "epoch": 36,
         "current": None,
@@ -3277,17 +3249,14 @@ async def test_confirmed_raylight_restart_recovery_preserves_epoch_and_builds_ne
     assert len(backups) == 1
     with Database(backups[0]).connect() as backup_connection:
         assert backup_connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-    assert Database(backups[0]).get_raylight_runtime_state(origin) == before
-    assert not database.settle_raylight_runtime_prompt(
-        origin,
-        "old-eight-to-four-tail",
+    assert Database(backups[0]).get_raylight_runtime_state() == before
+    assert not database.settle_raylight_runtime_prompt("old-eight-to-four-tail",
         succeeded=True,
     )
     repeated = await client.post(
         "/api/raylight/runtime/recovery/confirm-comfy-restart",
         json={
             "confirmation": "comfyui_process_restarted",
-            "expected_comfy_origin": "http://comfy.test:8188",
             "expected_epoch": 36,
             "expected_recovery_token": blocked_status["recovery_token"],
         },
@@ -3317,7 +3286,7 @@ async def test_confirmed_raylight_restart_recovery_preserves_epoch_and_builds_ne
 async def test_raylight_restart_recovery_is_strict_and_fails_closed(
     client, fake_comfy
 ) -> None:
-    origin, before = _install_stale_eight_gpu_runtime(client, fake_comfy)
+    before = _install_stale_eight_gpu_runtime(client, fake_comfy)
     endpoint = "/api/raylight/runtime/recovery/confirm-comfy-restart"
     blocked_status = (
         await client.get(
@@ -3327,7 +3296,6 @@ async def test_raylight_restart_recovery_is_strict_and_fails_closed(
     ).json()
     base = {
         "confirmation": "comfyui_process_restarted",
-        "expected_comfy_origin": "http://comfy.test:8188",
         "expected_epoch": 36,
         "expected_recovery_token": blocked_status["recovery_token"],
     }
@@ -3342,11 +3310,11 @@ async def test_raylight_restart_recovery_is_strict_and_fails_closed(
     queued = await client.post(endpoint, json=base)
     assert queued.status_code == 409
     assert "empty ComfyUI queue" in queued.json()["detail"]
-    assert client.director_app.state.database.get_raylight_runtime_state(origin) == before
+    assert client.director_app.state.database.get_raylight_runtime_state() == before
 
     fake_comfy.pending = []
     submission_lock = client.director_app.state.submission_locks.setdefault(
-        origin,
+        "embedded",
         director_app_module.anyio.Lock(),
     )
     await submission_lock.acquire()
@@ -3381,7 +3349,7 @@ async def test_raylight_restart_recovery_is_strict_and_fails_closed(
     active = await client.post(endpoint, json=base)
     assert active.status_code == 409
     assert "all Director jobs to be terminal" in active.json()["detail"]
-    assert database.get_raylight_runtime_state(origin) == before
+    assert database.get_raylight_runtime_state() == before
     database.update_job(
         "active-during-raylight-recovery",
         status="failed",
@@ -3414,13 +3382,13 @@ async def test_raylight_restart_recovery_is_strict_and_fails_closed(
     active_child = await client.post(endpoint, json=base)
     assert active_child.status_code == 409
     assert "all Director jobs to be terminal" in active_child.json()["detail"]
-    assert database.get_raylight_runtime_state(origin) == before
+    assert database.get_raylight_runtime_state() == before
 
 
 async def test_raylight_restart_recovery_requires_exact_history_and_maps_stats_failure(
     client, fake_comfy, monkeypatch
 ) -> None:
-    origin, before = _install_stale_eight_gpu_runtime(client, fake_comfy)
+    before = _install_stale_eight_gpu_runtime(client, fake_comfy)
     status = (
         await client.get(
             "/api/raylight/runtime",
@@ -3429,7 +3397,6 @@ async def test_raylight_restart_recovery_requires_exact_history_and_maps_stats_f
     ).json()
     body = {
         "confirmation": "comfyui_process_restarted",
-        "expected_comfy_origin": "http://comfy.test:8188",
         "expected_epoch": 36,
         "expected_recovery_token": status["recovery_token"],
     }
@@ -3441,7 +3408,7 @@ async def test_raylight_restart_recovery_requires_exact_history_and_maps_stats_f
     assert missing.status_code == 409
     assert "exact terminal history" in missing.json()["detail"]
     database = client.director_app.state.database
-    assert database.get_raylight_runtime_state(origin) == before
+    assert database.get_raylight_runtime_state() == before
     assert not list(database.path.parent.glob(
         f"{database.path.stem}.before-raylight-recovery-*.sqlite3"
     ))
@@ -3455,21 +3422,19 @@ async def test_raylight_restart_recovery_requires_exact_history_and_maps_stats_f
         json=body,
     )
     assert unavailable.status_code == 502
-    assert database.get_raylight_runtime_state(origin) == before
+    assert database.get_raylight_runtime_state() == before
 
 
 async def test_raylight_restart_recovery_uses_durable_exact_terminal_certificate(
     client, fake_comfy
 ) -> None:
-    origin, _before = _install_stale_eight_gpu_runtime(client, fake_comfy)
+    _before = _install_stale_eight_gpu_runtime(client, fake_comfy)
     database = client.director_app.state.database
-    assert database.settle_raylight_runtime_prompt(
-        origin,
-        "old-eight-to-four-tail",
+    assert database.settle_raylight_runtime_prompt("old-eight-to-four-tail",
         succeeded=False,
         terminal_history_certified=True,
     )
-    certified = database.get_raylight_runtime_state(origin)
+    certified = database.get_raylight_runtime_state()
     assert certified is not None
     assert certified["tail_terminal_certificate"] == {
         "prompt_id": "old-eight-to-four-tail",
@@ -3491,14 +3456,13 @@ async def test_raylight_restart_recovery_uses_durable_exact_terminal_certificate
         "/api/raylight/runtime/recovery/confirm-comfy-restart",
         json={
             "confirmation": "comfyui_process_restarted",
-            "expected_comfy_origin": "http://comfy.test:8188",
             "expected_epoch": 36,
             "expected_recovery_token": blocked_status["recovery_token"],
         },
     )
 
     assert confirmed.status_code == 200, confirmed.text
-    recovered = database.get_raylight_runtime_state(origin)
+    recovered = database.get_raylight_runtime_state()
     assert recovered is not None
     assert recovered["epoch"] == 36
     assert recovered["current"] is None
@@ -3508,27 +3472,26 @@ async def test_raylight_restart_recovery_uses_durable_exact_terminal_certificate
 async def test_raylight_history_absence_never_mints_a_terminal_certificate(
     client, fake_comfy
 ) -> None:
-    origin, before = _install_stale_eight_gpu_runtime(client, fake_comfy)
+    before = _install_stale_eight_gpu_runtime(client, fake_comfy)
     fake_comfy.histories.clear()
 
     refreshed = await _refresh_raylight_runtime_tail(
         fake_comfy,
         client.director_app.state.database,
-        origin,
         before,
     )
 
     assert refreshed["tainted"] is True
     assert "tail_terminal_certificate" not in refreshed
     assert "tail_terminal_certificate" not in (
-        client.director_app.state.database.get_raylight_runtime_state(origin) or {}
+        client.director_app.state.database.get_raylight_runtime_state() or {}
     )
 
 
 async def test_raylight_restart_recovery_full_state_cas_preserves_late_tail(
     client, fake_comfy, monkeypatch
 ) -> None:
-    origin, before = _install_stale_eight_gpu_runtime(client, fake_comfy)
+    before = _install_stale_eight_gpu_runtime(client, fake_comfy)
     status = (
         await client.get(
             "/api/raylight/runtime",
@@ -3545,7 +3508,7 @@ async def test_raylight_restart_recovery_full_state_cas_preserves_late_tail(
     }
 
     def race_confirmation(*args, **kwargs):
-        database.put_raylight_runtime_state(origin, late)
+        database.put_raylight_runtime_state(late)
         return original_confirm(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -3557,14 +3520,13 @@ async def test_raylight_restart_recovery_full_state_cas_preserves_late_tail(
         "/api/raylight/runtime/recovery/confirm-comfy-restart",
         json={
             "confirmation": "comfyui_process_restarted",
-            "expected_comfy_origin": "http://comfy.test:8188",
             "expected_epoch": 36,
             "expected_recovery_token": status["recovery_token"],
         },
     )
     assert response.status_code == 409
     assert "runtime changed" in response.json()["detail"]
-    assert database.get_raylight_runtime_state(origin) == late
+    assert database.get_raylight_runtime_state() == late
     assert not list(database.path.parent.glob(
         f"{database.path.stem}.before-raylight-recovery-*.sqlite3"
     ))
@@ -3574,12 +3536,11 @@ async def test_malformed_raylight_runtime_is_structured_conflict_not_submission_
     client, fake_comfy
 ) -> None:
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(database.get_settings().comfy_url)
     with database.connect() as connection:
         connection.execute(
-            "INSERT INTO raylight_runtime_state(comfy_origin, descriptor, updated_at) "
+            "INSERT INTO raylight_runtime_state(singleton, descriptor, updated_at) "
             "VALUES(?, ?, ?)",
-            (origin, "{not-json", utc_now()),
+            (1, "{not-json", utc_now()),
         )
 
     status = await client.get(
@@ -4270,7 +4231,7 @@ async def test_cancelled_middle_ticket_keeps_pending_predecessor_order(
     monkeypatch.setattr(
         director_app_module, "_RAYLIGHT_GENERATION_POLL_SECONDS", 0.001
     )
-    endpoint_key = Database.canonical_comfy_origin(settings["comfy_url"])
+    endpoint_key = "embedded"
     pending_predecessor = asyncio.get_running_loop().create_future()
     client.director_app.state.submission_tails[endpoint_key] = pending_predecessor
 
@@ -4491,7 +4452,7 @@ async def test_cancel_new_parent_aborts_ambiguous_old_raylight_tail_gate(
     )
     await _wait_for_prompt_count(fake_comfy, 1)
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
+    origin = "embedded"
     old_child = database.list_job_children(old.json()["id"])[0]
     old_prompt_id = str(old_child["prompt_id"])
     fake_comfy.pending = []
@@ -4501,7 +4462,7 @@ async def test_cancel_new_parent_aborts_ambiguous_old_raylight_tail_gate(
     database.update_job(
         old.json()["id"], status="cancelling", stage="submission_cancel_unconfirmed"
     )
-    before_state = database.get_raylight_runtime_state(origin)
+    before_state = database.get_raylight_runtime_state()
 
     newer = await client.post(
         "/api/timeline/jobs",
@@ -4513,8 +4474,8 @@ async def test_cancel_new_parent_aborts_ambiguous_old_raylight_tail_gate(
         lambda: newer.json()["id"] not in client.director_app.state.submission_jobs
     )
     assert len(fake_comfy.prompts) == 1
-    assert database.get_raylight_runtime_state(origin) == before_state
-    assert database.get_raylight_runtime_state(origin)["tail_prompt_id"] == old_prompt_id
+    assert database.get_raylight_runtime_state() == before_state
+    assert database.get_raylight_runtime_state()["tail_prompt_id"] == old_prompt_id
 
 
 async def test_cancel_new_parent_aborts_ambiguous_old_shutdown_gate(
@@ -4531,8 +4492,8 @@ async def test_cancel_new_parent_aborts_ambiguous_old_shutdown_gate(
     )
     await _wait_for_prompt_count(fake_comfy, 1)
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
-    state = database.get_raylight_runtime_state(origin)
+    origin = "embedded"
+    state = database.get_raylight_runtime_state()
     assert state is not None and state["current"] is not None
     old_barrier_id = str(uuid.uuid4())
     old_parent_id = str(uuid.uuid4())
@@ -4586,7 +4547,7 @@ async def test_cancel_new_parent_aborts_ambiguous_old_shutdown_gate(
         "tail_action": "shutdown",
         "tainted": True,
     }
-    database.put_raylight_runtime_state(origin, before_state)
+    database.put_raylight_runtime_state(before_state)
 
     newer = await client.post(
         "/api/timeline/jobs",
@@ -4598,7 +4559,7 @@ async def test_cancel_new_parent_aborts_ambiguous_old_shutdown_gate(
         lambda: newer.json()["id"] not in client.director_app.state.submission_jobs
     )
     assert len(fake_comfy.prompts) == 1
-    assert database.get_raylight_runtime_state(origin) == before_state
+    assert database.get_raylight_runtime_state() == before_state
 
 
 async def test_standard_create_returns_preparing_behind_running_raylight(
@@ -4676,8 +4637,8 @@ async def test_new_parent_waits_for_ambiguous_old_raylight_shutdown(
     )
     await _wait_for_prompt_count(fake_comfy, 1)
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
-    state = database.get_raylight_runtime_state(origin)
+    origin = "embedded"
+    state = database.get_raylight_runtime_state()
     assert state is not None and state["current"] is not None
 
     old_barrier_id = str(uuid.uuid4())
@@ -4724,9 +4685,7 @@ async def test_new_parent_waits_for_ambiguous_old_raylight_shutdown(
             "completed_at": None,
         }
     )
-    database.put_raylight_runtime_state(
-        origin,
-        {
+    database.put_raylight_runtime_state({
             "version": 2,
             "epoch": state["epoch"],
             "current": state["current"],
@@ -5246,11 +5205,11 @@ async def test_raylight_runtime_epoch_and_taint_survive_database_restart(
     assert created.status_code == 200
     await _wait_for_prompt_count(fake_comfy, 1)
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
-    state = database.get_raylight_runtime_state(origin)
+    origin = "embedded"
+    state = database.get_raylight_runtime_state()
     assert state is not None and state["epoch"] == 1
     state["tainted"] = True
-    database.put_raylight_runtime_state(origin, state)
+    database.put_raylight_runtime_state(state)
     # Model a terminal actor failure whose exact history was pruned before the
     # restart. The durable child, rather than absence alone, certifies taint.
     fake_comfy.histories.pop(str(state["tail_prompt_id"]), None)
@@ -5274,7 +5233,7 @@ async def test_raylight_runtime_epoch_and_taint_survive_database_restart(
 
     # initialize() is the startup migration path of a new backend process.
     database.initialize()
-    restarted = database.get_raylight_runtime_state(origin)
+    restarted = database.get_raylight_runtime_state()
     assert restarted is not None
     assert restarted["epoch"] == 1
     assert restarted["tainted"] is True
@@ -5305,8 +5264,8 @@ async def test_raylight_exact_terminal_result_is_persisted_with_the_runtime_tail
     await _wait_for_submission_jobs(client)
 
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
-    state = database.get_raylight_runtime_state(origin)
+    origin = "embedded"
+    state = database.get_raylight_runtime_state()
     assert state is not None
     assert state["tail_terminal_certificate"] == {
         "prompt_id": state["tail_prompt_id"],
@@ -5342,8 +5301,8 @@ async def test_contradictory_raylight_generation_never_mints_terminal_certificat
     await _wait_for_submission_jobs(client)
 
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
-    state = database.get_raylight_runtime_state(origin)
+    origin = "embedded"
+    state = database.get_raylight_runtime_state()
     assert state is not None
     assert state["tainted"] is True
     assert "tail_terminal_certificate" not in state
@@ -5355,7 +5314,7 @@ async def test_legacy_direct_raylight_descriptor_advances_past_embedded_epoch(
     settings = _raylight_settings_document()
     assert (await client.put("/api/settings", json=settings)).status_code == 200
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
+    origin = "embedded"
     legacy = {
         "version": 1,
         "family": "fl2va",
@@ -5364,9 +5323,9 @@ async def test_legacy_direct_raylight_descriptor_advances_past_embedded_epoch(
     }
     with database.connect() as connection:
         connection.execute(
-            "INSERT INTO raylight_runtime_state(comfy_origin, descriptor, updated_at) "
+            "INSERT INTO raylight_runtime_state(singleton, descriptor, updated_at) "
             "VALUES(?, ?, ?)",
-            (origin, json.dumps(legacy), utc_now()),
+            (1, json.dumps(legacy), utc_now()),
         )
 
     created = await client.post(
@@ -5383,9 +5342,6 @@ async def test_legacy_unknown_raylight_pool_blocks_standard_until_ray_rebuild(
     client, fake_comfy, legacy_shape: str
 ) -> None:
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(
-        database.get_settings().comfy_url
-    )
     legacy_descriptor = {
         "version": 1,
         "family": "fl2va",
@@ -5405,9 +5361,9 @@ async def test_legacy_unknown_raylight_pool_blocks_standard_until_ray_rebuild(
     )
     with database.connect() as connection:
         connection.execute(
-            "INSERT INTO raylight_runtime_state(comfy_origin, descriptor, updated_at) "
+            "INSERT INTO raylight_runtime_state(singleton, descriptor, updated_at) "
             "VALUES(?, ?, ?)",
-            (origin, json.dumps(raw_state), utc_now()),
+            (1, json.dumps(raw_state), utc_now()),
         )
 
     created = await client.post(
@@ -5437,17 +5393,15 @@ async def test_restart_recovers_positive_shutdown_barrier_before_standard(
     assert ray.status_code == 200
     await _wait_for_prompt_count(fake_comfy, 1)
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
-    state = database.get_raylight_runtime_state(origin)
+    origin = "embedded"
+    state = database.get_raylight_runtime_state()
     assert state is not None and state["current"] is not None
 
     # Model the durable write made immediately before POST /prompt when the
     # backend then dies after RayKill reaches successful history but before it
     # can clear the ledger synchronously.
     barrier_prompt_id = "barrier-completed-before-restart"
-    database.put_raylight_runtime_state(
-        origin,
-        {
+    database.put_raylight_runtime_state({
             "version": 2,
             "epoch": state["epoch"],
             "current": state["current"],
@@ -5487,7 +5441,7 @@ async def test_restart_recovers_positive_shutdown_barrier_before_standard(
         node.get("class_type") == "RayKill"
         for node in submitted[0]["prompt"].values()
     )
-    settled = database.get_raylight_runtime_state(origin)
+    settled = database.get_raylight_runtime_state()
     assert settled is not None
     assert settled["current"] is None
     assert settled["tail_action"] is None
@@ -5507,13 +5461,11 @@ async def test_restart_replaces_dead_shutdown_tail_before_standard(
     assert ray.status_code == 200
     await _wait_for_prompt_count(fake_comfy, 1)
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(settings["comfy_url"])
-    state = database.get_raylight_runtime_state(origin)
+    origin = "embedded"
+    state = database.get_raylight_runtime_state()
     assert state is not None and state["current"] is not None
     dead_prompt_id = f"dead-shutdown-{old_barrier_result}"
-    database.put_raylight_runtime_state(
-        origin,
-        {
+    database.put_raylight_runtime_state({
             "version": 2,
             "epoch": state["epoch"],
             "current": state["current"],
@@ -5876,8 +5828,9 @@ async def test_continuity_restart_does_not_resume_an_unsubmitted_successor(
     # successor POST has been claimed. A new process must cancel that local row,
     # never reconstruct/bind the dependency and resume generation automatically.
     restarted = create_app(
+        comfy_url="http://comfy.test:8188",
         database_path=database.path,
-        comfy_factory=lambda _settings: fake_comfy,
+        comfy_factory=lambda _comfy_url: fake_comfy,
     )
     restarted.state.reconcile_interval_seconds = 0.01
     monkeypatch.setattr(restarted.state.progress_manager, "ensure", Mock())

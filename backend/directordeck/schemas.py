@@ -6,7 +6,6 @@ import secrets
 from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import (
-    AnyHttpUrl,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -61,37 +60,10 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-StorageSource = Literal[
-    "explicit",
-    "environment",
-    "bootstrap",
-    "legacy",
-    "default",
-]
-
-
-class StorageConfigureRequest(StrictModel):
-    database_path: Annotated[str, Field(min_length=1, max_length=4096)]
-
-
-class StorageMigrateRequest(StrictModel):
-    target_path: Annotated[str, Field(min_length=1, max_length=4096)]
-
-
 class StorageStatusRead(StrictModel):
+    """The fixed database location of this embedded Director process."""
+
     active_database_path: str
-    active_database_identity: Annotated[
-        str, Field(pattern=r"^[0-9a-f]{64}$")
-    ]
-    configured_database_path: str
-    recommended_database_path: str
-    source: StorageSource
-    restart_required: bool
-
-
-class StorageMigrationRead(StorageStatusRead):
-    migrated_from: str
-    migrated_to: str
 
 
 class ModelBinding(StrictModel):
@@ -138,15 +110,6 @@ class StandardLoraLoaderOverride(StrictModel):
     loader: StandardLoraLoader
     lora_name: Annotated[str, Field(min_length=1, max_length=1024)]
     model_filename: Annotated[str, Field(min_length=1, max_length=1024)]
-    # Verbatim like RuntimeSettings.comfy_url: AnyHttpUrl would re-add "/" to
-    # bare origins and break the browser's byte-exact settings round-trip.
-    comfy_origin: Annotated[str, Field(min_length=1, max_length=2048)]
-
-    @field_validator("comfy_origin", mode="after")
-    @classmethod
-    def validate_comfy_origin(cls, value: str) -> str:
-        AnyHttpUrl(value)
-        return value
 
 
 class DiffusionModelBinding(ModelBinding):
@@ -201,15 +164,8 @@ class SettingsModels(StrictModel):
 
 
 class RuntimeSettings(StrictModel):
-    # An empty value is the explicit first-run state. Runtime operations must
-    # require a configured URL before constructing a ComfyUI client; keeping
-    # the empty state in this persisted model lets the settings page be the
-    # sole source of that configuration.
-    # The string is validated but persisted verbatim: AnyHttpUrl re-adds "/"
-    # to bare origins, and the browser compares the authoritative GET
-    # byte-for-byte with the payload it just PUT — any server-side rewrite
-    # becomes an infinite "settings differ" retry loop.
-    comfy_url: str = ""
+    # The ComfyUI address is not a setting: the plugin embeds Director in one
+    # ComfyUI process and create_app injects that instance's loopback URL.
     client_id: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")]
     # Pure Standard segment prompts repeat stable loader ids/inputs so ComfyUI
     # may retain its endpoint-local cache between prompts. RayLight uses an
@@ -231,29 +187,6 @@ class RuntimeSettings(StrictModel):
     # runtime, never persisted.
     multi_gpu_enabled: bool = False
     models: SettingsModels
-
-    @field_validator("comfy_url", mode="after")
-    @classmethod
-    def normalize_comfy_url(cls, value: str) -> str:
-        if value == "":
-            return ""
-        AnyHttpUrl(value)
-        return value
-
-    @model_validator(mode="after")
-    def validate_standard_lora_override_origins(self) -> "RuntimeSettings":
-        current_origin = str(self.comfy_url).rstrip("/")
-        for family in ("fl2va", "ref2va"):
-            override = getattr(self.models, family).standard_lora_loader_override
-            if (
-                override is not None
-                and str(override.comfy_origin).rstrip("/") != current_origin
-            ):
-                raise ValueError(
-                    f"{family}.standard_lora_loader_override must match the "
-                    "current ComfyUI origin"
-                )
-        return self
 
 
 class RuntimeSettingsAuthorityRead(StrictModel):
@@ -303,11 +236,10 @@ def canonicalize_live_runtime_settings(settings: RuntimeSettings) -> RuntimeSett
     )
 
 
-def default_settings(comfy_url: str = "") -> RuntimeSettings:
+def default_settings() -> RuntimeSettings:
     return RuntimeSettings.model_validate(
         {
-            "comfy_url": comfy_url,
-            "client_id": "director-web",
+            "client_id": "directordeck",
             "memory_policy": "keep_resident",
             "raylight_residency_policy": "keep_until_switch",
             "models": {
@@ -1259,10 +1191,6 @@ def mode_draft_to_timeline(
     )
 
 
-class ComfyURLRequest(StrictModel):
-    comfy_url: AnyHttpUrl
-
-
 class DetectShotsRequest(StrictModel):
     """Safe web contract for RV2V source-video shot detection."""
 
@@ -1365,10 +1293,6 @@ class TimelineCompileRead(StrictModel):
 class AssetListRead(StrictModel):
     assets: list[AssetReference]
     outputs_preserved: Literal[True] = True
-    active_database_identity: Annotated[
-        str, Field(pattern=r"^[0-9a-f]{64}$")
-    ]
-    comfy_origin: Annotated[str, Field(min_length=1)]
 
 
 class AssetDeleteRead(StrictModel):
@@ -1393,7 +1317,6 @@ class AssetTrashRequest(StrictModel):
 
 class AssetTrashBatchRead(StrictModel):
     batch_id: str
-    comfy_origin: str
     asset_ids: list[str]
     assets: list[AssetReference]
     cascade: bool
@@ -1406,10 +1329,6 @@ class AssetTrashBatchRead(StrictModel):
 class AssetTrashListRead(StrictModel):
     batches: list[AssetTrashBatchRead]
     remote_files_preserved: Literal[True] = True
-    active_database_identity: Annotated[
-        str, Field(pattern=r"^[0-9a-f]{64}$")
-    ]
-    comfy_origin: Annotated[str, Field(min_length=1)]
 
 
 class AssetTrashRestoreRequest(StrictModel):
@@ -1543,7 +1462,6 @@ class RayLightRuntimeRecoveryConfirmRequest(StrictModel):
     """Operator certificate for discarding a pre-restart RayLight ledger."""
 
     confirmation: Literal["comfyui_process_restarted"]
-    expected_comfy_origin: AnyHttpUrl
     expected_epoch: Annotated[int, Field(ge=0)]
     expected_recovery_token: Annotated[
         str, Field(pattern=r"^[0-9a-f]{64}$")
@@ -1723,9 +1641,6 @@ class ProjectSummaryRead(StrictModel):
 
 class ProjectListRead(StrictModel):
     projects: list[ProjectSummaryRead]
-    active_database_identity: Annotated[
-        str, Field(pattern=r"^[0-9a-f]{64}$")
-    ]
 
 
 class ProjectCreateRequest(StrictModel):
@@ -1775,14 +1690,6 @@ class TimelineRevisionExhaustedRead(StrictModel):
     message: str
     project_id: str
     revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
-
-
-class TimelineComfyOriginConflictRead(StrictModel):
-    code: Literal["timeline_comfy_origin_conflict"] = (
-        "timeline_comfy_origin_conflict"
-    )
-    message: str
-    project_id: str
 
 
 class ProjectDeleteRead(StrictModel):

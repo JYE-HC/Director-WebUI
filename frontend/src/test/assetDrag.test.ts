@@ -70,7 +70,7 @@ describe("素材拖放载荷", () => {
       return {
         id: `asset-${file.name}`,
         name: file.name,
-        subfolder: "director-web",
+        subfolder: "directordeck",
         type: "input" as const,
         kind,
         ...(kind === "video" ? {
@@ -102,7 +102,7 @@ describe("素材拖放载荷", () => {
       return {
         id: "old-endpoint-asset",
         name: file.name,
-        subfolder: "director-web",
+        subfolder: "directordeck",
         type: "input" as const,
         kind: "image" as const,
       };
@@ -132,7 +132,7 @@ describe("素材拖放载荷", () => {
       return {
         id: `asset-${file.name}`,
         name: file.name,
-        subfolder: "director-web",
+        subfolder: "directordeck",
         type: "input" as const,
         kind: "image" as const,
       };

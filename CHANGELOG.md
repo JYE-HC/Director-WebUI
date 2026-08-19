@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 - Unreleased
+
+- Rebuilt Director as a pure ComfyUI plugin (registry name DirectorDeck): the
+  backend embeds in the ComfyUI process, the SPA is served by ComfyUI under
+  `/directordeck/`, and the database lives in ComfyUI's `user/directordeck/` directory.
+- Removed the standalone deployment form: bootstrap/install.sh/director.sh,
+  the process supervisor, the release installer, and all multi-process
+  tooling. No migration path is provided for pre-plugin installs.
+
 ## 0.1.0-rc1 - 2026-08-16
 
 - Prepared a privacy-clean release history for Director Web.

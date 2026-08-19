@@ -43,7 +43,6 @@ import type {
   RuntimeSettings,
   RuntimeSettingsAuthority,
   StorageConfiguration,
-  StorageMigrationResult,
   TaskListResponse,
   TaskBulkCancelResponse,
   TaskDiagnostic,
@@ -54,31 +53,11 @@ import type {
   TimelineTaskRequest,
 } from "./types";
 
-// When the SPA is served by the ComfyUI plugin under /director/, the API is
-// proxied at /director/api on the same origin; standalone mode keeps /api.
+// The SPA is served by the ComfyUI plugin under /directordeck/, and the API is
+// proxied at /directordeck/api on the same origin.
 const API_BASE = (
-  import.meta.env.VITE_API_BASE_URL ||
-  (typeof window !== "undefined" && window.location.pathname.startsWith("/director/")
-    ? "/director/api"
-    : "/api")
+  import.meta.env.VITE_API_BASE_URL || "/directordeck/api"
 ).replace(/\/$/, "");
-export const DATABASE_IDENTITY_STALE_EVENT = "director:stale-database-identity";
-let latchedDatabaseIdentity: string | null = null;
-
-// The ComfyUI host aiohttp app registers /director/status only when the
-// plugin embeds the backend. Standalone servers (vite dev/preview or a bare
-// deployment) answer 404, an HTML fallback, or nothing at all, so only a
-// valid JSON payload with the plugin's `backend` field proves embedded mode.
-export async function detectEmbeddedComfyUi(): Promise<boolean> {
-  try {
-    const response = await fetch("/director/status", { cache: "no-store" });
-    if (!response.ok) return false;
-    const payload: unknown = await response.json();
-    return typeof payload === "object" && payload !== null && "backend" in payload;
-  } catch {
-    return false;
-  }
-}
 
 export function taskEventsUrl(): string {
   return `${API_BASE}/tasks/events`;
@@ -88,10 +67,8 @@ export type ApiErrorCode =
   | "raylight_recovery_in_flight"
   | "timeline_revision_conflict"
   | "assets_in_use"
-  | "asset_trash_origin_conflict"
   | "asset_trash_restore_conflict"
-  | "asset_trash_purge_conflict"
-  | "asset_upload_origin_changed";
+  | "asset_trash_purge_conflict";
 
 export class ApiError extends Error {
   constructor(
@@ -109,10 +86,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   headers.set("Accept", "application/json");
-  const method = (init?.method ?? "GET").toUpperCase();
-  if (latchedDatabaseIdentity && method !== "GET" && method !== "HEAD") {
-    headers.set("X-Director-Database-Identity", latchedDatabaseIdentity);
-  }
   const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (!response.ok) {
     let responseText = "";
@@ -131,10 +104,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         // Plain-text and HTML errors still retain their HTTP status below.
       }
     }
-    if (
-      response.status === 409 && isRecord(details) &&
-      details.code === "stale_database_identity"
-    ) window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT));
     const parsed = parseHttpError(details, response.status);
     throw new ApiError(parsed.message, response.status, parsed.details, parsed.code);
   }
@@ -209,9 +178,6 @@ function uploadAssetWithProgress(
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${API_BASE}/assets`);
     xhr.setRequestHeader("Accept", "application/json");
-    if (latchedDatabaseIdentity) {
-      xhr.setRequestHeader("X-Director-Database-Identity", latchedDatabaseIdentity);
-    }
     xhr.responseType = "json";
     xhr.upload.onprogress = (event) => {
       onProgress({
@@ -448,17 +414,13 @@ function parseHttpError(
     detail.code === "raylight_recovery_in_flight" ||
     detail.code === "timeline_revision_conflict" ||
     detail.code === "assets_in_use" ||
-    detail.code === "asset_trash_origin_conflict" ||
     detail.code === "asset_trash_restore_conflict" ||
-    detail.code === "asset_trash_purge_conflict" ||
-    detail.code === "asset_upload_origin_changed"
+    detail.code === "asset_trash_purge_conflict"
       ? detail.code
       : undefined;
   const assetCode = candidateCode === "assets_in_use" ||
-    candidateCode === "asset_trash_origin_conflict" ||
     candidateCode === "asset_trash_restore_conflict" ||
-    candidateCode === "asset_trash_purge_conflict" ||
-    candidateCode === "asset_upload_origin_changed";
+    candidateCode === "asset_trash_purge_conflict";
   const conflicts = candidateCode === "asset_trash_restore_conflict" ||
       candidateCode === "asset_trash_purge_conflict"
     ? parseAssetTrashConflictOwners(detail.conflicts)
@@ -1035,14 +997,11 @@ function parseProjectSummary(value: unknown): ProjectSummary {
 function parseProjectList(value: unknown): ProjectListResponse {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ["projects", "active_database_identity"]) ||
-    !Array.isArray(value.projects) ||
-    typeof value.active_database_identity !== "string" ||
-    !/^[0-9a-f]{64}$/.test(value.active_database_identity)
+    !hasExactKeys(value, ["projects"]) ||
+    !Array.isArray(value.projects)
   ) throw new ApiError("项目列表响应结构无效", 502, value);
   return {
     projects: value.projects.map(parseProjectSummary),
-    active_database_identity: value.active_database_identity,
   };
 }
 
@@ -1069,74 +1028,14 @@ function isStoragePath(value: unknown, allowHomeRelative = false): value is stri
     (value.startsWith("/") || (allowHomeRelative && value.startsWith("~/")));
 }
 
-const STORAGE_CONFIGURATION_SOURCES = new Set([
-  "explicit",
-  "environment",
-  "bootstrap",
-  "legacy",
-  "default",
-]);
-
-function hasStorageConfigurationFields(value: Record<string, unknown>): boolean {
-  return isStoragePath(value.active_database_path) &&
-    typeof value.active_database_identity === "string" &&
-    /^[0-9a-f]{64}$/.test(value.active_database_identity) &&
-    isStoragePath(value.configured_database_path, true) &&
-    isStoragePath(value.recommended_database_path) &&
-    typeof value.source === "string" &&
-    STORAGE_CONFIGURATION_SOURCES.has(value.source) &&
-    typeof value.restart_required === "boolean";
-}
-
 function parseStorageConfiguration(value: unknown): StorageConfiguration {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, [
-      "active_database_path",
-      "active_database_identity",
-      "configured_database_path",
-      "recommended_database_path",
-      "source",
-      "restart_required",
-    ]) ||
-    !hasStorageConfigurationFields(value)
+    !hasExactKeys(value, ["active_database_path"]) ||
+    !isStoragePath(value.active_database_path)
   ) throw new ApiError("数据存储响应结构无效", 502, value);
   return {
-    active_database_path: value.active_database_path as string,
-    active_database_identity: value.active_database_identity as string,
-    configured_database_path: value.configured_database_path as string,
-    recommended_database_path: value.recommended_database_path as string,
-    source: value.source as StorageConfiguration["source"],
-    restart_required: value.restart_required as boolean,
-  };
-}
-
-function parseStorageMigrationResult(value: unknown): StorageMigrationResult {
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, [
-      "active_database_path",
-      "active_database_identity",
-      "configured_database_path",
-      "recommended_database_path",
-      "source",
-      "restart_required",
-      "migrated_from",
-      "migrated_to",
-    ]) ||
-    !hasStorageConfigurationFields(value) ||
-    !isStoragePath(value.migrated_from) ||
-    !isStoragePath(value.migrated_to)
-  ) throw new ApiError("数据库迁移响应结构无效", 502, value);
-  return {
-    active_database_path: value.active_database_path as string,
-    active_database_identity: value.active_database_identity as string,
-    configured_database_path: value.configured_database_path as string,
-    recommended_database_path: value.recommended_database_path as string,
-    source: value.source as StorageConfiguration["source"],
-    restart_required: value.restart_required as boolean,
-    migrated_from: value.migrated_from as string,
-    migrated_to: value.migrated_to as string,
+    active_database_path: value.active_database_path,
   };
 }
 
@@ -1383,51 +1282,12 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
     left.every((item, index) => item === right[index]);
 }
 
-type OptionalAssetResponseScope = {
-  active_database_identity?: string;
-  comfy_origin?: string;
-};
-
-function parseOptionalAssetResponseScope(
-  value: Record<string, unknown>,
-  legacyKeys: readonly string[],
-): OptionalAssetResponseScope | null {
-  if (hasExactKeys(value, legacyKeys)) return {};
-  if (!hasExactKeys(value, [
-    ...legacyKeys,
-    "active_database_identity",
-    "comfy_origin",
-  ])) return null;
-  if (
-    typeof value.active_database_identity !== "string" ||
-    !/^[0-9a-f]{64}$/.test(value.active_database_identity) ||
-    typeof value.comfy_origin !== "string" ||
-    value.comfy_origin.trim() !== value.comfy_origin ||
-    !value.comfy_origin ||
-    value.comfy_origin.endsWith("/")
-  ) return null;
-  try {
-    const parsed = new URL(value.comfy_origin);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-  } catch {
-    return null;
-  }
-  return {
-    active_database_identity: value.active_database_identity,
-    comfy_origin: value.comfy_origin,
-  };
-}
-
 function parseAssetList(value: unknown): AssetListResponse {
   if (!isRecord(value)) {
     throw new ApiError("素材列表响应结构无效", 502, value);
   }
-  const scope = parseOptionalAssetResponseScope(
-    value,
-    ["assets", "outputs_preserved"],
-  );
   if (
-    scope === null ||
+    !hasExactKeys(value, ["assets", "outputs_preserved"]) ||
     value.outputs_preserved !== true ||
     !Array.isArray(value.assets)
   ) throw new ApiError("素材列表响应结构无效", 502, value);
@@ -1446,7 +1306,6 @@ function parseAssetList(value: unknown): AssetListResponse {
   return {
     assets,
     outputs_preserved: true,
-    ...scope,
   };
 }
 
@@ -1458,7 +1317,6 @@ function parseAssetTrashBatch(
     !isRecord(value) ||
     !hasExactKeys(value, [
       "batch_id",
-      "comfy_origin",
       "asset_ids",
       "assets",
       "cascade",
@@ -1468,7 +1326,6 @@ function parseAssetTrashBatch(
       "remote_files_preserved",
     ]) ||
     typeof value.batch_id !== "string" || !value.batch_id ||
-    typeof value.comfy_origin !== "string" || !value.comfy_origin ||
     typeof value.cascade !== "boolean" ||
     typeof value.created_at !== "string" || !value.created_at ||
     value.remote_files_preserved !== true ||
@@ -1507,7 +1364,6 @@ function parseAssetTrashBatch(
   }
   return {
     batch_id: value.batch_id,
-    comfy_origin: value.comfy_origin,
     asset_ids: assetIds,
     assets,
     cascade: value.cascade,
@@ -1524,12 +1380,8 @@ function parseAssetTrashList(value: unknown): AssetTrashListResponse {
   if (!isRecord(value)) {
     throw new ApiError("素材回收站响应结构无效", 502, value);
   }
-  const scope = parseOptionalAssetResponseScope(
-    value,
-    ["batches", "remote_files_preserved"],
-  );
   if (
-    scope === null ||
+    !hasExactKeys(value, ["batches", "remote_files_preserved"]) ||
     !Array.isArray(value.batches) ||
     value.remote_files_preserved !== true
   ) throw new ApiError("素材回收站响应结构无效", 502, value);
@@ -1538,13 +1390,9 @@ function parseAssetTrashList(value: unknown): AssetTrashListResponse {
   const assetIds = batches.flatMap((item) => item.asset_ids);
   if (
     new Set(batchIds).size !== batchIds.length ||
-    new Set(assetIds).size !== assetIds.length ||
-    (batches.length > 1 &&
-      batches.some((item) => item.comfy_origin !== batches[0].comfy_origin)) ||
-    (scope.comfy_origin !== undefined &&
-      batches.some((item) => item.comfy_origin !== scope.comfy_origin))
+    new Set(assetIds).size !== assetIds.length
   ) throw new ApiError("素材回收站响应结构无效", 502, value);
-  return { batches, remote_files_preserved: true, ...scope };
+  return { batches, remote_files_preserved: true };
 }
 
 function parseAssetTrashRestoreResponse(
@@ -1641,15 +1489,6 @@ function parseJobClearResponse(value: unknown): JobClearResponse {
 }
 
 export const directorApi = {
-  latchDatabaseIdentity(identity: string): string {
-    if (!/^[0-9a-f]{64}$/.test(identity)) throw new Error("数据库身份无效");
-    latchedDatabaseIdentity ??= identity;
-    return latchedDatabaseIdentity;
-  },
-  /** Test isolation only; production code must never clear a live page latch. */
-  resetDatabaseIdentityForTests(): void {
-    latchedDatabaseIdentity = null;
-  },
   getCapabilities: (signal: AbortSignal | undefined, authorityToken: string) =>
     request<unknown>("/capabilities", {
       signal,
@@ -1689,23 +1528,10 @@ export const directorApi = {
     request<RayLightInstallSnapshot>("/media/ffmpeg/cancel", { method: "POST" }),
   getStorage: (signal?: AbortSignal) =>
     request<unknown>("/storage", { signal }).then(parseStorageConfiguration),
-  updateStorage: (databasePath: string) =>
-    request<unknown>("/storage", {
-      method: "PUT",
-      body: JSON.stringify({ database_path: databasePath }),
-    }).then(parseStorageConfiguration),
-  migrateStorage: (targetPath: string) =>
-    request<unknown>("/storage/migrate", {
-      method: "POST",
-      body: JSON.stringify({ target_path: targetPath }),
-    }).then(parseStorageMigrationResult),
-  testConnection: (comfyUrl: string) =>
-    request<ConnectionTestResult>("/capabilities", {
-      method: "POST",
-      body: JSON.stringify({ comfy_url: comfyUrl }),
-    }),
+  // The only endpoint is the embedded host instance; the probe takes no URL.
+  testConnection: () =>
+    request<ConnectionTestResult>("/capabilities", { method: "POST" }),
   confirmRayLightRuntimeRecovery: (
-    expectedComfyOrigin: string,
     expectedEpoch: number,
     expectedRecoveryToken: string,
     signal?: AbortSignal,
@@ -1716,7 +1542,6 @@ export const directorApi = {
       signal,
       body: JSON.stringify({
         confirmation: "comfyui_process_restarted",
-        expected_comfy_origin: expectedComfyOrigin,
         expected_epoch: expectedEpoch,
         expected_recovery_token: expectedRecoveryToken,
       }),

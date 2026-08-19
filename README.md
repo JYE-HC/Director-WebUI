@@ -4,6 +4,10 @@
 只选择 FL2VA 或 Ref2VA 模型族，后端再按绑定素材推导 T2V、I2V、FL2V、R2V、V2V 或
 RV2V 执行配方，而不是先进入某一种生成模式。
 
+Director 是纯 ComfyUI 插件（ComfyUI Registry 发布名 **DirectorDeck**）：后端嵌入
+ComfyUI 进程运行，前端页面由 ComfyUI 托管在 `/directordeck/`，数据库固定在 ComfyUI
+`user/directordeck/database/`。不再有独立部署形态。
+
 ## 执行边界
 
 - 浏览器只提交严格校验的时间线、素材 ID、分段选择和系统设置，不能提交 ComfyUI
@@ -35,7 +39,6 @@ RV2V 执行配方，而不是先进入某一种生成模式。
 - 视频上传后由后端 ffmpeg/ffprobe 生成并登记不可变 24fps 代理；智能分镜也在后端执行；
 - FL2VA 与 Ref2VA 是独立模型配置槽，但都可选择 ComfyUI 返回的完整 diffusion 清单；
 - 每个模型族配置一个逻辑 GPU 池：单卡自动使用 Standard，两张或以上自动使用 RayLight；
-  旧 `backend` 设置只为兼容升级而接受，保存后统一归一为 `auto`，不能隐藏覆盖 GPU 池；
 - 派生出的 RayLight 缺节点、GPU 或拓扑错误时直接阻断，不会静默退回 Standard；RayLight 默认按
   完整 RayLight 配置 key 保留 worker 权重，同 key 复用，不兼容 key 或 Standard 会先安全释放旧池；
 - UNET、CLIP、Video VAE、Audio VAE 可配置 ComfyUI 逻辑设备；`gpu:N` 不是物理卡号；
@@ -55,17 +58,17 @@ RV2V 执行配方，而不是先进入某一种生成模式。
   响应禁止缓存和 MIME 嗅探；
 - 安全取消依赖当前 ComfyUI 原生原子 job-cancel API；旧服务器缺少该能力时界面禁用取消，
   不会退回可能误杀其他任务的全局 interrupt；
-- 终态任务支持单条删除和批量清理。删除导演台记录不会越权删除远程 ComfyUI 文件；
+- 终态任务支持单条删除和批量清理。删除导演台记录不会越权删除 ComfyUI 文件；
 - 每个非歧义分段输出通过稳定 `segment_results` 映射回 timeline；只有任务的完整 timeline 和
   runtime settings 快照都与当前服务器权威值严格相同时，主监视器才显示该候选。本地尚未完成自动同步的编辑
   期间也会隐藏候选；历史 take 仍保留在任务抽屉中；完整长片仍由父任务单独暴露组装后的 output；
 - 被草稿引用的资产默认拒绝移除；显式级联只在一个事务中解除 typed 引用、修复 slot/提示词并
-  保持模型族、按剩余素材重算配方，任一步失败整笔回滚；它不删除 ComfyUI 远程输入或任何生成输出；
+  保持模型族、按剩余素材重算配方，任一步失败整笔回滚；它不删除 ComfyUI 输入或任何生成输出；
 - 深色和 Claude 风暖色浅色主题；左右栏及全局设置浮层不会挤占时间线工作区。
 
 原生时间线现在支持基于官方 `MiniMaxH3AddGuide` 的逐段接续。启用 `continuity` 后，首个启用段以及
 带显式 `first_image` 的 FL2VA 段是锚点重置；其余段依赖时间线上紧邻的前一个启用段，T2V、FL2V 与
-Ref2V 可以混排。前驱既可以在同一次运行中生成，也可以复用当前 ComfyUI 端点上该稳定分段 ID 的最新
+Ref2V 可以混排。前驱既可以在同一次运行中生成，也可以复用当前 ComfyUI 实例上该稳定分段 ID 的最新
 成功成片；历史成片只匹配宽高、FPS 和 H3 可见帧数，不因提示词、生成配方、参考素材、模型、LoRA 或
 推理参数变化而失效。后端确认前驱的唯一 `SaveVideo` 输出后，才把该 `[output]` 动态绑定到后段的
 `LoadVideo` 并提交。后段取前驱最后 N 帧（N 为
@@ -78,7 +81,7 @@ Director 的跨段 AV latent handoff，也不是剪辑层 crossfade。前驱失�
 
 纯 Standard 任务不主动执行段间清显存，稳定 loader 输入有利于跨任务复用。RayLight 默认使用
 `keep_until_switch`：family、model、LoRA、GPU pool、topology 与会修改 worker 的 sigma shift 完全相同的后续分段和任务直接复用 CUDA
-权重；任一项变化时，Director 会在 endpoint 提交锁内先提交并等待 `RayKill` 安全屏障，再用递增 epoch
+权重；任一项变化时，Director 会在提交锁内先提交并等待 `RayKill` 安全屏障，再用递增 epoch
 创建新池。切到 Standard 也先清旧 Ray 池，因此 FL2VA 与 Ref2VA 可以在同一组 GPU 上顺序运行，无需重启
 ComfyUI，也不依赖 OOM 自动卸载。Director 还固定发送 `driver_cleanup_policy=ray_devices`：采样前只释放
 `GPU_SELECT` 所列 Ray 逻辑卡上的 Comfy driver 模型，不会强制卸载放在非 Ray 卡上的 CLIP/VAE；这些非 Ray
@@ -89,158 +92,92 @@ RayLight 会保留 ModelPatcher 与 actor handle，因此同 key 可以沿用 ep
 开始时把权重重新载入 CUDA。Ray cluster 仍会被追踪，切到 Standard 前同样先完整 shutdown。
 Director 每次只向 ComfyUI 提交一个 Ray 生成段，必须等该 prompt 的 exact history 到达成功终态，才提交
 同一父任务或后一父任务的下一段；失败或外部移除会先 taint 旧池并执行 RayKill，再用新 epoch 继续剩余段。
-创建接口在预检成功且任务/分段已持久化、endpoint 顺序票据已登记后立即返回 `preparing`，不会占住浏览器请求。
-这些保证只覆盖经过 Director endpoint 提交锁排队的任务；在 ComfyUI Web 手工提交的 workflow 不受
+创建接口在预检成功且任务/分段已持久化、提交顺序票据已登记后立即返回 `preparing`，不会占住浏览器请求。
+这些保证只覆盖经过 Director 提交锁排队的任务；在 ComfyUI Web 手工提交的 workflow 不受
 Director 调度，可能使持久状态失真且无法保证被自动检测，不能把手工混跑当成受支持的并发路径。
 `keep_until_switch` 只承诺兼容 Ray worker 池的生命周期；若 CLIP/VAE 与该池共用同一张卡，跨进程显存
 无法由 ComfyUI 单方面自动协调，不能同时承诺辅助模型常驻，显存不足时应改用“任务后释放”或分离设备。
 
-极少数预发布版本写入的 v1 RayLight 账本缺少可验证的完整 loader chain。升级后 Director 会保留其中的
-epoch，但把可能仍存活的旧 actor 标成未知：在一次 Director RayLight 任务用新 epoch 显式重建运行池前，
-Standard 提交会失败封闭，不能把“旧账本无法描述”误当成“显存里一定没有旧池”。
-
 ## 生成文件与任务记录
 
 每个分段由 `SaveVideo` 写入任务设置快照对应的 ComfyUI output，最终长片上传到该实例的
-`output/director-web/timelines/`。SQLite 只保存 `filename/subfolder/type` 引用和审计快照，
+`output/directordeck/timelines/`。SQLite 只保存 `filename/subfolder/type` 引用和审计快照，
 不复制媒体正文。因此：
 
 - 在 ComfyUI 界面清 history 不等于删除磁盘文件；
 - 在 ComfyUI 删除文件不会自动删除导演台任务，预览会随文件消失而失效；
 - 在导演台删除任务只删除本地记录，输出文件仍由 ComfyUI 管理。
 
-资产同时绑定上传时的 canonical ComfyUI origin。切换服务器后必须在新实例重新上传，避免
-相同相对路径被误认为同一份素材。
+素材正文保存在 ComfyUI 的 input 目录，数据库只记录相对路径引用；二者都绑定当前
+ComfyUI 安装，迁移到另一套 ComfyUI 时需要重新上传素材。
 
-## 安装与启动
+## 安装
 
-> **新：ComfyUI 插件形态（推荐方向，当前处于 P1 完成、待发布状态）。**
-> Director 可以作为 ComfyUI 插件运行：后端内嵌进 ComfyUI 进程，前端由
-> ComfyUI 托管在 `/director/`，数据库位于 ComfyUI `user/director/`。
-> 在本仓库构建并软链到 ComfyUI：
->
-> ```bash
-> cd frontend && npm ci && npm run build && cd ..
-> python3 tools/build_plugin.py --link /path/to/ComfyUI
-> # 重启 ComfyUI 后，侧栏 Director 面板打开导演台
-> ```
->
-> 多卡（RayLight）与 ffmpeg 均为插件内按需安装：系统设置中开启多卡推理
-> 或在媒体工具面板点击安装即可。独立部署形态（下文）仍保留可用。
+Director 以 **DirectorDeck** 为名发布到 ComfyUI Registry。精确兼容基线见
+[发布说明](RELEASE.md)。模型权重、LoRA 和用户素材不随插件分发。
 
-这是 Linux 本地部署的首个 alpha 发布候选。精确兼容基线和依赖来源见
-[发布说明](RELEASE.md)。模型权重、LoRA 和用户素材不随本仓库分发。
+- **ComfyUI Manager（推荐）**：在 Manager 中搜索 `DirectorDeck` 安装，然后重启 ComfyUI。
+- **手动安装**：把插件仓库克隆到 ComfyUI 的 `custom_nodes/` 下，并用 ComfyUI 的
+  Python 环境安装依赖，然后重启 ComfyUI：
 
-推荐使用仓库根目录的一键引导脚本，依次完成平台检测、系统依赖、uv、Node.js、ffmpeg、
-ComfyUI 准备、Director 安装与验证。先运行只读检查，再安装：
+  ```bash
+  cd /path/to/ComfyUI/custom_nodes
+  git clone https://github.com/JYE-HC/DirectorDeck.git
+  /path/to/ComfyUI/.venv/bin/pip install -r DirectorDeck/requirements.txt
+  ```
+
+  Windows portable 版改用其自带的 `python_embeded` 解释器执行同一 pip 命令。
+
+从本开发仓库联调时，改为构建插件包并软链进 ComfyUI：
 
 ```bash
-./bootstrap.sh check     # 只读环境检查，不写入任何文件
-./bootstrap.sh install   # 交互式安装；加 -y 使用推荐默认值
-./bootstrap.sh verify    # 只验证已安装内容
+cd frontend && npm ci && npm run build && cd ..
+python3 tools/build_plugin.py --link /path/to/ComfyUI
 ```
 
-安装按固定步骤队列执行：检测平台、检查项目文件系统位置、选择 ComfyUI 安装方式、安装系统
-依赖、uv、Node.js、ffmpeg、准备 ComfyUI、安装 ComfyUI 依赖、安装 Director 与 custom
-nodes、离线验证、可选在线验证、生成启动配置、可选启动服务。`--dry-run` 只打印检测结果与
-安装计划；`--resume`/`--from`/`--only`/`--skip` 控制断点续装与步骤裁剪；`--no-sudo`
-禁止安装系统包，uv/node/ffmpeg 尽量装入项目 `.tools/`；已有兼容 Node.js 时可用
-`--node-bin-dir PATH` 直接复用。
+## 使用
 
-ComfyUI 有三种接入方式：自动 clone（默认，`--comfyui-ref latest|tested|<tag/sha>`）、复用
-已有安装（`--comfyui-root PATH`，可用 `--comfy-python PATH` 指定解释器）、跳过本地安装直连
-远程实例（`--skip-comfyui --comfyui-url URL`）。WSL2 下项目位于 /mnt/c 时会自动迁移到
-WSL 原生文件系统（`--skip-relocation` 关闭），并可用 `--windows-comfyui-root` 复用
-Windows 侧 ComfyUI 的模型目录。
+重启 ComfyUI 后，通过顶部菜单或侧栏的 **Director** 入口打开导演台；浏览器直接访问
+`http://<ComfyUI 地址>/directordeck/` 亦可。后端嵌入 ComfyUI 进程，ComfyUI 连接地址由插件自动
+推导注入，无需手动配置。
 
-本地 ComfyUI 模式下，Director 前后端与 bundled custom nodes 的安装及离线验证由发布包内的
-`install.sh` 完成。安装器会校验本发布包、ComfyUI Git 能力、Python/CUDA/Ray 环境、Node、ffmpeg
-和 custom node 冲突；它不会执行 `git pull`、切换 ComfyUI commit、修补 ComfyUI 核心、下载模型
-或自动重启 ComfyUI。与实测 ComfyUI commit 相同或属于它的后继版本均可安装；本地改动只提示
-统计信息，不会展示文件名，也不会阻止安装。若已有同名但内容不同的节点，交互终端会当场询问：
-备份并替换（需先停止 ComfyUI）、复用现有内容（写入 `.director-keep` 标记，未经 Director
-兼容性校验，不兼容时生成会明确报错）或中止安装；非交互模式（`-y`/`--dry-run`/`check`）保持
-失败封闭并打印当前入口下完整可执行的替换命令（`--replace-node <名称> --confirm-comfyui-stopped`，
-bootstrap 下为 `./bootstrap.sh --only install_director ...`）。旧目录会保存在 ComfyUI 根下的
-`.director-backups/`，不会被删除。
+Director 没有登录鉴权，随 ComfyUI 同源提供服务。不要把 ComfyUI 直接暴露到公网；
+跨机器访问前应在反向代理层增加 TLS、身份认证与来源限制。
 
-标准单卡链只使用 ComfyUI core/官方 extras。两张及以上 GPU 才会使用仓库内的 Director 定制
-RayLight；`ComfyUI-MiniMax-H3-Turbo` 只在选择旧版专用 Turbo LoRA 时使用。不要安装旧
-`MiniMaxH3Director` 大节点，Director 不依赖并明确拒绝它。
+## 多卡（RayLight）
 
-安装与服务管理共用同一入口。`start`/`stop`/`restart`/`status`/`logs` 同时管理 Director 与本地
-ComfyUI（远程 ComfyUI 模式下只管理 Director）；带 `-director` 或 `-comfyui` 后缀的命令只管理
-对应一方：
+单卡自动走 Standard 链，只使用 ComfyUI core 与官方 extras。两张及以上 GPU 时在“系统设置”
+开启多卡推理，并按提示在插件内安装 RayLight 依赖（`requirements-raylight.txt`）后重启
+ComfyUI。多卡仅支持 Linux。`ComfyUI-MiniMax-H3-Turbo` 只在选择旧版专用 Turbo LoRA 时使用；
+不要安装旧 `MiniMaxH3Director` 大节点，Director 不依赖并明确拒绝它。
 
-```bash
-./bootstrap.sh start|stop|restart|status|logs   # Director + 本地 ComfyUI
-./bootstrap.sh start-director|stop-director|restart-director|status-director|logs-director
-./bootstrap.sh start-comfyui|stop-comfyui|restart-comfyui|status-comfyui|logs-comfyui
-./bootstrap.sh reset    # 只清空 .director-install 安装状态，不删除 ComfyUI、数据库或模型
-```
+## ffmpeg
 
-`logs` 不带参数时同时跟踪 backend/frontend/comfyui 三份日志，也可用
-`logs backend|frontend|comfyui` 只看一份。
+上传探测与长片组装需要 ffmpeg/ffprobe。系统缺失时可在“系统设置”的媒体工具面板一键安装
+static-ffmpeg，无需手动配置环境。
 
-监听地址和端口可在安装或 `start`/`restart` 时用 `--listen-host`、`--backend-port`
-（默认 8787）、`--frontend-port`（默认 4173）覆盖；`--start`/`--start-comfyui` 让安装
-成功后直接拉起对应服务。例如让前后端监听所有 IPv4 网卡：
+## 数据位置
 
-```bash
-./bootstrap.sh restart --host 0.0.0.0 --backend-port 8788 --frontend-port 4174
-```
+数据库固定为 ComfyUI `user/directordeck/database/directordeck.sqlite3`，随 ComfyUI 安装走，
+不在插件目录内。独立部署形态已移除，不提供旧数据的迁移路径。
 
-`director.sh` 使用用户级临时 systemd unit 管理前后端进程，默认只监听 `127.0.0.1`，日志写入
-`data/director-backend.log` 和 `data/director-frontend.log`，可用 `./bootstrap.sh logs backend`
-或 `./bootstrap.sh logs frontend` 跟踪。`0.0.0.0` 仅用于监听，浏览器访问时应使用服务器实际 IP。
-
-不具备引导脚本条件时也可手动安装。后端：
-
-```bash
-uv sync --all-groups
-uv run director-web
-```
-
-前端：
-
-```bash
-cd frontend
-npm ci        # 生产构建：npm run build；开发调试：npm run dev
-```
-
-Vite 仅监听本机并把 `/api` 代理到后端。首次启动没有写死的 ComfyUI URL：bootstrap 在启动
-Director 后会把安装时确定的地址（本地模式为 `http://127.0.0.1:<端口>`，远程模式为
-`--comfyui-url` 的值）一次性写入空的设置，已有配置绝不覆盖；其余情况下在“系统设置”填写
-有效地址后会自动应用，权威回读完成后应用才读取模型、GPU 与节点能力并开放上传和提交。
-
-数据库默认位于 Director 项目根目录下的 `.data/database/director.sqlite3`，不随启动工作目录
-变化。升级时若新位置尚不存在但仓库旧路径 `data/director.sqlite3` 存在，Director 会继续打开旧库，
-避免一次升级直接出现空工作区。随后可在“系统设置 → 数据存储”中把当前库一致性迁移到默认位置，
-或选择另一个已经存在且通过校验的 Director 数据库。迁移/切换成功后当前进程会停止普通写入；重启
-Director 后新路径才生效。路径选择保存在数据库外的 `.data/database/storage.json`；可用
-`DIRECTOR_STORAGE_CONFIG_PATH` 覆盖该配置文件位置，`DIRECTOR_DATABASE_PATH` 启动数据库覆盖
-仍有更高优先级。页面会在操作前确认运行设置和时间线均已同步，并在成功后锁定编辑直到整页刷新；
-每个写请求还携带本页启动时取得的数据库身份，因此只重启后端而保留旧页面也不能把旧库内容写进新库。
-
-SQLite 的 `director.sqlite3-wal` 与 `director.sqlite3-shm` 是活动数据库的事务旁路文件，
-`director.sqlite3.instance.lock` 是单实例锁元数据；它们都不是额外工作区，也不应在运行时单独
+`directordeck.sqlite3-wal` 与 `directordeck.sqlite3-shm` 是活动数据库的事务旁路文件，
+`directordeck.sqlite3.instance.lock` 是单实例锁元数据；它们都不是额外工作区，也不应在运行时单独
 复制或删除。手工备份文件只有在明确恢复时才会使用，Director 不会自动把名字相似的备份当作
 当前数据库。
-
-本版没有登录鉴权，不要直接暴露到公网。跨机器访问前应在反向代理层增加 TLS、身份认证与来源限制。
 
 ## 开发与完整验证
 
 ```bash
-UV_CACHE_DIR=/tmp/director-web-uv-cache uv sync --all-groups
-UV_CACHE_DIR=/tmp/director-web-uv-cache uv run pytest backend/tests -q
+uv sync --all-groups
+uv run pytest backend/tests -q
 cd frontend
 npm ci
 npm test
 npm run build
 ```
 
-轻量安装验证不需要模型或素材。完整原生 prompt 验证需要准备一个图片、一个 24fps 视频、旧 Turbo
+轻量验证不需要模型或素材。完整原生 prompt 验证需要准备一个图片、一个 24fps 视频、旧 Turbo
 LoRA 和一个已有输出视频，并以 ComfyUI 相对路径传入：
 
 ```bash

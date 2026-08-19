@@ -8,15 +8,15 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
-from director.compiler import (
+from directordeck.compiler import (
     DraftNotRunnable,
     build_unified_timeline,
     validate_unified_runnable,
 )
-from director.database import Database
-from director.h3_capabilities import H3_REFERENCE_LIMITS
-from director.native_templates import NativeTemplateError, compile_native_timeline
-from director.schemas import (
+from directordeck.database import Database
+from directordeck.h3_capabilities import H3_REFERENCE_LIMITS
+from directordeck.native_templates import NativeTemplateError, compile_native_timeline
+from directordeck.schemas import (
     MINIMAX_H3_PROMPT_MAX_CHARACTERS,
     UnifiedTimelineDraft,
     default_settings,
@@ -599,7 +599,6 @@ async def test_complete_long_source_autosave_succeeds_before_split(client) -> No
     client.director_app.state.database.put_asset(
         source["id"],
         source,
-        comfy_origin="http://comfy.test:8188",
     )
     draft = timeline(
         segment(
@@ -914,9 +913,7 @@ def test_restart_releases_stale_assembly_claim_for_retry(tmp_path) -> None:
             "outputs": [],
             "error": None,
             "config_snapshot": {"timeline": timeline(segment("t2v", "a"))},
-            "settings_snapshot": default_settings(
-                "http://comfy.test:8188"
-            ).model_dump(mode="json"),
+            "settings_snapshot": default_settings().model_dump(mode="json"),
             "prompt_snapshot": {},
             "created_at": now,
             "updated_at": now,
@@ -960,7 +957,7 @@ async def test_cancelled_parent_with_completed_children_does_not_start_assembly(
         },
     }
     assemble = Mock(side_effect=AssertionError("assembly must not start"))
-    monkeypatch.setattr("director.app.assemble_video_bytes", assemble)
+    monkeypatch.setattr("directordeck.app.assemble_video_bytes", assemble)
 
     cancelled = await client.post(f"/api/jobs/{created['id']}/cancel")
 
@@ -1091,7 +1088,7 @@ async def test_selected_compile_does_not_validate_unselected_stale_asset(client)
     stale = segment("i2v", "later")
     stale["first_image"] = {
         "name": "gone.png",
-        "subfolder": "director-web",
+        "subfolder": "directordeck",
         "type": "input",
         "kind": "image",
         "id": "not-registered",
@@ -1165,19 +1162,17 @@ async def test_timeline_preflight_rejects_unavailable_logical_gpu(
     assert fake_comfy.prompts == []
 
 
-async def test_asset_library_lists_active_origin_and_refuses_referenced_delete(
+async def test_asset_library_refuses_referenced_delete(
     client,
 ) -> None:
     database = client.director_app.state.database
     foreign = asset("foreign.png", "image")
     foreign["id"] = "foreign-origin"
-    database.put_asset(
-        foreign["id"], foreign, comfy_origin="http://another-comfy.test:8188"
-    )
+    database.put_asset(foreign["id"], foreign)
     listed = await client.get("/api/assets?kind=image")
     ids = {item["id"] for item in listed.json()["assets"]}
     assert "fixture-image-first.png" in ids
-    assert "foreign-origin" not in ids
+    assert "foreign-origin" in ids
 
     draft = timeline(
         segment("i2v", "image-shot", first_image=asset("first.png", "image"))

@@ -5,9 +5,9 @@ import sqlite3
 
 import pytest
 
-from director.app import _UPLOAD_LIMITS, _media_response, _read_upload_limited
-from director.database import Database
-from director.schemas import default_settings
+from directordeck.app import _UPLOAD_LIMITS, _media_response, _read_upload_limited
+from directordeck.database import Database
+from directordeck.schemas import default_settings
 
 from .conftest import runnable_draft, wait_for_submission_tasks
 
@@ -116,7 +116,7 @@ def test_every_video_asset_requires_metadata(mode: str) -> None:
     else:
         draft["shots"][0]["reference_videos"][0].pop("metadata")
 
-    from director.schemas import validate_mode_draft
+    from directordeck.schemas import validate_mode_draft
 
     with pytest.raises(ValueError, match="server-probed metadata"):
         validate_mode_draft(mode, draft)
@@ -131,7 +131,7 @@ def test_upload_limits_match_the_public_policy() -> None:
 
 
 async def test_upload_reader_always_requests_bounded_chunks(monkeypatch) -> None:
-    import director.app as app_module
+    import directordeck.app as app_module
 
     class Reader:
         def __init__(self, content: bytes) -> None:
@@ -165,75 +165,6 @@ async def test_upload_rejects_disguised_media_bytes(client, fake_comfy) -> None:
 
     assert response.status_code == 422
     assert fake_comfy.uploads == []
-
-
-async def test_asset_origin_blocks_execution_after_endpoint_switch(client, fake_comfy) -> None:
-    settings = (await client.get("/api/settings")).json()
-    settings["comfy_url"] = "http://other-comfy.test:8188"
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
-
-    draft = runnable_draft("i2v")
-    saved = await client.put("/api/drafts/i2v", json=draft)
-    submitted = await client.post("/api/jobs", json={"mode": "i2v", "config": draft})
-
-    assert saved.status_code == 422
-    assert submitted.status_code == 422
-    assert "belongs to ComfyUI" in submitted.text
-    assert fake_comfy.prompts == []
-
-
-async def test_preview_uses_the_asset_origin_not_current_settings(client) -> None:
-    seen_urls: list[str] = []
-    app = client.director_app
-    original_factory = app.state.comfy_factory
-
-    def recording_factory(settings):
-        seen_urls.append(str(settings.comfy_url).rstrip("/"))
-        return original_factory(settings)
-
-    app.state.comfy_factory = recording_factory
-    settings = (await client.get("/api/settings")).json()
-    settings["comfy_url"] = "http://other-comfy.test:8188"
-    await client.put("/api/settings", json=settings)
-
-    preview = await client.get("/api/assets/fixture-image-first.png/preview")
-
-    assert preview.status_code == 200
-    assert seen_urls[-1] == "http://comfy.test:8188"
-
-
-def test_asset_origin_migration_backfills_from_persisted_settings(tmp_path) -> None:
-    path = tmp_path / "legacy.sqlite3"
-    settings = default_settings("http://legacy-comfy.test:8188")
-    document = {
-        "name": "legacy.png",
-        "subfolder": "director-web",
-        "type": "input",
-        "kind": "image",
-        "id": "legacy-asset",
-    }
-    with sqlite3.connect(path) as db:
-        db.executescript(
-            """
-            CREATE TABLE settings(singleton INTEGER PRIMARY KEY, document TEXT NOT NULL, updated_at TEXT NOT NULL);
-            CREATE TABLE assets(id TEXT PRIMARY KEY, document TEXT NOT NULL, created_at TEXT NOT NULL);
-            """
-        )
-        db.execute(
-            "INSERT INTO settings VALUES(1, ?, 'then')", (settings.model_dump_json(),)
-        )
-        db.execute(
-            "INSERT INTO assets VALUES('legacy-asset', ?, 'then')",
-            (json.dumps(document),),
-        )
-
-    database = Database(path)
-    database.initialize()
-
-    assert database.get_asset_record("legacy-asset") == (
-        document,
-        "http://legacy-comfy.test:8188",
-    )
 
 
 def test_media_response_is_nosniff_and_unicode_header_is_latin1_safe() -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from director.app import PromptTerminalEvents
+from directordeck.app import PromptTerminalEvents
 
 
 async def test_prompt_terminal_events_notify_wakes_registered_waiter():

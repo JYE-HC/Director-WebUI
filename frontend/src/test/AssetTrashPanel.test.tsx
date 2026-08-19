@@ -5,12 +5,11 @@ import type { AssetTrashBatch } from "../api/types";
 
 const batch: AssetTrashBatch = {
   batch_id: "trash-batch-1",
-  comfy_origin: "http://127.0.0.1:8188",
   asset_ids: ["asset-a"],
   assets: [{
     id: "asset-a",
     name: "参考图.png",
-    subfolder: "director-web",
+    subfolder: "directordeck",
     type: "input",
     kind: "image",
   }],

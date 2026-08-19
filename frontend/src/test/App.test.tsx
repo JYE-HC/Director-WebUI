@@ -8,7 +8,7 @@ import App, {
   RUNTIME_SETTINGS_PENDING_KEY,
   UNBOUND_RUNTIME_SETTINGS_PENDING_KEY,
 } from "../App";
-import { ApiError, DATABASE_IDENTITY_STALE_EVENT, directorApi } from "../api/client";
+import { ApiError, directorApi } from "../api/client";
 import {
   DEFAULT_SETTINGS,
   EMPTY_CAPABILITIES,
@@ -70,10 +70,8 @@ class AppTestBroadcastChannel {
 }
 
 const ACTIVE_DATABASE_PATH = "/srv/director/data/director.sqlite3";
-const ACTIVE_DATABASE_IDENTITY = "a".repeat(64);
 const ACTIVE_DATABASE = {
   active_database_path: ACTIVE_DATABASE_PATH,
-  active_database_identity: ACTIVE_DATABASE_IDENTITY,
 };
 // Test-only shorthand for this realm's exact v7 branch key. Production code
 // enumerates by scope and never treats the v7 prefix as a singleton key.
@@ -88,15 +86,11 @@ const timelineWalStorageRaw = (
 };
 const ACTIVE_STORAGE_CONFIGURATION = {
   ...ACTIVE_DATABASE,
-  configured_database_path: ACTIVE_DATABASE_PATH,
-  recommended_database_path: "/srv/director/.data/database/director.sqlite3",
-  source: "default" as const,
-  restart_required: false,
 };
 
 async function readRawTimelineJournal(key: string): Promise<unknown | undefined> {
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open("director-web-timeline-history", 1);
+    const request = indexedDB.open("directordeck-timeline-history", 1);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains("journals")) {
         request.result.createObjectStore("journals", { keyPath: "key" });
@@ -119,7 +113,7 @@ async function readRawTimelineJournal(key: string): Promise<unknown | undefined>
 
 async function putRawTimelineJournal(value: unknown): Promise<void> {
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open("director-web-timeline-history", 1);
+    const request = indexedDB.open("directordeck-timeline-history", 1);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
@@ -156,7 +150,6 @@ const saveRuntimeSettingsWal = (
   version: 1,
   pending: true,
   active_database_path: database.active_database_path,
-  active_database_identity: database.active_database_identity,
   written_at_ms: Date.now(),
   settings,
 }));
@@ -170,13 +163,6 @@ const imageAsset: AssetReference = {
   preview_url: "/api/assets/asset-image-app/preview",
 };
 
-const endpointBImageAsset: AssetReference = {
-  ...imageAsset,
-  id: "asset-image-endpoint-b",
-  name: "B 服务器素材.png",
-  preview_url: "/api/assets/asset-image-endpoint-b/preview",
-};
-
 function appAssetTrashBatch(
   assetIds: readonly string[] = [imageAsset.id],
   cascade = false,
@@ -187,7 +173,6 @@ function appAssetTrashBatch(
 ): AssetTrashBatch {
   return {
     batch_id: batchId,
-    comfy_origin: CONFIGURED_SETTINGS.comfy_url,
     asset_ids: [...assetIds],
     assets: assetIds.map((assetId) => assetId === imageAsset.id
       ? imageAsset
@@ -206,27 +191,18 @@ function appAssetTrashList(batches: AssetTrashBatch[]) {
   return {
     batches,
     remote_files_preserved: true as const,
-    active_database_identity: ACTIVE_DATABASE_IDENTITY,
-    comfy_origin: CONFIGURED_SETTINGS.comfy_url,
   };
 }
 
-function appAssetList(
-  assets: AssetReference[],
-  comfyOrigin = CONFIGURED_SETTINGS.comfy_url,
-  databaseIdentity = ACTIVE_DATABASE_IDENTITY,
-) {
+function appAssetList(assets: AssetReference[]) {
   return {
     assets,
     outputs_preserved: true as const,
-    active_database_identity: databaseIdentity,
-    comfy_origin: comfyOrigin,
   };
 }
 
 const CONFIGURED_SETTINGS = {
   ...DEFAULT_SETTINGS,
-  comfy_url: "http://comfy.test:8188",
 };
 
 function runtimeAuthority(settings: typeof CONFIGURED_SETTINGS) {
@@ -365,7 +341,6 @@ function mockCommonRequests(settings = CONFIGURED_SETTINGS) {
     return { document, revision };
   });
   vi.spyOn(directorApi, "listProjects").mockResolvedValue({
-    active_database_identity: ACTIVE_DATABASE_IDENTITY,
     projects: [{
       id: "default",
       title: "未命名长视频",
@@ -396,7 +371,6 @@ beforeEach(() => {
   localStorage.clear();
   AppTestBroadcastChannel.channels.clear();
   seededTimelineServerProject = null;
-  directorApi.resetDatabaseIdentityForTests();
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -467,48 +441,6 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByLabelText("片段提示词")).toHaveValue("服务器权威提示词");
     expect(directorApi.getTimeline).toHaveBeenCalledTimes(2);
     expect(update).not.toHaveBeenCalled();
-  });
-
-  it("素材列表须等待数据库与 endpoint 权威，并拒绝错 scope 响应", async () => {
-    const foreignAsset = {
-      ...imageAsset,
-      id: "asset-from-foreign-scope",
-      name: "其他数据库的素材.png",
-    };
-    mockCommonRequests();
-    let resolveStorage!: (value: typeof ACTIVE_STORAGE_CONFIGURATION) => void;
-    vi.mocked(directorApi.getStorage)
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveStorage = resolve; }))
-      .mockResolvedValue(ACTIVE_STORAGE_CONFIGURATION);
-    vi.mocked(directorApi.listAssets).mockResolvedValue(appAssetList(
-      [foreignAsset],
-      "http://foreign-comfy.test:8188",
-      "b".repeat(64),
-    ));
-
-    render(<App />);
-
-    await waitFor(() => expect(directorApi.getSettingsAuthority).toHaveBeenCalled());
-    expect(directorApi.listAssets).not.toHaveBeenCalled();
-
-    await act(async () => resolveStorage(ACTIVE_STORAGE_CONFIGURATION));
-    await waitUntilReady();
-    await waitFor(() => expect(directorApi.listAssets).toHaveBeenCalledTimes(1));
-    expect(screen.queryByText(foreignAsset.name)).not.toBeInTheDocument();
-  });
-
-  it("设置 URL 带尾斜杠时素材列表仍按 canonical origin 匹配并显示", async () => {
-    const slashedSettings = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy.test:8188/" };
-    mockCommonRequests(slashedSettings);
-    vi.mocked(directorApi.listAssets).mockResolvedValue(
-      appAssetList([imageAsset], "http://comfy.test:8188"),
-    );
-
-    render(<App />);
-    await waitUntilReady();
-
-    await waitFor(() => expect(directorApi.listAssets).toHaveBeenCalled());
-    expect(await screen.findByText(imageAsset.name)).toBeInTheDocument();
   });
 
   it("旧 v2 长期镜像只隔离保留，不参与启动恢复或反写服务器", async () => {
@@ -642,7 +574,6 @@ describe("统一长视频时间线应用", () => {
     });
     await saveTimelineHistoryJournal({
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: getTimelineBranchOwnerId(),
     }, {
@@ -802,7 +733,6 @@ describe("统一长视频时间线应用", () => {
     });
     const journalScope = {
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: "foreign-clean-stale-owner",
     };
@@ -904,7 +834,6 @@ describe("统一长视频时间线应用", () => {
     });
     const journalScope = {
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId,
     };
@@ -959,7 +888,6 @@ describe("统一长视频时间线应用", () => {
     });
     await saveTimelineHistoryJournal({
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: "foreign-journal-ack",
     }, {
@@ -998,7 +926,6 @@ describe("统一长视频时间线应用", () => {
     });
     await saveTimelineHistoryJournal({
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: "previous-page-clean-owner",
     }, {
@@ -1038,7 +965,6 @@ describe("统一长视频时间线应用", () => {
     });
     await saveTimelineHistoryJournal({
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: "foreign-clean-history",
     }, {
@@ -1099,7 +1025,6 @@ describe("统一长视频时间线应用", () => {
     });
     const scope = {
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: getTimelineBranchOwnerId(),
     };
@@ -1164,7 +1089,6 @@ describe("统一长视频时间线应用", () => {
     });
     const journalScope = {
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId,
     };
@@ -1189,7 +1113,7 @@ describe("统一长视频时间线应用", () => {
       [...AppTestBroadcastChannel.channels.values()].some((peers) => peers.size > 0),
     ).toBe(true));
     const peer = createTimelineRevisionChannel({
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      databasePath: ACTIVE_DATABASE_PATH,
       projectId: DEFAULT_PROJECT_ID,
     }, null, vi.fn());
     peer.publish({ revision: 5, documentHash: "remote-five" });
@@ -1222,7 +1146,7 @@ describe("统一长视频时间线应用", () => {
     render(<App />);
     await waitUntilReady();
     const peer = createTimelineRevisionChannel({
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      databasePath: ACTIVE_DATABASE_PATH,
       projectId: DEFAULT_PROJECT_ID,
     }, null, vi.fn());
     peer.publish({ revision: 5, documentHash: "remote-stale-get" });
@@ -1276,7 +1200,7 @@ describe("统一长视频时间线应用", () => {
       target: { value: "本地更新 B" },
     });
     const peer = createTimelineRevisionChannel({
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
+      databasePath: ACTIVE_DATABASE_PATH,
       projectId: DEFAULT_PROJECT_ID,
     }, null, vi.fn());
     peer.publish({ revision: 6, documentHash: "remote-current-head" });
@@ -1318,7 +1242,6 @@ describe("统一长视频时间线应用", () => {
     });
     await saveTimelineHistoryJournal({
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: getTimelineBranchOwnerId(),
     }, {
@@ -1368,7 +1291,6 @@ describe("统一长视频时间线应用", () => {
     });
     const scope = {
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: getTimelineBranchOwnerId(),
     };
@@ -1404,64 +1326,9 @@ describe("统一长视频时间线应用", () => {
   // CI push 运行的共享 runner 上 hydration 偶发整体停滞（连时间线工作区都未
   // 渲染），15s 超时也不足；详见 踩坑_开发环境与测试.md「CI 偶发失败」。retry 只
   // 掩盖这种环境性停滞，确定性回归仍会三次全败。
-  it("采用服务器的 authority GET 在数据库变 stale 后不得落地或删除冲突证据", { retry: 2, timeout: 30000 }, async () => {
-    vi.stubGlobal("indexedDB", new IDBFactory());
-    const user = userEvent.setup();
-    const base = createTimelineProject();
-    base.segments[0].prompt = "stale adopt 基线";
-    const pending = structuredClone(base);
-    pending.segments[0].prompt = "stale 后必须保留";
-    const remote = structuredClone(base);
-    remote.segments[0].prompt = "迟到 GET 不得安装";
-    const history = recordTimelineHistory(createTimelineHistory(), {
-      label: "编辑提示词",
-      before: base,
-      after: pending,
-      now: 32,
-    });
-    const scope = {
-      databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
-      projectId: DEFAULT_PROJECT_ID,
-      ownerId: getTimelineBranchOwnerId(),
-    };
-    await saveTimelineHistoryJournal(scope, {
-      document: base,
-      revision: 2,
-    }, history);
-    const evidenceToken = await readTimelineHistoryJournalVersionToken(scope);
-    mockCommonRequests();
-    let resolveAdopt!: (authority: { document: typeof remote; revision: number }) => void;
-    vi.mocked(directorApi.getTimelineAuthority)
-      .mockResolvedValueOnce({ document: remote, revision: 3 })
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveAdopt = resolve; }));
-    const update = vi.mocked(directorApi.updateTimelineAuthority);
-
-    render(<App />);
-    await waitUntilReady();
-    await user.click(await screen.findByRole("button", { name: "采用服务器版本" }));
-    await waitFor(() => expect(vi.mocked(directorApi.getTimelineAuthority))
-      .toHaveBeenCalledTimes(2));
-    act(() => window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT)));
-    await act(async () => resolveAdopt({ document: remote, revision: 3 }));
-    await new Promise((resolve) => window.setTimeout(resolve, 20));
-
-    expect(screen.getByLabelText("片段提示词")).toHaveValue("stale 后必须保留");
-    expect(screen.getByText(/本页已停止修改/)).toBeInTheDocument();
-    expect(await readTimelineHistoryJournalVersionToken(scope)).toEqual(evidenceToken);
-    expect(update).not.toHaveBeenCalled();
-  });
-
-  it("storage A 后读取到 timeline B 时二次身份核对失败并保持整页只读", async () => {
+  it("storage A 后读取到 timeline B 时二次路径核对失败并保持整页只读", async () => {
     const databaseBPath = "/srv/director/data/database-b.sqlite3";
-    const databaseB = {
-      active_database_path: databaseBPath,
-      active_database_identity: "b".repeat(64),
-      configured_database_path: databaseBPath,
-      recommended_database_path: "/srv/director/.data/database/director.sqlite3",
-      source: "explicit" as const,
-      restart_required: false,
-    };
+    const databaseB = { active_database_path: databaseBPath };
     const databaseBProject = createTimelineProject();
     databaseBProject.title = "不应被 A 页面接受的 B 项目";
     databaseBProject.segments[0].prompt = "来自数据库 B";
@@ -1485,27 +1352,7 @@ describe("统一长视频时间线应用", () => {
     expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "系统设置" }));
-    expect(await screen.findByLabelText("数据库目标路径")).toBeDisabled();
-    expect(screen.getByRole("button", { name: "保存路径（重启后切换）" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "迁移当前数据库并切换" })).toBeDisabled();
-  });
-
-  it("精确 stale database identity 事件会锁定已加载页面且不再生成 WAL", async () => {
-    mockCommonRequests();
-    const update = vi.mocked(directorApi.updateTimeline);
-    render(<App />);
-    await waitUntilReady();
-    update.mockClear();
-
-    act(() => window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT)));
-
-    expect((await screen.findAllByText(/本页已停止修改.*刷新整个页面/)).length).toBeGreaterThan(0);
-    const prompt = screen.getByLabelText("片段提示词");
-    const before = (prompt as HTMLTextAreaElement).value;
-    fireEvent.change(prompt, { target: { value: "stale 页面不得继续修改" } });
-    expect(prompt).toHaveValue(before);
-    expect(update).not.toHaveBeenCalled();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
+    expect(await screen.findByLabelText("客户端 ID")).toBeDisabled();
   });
 
   it("跨库 v4 WAL 与无身份 v3 WAL 都只隔离，服务器项目保持权威", async () => {
@@ -1516,7 +1363,6 @@ describe("统一长视频时间线应用", () => {
     saveLocalTimelineWal({
       database: {
       active_database_path: "/srv/director/data/other.sqlite3",
-      active_database_identity: "b".repeat(64),
       },
       project_id: DEFAULT_PROJECT_ID,
       base_server_revision: 0,
@@ -1552,7 +1398,6 @@ describe("统一长视频时间线应用", () => {
     const staleSettings = { ...CONFIGURED_SETTINGS, client_id: "stale-other-database" };
     saveRuntimeSettingsWal(staleSettings, {
       active_database_path: "/srv/director/data/other.sqlite3",
-      active_database_identity: "b".repeat(64),
     });
     const mismatchedRaw = localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY);
     const unboundRaw = JSON.stringify({ ...staleSettings, client_id: "old-unbound" });
@@ -1576,7 +1421,6 @@ describe("统一长视频时间线应用", () => {
     const staleSettings = { ...CONFIGURED_SETTINGS, client_id: "second-database-wal" };
     saveRuntimeSettingsWal(staleSettings, {
       active_database_path: "/srv/director/data/other.sqlite3",
-      active_database_identity: "b".repeat(64),
     });
     const raw = localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY);
     mockCommonRequests();
@@ -1613,7 +1457,6 @@ describe("统一长视频时间线应用", () => {
       owner_id: "database-b-tab",
       pending: true,
       active_database_path: "/srv/director/data/database-b.sqlite3",
-      active_database_identity: "b".repeat(64),
       written_at_ms: Date.now(),
       settings: databaseBSettings,
     });
@@ -1628,7 +1471,6 @@ describe("统一长视频时间线应用", () => {
     expect(JSON.parse(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)!)).toMatchObject({
       version: 2,
       owner_id: expect.any(String),
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       settings: { client_id: desired.client_id },
     });
     await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(desired));
@@ -1656,247 +1498,6 @@ describe("统一长视频时间线应用", () => {
     render(<App />);
     await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(pendingSettings));
     await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull());
-  });
-
-  it("Settings 自己先读到 storage 时，App hydration 未完成仍禁用切库且不清 WAL", async () => {
-    const pending = createTimelineProject();
-    pending.title = "尚未检查身份的 WAL";
-    saveLocalTimeline(pending);
-    mockCommonRequests();
-    let resolveAppStorage!: (value: typeof ACTIVE_STORAGE_CONFIGURATION) => void;
-    vi.mocked(directorApi.getStorage)
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveAppStorage = resolve; }))
-      .mockResolvedValue(ACTIVE_STORAGE_CONFIGURATION);
-    const migrate = vi.spyOn(directorApi, "migrateStorage");
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    const user = userEvent.setup();
-
-    const view = render(<App />);
-    expect((await screen.findAllByText(/正在从服务器恢复时间线/)).length).toBeGreaterThan(0);
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const path = await screen.findByLabelText("数据库目标路径");
-    expect(path).toBeDisabled();
-    expect(screen.getByRole("button", { name: "迁移当前数据库并切换" })).toBeDisabled();
-    expect(migrate).not.toHaveBeenCalled();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).not.toBeNull();
-    view.unmount();
-    resolveAppStorage(ACTIVE_STORAGE_CONFIGURATION);
-  });
-
-  it("切库成功后关闭设置仍全局锁写且不产生新 WAL，PUT active 后解除", async () => {
-    const user = userEvent.setup();
-    const target = "/srv/director/data/next.sqlite3";
-    const pendingStorage = {
-      ...ACTIVE_STORAGE_CONFIGURATION,
-      configured_database_path: target,
-      restart_required: true,
-    };
-    mockCommonRequests();
-    vi.mocked(directorApi.getStorage)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockResolvedValue(pendingStorage);
-    const migrate = vi.spyOn(directorApi, "migrateStorage").mockResolvedValue({
-      ...pendingStorage,
-      migrated_from: ACTIVE_DATABASE_PATH,
-      migrated_to: target,
-    });
-    const cancelSwitch = vi.spyOn(directorApi, "updateStorage").mockResolvedValue(ACTIVE_STORAGE_CONFIGURATION);
-    const updateTimeline = vi.mocked(directorApi.updateTimeline);
-    const updateSettings = vi.spyOn(directorApi, "updateSettings");
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    await waitUntilReady();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const path = await screen.findByLabelText("数据库目标路径");
-    await user.clear(path);
-    await user.type(path, target);
-    await user.click(screen.getByRole("button", { name: "迁移当前数据库并切换" }));
-
-    await waitFor(() => expect(migrate).toHaveBeenCalledWith(target));
-    expect(await screen.findByText(/当前页面停止修改/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    const prompt = screen.getByLabelText("片段提示词");
-    const before = (prompt as HTMLTextAreaElement).value;
-    fireEvent.change(prompt, { target: { value: "切库锁定后不应写入" } });
-    expect(prompt).toHaveValue(before);
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateTimeline).not.toHaveBeenCalled();
-    expect(updateSettings).not.toHaveBeenCalled();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull();
-
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    await user.click(await screen.findByRole("button", { name: "取消切换并继续使用当前库" }));
-    await waitFor(() => expect(cancelSwitch).toHaveBeenCalledWith(ACTIVE_DATABASE_PATH));
-    await waitFor(() => expect(screen.queryByText(/当前页面停止修改/)).not.toBeInTheDocument());
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "取消后恢复写入" } });
-    await waitFor(() => expect(updateTimeline).toHaveBeenCalledWith(
-      expect.objectContaining({ segments: [expect.objectContaining({ prompt: "取消后恢复写入" })] }),
-    ));
-  });
-
-  it("lost-response 后带同库 WAL 的 pending switch 可先取消冻结，再按顺序恢复两类 WAL", async () => {
-    const user = userEvent.setup();
-    const pendingTimeline = createTimelineProject();
-    pendingTimeline.title = "冻结前尚未确认的时间线";
-    pendingTimeline.segments[0].prompt = "待恢复时间线";
-    saveLocalTimeline(pendingTimeline);
-    const pendingSettings = { ...CONFIGURED_SETTINGS, client_id: "pending-after-lost-response" };
-    saveRuntimeSettingsWal(pendingSettings);
-    const pendingStorage = {
-      ...ACTIVE_STORAGE_CONFIGURATION,
-      configured_database_path: "/srv/director/data/next.sqlite3",
-      restart_required: true,
-    };
-    mockCommonRequests();
-    vi.mocked(directorApi.getStorage).mockResolvedValue(pendingStorage);
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(pendingSettings));
-    const cancelSwitch = vi.spyOn(directorApi, "updateStorage").mockResolvedValue(ACTIVE_STORAGE_CONFIGURATION);
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(pendingSettings);
-    const updateTimeline = vi.mocked(directorApi.updateTimeline);
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    expect((await screen.findAllByText(pendingTimeline.title)).length).toBeGreaterThan(0);
-    expect(await screen.findByText(/当前页面停止修改/)).toBeInTheDocument();
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateSettings).not.toHaveBeenCalled();
-    expect(updateTimeline).not.toHaveBeenCalled();
-    expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).not.toBeNull();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).not.toBeNull();
-
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    await user.click(await screen.findByRole("button", { name: "取消切换并继续使用当前库" }));
-
-    await waitFor(() => expect(cancelSwitch).toHaveBeenCalledWith(ACTIVE_DATABASE_PATH));
-    await waitFor(() => expect(updateTimeline).toHaveBeenCalledWith(
-      expect.objectContaining({ title: pendingTimeline.title }),
-    ));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(pendingSettings), { timeout: 3_000 });
-    expect(cancelSwitch.mock.invocationCallOrder[0]).toBeLessThan(updateSettings.mock.invocationCallOrder[0]);
-    expect(cancelSwitch.mock.invocationCallOrder[0]).toBeLessThan(updateTimeline.mock.invocationCallOrder[0]);
-    await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull());
-    await waitFor(() => expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull());
-  });
-
-  it("迁移响应丢失但服务器已提交时通过 storage GET 转为重启锁，关闭设置也不能继续写", async () => {
-    const user = userEvent.setup();
-    const target = "/srv/director/data/response-lost.sqlite3";
-    const pendingStorage = {
-      ...ACTIVE_STORAGE_CONFIGURATION,
-      configured_database_path: target,
-      restart_required: true,
-    };
-    mockCommonRequests();
-    vi.mocked(directorApi.getStorage)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockResolvedValue(pendingStorage);
-    const migrate = vi.spyOn(directorApi, "migrateStorage")
-      .mockRejectedValue(new TypeError("response connection lost"));
-    const updateTimeline = vi.mocked(directorApi.updateTimeline);
-    const updateSettings = vi.spyOn(directorApi, "updateSettings");
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    await waitUntilReady();
-    updateTimeline.mockClear();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const path = await screen.findByLabelText("数据库目标路径");
-    await user.clear(path);
-    await user.type(path, target);
-    await user.click(screen.getByRole("button", { name: "迁移当前数据库并切换" }));
-
-    await waitFor(() => expect(migrate).toHaveBeenCalledWith(target));
-    expect(await screen.findByRole("button", { name: "取消切换并继续使用当前库" })).toBeInTheDocument();
-    expect(screen.getByText(/服务器确认数据库迁移或路径切换正在等待重启/)).toBeInTheDocument();
-    expect(screen.getByText(/当前页面停止修改/)).toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    const prompt = screen.getByLabelText("片段提示词");
-    const before = (prompt as HTMLTextAreaElement).value;
-    fireEvent.change(prompt, { target: { value: "响应丢失后不得写入" } });
-    expect(prompt).toHaveValue(before);
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateTimeline).not.toHaveBeenCalled();
-    expect(updateSettings).not.toHaveBeenCalled();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull();
-  });
-
-  it("迁移响应与后续 storage GET 都不可达时持续全局锁定并自动重试核对", async () => {
-    const user = userEvent.setup();
-    const target = "/srv/director/data/unknown-result.sqlite3";
-    mockCommonRequests();
-    vi.mocked(directorApi.getStorage)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
-      .mockRejectedValue(new TypeError("storage authority unavailable"));
-    vi.spyOn(directorApi, "migrateStorage")
-      .mockRejectedValue(new TypeError("response connection lost"));
-    const updateTimeline = vi.mocked(directorApi.updateTimeline);
-    const updateSettings = vi.spyOn(directorApi, "updateSettings");
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    await waitUntilReady();
-    updateTimeline.mockClear();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const path = await screen.findByLabelText("数据库目标路径");
-    await user.clear(path);
-    await user.type(path, target);
-    await user.click(screen.getByRole("button", { name: "迁移当前数据库并切换" }));
-
-    expect((await screen.findAllByText(/数据库操作响应尚未确认，正在自动核对服务器状态/)).length).toBeGreaterThan(0);
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    expect(screen.getByText(/数据库操作响应尚未确认，正在自动核对服务器状态/)).toBeInTheDocument();
-    const prompt = screen.getByLabelText("片段提示词");
-    const before = (prompt as HTMLTextAreaElement).value;
-    fireEvent.change(prompt, { target: { value: "未知结果时不得写入" } });
-    expect(prompt).toHaveValue(before);
-    await waitFor(() => expect(directorApi.getStorage).toHaveBeenCalledTimes(5), { timeout: 2_500 });
-    expect(updateTimeline).not.toHaveBeenCalled();
-    expect(updateSettings).not.toHaveBeenCalled();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull();
-  });
-
-  it("存储请求收到明确 4xx 拒绝时安全解除操作锁并恢复编辑", async () => {
-    const user = userEvent.setup();
-    const target = "/srv/director/data/rejected.sqlite3";
-    mockCommonRequests();
-    vi.spyOn(directorApi, "migrateStorage")
-      .mockRejectedValue(new ApiError("目标数据库校验失败", 422));
-    const updateTimeline = vi.mocked(directorApi.updateTimeline);
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    await waitUntilReady();
-    updateTimeline.mockClear();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const path = await screen.findByLabelText("数据库目标路径");
-    await user.clear(path);
-    await user.type(path, target);
-    await user.click(screen.getByRole("button", { name: "迁移当前数据库并切换" }));
-
-    expect(await screen.findByText("目标数据库校验失败")).toBeInTheDocument();
-    expect(screen.queryByText(/数据库操作响应尚未确认/)).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    fireEvent.change(screen.getByLabelText("片段提示词"), {
-      target: { value: "明确拒绝后恢复编辑" },
-    });
-    await waitFor(() => expect(updateTimeline).toHaveBeenCalledWith(expect.objectContaining({
-      segments: [expect.objectContaining({ prompt: "明确拒绝后恢复编辑" })],
-    })));
   });
 
   it("顶栏项目名可用键盘进入编辑，并实时同步且不显示任何保存控件", async () => {
@@ -2139,7 +1740,6 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [{
         id: DEFAULT_PROJECT_ID,
         title: project.title,
@@ -2608,7 +2208,7 @@ describe("统一长视频时间线应用", () => {
 
   it("持久化素材栏宽度，并在视口变化时限制在半屏以内", async () => {
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 1400 });
-    localStorage.setItem("director-web:sidebar-expanded-width", "损坏值");
+    localStorage.setItem("directordeck:sidebar-expanded-width", "损坏值");
     mockCommonRequests();
     render(<App />);
     await waitUntilReady();
@@ -2619,7 +2219,7 @@ describe("统一长视频时间线应用", () => {
     expect(handle).toHaveAttribute("aria-valuenow", "292");
     fireEvent.keyDown(handle, { key: "End" });
     await waitFor(() => expect(handle).toHaveAttribute("aria-valuenow", "700"));
-    await waitFor(() => expect(localStorage.getItem("director-web:sidebar-expanded-width")).toBe("700"));
+    await waitFor(() => expect(localStorage.getItem("directordeck:sidebar-expanded-width")).toBe("700"));
 
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 1000 });
     fireEvent(window, new Event("resize"));
@@ -2627,7 +2227,7 @@ describe("统一长视频时间线应用", () => {
       expect(handle).toHaveAttribute("aria-valuemin", "235");
       expect(handle).toHaveAttribute("aria-valuemax", "500");
       expect(handle).toHaveAttribute("aria-valuenow", "500");
-      expect(localStorage.getItem("director-web:sidebar-expanded-width")).toBe("500");
+      expect(localStorage.getItem("directordeck:sidebar-expanded-width")).toBe("500");
     });
   });
 
@@ -2727,7 +2327,6 @@ describe("统一长视频时间线应用", () => {
       loader: "model_only",
       lora_name: "style.safetensors",
       model_filename: initial.models.ref2va.filename,
-      comfy_origin: initial.comfy_url,
     };
     mockCommonRequests(initial);
     const confirmed = structuredClone(initial);
@@ -2906,7 +2505,7 @@ describe("统一长视频时间线应用", () => {
     const defaultProject = createTimelineProject();
     defaultProject.title = "默认项目权威";
     defaultProject.segments[0].prompt = "默认项目提示词";
-    localStorage.setItem("director-web:v1:active-project-id", removedProjectId);
+    localStorage.setItem("directordeck:v1:active-project-id", removedProjectId);
     mockCommonRequests();
 
     vi.mocked(directorApi.getProjectTimelineAuthority)
@@ -2916,7 +2515,6 @@ describe("统一长视频时间线应用", () => {
       revision: 23,
     });
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [{
         id: DEFAULT_PROJECT_ID,
         title: defaultProject.title,
@@ -2937,7 +2535,7 @@ describe("统一长视频时间线应用", () => {
       name: `重命名项目，当前名称：${defaultProject.title}`,
     })).toBeInTheDocument();
     expect(screen.getByLabelText("片段提示词")).toHaveValue("默认项目提示词");
-    expect(localStorage.getItem("director-web:v1:active-project-id")).toBe(DEFAULT_PROJECT_ID);
+    expect(localStorage.getItem("directordeck:v1:active-project-id")).toBe(DEFAULT_PROJECT_ID);
 
     fireEvent.change(screen.getByLabelText("片段提示词"), {
       target: { value: "只写回默认项目" },
@@ -2959,9 +2557,8 @@ describe("统一长视频时间线应用", () => {
     const databaseB = {
       ...ACTIVE_STORAGE_CONFIGURATION,
       active_database_path: "/srv/director/data/director-b.sqlite3",
-      active_database_identity: "b".repeat(64),
     };
-    localStorage.setItem("director-web:v1:active-project-id", removedProjectId);
+    localStorage.setItem("directordeck:v1:active-project-id", removedProjectId);
     mockCommonRequests();
     vi.mocked(directorApi.getProjectTimelineAuthority)
       .mockRejectedValue(new ApiError("project not found", 404));
@@ -2969,7 +2566,6 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(ACTIVE_STORAGE_CONFIGURATION)
       .mockResolvedValue(databaseB);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [{
         id: DEFAULT_PROJECT_ID,
         title: "数据库 A 默认项目",
@@ -2983,7 +2579,7 @@ describe("统一长视频时间线应用", () => {
 
     expect(await screen.findByText(/数据库身份.*变化|数据库身份已过期/)).toBeInTheDocument();
     expect(directorApi.getTimelineAuthority).not.toHaveBeenCalled();
-    expect(localStorage.getItem("director-web:v1:active-project-id")).toBe(removedProjectId);
+    expect(localStorage.getItem("directordeck:v1:active-project-id")).toBe(removedProjectId);
     expect(screen.getByRole("combobox", { name: "切换项目" })).toBeDisabled();
   });
 
@@ -3019,7 +2615,6 @@ describe("统一长视频时间线应用", () => {
         resolveInitialList = resolve;
       }))
       .mockResolvedValue({
-        active_database_identity: ACTIVE_DATABASE_IDENTITY,
         projects: [defaultSummary, createdSummary],
       });
     vi.spyOn(directorApi, "createProject").mockResolvedValue(createdSummary);
@@ -3049,7 +2644,6 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
 
     await act(async () => resolveInitialList({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [defaultSummary],
     }));
     await new Promise((resolve) => window.setTimeout(resolve, 20));
@@ -3085,10 +2679,9 @@ describe("统一长视频时间线应用", () => {
         segment_count: 1,
       },
     ];
-    localStorage.setItem("director-web:v1:active-project-id", deletedProjectId);
+    localStorage.setItem("directordeck:v1:active-project-id", deletedProjectId);
     mockCommonRequests();
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: summaries,
     });
     vi.mocked(directorApi.getProjectTimelineAuthority).mockResolvedValue({
@@ -3154,7 +2747,6 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         {
           id: DEFAULT_PROJECT_ID,
@@ -3213,7 +2805,6 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -3251,7 +2842,6 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -3293,7 +2883,6 @@ describe("统一长视频时间线应用", () => {
       return structuredClone(serverProjectA);
     });
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -3352,7 +2941,6 @@ describe("统一长视频时间线应用", () => {
       return structuredClone(serverProjectA);
     });
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -3414,87 +3002,6 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(screen.getByRole("button", {
       name: "重命名项目，当前名称：handoff 项目 B",
     })).toBeInTheDocument());
-  });
-
-  it("目标 authority 已返回但 journal 仍在读取时数据库变 stale，不安装迟到项目", async () => {
-    vi.stubGlobal("indexedDB", new IDBFactory());
-    const projectA = createTimelineProject();
-    projectA.title = "数据库 A 当前项目";
-    const projectBBase = structuredClone(projectA);
-    projectBBase.title = "目标 B 基线";
-    const projectB = structuredClone(projectBBase);
-    projectB.title = "绝不能跨 stale 安装的 B";
-    const history = recordTimelineHistory(createTimelineHistory(), {
-      label: "重命名项目",
-      before: projectBBase,
-      after: projectB,
-      now: 40,
-    });
-    await saveTimelineHistoryJournal({
-      databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
-      projectId: "project-b",
-      ownerId: getTimelineBranchOwnerId(),
-    }, {
-      document: projectBBase,
-      revision: 0,
-    }, history);
-    mockCommonRequests();
-    vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
-    vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
-      projects: [
-        { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
-        { id: "project-b", title: projectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
-      ],
-    });
-    const targetAuthority = vi.mocked(directorApi.getProjectTimelineAuthority)
-      .mockResolvedValue({ document: projectB, revision: 1 });
-    const updateTarget = vi.mocked(directorApi.updateProjectTimelineAuthority);
-
-    render(<App />);
-    await waitUntilReady();
-    let releaseJournal!: () => void;
-    const journalGate = new Promise<void>((resolve) => { releaseJournal = resolve; });
-    const realOpen = indexedDB.open.bind(indexedDB);
-    let blockedOpenCount = 0;
-    vi.spyOn(indexedDB, "open").mockImplementation((name, version) => {
-      const request = version === undefined ? realOpen(name) : realOpen(name, version);
-      blockedOpenCount += 1;
-      return new Proxy(request, {
-        get(target, property) {
-          return Reflect.get(target, property, target);
-        },
-        set(target, property, value) {
-          if (property === "onsuccess" && typeof value === "function") {
-            target.onsuccess = (event) => {
-              void journalGate.then(() => value.call(target, event));
-            };
-            return true;
-          }
-          return Reflect.set(target, property, value, target);
-        },
-      });
-    });
-    const switcher = screen.getByRole("combobox", { name: "切换项目" });
-    await screen.findByRole("option", { name: projectB.title });
-    fireEvent.change(switcher, { target: { value: "project-b" } });
-    await waitFor(() => expect(targetAuthority).toHaveBeenCalledWith("project-b", undefined));
-    await waitFor(() => expect(blockedOpenCount).toBeGreaterThan(0));
-
-    act(() => window.dispatchEvent(new Event(DATABASE_IDENTITY_STALE_EVENT)));
-    releaseJournal();
-    await new Promise((resolve) => window.setTimeout(resolve, 30));
-
-    expect(switcher).toHaveValue(DEFAULT_PROJECT_ID);
-    expect(switcher).toBeDisabled();
-    expect(screen.getByRole("button", {
-      name: "重命名项目，当前名称：数据库 A 当前项目",
-    })).toBeInTheDocument();
-    expect(screen.queryByRole("button", {
-      name: "重命名项目，当前名称：绝不能跨 stale 安装的 B",
-    })).not.toBeInTheDocument();
-    expect(updateTarget).not.toHaveBeenCalled();
   });
 
   it("只选择停用片段时明确阻止预检和生成，重新启用后自动恢复", async () => {
@@ -4008,158 +3515,6 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1), { timeout: 3_000 });
   });
 
-  it("生成内部随机 Seed 更新不被排队 endpoint 冻结，仍先按旧权威提交任务", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments[0].prompt = "随机种子执行边界";
-    project.sampling.fl2va = { ...project.sampling.fl2va, seed: 101, random_seed: true };
-    vi.spyOn(globalThis.crypto, "getRandomValues").mockImplementation(
-      <T extends ArrayBufferView | null>(array: T): T => {
-        if (array instanceof Uint32Array) { array[0] = 0; array[1] = 909; }
-        return array;
-      },
-    );
-    mockCommonRequests();
-    const serverProject = structuredClone(project);
-    serverProject.segments[0].prompt = "服务器基线";
-    vi.mocked(directorApi.getTimeline).mockResolvedValue(serverProject);
-    const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://queued-during-seed.test:8188" };
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointB));
-    let resolveTimeline!: (value: typeof project) => void;
-    vi.mocked(directorApi.updateTimeline)
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveTimeline = resolve; }))
-      .mockImplementation(async (value) => value);
-    let resolveTask!: (value: GenerationTask) => void;
-    const createTask = vi.spyOn(directorApi, "createTimelineTask").mockImplementation(
-      () => new Promise((resolve) => { resolveTask = resolve; }),
-    );
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointB);
-
-    render(<App />);
-    await waitUntilReady();
-    fireEvent.change(screen.getByLabelText("片段提示词"), {
-      target: { value: project.segments[0].prompt },
-    });
-    await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointB.comfy_url);
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateSettings).not.toHaveBeenCalled();
-
-    await act(async () => resolveTimeline(project));
-    await waitFor(() => expect(createTask).toHaveBeenCalledTimes(1));
-    expect(createTask).toHaveBeenCalledWith({
-      config: expect.objectContaining({
-        sampling: expect.objectContaining({ fl2va: expect.objectContaining({ seed: 909 }) }),
-      }),
-      segment_ids: [project.segments[0].id],
-    });
-    expect(updateSettings).not.toHaveBeenCalled();
-    await act(async () => resolveTask(queuedTimelineTask));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
-  });
-
-  it.each(["生成", "预检"] as const)("%s执行在途时素材移出不调用删除接口", async (kind) => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments = [{ ...createTimelineSegment("fl2va", 1), prompt: "执行素材边界", first_image: imageAsset }];
-    mockCommonRequests();
-    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
-    vi.mocked(directorApi.listAssets).mockResolvedValue(appAssetList([imageAsset]));
-    let resolveTask!: (value: GenerationTask) => void;
-    vi.spyOn(directorApi, "createTimelineTask").mockImplementation(
-      () => new Promise((resolve) => { resolveTask = resolve; }),
-    );
-    let resolveCompile!: (value: TimelineCompileReport) => void;
-    vi.spyOn(directorApi, "compileTimeline").mockImplementation(
-      () => new Promise((resolve) => { resolveCompile = resolve; }),
-    );
-    const trash = vi.mocked(directorApi.trashAssets);
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    await waitUntilReady();
-    await user.click(await screen.findByRole("listitem"));
-    if (kind === "生成") {
-      await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
-      await waitFor(() => expect(directorApi.createTimelineTask).toHaveBeenCalledTimes(1));
-    } else {
-      await user.click(screen.getByRole("button", { name: "预检执行计划" }));
-      await waitFor(() => expect(directorApi.compileTimeline).toHaveBeenCalledTimes(1));
-    }
-    expect(screen.getByRole("combobox", { name: "切换项目" })).toBeDisabled();
-    await user.click(screen.getByRole("button", { name: "移出素材库" }));
-    expect(trash).not.toHaveBeenCalled();
-    expect(screen.getByText(/生成或预检正在使用当前素材/)).toBeInTheDocument();
-
-    if (kind === "生成") await act(async () => resolveTask(queuedTimelineTask));
-    else await act(async () => resolveCompile({
-      execution_strategy: "native_segment_graph_v1",
-      model_families: ["fl2va"],
-      plans: [],
-      node_policy: { graph_source: "server", accepts_client_workflow: false, allowed_nodes: [], custom_nodes: [], provenance: {} },
-    }));
-  });
-
-  it("预检响应前时间线与 endpoint 变化时丢弃旧报告，再自动同步设置", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments[0].prompt = "预检设置边界";
-    saveLocalTimeline(project);
-    mockCommonRequests();
-    const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy-after-compile.test:8188" };
-    const listAssets = vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce(appAssetList([]))
-      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointB));
-    const report: TimelineCompileReport = {
-      execution_strategy: "native_segment_graph_v1",
-      model_families: ["fl2va"],
-      plans: [],
-      node_policy: {
-        graph_source: "server",
-        accepts_client_workflow: false,
-        allowed_nodes: [],
-        custom_nodes: [],
-        provenance: {},
-      },
-    };
-    let resolveCompile!: (value: TimelineCompileReport) => void;
-    const compile = vi.spyOn(directorApi, "compileTimeline").mockImplementation(
-      () => new Promise((resolve) => { resolveCompile = resolve; }),
-    );
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointB);
-
-    render(<App />);
-    await waitUntilReady();
-    await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalled());
-    await user.click(screen.getByRole("button", { name: "预检执行计划" }));
-    await waitFor(() => expect(compile).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointB.comfy_url);
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "预检后的新版本" } });
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateSettings).not.toHaveBeenCalled();
-
-    await act(async () => resolveCompile(report));
-    expect(screen.queryByRole("region", { name: "服务端执行计划" })).not.toBeInTheDocument();
-    expect(screen.getByText(/时间线、分段选择或运行设置已变化，请重新预检/)).toBeInTheDocument();
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
-  });
-
   it("预检与生成使用同一显式分段集合，勾选变化会丢弃在途旧报告", async () => {
     const user = userEvent.setup();
     const first = { ...createTimelineSegment("fl2va", 1), prompt: "第一段" };
@@ -4366,7 +3721,7 @@ describe("统一长视频时间线应用", () => {
 
   it("主题偏好独立保存，系统设置以浮层打开并关闭后回到时间线", async () => {
     const user = userEvent.setup();
-    localStorage.setItem("director-web:theme", "light");
+    localStorage.setItem("directordeck:theme", "light");
     mockCommonRequests();
 
     render(<App />);
@@ -4445,7 +3800,7 @@ describe("统一长视频时间线应用", () => {
 
     await user.click(screen.getByRole("button", { name: "测试连接" }));
 
-    expect(await screen.findByText("当前填写地址可连接")).toBeInTheDocument();
+    expect(await screen.findByText("当前实例可连接")).toBeInTheDocument();
     await waitFor(() => expect(within(gpuPanel).getByText("GPU 1")).toBeInTheDocument());
     expect(directorApi.getCapabilities).toHaveBeenCalledTimes(2);
     expect(directorApi.getGpus).toHaveBeenCalledTimes(2);
@@ -4532,7 +3887,6 @@ describe("统一长视频时间线应用", () => {
     fireEvent.click(recover);
     fireEvent.click(recover);
     await waitFor(() => expect(confirmRecovery).toHaveBeenCalledWith(
-      "http://comfy.test:8188",
       36,
       "a".repeat(64),
       expect.any(AbortSignal),
@@ -4544,8 +3898,6 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByRole("alert", { name: "旧 RayLight 运行状态引用了当前不可见 GPU" })).toBeInTheDocument();
     expect(recover).toBeDisabled();
     expect(recover).toHaveAttribute("aria-busy", "true");
-    expect(await screen.findByRole("button", { name: "保存路径（重启后切换）" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "迁移当前数据库并切换" })).toBeDisabled();
 
     await act(async () => resolveAuthoritativeStatus(recoveredStatus));
     await waitFor(() => expect(screen.queryByRole("alert", {
@@ -4641,8 +3993,8 @@ describe("统一长视频时间线应用", () => {
 
     await waitFor(() => expect(confirmRecovery).toHaveBeenCalledTimes(2), { timeout: 2_000 });
     expect(confirmRecovery.mock.calls).toEqual([
-      ["http://comfy.test:8188", 36, "c".repeat(64), expect.any(AbortSignal)],
-      ["http://comfy.test:8188", 36, "c".repeat(64), expect.any(AbortSignal)],
+      [36, "c".repeat(64), expect.any(AbortSignal)],
+      [36, "c".repeat(64), expect.any(AbortSignal)],
     ]);
     await waitFor(() => expect(screen.queryByRole("alert", {
       name: "旧 RayLight 运行状态引用了当前不可见 GPU",
@@ -4708,14 +4060,12 @@ describe("统一长视频时间线应用", () => {
     // authority read did not terminate the ambiguous operation.
     await waitFor(() => expect(confirmRecovery).toHaveBeenCalledTimes(3), { timeout: 2_500 });
     expect(confirmRecovery.mock.calls.slice(0, 3)).toEqual([
-      ["http://comfy.test:8188", 36, "d".repeat(64), expect.any(AbortSignal)],
-      ["http://comfy.test:8188", 36, "d".repeat(64), expect.any(AbortSignal)],
-      ["http://comfy.test:8188", 36, "d".repeat(64), expect.any(AbortSignal)],
+      [36, "d".repeat(64), expect.any(AbortSignal)],
+      [36, "d".repeat(64), expect.any(AbortSignal)],
+      [36, "d".repeat(64), expect.any(AbortSignal)],
     ]);
     expect(recover).toBeDisabled();
     expect(recover).toHaveAttribute("aria-busy", "true");
-    expect(screen.getByRole("button", { name: "保存路径（重启后切换）" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "迁移当前数据库并切换" })).toBeDisabled();
     expect(screen.queryByText(/RayLight 恢复失败/)).not.toBeInTheDocument();
 
     await act(async () => resolveConvergedRetry(recoveredStatus));
@@ -4756,74 +4106,6 @@ describe("统一长视频时间线应用", () => {
     expect(confirmRecovery).toHaveBeenCalledTimes(2);
     expect(recover).toBeEnabled();
     expect(recover).not.toHaveAttribute("aria-busy");
-    expect(screen.getByRole("button", { name: "保存路径（重启后切换）" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "迁移当前数据库并切换" })).toBeEnabled();
-  });
-
-  it("恢复期间服务器 endpoint 外部切换时不把新 endpoint 的 clean 状态标成旧源", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments[0].prompt = "外部切换核对";
-    saveLocalTimeline(project);
-    mockCommonRequests();
-    const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://external-b.test:8188" };
-    const listAssets = vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce(appAssetList([]))
-      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
-    const blockedStatus = {
-      active: true,
-      recovery_required: true,
-      epoch: 36,
-      runtime_gpu_indexes: [0, 1, 2, 3],
-      available_gpu_indexes: [] as number[],
-      invalid_gpu_indexes: [0, 1, 2, 3],
-      tainted: true,
-      recovery_token: "f".repeat(64),
-    };
-    const endpointBClean = {
-      ...EMPTY_RAYLIGHT_RUNTIME_STATUS,
-      available_gpu_indexes: [] as number[],
-    };
-    const authorityA = {
-      settings: CONFIGURED_SETTINGS,
-      authority_token: "a".repeat(64),
-    };
-    const authorityB = {
-      settings: endpointB,
-      authority_token: "b".repeat(64),
-    };
-    vi.mocked(directorApi.getSettingsAuthority)
-      // Initial App resource snapshot (head + tail), then the recovery head.
-      .mockResolvedValueOnce(authorityA)
-      .mockResolvedValueOnce(authorityA)
-      .mockResolvedValueOnce(authorityA)
-      // Recovery tail observes B. The App must discard the whole batch and
-      // let external-authority reconciliation adopt B as a fresh snapshot.
-      .mockResolvedValue(authorityB);
-    vi.mocked(directorApi.getRayLightRuntimeStatus)
-      .mockResolvedValueOnce(blockedStatus)
-      .mockResolvedValue(endpointBClean);
-    const confirmRecovery = vi.spyOn(directorApi, "confirmRayLightRuntimeRecovery")
-      .mockRejectedValue(new ApiError("ComfyUI endpoint changed", 409));
-    const updateSettings = vi.spyOn(directorApi, "updateSettings")
-      .mockImplementation(async (settings) => settings);
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    await waitUntilReady();
-    await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    await user.click(await screen.findByRole("button", {
-      name: "确认 ComfyUI 已重启并恢复 RayLight",
-    }));
-
-    await waitFor(() => expect(confirmRecovery).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.getByLabelText("ComfyUI 地址")).toHaveValue(endpointB.comfy_url));
-    expect(screen.queryByText(/已确认 ComfyUI 重启并恢复 RayLight/)).not.toBeInTheDocument();
-    expect(confirmRecovery).toHaveBeenCalledTimes(1);
-    expect(updateSettings).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "预检执行计划" })).toBeEnabled());
   });
 
   it("恢复四资源批次遇到同 URL 的 authority ABA 时丢弃 clean 快照", async () => {
@@ -4936,7 +4218,7 @@ describe("统一长视频时间线应用", () => {
     }));
     await waitFor(() => expect(directorApi.getRayLightRuntimeStatus).toHaveBeenCalledTimes(2));
     expect(confirmRecovery).toHaveBeenCalledTimes(1);
-    const signal = confirmRecovery.mock.calls[0][3];
+    const signal = confirmRecovery.mock.calls[0][2];
     expect(signal).toBeInstanceOf(AbortSignal);
     expect(signal?.aborted).toBe(false);
 
@@ -4998,83 +4280,6 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeEnabled();
     expect(updateSettings).not.toHaveBeenCalled();
   }, 5_000);
-
-  it("临时不同 URL 的成功测试不刷新或污染当前权威资源", async () => {
-    const user = userEvent.setup();
-    mockCommonRequests();
-    vi.mocked(directorApi.getGpus).mockResolvedValue([GPU_ZERO]);
-    vi.mocked(directorApi.getRayLightRuntimeStatus).mockResolvedValue({
-      ...EMPTY_RAYLIGHT_RUNTIME_STATUS,
-      available_gpu_indexes: [0],
-    });
-    vi.spyOn(directorApi, "testConnection").mockResolvedValue({
-      ok: true,
-      message: "临时地址连接成功",
-    });
-
-    render(<App />);
-    await waitUntilReady();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    await user.clear(screen.getByLabelText("客户端 ID"));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, "http://temporary-comfy.test:8188");
-    await user.click(screen.getByRole("button", { name: "测试连接" }));
-
-    expect(await screen.findByText("当前填写地址可连接")).toBeInTheDocument();
-    expect(directorApi.testConnection).toHaveBeenCalledWith("http://temporary-comfy.test:8188");
-    expect(directorApi.getCapabilities).toHaveBeenCalledTimes(1);
-    expect(directorApi.getGpus).toHaveBeenCalledTimes(1);
-    expect(directorApi.getModels).toHaveBeenCalledTimes(1);
-    const gpuPanel = screen.getByRole("heading", { name: "GPU 状态" }).closest("section");
-    if (!gpuPanel) throw new Error("GPU status panel missing");
-    expect(within(gpuPanel).getByText("A6000-0")).toBeInTheDocument();
-    expect(within(gpuPanel).queryByText("A6000-1")).not.toBeInTheDocument();
-  });
-
-  it("系统设置自动同步由 App 持有，关闭浮层后仍完成 endpoint 权威切换", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments[0].prompt = "雨夜长镜头";
-    saveLocalTimeline(project);
-    mockCommonRequests();
-    const endpointBSettings = {
-      ...CONFIGURED_SETTINGS,
-      comfy_url: "http://comfy-b.test:8188",
-    };
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointBSettings));
-    vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce(appAssetList([imageAsset]))
-      .mockResolvedValue(appAssetList([endpointBImageAsset], endpointBSettings.comfy_url));
-    let resolvePut!: (settings: typeof endpointBSettings) => void;
-    const update = vi.spyOn(directorApi, "updateSettings").mockImplementation(
-      () => new Promise((resolve) => { resolvePut = resolve; }),
-    );
-
-    render(<App />);
-    await waitUntilReady();
-    expect(await screen.findByText(imageAsset.name)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointBSettings.comfy_url);
-    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-
-    const navigation = screen.getByRole("button", { name: "系统设置" });
-    expect(navigation).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    expect(screen.queryByRole("dialog", { name: "系统设置" })).not.toBeInTheDocument();
-
-    await act(async () => resolvePut(endpointBSettings));
-    await waitFor(() => expect(directorApi.listAssets).toHaveBeenCalledTimes(2));
-    expect(navigation).toBeEnabled();
-    expect(await screen.findByText(endpointBImageAsset.name)).toBeInTheDocument();
-    expect(screen.queryByText(imageAsset.name)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeEnabled();
-  });
 
   it("系统设置连续输入只提交最终快照且 PUT 严格单在途", async () => {
     const user = userEvent.setup();
@@ -5140,67 +4345,6 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
   });
 
-  it("本地素材上传期间排队 endpoint 切换时丢弃旧源结果并继续最新设置", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments = [{ ...createTimelineSegment("ref2va", 1), id: project.segments[0].id }];
-    saveLocalTimeline(project);
-    mockCommonRequests();
-    const uploadedVideo: AssetReference = {
-      id: "external-video-app",
-      name: "外部源视频.mp4",
-      subfolder: "director",
-      type: "input",
-      kind: "video",
-      preview_url: "/api/assets/external-video-app/preview",
-      metadata: {
-        duration: 5,
-        native_fps: 24,
-        frame_count: 120,
-        width: 864,
-        height: 480,
-        probe_method: "ffprobe",
-        has_audio: true,
-      },
-    };
-    let resolveUpload!: (asset: AssetReference) => void;
-    const upload = vi.spyOn(directorApi, "uploadAsset").mockImplementation(
-      () => new Promise((resolve) => { resolveUpload = resolve; }),
-    );
-    const update = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(CONFIGURED_SETTINGS);
-
-    render(<App />);
-    await waitUntilReady();
-    const file = new File(["video"], "外部源视频.mp4", { type: "video/mp4" });
-    fireEvent.drop(screen.getByRole("region", { name: "源视频（可选），占用 <Video 1>" }), {
-      dataTransfer: {
-        types: ["Files"],
-        files: [file],
-        getData: vi.fn(() => ""),
-        setData: vi.fn(),
-        dropEffect: "copy",
-        effectAllowed: "copy",
-      },
-    });
-    await waitFor(() => expect(upload).toHaveBeenCalledWith(file, "video", expect.any(Function)));
-    expect(screen.getByText(/完成前暂时锁定同步、预检和生成/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "保存时间线" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeDisabled();
-
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, "http://comfy-other.test:8188");
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(update).not.toHaveBeenCalled();
-
-    await act(async () => resolveUpload(uploadedVideo));
-    await waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
-    expect(within(screen.getByRole("region", { name: "源视频（可选），占用 <Video 1>" })).queryByText(/外部源视频\.mp4/)).not.toBeInTheDocument();
-    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-  });
-
   it("上传 intent 会失效在途项目切换，完成结果只绑定发起上传的项目", async () => {
     const projectA = createTimelineProject();
     projectA.title = "上传所属项目 A";
@@ -5209,7 +4353,6 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(projectA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: staleProjectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -5252,231 +4395,6 @@ describe("统一长视频时间线应用", () => {
       name: "重命名项目，当前名称：上传所属项目 A",
     })).toBeInTheDocument();
     expect(screen.getByText(file.name)).toBeInTheDocument();
-  });
-
-  it("endpoint 切换先等待在途时间线确认，并在边界内拒绝新的项目编辑", async () => {
-    const user = userEvent.setup();
-    mockCommonRequests();
-    const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy-boundary.test:8188" };
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointB));
-    let resolveTimeline!: (project: ReturnType<typeof createTimelineProject>) => void;
-    const updateTimeline = vi.mocked(directorApi.updateTimeline)
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveTimeline = resolve; }))
-      .mockImplementation(async (project) => project);
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointB);
-
-    render(<App />);
-    await waitUntilReady();
-    const prompt = screen.getByLabelText("片段提示词");
-    fireEvent.change(prompt, { target: { value: "切换前的精确版本" } });
-    await waitFor(() => expect(updateTimeline).toHaveBeenCalledTimes(1));
-    const exactProject = updateTimeline.mock.calls[0][0];
-
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointB.comfy_url);
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateSettings).not.toHaveBeenCalled();
-
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "不应越过边界" } });
-    expect(screen.getByLabelText("片段提示词")).toHaveValue("切换前的精确版本");
-    expect(screen.getByText(/正在切换 ComfyUI 地址/)).toBeInTheDocument();
-
-    await act(async () => resolveTimeline(exactProject));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
-  });
-
-  it("endpoint 边界等待期间的无效新草稿取消旧目标并恢复时间线编辑", async () => {
-    const user = userEvent.setup();
-    mockCommonRequests();
-    let resolveTimeline!: (project: ReturnType<typeof createTimelineProject>) => void;
-    const updateTimeline = vi.mocked(directorApi.updateTimeline)
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveTimeline = resolve; }))
-      .mockImplementation(async (project) => project);
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(CONFIGURED_SETTINGS);
-
-    render(<App />);
-    await waitUntilReady();
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "边界基线" } });
-    await waitFor(() => expect(updateTimeline).toHaveBeenCalledTimes(1));
-    const exactProject = updateTimeline.mock.calls[0][0];
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, "http://queued-b.test:8188");
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateSettings).not.toHaveBeenCalled();
-    await user.clear(endpoint);
-    await user.type(endpoint, "invalid-c");
-
-    await act(async () => resolveTimeline(exactProject));
-    await new Promise((resolve) => window.setTimeout(resolve, 50));
-    expect(updateSettings).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "无效设置下仍可修时间线" } });
-    expect(screen.getByLabelText("片段提示词")).toHaveValue("无效设置下仍可修时间线");
-  });
-
-  it("仅输入无效 endpoint 不冻结时间线编辑", async () => {
-    const user = userEvent.setup();
-    mockCommonRequests();
-    const updateSettings = vi.spyOn(directorApi, "updateSettings");
-
-    render(<App />);
-    await waitUntilReady();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, "invalid-endpoint");
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "时间线仍可编辑" } });
-    expect(screen.getByLabelText("片段提示词")).toHaveValue("时间线仍可编辑");
-    expect(updateSettings).not.toHaveBeenCalled();
-  });
-
-  it("endpoint 切换遇到时间线 422 时不提交设置，修正时间线后自动继续", async () => {
-    const user = userEvent.setup();
-    mockCommonRequests();
-    const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy-after-fix.test:8188" };
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointB));
-    let rejectTimeline!: (reason: unknown) => void;
-    const updateTimeline = vi.mocked(directorApi.updateTimeline)
-      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectTimeline = reject; }))
-      .mockImplementation(async (project) => project);
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointB);
-
-    render(<App />);
-    await waitUntilReady();
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "服务端拒绝的版本" } });
-    await waitFor(() => expect(updateTimeline).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointB.comfy_url);
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateSettings).not.toHaveBeenCalled();
-
-    await act(async () => rejectTimeline(new ApiError("提示词字段无效", 422)));
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    expect(await screen.findByText(/服务器拒绝当前时间线.*提示词字段无效/)).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "修正后的版本" } });
-    expect(screen.getByLabelText("片段提示词")).toHaveValue("修正后的版本");
-    await waitFor(() => expect(updateTimeline).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
-  });
-
-  it("endpoint PUT 422 且回读仍为旧地址时解除时间线 gate 但保持生成锁", async () => {
-    const user = userEvent.setup();
-    mockCommonRequests();
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValue(runtimeAuthority(CONFIGURED_SETTINGS));
-    const updateSettings = vi.spyOn(directorApi, "updateSettings")
-      .mockRejectedValue(new ApiError("新地址被服务器拒绝", 422));
-
-    render(<App />);
-    await waitUntilReady();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, "http://rejected-endpoint.test:8188");
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    expect(await screen.findByText(/服务器拒绝当前系统设置.*新地址被服务器拒绝/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "拒绝后仍可编辑时间线" } });
-    expect(screen.getByLabelText("片段提示词")).toHaveValue("拒绝后仍可编辑时间线");
-  });
-
-  it("endpoint PUT 后出现无效新草稿，资源重试成功会解除时间线 gate", async () => {
-    const user = userEvent.setup();
-    mockCommonRequests();
-    const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://confirmed-b.test:8188" };
-    const listAssets = vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce(appAssetList([]))
-      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointB));
-    vi.mocked(directorApi.getCapabilities)
-      .mockResolvedValueOnce(ONLINE_CAPABILITIES)
-      .mockResolvedValueOnce({ ...ONLINE_CAPABILITIES, connection: "offline" })
-      .mockResolvedValue(ONLINE_CAPABILITIES);
-    vi.mocked(directorApi.getModels)
-      .mockResolvedValueOnce(MODEL_INVENTORY)
-      .mockRejectedValueOnce(new Error("B model inventory pending"))
-      .mockResolvedValue(MODEL_INVENTORY);
-    let resolvePut!: (value: typeof endpointB) => void;
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockImplementation(
-      () => new Promise((resolve) => { resolvePut = resolve; }),
-    );
-
-    render(<App />);
-    await waitUntilReady();
-    await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointB.comfy_url);
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
-    await user.clear(endpoint);
-    await user.type(endpoint, "invalid-c");
-    await act(async () => resolvePut(endpointB));
-    await waitFor(() => expect(directorApi.getCapabilities).toHaveBeenCalledTimes(3), { timeout: 3_500 });
-
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    expect(screen.getByText(/系统设置有无效输入/)).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("片段提示词"), { target: { value: "资源恢复后仍可编辑" } });
-    expect(screen.getByLabelText("片段提示词")).toHaveValue("资源恢复后仍可编辑");
-  });
-
-  it.each(["完成", "失败"] as const)("侧栏素材上传%s后自动续写上传期间的时间线编辑", async (outcome) => {
-    mockCommonRequests();
-    let resolveUpload!: (asset: AssetReference) => void;
-    let rejectUpload!: (reason: unknown) => void;
-    const upload = vi.spyOn(directorApi, "uploadAsset").mockImplementation(
-      () => new Promise((resolve, reject) => {
-        resolveUpload = resolve;
-        rejectUpload = reject;
-      }),
-    );
-    const update = vi.mocked(directorApi.updateTimeline);
-
-    render(<App />);
-    await waitUntilReady();
-    const file = new File(["image"], "上传锁测试.png", { type: "image/png" });
-    const input = document.querySelector<HTMLInputElement>(
-      '.asset-sidebar__upload input[type="file"]',
-    );
-    expect(input).not.toBeNull();
-    fireEvent.change(input!, { target: { files: [file] } });
-    await waitFor(() => expect(upload).toHaveBeenCalledWith(file, "image", expect.any(Function)));
-
-    fireEvent.change(screen.getByLabelText("片段提示词"), {
-      target: { value: `上传${outcome}期间的编辑` },
-    });
-    await new Promise((resolve) => window.setTimeout(resolve, 250));
-    expect(update).not.toHaveBeenCalled();
-    expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).not.toBeNull();
-
-    if (outcome === "完成") {
-      await act(async () => resolveUpload({ ...imageAsset, id: "upload-lock-image", name: file.name }));
-    } else {
-      await act(async () => rejectUpload(new Error("模拟上传失败")));
-    }
-    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-    expect(update).toHaveBeenCalledWith(expect.objectContaining({
-      segments: [expect.objectContaining({ prompt: `上传${outcome}期间的编辑` })],
-    }));
-    await waitFor(() => expect(localStorage.getItem(TIMELINE_WAL_STORAGE_KEY)).toBeNull());
   });
 
   it("工作区快捷模型自动同步期间仍可打开设置，但阻断素材删除、compile 和生成", async () => {
@@ -5531,44 +4449,6 @@ describe("统一长视频时间线应用", () => {
         ref2va: expect.objectContaining({ filename: "alternate-diffusion.safetensors" }),
       }),
     }));
-  });
-
-  it("endpoint 权威 GET 成功但素材刷新失败时清空旧源并保持生成锁", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments[0].prompt = "海边远景";
-    saveLocalTimeline(project);
-    mockCommonRequests();
-    const endpointBSettings = {
-      ...CONFIGURED_SETTINGS,
-      comfy_url: "http://comfy-b.test:8188",
-    };
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointBSettings));
-    vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce(appAssetList([imageAsset]))
-      .mockRejectedValue(new Error("B 素材接口离线"));
-    vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointBSettings);
-
-    render(<App />);
-    await waitUntilReady();
-    expect(await screen.findByText(imageAsset.name)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointBSettings.comfy_url);
-    expect(await screen.findByText(/新 ComfyUI 对应的素材库无法权威刷新/)).toBeInTheDocument();
-
-    const navigation = screen.getByRole("button", { name: "系统设置" });
-    expect(navigation).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    expect(screen.queryByText(imageAsset.name)).not.toBeInTheDocument();
-    expect(screen.getByText(/运行设置或素材库正在后台自动核对/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: /同步运行设置/ })).not.toBeInTheDocument();
   });
 
   it("PUT 丢失响应但权威 GET 已确认目标设置时按成功收敛", async () => {
@@ -5663,45 +4543,6 @@ describe("统一长视频时间线应用", () => {
     await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
     await waitFor(() => expect(screen.getByRole("button", { name: /生成任务/ })).toBeEnabled());
   }, 8_000);
-
-  it("endpoint 资源部分失败时只重试资源接口，设置 PUT 保持一次", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments[0].prompt = "新端点资源重试";
-    saveLocalTimeline(project);
-    mockCommonRequests();
-    const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy-resource-b.test:8188" };
-    const listAssets = vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce(appAssetList([]))
-      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointB));
-    vi.mocked(directorApi.getCapabilities)
-      .mockResolvedValueOnce(ONLINE_CAPABILITIES)
-      .mockResolvedValueOnce({ ...ONLINE_CAPABILITIES, connection: "offline" })
-      .mockResolvedValue(ONLINE_CAPABILITIES);
-    vi.mocked(directorApi.getModels)
-      .mockResolvedValueOnce(MODEL_INVENTORY)
-      .mockRejectedValueOnce(new Error("model inventory unavailable"))
-      .mockResolvedValue(MODEL_INVENTORY);
-    const update = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointB);
-
-    render(<App />);
-    await waitUntilReady();
-    await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointB.comfy_url);
-    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(directorApi.getCapabilities).toHaveBeenCalledTimes(3), { timeout: 3_500 });
-    expect(directorApi.getModels).toHaveBeenCalledTimes(3);
-    expect(update).toHaveBeenCalledTimes(1);
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: /生成任务/ })).toBeEnabled());
-  });
 
   it("设置 PUT 422 且权威 GET 失败时停止重试并保留可行动提示", async () => {
     const user = userEvent.setup();
@@ -5864,7 +4705,7 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
 
     const source = FakeEventSource.instances[0];
-    expect(source.url).toBe("/api/tasks/events");
+    expect(source.url).toBe("/directordeck/api/tasks/events");
     const initialTaskReads = vi.mocked(directorApi.listTasks).mock.calls.length;
     vi.mocked(directorApi.listTasks).mockResolvedValueOnce({
       jobs: [queuedTimelineTask],
@@ -5919,7 +4760,6 @@ describe("统一长视频时间线应用", () => {
     };
     let importCreated = false;
     vi.mocked(directorApi.listProjects).mockImplementation(async () => ({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         {
           id: DEFAULT_PROJECT_ID,
@@ -6116,8 +4956,6 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValue({
         assets: [],
         outputs_preserved: true,
-        active_database_identity: ACTIVE_DATABASE_IDENTITY,
-        comfy_origin: CONFIGURED_SETTINGS.comfy_url,
       });
     vi.mocked(directorApi.listAssetTrash).mockResolvedValue(appAssetTrashList([batch]));
     const trash = vi.mocked(directorApi.trashAssets).mockRejectedValue(
@@ -6321,7 +5159,6 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(projectA)
       .mockResolvedValue(authoritativeA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: staleProjectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -6391,7 +5228,6 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(projectA)
       .mockResolvedValue(restoredA);
     vi.mocked(directorApi.listProjects).mockResolvedValue({
-      active_database_identity: ACTIVE_DATABASE_IDENTITY,
       projects: [
         { id: DEFAULT_PROJECT_ID, title: projectA.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
         { id: "project-b", title: staleProjectB.title, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z", segment_count: 1 },
@@ -6492,82 +5328,6 @@ describe("统一长视频时间线应用", () => {
     expect(wal?.pending_project.segments[0].prompt).toBe("新 authority 上的编辑");
   });
 
-  it("素材 mutation 已提交后即使外部 endpoint 改变，仍按项目数据库 scope 完成 timeline resync", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.title = "外部 endpoint 切换前";
-    project.segments = [{
-      ...createTimelineSegment("fl2va", 1),
-      prompt: "等待素材提交",
-      first_image: imageAsset,
-    }];
-    const authoritative = structuredClone(project);
-    authoritative.title = "外部 endpoint 切换后的 timeline 权威";
-    const authoritativeSegment = authoritative.segments[0];
-    if (authoritativeSegment?.mode !== "fl2va") throw new Error("expected fl2va segment");
-    authoritativeSegment.first_image = null;
-    const endpointB = {
-      ...CONFIGURED_SETTINGS,
-      comfy_url: "http://external-during-trash.test:8188",
-    };
-    const authorityA = runtimeAuthority(CONFIGURED_SETTINGS);
-    const authorityB = runtimeAuthority(endpointB);
-    mockCommonRequests();
-    vi.mocked(directorApi.getTimelineAuthority)
-      .mockResolvedValueOnce({ document: project, revision: 4 })
-      .mockResolvedValue({ document: authoritative, revision: 5 });
-    vi.mocked(directorApi.getSettingsAuthority)
-      // Initial runtime head/tail, then connection-test head/tail observes A→B.
-      .mockResolvedValueOnce(authorityA)
-      .mockResolvedValueOnce(authorityA)
-      .mockResolvedValueOnce(authorityA)
-      .mockResolvedValueOnce(authorityB)
-      // External-authority refresh establishes a complete B head/tail.
-      .mockResolvedValue(authorityB);
-    vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce(appAssetList([imageAsset]))
-      .mockResolvedValue(appAssetList([], endpointB.comfy_url));
-    let resolveConnection!: (result: { ok: boolean; message: string }) => void;
-    vi.spyOn(directorApi, "testConnection")
-      .mockImplementation(() => new Promise((resolve) => { resolveConnection = resolve; }));
-    const updateSettings = vi.spyOn(directorApi, "updateSettings")
-      .mockImplementation(async (value) => value);
-    let resolveTrash!: (batch: AssetTrashBatch) => void;
-    const trash = vi.mocked(directorApi.trashAssets)
-      .mockImplementation(() => new Promise((resolve) => { resolveTrash = resolve; }));
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    await waitUntilReady();
-    await screen.findByRole("listitem");
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    await user.click(screen.getByRole("button", { name: "测试连接" }));
-    await waitFor(() => expect(directorApi.testConnection).toHaveBeenCalled());
-    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
-    await user.click(await screen.findByRole("listitem"));
-    await user.click(screen.getByRole("button", { name: "移出素材库" }));
-    await waitFor(() => expect(trash).toHaveBeenCalledWith([imageAsset.id], true));
-
-    await act(async () => resolveConnection({ ok: true, message: "连接成功" }));
-    await waitFor(() => expect(vi.mocked(directorApi.getSettingsAuthority).mock.calls.length)
-      .toBeGreaterThanOrEqual(5));
-    await waitFor(() => expect(vi.mocked(directorApi.listAssets).mock.calls.length)
-      .toBeGreaterThanOrEqual(2));
-    await act(async () => resolveTrash(appAssetTrashBatch(
-      [imageAsset.id],
-      true,
-      { [imageAsset.id]: [`timeline:${project.segments[0].id}:first_image`] },
-    )));
-
-    await waitFor(() => expect(directorApi.getTimelineAuthority).toHaveBeenCalledTimes(2));
-    expect(await screen.findByRole("button", {
-      name: "重命名项目，当前名称：外部 endpoint 切换后的 timeline 权威",
-    })).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole("button", { name: "预检执行计划" }))
-      .toBeEnabled());
-    expect(updateSettings).not.toHaveBeenCalled();
-  });
-
   it("级联成功但权威回读失败时不套用不完整本地降级，并自动恢复权威时间线", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const user = userEvent.setup();
@@ -6583,7 +5343,6 @@ describe("统一长视频时间线应用", () => {
     });
     const journalScope = {
       databasePath: ACTIVE_DATABASE_PATH,
-      databaseIdentity: ACTIVE_DATABASE_IDENTITY,
       projectId: DEFAULT_PROJECT_ID,
       ownerId: getTimelineBranchOwnerId(),
     };
@@ -6699,64 +5458,6 @@ describe("统一长视频时间线应用", () => {
       name: "重命名项目，当前名称：级联后的权威项目",
     })).toBeInTheDocument();
     expect(screen.queryByText("迟到的旧保存响应")).not.toBeInTheDocument();
-  });
-
-  it("素材移出意图从时间线 flush 前阻断 endpoint PUT，级联结束后自动继续", async () => {
-    const user = userEvent.setup();
-    const project = createTimelineProject();
-    project.segments = [{ ...createTimelineSegment("fl2va", 1), prompt: "删除边界", first_image: imageAsset }];
-    mockCommonRequests();
-    const endpointB = { ...CONFIGURED_SETTINGS, comfy_url: "http://comfy-after-delete.test:8188" };
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(endpointB));
-    vi.mocked(directorApi.listAssets)
-      .mockResolvedValueOnce(appAssetList([imageAsset]))
-      .mockResolvedValue(appAssetList([]));
-    const authoritative = {
-      ...project,
-      segments: [{ ...project.segments[0], first_image: null, last_image: null }],
-    };
-    vi.mocked(directorApi.getTimeline)
-      .mockResolvedValueOnce(project)
-      .mockResolvedValue(authoritative);
-    let resolveTimeline!: (value: typeof project) => void;
-    vi.mocked(directorApi.updateTimeline).mockImplementationOnce(
-      () => new Promise((resolve) => { resolveTimeline = resolve; }),
-    );
-    let resolveTrash!: (value: AssetTrashBatch) => void;
-    const trash = vi.mocked(directorApi.trashAssets).mockImplementation(
-      () => new Promise((resolve) => { resolveTrash = resolve; }),
-    );
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(endpointB);
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    render(<App />);
-    await waitUntilReady();
-    fireEvent.change(screen.getByLabelText("片段提示词"), {
-      target: { value: "删除边界，等待同步" },
-    });
-    await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
-    await user.click(await screen.findByRole("listitem"));
-    await user.click(screen.getByRole("button", { name: "移出素材库" }));
-    expect(screen.getByText("正在原子解除素材引用；时间线编辑与生成暂时锁定。")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "系统设置" }));
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, endpointB.comfy_url);
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateSettings).not.toHaveBeenCalled();
-
-    await act(async () => resolveTimeline(project));
-    await waitFor(() => expect(trash).toHaveBeenCalledTimes(1));
-    expect(updateSettings).not.toHaveBeenCalled();
-    await act(async () => resolveTrash(appAssetTrashBatch(
-      [imageAsset.id],
-      true,
-      { [imageAsset.id]: [`timeline:${project.segments[0].id}:first_image`] },
-    )));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1), { timeout: 3_000 });
   });
 
   it("级联等待的在途同步失败时保留 WAL 且不显示保存功能", async () => {

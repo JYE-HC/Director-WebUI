@@ -39,7 +39,6 @@ function renderSidebar(overrides: Partial<WorkspaceAssetSidebarProps> = {}) {
     gridSize: "medium",
     runtimeEnabled: true,
     connection: "online",
-    runtimeConfigured: true,
     settingsActive: false,
     onUploadFiles: vi.fn().mockResolvedValue({ assets: [], failures: [], authority_stale: false }),
     onUploaded: vi.fn(),
@@ -141,9 +140,9 @@ describe("WorkspaceAssetSidebar", () => {
   });
 
   it.each([
-    ["离线", { connection: "offline" as const, runtimeConfigured: true }, "ComfyUI 离线", "status-dot--offline"],
-    ["检测中", { connection: "checking" as const, runtimeConfigured: true }, "正在检测 ComfyUI", "status-dot--checking"],
-    ["未配置", { connection: "unknown" as const, runtimeConfigured: false }, "ComfyUI 尚未配置", "status-dot--unknown"],
+    ["离线", { connection: "offline" as const }, "ComfyUI 离线", "status-dot--offline"],
+    ["检测中", { connection: "checking" as const }, "正在检测 ComfyUI", "status-dot--checking"],
+    ["未知", { connection: "unknown" as const }, "等待 ComfyUI 状态", "status-dot--unknown"],
   ])("在系统设置按钮内保留%s状态", (_name, overrides, label, dotClass) => {
     renderSidebar(overrides);
 

@@ -62,7 +62,7 @@ class NativeTemplateError(ValueError):
 
 
 _UNBOUND_PREDECESSOR_OUTPUT = (
-    "__DIRECTOR_UNBOUND_PREDECESSOR_OUTPUT__.mp4 [output]"
+    "__DIRECTORDECK_UNBOUND_PREDECESSOR_OUTPUT__.mp4 [output]"
 )
 
 
@@ -1424,7 +1424,7 @@ def _decode_and_save(
         "SaveVideo",
         video=_edge(video),
         filename_prefix=(
-            f"video/Director_timeline_{job_id[:8]}_{safe_segment}"
+            f"video/DirectorDeck_timeline_{job_id[:8]}_{safe_segment}"
         ),
         format="auto",
         codec="auto",

@@ -71,7 +71,7 @@ export async function installDirectorApiMock(
   authority: DirectorApiMockAuthority = createDirectorApiMockAuthority(),
 ): Promise<void> {
 
-  await page.route("**/api/**", async (route) => {
+  await page.route("**/directordeck/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
@@ -79,37 +79,32 @@ export async function installDirectorApiMock(
 
     // The glob also sees Vite source modules such as /src/api/client.ts.
     // Intercept only the server namespace and let application modules load.
-    if (path !== "/api" && !path.startsWith("/api/")) {
+    if (path !== "/directordeck/api" && !path.startsWith("/directordeck/api/")) {
       await route.continue();
       return;
     }
 
-    if (path === "/api/tasks/events") {
+    if (path === "/directordeck/api/tasks/events") {
       // HTTP 204 tells EventSource not to reconnect. Task events are unrelated
       // to document history and a closed stream keeps the test deterministic.
       await route.fulfill({ status: 204 });
       return;
     }
-    if (path === "/api/storage" && method === "GET") {
+    if (path === "/directordeck/api/storage" && method === "GET") {
       await json(route, {
-        active_database_path: "/srv/director/e2e.sqlite3",
-        active_database_identity: DATABASE_IDENTITY,
-        configured_database_path: "/srv/director/e2e.sqlite3",
-        recommended_database_path: "/srv/director/.data/database/director.sqlite3",
-        source: "explicit",
-        restart_required: false,
+        active_database_path: "/srv/directordeck/e2e.sqlite3",
       });
       return;
     }
-    if (path === "/api/settings/authority" && method === "GET") {
+    if (path === "/directordeck/api/settings/authority" && method === "GET") {
       await json(route, { settings, authority_token: RUNTIME_AUTHORITY });
       return;
     }
-    if (path === "/api/settings" && method === "GET") {
+    if (path === "/directordeck/api/settings" && method === "GET") {
       await json(route, settings);
       return;
     }
-    if (path === "/api/capabilities" && method === "GET") {
+    if (path === "/directordeck/api/capabilities" && method === "GET") {
       await json(route, {
         connection: "online",
         supported_modes: ["t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v"],
@@ -123,11 +118,11 @@ export async function installDirectorApiMock(
       });
       return;
     }
-    if (path === "/api/gpus" && method === "GET") {
+    if (path === "/directordeck/api/gpus" && method === "GET") {
       await json(route, { gpus: [] });
       return;
     }
-    if (path === "/api/models" && method === "GET") {
+    if (path === "/directordeck/api/models" && method === "GET") {
       await json(route, {
         fl2va: [settings.models.fl2va.filename],
         ref2va: [settings.models.ref2va.filename],
@@ -138,11 +133,11 @@ export async function installDirectorApiMock(
       });
       return;
     }
-    if (path === "/api/raylight/runtime" && method === "GET") {
+    if (path === "/directordeck/api/raylight/runtime" && method === "GET") {
       await json(route, EMPTY_RAYLIGHT_RUNTIME_STATUS);
       return;
     }
-    if (path === "/api/projects" && method === "GET") {
+    if (path === "/directordeck/api/projects" && method === "GET") {
       await json(route, {
         active_database_identity: DATABASE_IDENTITY,
         projects: [{
@@ -155,15 +150,15 @@ export async function installDirectorApiMock(
       });
       return;
     }
-    if (path === "/api/timeline" && method === "GET") {
+    if (path === "/directordeck/api/timeline" && method === "GET") {
       await json(route, authority.project);
       return;
     }
-    if (path === "/api/timeline/authority" && method === "GET") {
+    if (path === "/directordeck/api/timeline/authority" && method === "GET") {
       await json(route, { document: authority.project, revision: authority.revision });
       return;
     }
-    if (path === "/api/timeline/authority" && method === "PUT") {
+    if (path === "/directordeck/api/timeline/authority" && method === "PUT") {
       authority.timelineAuthorityPutAttempts += 1;
       if (authority.rejectTimelineAuthorityPuts) {
         await route.abort("failed");
@@ -190,14 +185,14 @@ export async function installDirectorApiMock(
       await json(route, { document: authority.project, revision: authority.revision });
       return;
     }
-    if (path === "/api/timeline" && method === "PUT") {
+    if (path === "/directordeck/api/timeline" && method === "PUT") {
       const body = request.postDataJSON() as TimelineProject;
       authority.project = structuredClone(body);
       authority.revision += 1;
       await json(route, authority.project);
       return;
     }
-    if (path === "/api/assets" && method === "GET") {
+    if (path === "/directordeck/api/assets" && method === "GET") {
       await json(route, {
         assets: [],
         outputs_preserved: true,
@@ -206,7 +201,7 @@ export async function installDirectorApiMock(
       });
       return;
     }
-    if (path === "/api/jobs" && method === "GET") {
+    if (path === "/directordeck/api/jobs" && method === "GET") {
       const offset = Number(url.searchParams.get("offset") ?? 0);
       await json(route, {
         jobs: [],
