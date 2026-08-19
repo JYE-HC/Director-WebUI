@@ -589,6 +589,7 @@ describe("共享设置表单", () => {
     const user = userEvent.setup();
     const saveSettings = vi.fn(async (value: RuntimeSettings) => value);
     const settings = structuredClone(CONFIGURED_SETTINGS);
+    settings.multi_gpu_enabled = true;
     settings.raylight_residency_policy = "release_after_sampling";
     settings.models.fl2va.backend = "auto";
     settings.models.fl2va.raylight = {
@@ -647,6 +648,7 @@ describe("共享设置表单", () => {
   it("Ref2VA GPU 池从单卡改为多卡时自动切入 RayLight", async () => {
     const user = userEvent.setup();
     const settings = structuredClone(CONFIGURED_SETTINGS);
+    settings.multi_gpu_enabled = true;
     settings.models.ref2va.backend = "auto";
     render(
       <SettingsPage
@@ -672,6 +674,7 @@ describe("共享设置表单", () => {
   it("Auto 后端的 GPU 池扩为多卡并解析到 RayLight 时自动常驻", async () => {
     const user = userEvent.setup();
     const settings = structuredClone(CONFIGURED_SETTINGS);
+    settings.multi_gpu_enabled = true;
     settings.raylight_residency_policy = "release_after_sampling";
     render(
       <SettingsPage
@@ -883,6 +886,108 @@ describe("共享设置表单", () => {
     expect(saved.at(-1)?.multi_gpu_enabled).toBe(true);
   });
 
+  it("未启用多卡时 GPU 池勾选整体禁用并提示", () => {
+    render(
+      <SettingsPage
+        settings={CONFIGURED_SETTINGS}
+        resourcesReady
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[
+          { index: 0, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
+          { index: 1, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
+        ]}
+        models={MODEL_INVENTORY}
+        loadingModels={false}
+        onSaved={confirmConfiguredSettings}
+      />,
+    );
+
+    expect(screen.getByLabelText("FL2VA 扩散模型 RayLight 逻辑 GPU 1")).toBeDisabled();
+    expect(screen.getByLabelText("REF2VA 扩散模型 RayLight 逻辑 GPU 1")).toBeDisabled();
+    expect(screen.getAllByText("启用多卡推理后可配置多卡 GPU 池。")).toHaveLength(2);
+  });
+
+  it("池为多卡时关闭多卡开关会把两族收敛为单卡并重置拓扑", async () => {
+    const user = userEvent.setup();
+    const saved: RuntimeSettings[] = [];
+    const enabled = structuredClone(CONFIGURED_SETTINGS);
+    enabled.multi_gpu_enabled = true;
+    for (const family of ["fl2va", "ref2va"] as const) {
+      enabled.models[family].raylight = {
+        ...enabled.models[family].raylight,
+        gpu_select: [0, 1],
+        ulysses_degree: 2,
+        ring_degree: 1,
+      };
+    }
+    vi.spyOn(directorApi, "getRayLightSetup").mockResolvedValue({
+      enabled: true,
+      platform_supported: true,
+      dependencies_installed: true,
+      requirements_available: true,
+      install: { state: "idle", log_tail: [], returncode: null, error: null, started_at: null },
+    });
+    render(
+      <SettingsPage
+        settings={enabled}
+        resourcesReady
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[
+          { index: 0, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
+          { index: 1, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
+        ]}
+        models={MODEL_INVENTORY}
+        loadingModels={false}
+        onSaved={async (next) => { saved.push(next); return next; }}
+      />,
+    );
+
+    await user.click(await screen.findByLabelText("启用多卡推理"));
+
+    await waitFor(() => expect(saved.length).toBeGreaterThan(0));
+    const last = saved.at(-1)!;
+    expect(last.multi_gpu_enabled).toBe(false);
+    for (const family of ["fl2va", "ref2va"] as const) {
+      expect(last.models[family].raylight.gpu_select).toEqual([0]);
+      expect(last.models[family].raylight.ulysses_degree).toBe(1);
+      expect(last.models[family].raylight.ring_degree).toBe(1);
+    }
+  });
+
+  it("启用多卡后 GPU 池可正常多选", async () => {
+    const user = userEvent.setup();
+    const saved: RuntimeSettings[] = [];
+    const enabled = structuredClone(CONFIGURED_SETTINGS);
+    enabled.multi_gpu_enabled = true;
+    vi.spyOn(directorApi, "getRayLightSetup").mockResolvedValue({
+      enabled: true,
+      platform_supported: true,
+      dependencies_installed: true,
+      requirements_available: true,
+      install: { state: "idle", log_tail: [], returncode: null, error: null, started_at: null },
+    });
+    render(
+      <SettingsPage
+        settings={enabled}
+        resourcesReady
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[
+          { index: 0, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
+          { index: 1, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
+        ]}
+        models={MODEL_INVENTORY}
+        loadingModels={false}
+        onSaved={async (next) => { saved.push(next); return next; }}
+      />,
+    );
+
+    const checkbox = await screen.findByLabelText("FL2VA 扩散模型 RayLight 逻辑 GPU 1");
+    expect(checkbox).toBeEnabled();
+    await user.click(checkbox);
+    await waitFor(() => expect(saved.length).toBeGreaterThan(0));
+    expect(saved.at(-1)?.models.fl2va.raylight.gpu_select).toEqual([0, 1]);
+  });
+
   it("开启多卡后可从设置页发起组件安装", async () => {
     const user = userEvent.setup();
     const enabled = structuredClone(CONFIGURED_SETTINGS);
@@ -920,6 +1025,7 @@ describe("共享设置表单", () => {
   it("多卡 GPU 池自动使用 RayLight 并清除隐藏旧设置", async () => {
     const user = userEvent.setup();
     const configured = structuredClone(CONFIGURED_SETTINGS);
+    configured.multi_gpu_enabled = true;
     configured.models.fl2va.device = "gpu:1";
     configured.models.fl2va.lora_name = "style.safetensors";
     configured.models.fl2va.lora_loader = "dedicated";
@@ -957,6 +1063,7 @@ describe("共享设置表单", () => {
   it("增加第二张逻辑 GPU 后自动切入 RayLight 并原子更新 Ulysses 拓扑", async () => {
     const user = userEvent.setup();
     const confirmed = structuredClone(CONFIGURED_SETTINGS);
+    confirmed.multi_gpu_enabled = true;
     confirmed.models.fl2va.backend = "auto";
     confirmed.models.fl2va.raylight = {
       ...confirmed.models.fl2va.raylight,
@@ -965,9 +1072,11 @@ describe("共享设置表单", () => {
       ring_degree: 1,
     };
     const saveSettings = vi.fn(async () => confirmed);
+    const initial = structuredClone(CONFIGURED_SETTINGS);
+    initial.multi_gpu_enabled = true;
     render(
       <SettingsPage
-        settings={CONFIGURED_SETTINGS}
+        settings={initial}
         resourcesReady
         capabilities={{
           ...ONLINE_CAPABILITIES,

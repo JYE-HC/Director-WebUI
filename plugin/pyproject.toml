@@ -1,7 +1,7 @@
 [project]
 name = "director-deck"
-description = "Director long-video studio embedded in ComfyUI"
-version = "0.2.0"
+description = "长视频导演台，面向 MiniMax H3。一键启动 WebUI 在 timeline 上创作！"
+version = "0.2.1"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.116.*",
@@ -19,4 +19,5 @@ Repository = "https://github.com/JYE-HC/DirectorDeck"
 [tool.comfy]
 PublisherId = "jye-hc"
 DisplayName = "DirectorDeck"
-Icon = ""
+Icon = "https://raw.githubusercontent.com/JYE-HC/DirectorDeck/main/icon.png"
+Banner = "https://raw.githubusercontent.com/JYE-HC/DirectorDeck/main/banner.png"

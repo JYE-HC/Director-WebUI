@@ -555,6 +555,41 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
         : {}),
     });
   };
+  const setMultiGpuEnabled = (enabled: boolean) => {
+    if (enabled) {
+      change({ ...working, multi_gpu_enabled: true });
+      return;
+    }
+    // A disabled multi-GPU switch must never leave a multi-card RayLight pool
+    // behind: the backend fails closed when it compiles raylight units with
+    // multi_gpu_enabled=false. Converge both diffusion families to their first
+    // selected card atomically, with the single-card topology preset.
+    change({
+      ...working,
+      multi_gpu_enabled: false,
+      models: {
+        ...working.models,
+        fl2va: {
+          ...working.models.fl2va,
+          raylight: {
+            ...working.models.fl2va.raylight,
+            gpu_select: [working.models.fl2va.raylight.gpu_select[0] ?? 0],
+            ulysses_degree: 1,
+            ring_degree: 1,
+          },
+        },
+        ref2va: {
+          ...working.models.ref2va,
+          raylight: {
+            ...working.models.ref2va.raylight,
+            gpu_select: [working.models.ref2va.raylight.gpu_select[0] ?? 0],
+            ulysses_degree: 1,
+            ring_degree: 1,
+          },
+        },
+      },
+    });
+  };
   const toggleRayLightGpu = (
     role: "fl2va" | "ref2va",
     index: number,
@@ -709,7 +744,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                 aria-label="启用多卡推理"
                 disabled={effectiveRuntimeEditingDisabled || rayLightSetup?.platform_supported === false}
                 checked={working.multi_gpu_enabled}
-                onChange={(event) => change({ ...working, multi_gpu_enabled: event.target.checked })}
+                onChange={(event) => setMultiGpuEnabled(event.target.checked)}
               />
               <span><strong>启用多卡推理（RayLight）</strong><small>GPU 池配置 2 张及以上逻辑卡时自动使用 RayLight 执行</small></span>
             </label>
@@ -784,12 +819,13 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                     <p>{resolvedBackend === "standard" ? `GPU 池只有 1 张卡，自动使用标准原生子图；gpu:N 是 ComfyUI 进程内逻辑编号。` : `GPU 池有 ${diffusion.raylight.gpu_select.length} 张卡，自动使用 RayLight；逻辑 GPU ${diffusion.raylight.gpu_select.join(", ")}，U${diffusion.raylight.ulysses_degree} × R${diffusion.raylight.ring_degree} × 条件1 × 数据1。`}</p>
                     {backendCapability?.available !== true && <p className="inline-error">当前 ComfyUI 的 {resolvedBackend === "raylight" ? "RayLight" : "标准"}后端不可用：{backendCapability?.missing_nodes.join("、") || "尚未报告执行能力"}</p>}
                     <div className="raylight-topology">
-                      <fieldset disabled={!runtimeResourcesReady}>
+                      <fieldset disabled={!runtimeResourcesReady || !working.multi_gpu_enabled}>
                         <legend>RayLight 逻辑 GPU 池</legend>
                         <div className="raylight-gpu-pool">
                           {rayGpuIndexes.map((index) => <label key={index} className={diffusion.raylight.gpu_select.includes(index) ? "is-selected" : ""}><input type="checkbox" aria-label={`${meta.label} RayLight 逻辑 GPU ${index}`} checked={diffusion.raylight.gpu_select.includes(index)} onChange={(event) => toggleRayLightGpu(diffusionRole, index, event.target.checked)} /><span>GPU {index}</span><small>逻辑编号</small></label>)}
                         </div>
                       </fieldset>
+                      {!working.multi_gpu_enabled && <small>启用多卡推理后可配置多卡 GPU 池。</small>}
                       <Field label="Ulysses degree"><select aria-label={`${meta.label} RayLight Ulysses degree`} disabled={!runtimeResourcesReady || resolvedBackend !== "raylight"} value={diffusion.raylight.ulysses_degree} onChange={(event) => setRayLightAxis(diffusionRole, "ulysses_degree", Number(event.target.value))}>{degreeOptions.map((degree) => <option key={degree} value={degree}>{degree}</option>)}</select></Field>
                       <Field label="Ring degree"><select aria-label={`${meta.label} RayLight Ring degree`} disabled={!runtimeResourcesReady || resolvedBackend !== "raylight"} value={diffusion.raylight.ring_degree} onChange={(event) => setRayLightAxis(diffusionRole, "ring_degree", Number(event.target.value))}>{degreeOptions.map((degree) => <option key={degree} value={degree}>{degree}</option>)}</select></Field>
                       <div className="fixed-runtime-value fixed-runtime-value--topology"><span>条件 / 数据并行</span><strong>1 × 1</strong><small>当前拓扑固定</small></div>
