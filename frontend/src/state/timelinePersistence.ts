@@ -2,6 +2,7 @@ import {
   normalizeTimelineProject,
   type TimelineProject,
 } from "../domain/timelineProject";
+import { isStoragePath } from "../domain/storagePath";
 import {
   deserializeTimelineHistory,
   serializeTimelineHistory,
@@ -178,10 +179,7 @@ export function legacyTimelineHistoryJournalKey(
 }
 
 function validProjectScope(scope: TimelinePersistenceProjectScope): boolean {
-  return typeof scope.databasePath === "string" &&
-    scope.databasePath.startsWith("/") &&
-    scope.databasePath.length <= 4096 &&
-    !/[\u0000-\u001f\u007f]/.test(scope.databasePath) &&
+  return isStoragePath(scope.databasePath) &&
     /^[A-Za-z0-9._:-]{1,128}$/.test(scope.projectId);
 }
 

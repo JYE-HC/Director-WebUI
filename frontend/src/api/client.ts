@@ -12,6 +12,7 @@ import {
 } from "../domain/timelineProject";
 import { normalizeAssetReference } from "../domain/assets";
 import { alignH3FrameCount } from "../domain/timing";
+import { isStoragePath } from "../domain/storagePath";
 import type {
   CapabilityReport,
   AssetCascadeDeleteResponse,
@@ -1018,17 +1019,6 @@ function parseProjectDelete(value: unknown, expectedId: string): ProjectDeleteRe
     outputs_preserved: true,
     orphaned_jobs: value.orphaned_jobs as number,
   };
-}
-
-function isStoragePath(value: unknown, allowHomeRelative = false): value is string {
-  return typeof value === "string" &&
-    value.length > 1 &&
-    value.length <= 4096 &&
-    !/[\u0000-\u001f\u007f]/.test(value) &&
-    (value.startsWith("/") ||
-      /^[A-Za-z]:[\\/]/.test(value) ||
-      value.startsWith("\\\\") ||
-      (allowHomeRelative && value.startsWith("~/")));
 }
 
 function parseStorageConfiguration(value: unknown): StorageConfiguration {

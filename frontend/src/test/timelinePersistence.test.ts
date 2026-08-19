@@ -115,6 +115,29 @@ describe("timeline IndexedDB persistence", () => {
     )).resolves.toEqual({ status: "none" });
   });
 
+  it("Windows 盘符数据库路径的历史 journal 正常读写", async () => {
+    const { base, edited, history } = fixture();
+    const windowsScope: TimelinePersistenceScope = {
+      ...scope,
+      databasePath: "D:\\ComfyUI\\user\\directordeck\\database\\directordeck.sqlite3",
+    };
+    const token = await saveTimelineHistoryJournal(
+      windowsScope,
+      { document: base, revision: 7 },
+      history,
+    );
+    expect(token).toMatchObject({ key: timelineHistoryJournalKey(windowsScope) });
+
+    await expect(loadTimelineHistoryJournal(windowsScope, {
+      document: base,
+      revision: 7,
+    })).resolves.toMatchObject({
+      status: "restored",
+      project: edited,
+      confirmedRevision: 7,
+    });
+  });
+
   it("把服务器已经等于 pending head 识别为丢失 ACK", async () => {
     const { base, edited, history } = fixture();
     await saveTimelineHistoryJournal(

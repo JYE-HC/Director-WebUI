@@ -3,6 +3,7 @@ import {
   DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS,
   type TimelineSegmentCopyOptions,
 } from "./timelineProject";
+import { isStoragePath } from "./storagePath";
 
 export const TIMELINE_WORKSPACE_PREFERENCES_KEY =
   "directordeck:v1:timeline-workspace-preferences";
@@ -182,7 +183,7 @@ export function saveTimelineSegmentCopyOptions(
 }
 
 function validDatabase(database: TimelinePreferenceDatabase): boolean {
-  return database.active_database_path.startsWith("/");
+  return isStoragePath(database.active_database_path);
 }
 
 function segmentSelectionKey(
