@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type CSSProperties } from "react";
-import { ApiError, DATABASE_IDENTITY_STALE_EVENT, directorApi, taskEventsUrl } from "./api/client";
+import { ApiError, DATABASE_IDENTITY_STALE_EVENT, detectEmbeddedComfyUi, directorApi, taskEventsUrl } from "./api/client";
 import {
   EMPTY_CAPABILITIES,
   EMPTY_MODELS,
@@ -919,6 +919,9 @@ export default function App() {
   const [projectTitleEditing, setProjectTitleEditing] = useState(false);
   const [projectTitleDraft, setProjectTitleDraft] = useState("");
   const [theme, setTheme] = useState(readUiTheme);
+  // Until the one-shot probe settles the SPA assumes standalone mode, so the
+  // ComfyUI address field stays editable; a positive probe locks it.
+  const [embeddedComfyUi, setEmbeddedComfyUi] = useState(false);
   const [deletingTaskIds, setDeletingTaskIds] = useState<ReadonlySet<string>>(() => new Set());
   const [clearingTasks, setClearingTasks] = useState(false);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -1312,6 +1315,16 @@ export default function App() {
   }, [acceptStorageConfiguration, setStorageOperationLock]);
 
   useEffect(() => () => storageAuthorityControllerRef.current?.abort(), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void detectEmbeddedComfyUi().then((embedded) => {
+      if (!cancelled && embedded) setEmbeddedComfyUi(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const dispatchTimeline = useCallback((
     action: TimelineAction,
@@ -6152,6 +6165,7 @@ export default function App() {
             settings={runtimeSettingsDraft}
             confirmedSettings={state.settings}
             resourcesOrigin={runtimeResourcesOrigin}
+            embeddedComfyUi={embeddedComfyUi}
             capabilities={capabilities}
             gpus={gpus}
             models={models}

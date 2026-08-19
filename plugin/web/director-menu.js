@@ -1,10 +1,10 @@
-// ComfyUI-Director sidebar entry: open the Director workspace in a new tab,
+// DirectorDeck sidebar entry: open the Director workspace in a new tab,
 // show embedded-backend status, and link to documentation. The workspace
 // itself is a full-page SPA served at /director/.
 import { app } from "../../../scripts/app.js";
 
 app.registerExtension({
-  name: "ComfyUI.Director",
+  name: "DirectorDeck",
   setup() {
     app.extensionManager.registerSidebarTab({
       id: "director",

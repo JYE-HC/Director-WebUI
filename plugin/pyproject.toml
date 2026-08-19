@@ -1,7 +1,7 @@
 [project]
-name = "comfyui-director"
+name = "director-deck"
 description = "Director long-video studio embedded in ComfyUI"
-version = "0.1.0"
+version = "0.1.1"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.116.*",
@@ -14,9 +14,9 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/JYE-HC/ComfyUI-Director"
+Repository = "https://github.com/JYE-HC/DirectorDeck"
 
 [tool.comfy]
 PublisherId = "jye-hc"
-DisplayName = "Director"
+DisplayName = "DirectorDeck"
 Icon = ""

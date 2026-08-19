@@ -58,6 +58,84 @@ def test_fresh_database_ignores_env_and_restart_preserves_saved_url(
     )
 
 
+PINNED_LOOPBACK_URL = "http://127.0.0.1:28181"
+
+
+def test_pinned_comfy_url_overrides_reads_and_normalizes_writes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "director.sqlite3"
+    unpinned = Database(path)
+    unpinned.initialize()
+    unpinned.put_settings(default_settings("http://stale-loopback.test:8188"))
+
+    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
+    # A stale value stored before the plugin pinned the address is overridden
+    # on every public read path.
+    assert database.get_settings().comfy_url == PINNED_LOOPBACK_URL
+    settings, _authority = database.get_settings_authority()
+    assert settings.comfy_url == PINNED_LOOPBACK_URL
+
+    # Writes normalize to the pinned value before persisting, and the
+    # normalized document is what the write path returns.
+    returned = database.put_settings(default_settings("http://user-typed.test:9000"))
+    assert returned.comfy_url == PINNED_LOOPBACK_URL
+    assert database.get_settings().comfy_url == PINNED_LOOPBACK_URL
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT document FROM settings WHERE singleton = 1"
+        ).fetchone()
+    assert json.loads(row["document"])["comfy_url"] == PINNED_LOOPBACK_URL
+
+
+async def test_pinned_comfy_url_put_response_matches_authoritative_get(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        database_path=tmp_path / "director.sqlite3",
+        pinned_comfy_url=PINNED_LOOPBACK_URL,
+    )
+    app.state.database.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
+        base_url="http://testserver",
+    ) as client:
+        put = await client.put(
+            "/api/settings",
+            json=default_settings("http://elsewhere.test:9000").model_dump(mode="json"),
+        )
+        assert put.status_code == 200, put.text
+        get = await client.get("/api/settings")
+        assert get.status_code == 200
+
+    assert put.json()["comfy_url"] == PINNED_LOOPBACK_URL
+    # The browser compares its PUT draft with the authoritative GET
+    # byte-for-byte; the normalized PUT response must match it exactly or the
+    # latest-wins queue retries forever.
+    assert put.content == get.content
+
+
+async def test_standalone_put_comfy_url_persists_the_user_value(
+    tmp_path: Path,
+) -> None:
+    app = create_app(database_path=tmp_path / "director.sqlite3")
+    app.state.database.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
+        base_url="http://testserver",
+    ) as client:
+        put = await client.put(
+            "/api/settings",
+            json=default_settings("http://user-comfy.test:9000").model_dump(mode="json"),
+        )
+        assert put.status_code == 200, put.text
+        get = await client.get("/api/settings")
+        assert get.status_code == 200
+
+    assert put.json()["comfy_url"] == "http://user-comfy.test:9000"
+    assert get.json()["comfy_url"] == "http://user-comfy.test:9000"
+
+
 async def test_unconfigured_runtime_does_not_construct_a_client_or_leave_an_orphan_job(
     tmp_path: Path,
 ) -> None:

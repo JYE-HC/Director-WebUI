@@ -179,7 +179,7 @@ export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[]
   return errors;
 }
 
-export function SettingsPage({ settings, confirmedSettings = settings, resourcesOrigin = confirmedSettings.comfy_url, capabilities, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, storageOperationsDisabled = false, overlay = false, theme = "dark", onThemeChange = () => undefined, onDraftChange = () => undefined, onSaved, onBeforeStorageChange = async () => undefined, onStorageOperationStarted = () => undefined, onStorageOperationAborted = () => undefined, onStorageOperationUncertain = async () => { throw new Error("无法核对数据库存储状态"); }, onStorageConfigurationChanged = () => undefined, onStorageSwitchCancelled = async () => undefined, onConnectionTestSucceeded = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
+export function SettingsPage({ settings, confirmedSettings = settings, resourcesOrigin = confirmedSettings.comfy_url, capabilities, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, storageOperationsDisabled = false, overlay = false, theme = "dark", embeddedComfyUi = false, onThemeChange = () => undefined, onDraftChange = () => undefined, onSaved, onBeforeStorageChange = async () => undefined, onStorageOperationStarted = () => undefined, onStorageOperationAborted = () => undefined, onStorageOperationUncertain = async () => { throw new Error("无法核对数据库存储状态"); }, onStorageConfigurationChanged = () => undefined, onStorageSwitchCancelled = async () => undefined, onConnectionTestSucceeded = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
   settings: RuntimeSettings; confirmedSettings?: RuntimeSettings; capabilities: CapabilityReport; gpus: GPUResource[];
   resourcesOrigin?: string | null;
   models: ModelInventory;
@@ -194,6 +194,8 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   storageOperationsDisabled?: boolean;
   overlay?: boolean;
   theme?: UiTheme;
+  /** Plugin-embedded mode pins comfy_url server-side; the field is read-only. */
+  embeddedComfyUi?: boolean;
   onThemeChange?: (theme: UiTheme) => void;
   onDraftChange?: (settings: RuntimeSettings) => void;
   onRequestClose?: (restoreFocus?: boolean) => void;
@@ -932,9 +934,10 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
               <div className="field">
                 <label className="field__label" htmlFor="comfy-url">ComfyUI 地址</label>
                 <div className="sensitive-value">
-                  <input id="comfy-url" type={comfyUrlVisible ? "url" : "password"} required disabled={effectiveRuntimeEditingDisabled} autoComplete="off" value={working.comfy_url} placeholder="http://comfyui-host:8188" onChange={(event) => change({ ...working, comfy_url: event.target.value })} />
+                  <input id="comfy-url" type={comfyUrlVisible ? "url" : "password"} required disabled={effectiveRuntimeEditingDisabled} readOnly={embeddedComfyUi} aria-describedby={embeddedComfyUi ? "comfy-url-pinned-hint" : undefined} autoComplete="off" value={working.comfy_url} placeholder="http://comfyui-host:8188" onChange={(event) => change({ ...working, comfy_url: event.target.value })} />
                   <VisibilityToggle label="ComfyUI 地址显示状态" visible={comfyUrlVisible} onToggle={() => setComfyUrlVisible((current) => !current)} />
                 </div>
+                {embeddedComfyUi && <small id="comfy-url-pinned-hint">插件模式：自动指向当前 ComfyUI 实例，无需设置。</small>}
               </div>
               <Field label="客户端 ID"><input required disabled={effectiveRuntimeEditingDisabled} maxLength={128} pattern="[A-Za-z0-9._:-]+" value={working.client_id} onChange={(event) => change({ ...working, client_id: event.target.value })} /></Field>
             </div>
