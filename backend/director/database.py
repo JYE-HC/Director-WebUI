@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -37,6 +38,20 @@ from .schemas import (
     utc_now,
     validate_mode_draft,
     validate_timeline_draft,
+)
+
+logger = logging.getLogger(__name__)
+
+# Loopback origin shapes an embedded plugin database may hold from earlier
+# listen addresses of its own host ComfyUI instance.  Anything else is a
+# genuinely remote endpoint from the standalone era and must stay put.
+_LOOPBACK_ORIGIN_PREFIXES = (
+    "http://127.0.0.1",
+    "https://127.0.0.1",
+    "http://localhost",
+    "https://localhost",
+    "http://[::1]",
+    "https://[::1]",
 )
 
 
@@ -1074,6 +1089,10 @@ class Database:
         """
         if self.pinned_comfy_url is None:
             return
+        # Origin rows move first: a crash between the migration and the
+        # settings write is safe because the stale-settings branch below then
+        # still fires on the next start and the migration is idempotent.
+        self._migrate_loopback_comfy_origins()
         with self.connect() as db:
             row = db.execute(
                 "SELECT document FROM settings WHERE singleton = 1"
@@ -1084,6 +1103,69 @@ class Database:
         if stored == self.pinned_comfy_url:
             return
         self.put_settings(self.get_settings())
+
+    def _migrate_loopback_comfy_origins(self) -> None:
+        """Re-home loopback ``comfy_origin`` rows to the pinned host origin.
+
+        An embedded database belongs to exactly one ComfyUI installation (it
+        lives in that instance's user directory and the referenced files live
+        in its input directory), so every loopback-shaped origin is merely an
+        older listen address of this same host — port or IP changes must not
+        orphan scoped rows.  Runs on every pinned ``initialize()`` rather than
+        only when the stored settings converge: a database can hold legacy
+        origin rows while its settings row already matches the pinned value.
+        Non-loopback origins may name real remote endpoints from the
+        standalone era and are never touched.
+        """
+        if self.pinned_comfy_url is None:
+            return
+        target = self.canonical_comfy_origin(self.pinned_comfy_url)
+        if not target:
+            return
+        migrated: dict[str, int] = {}
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # Discover scoped tables by column name instead of keeping a list:
+            # any future table carrying ``comfy_origin`` is covered for free.
+            tables = []
+            for table_row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall():
+                table = str(table_row["name"])
+                columns = db.execute(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+                if any(str(column["name"]) == "comfy_origin" for column in columns):
+                    tables.append(table)
+            for table in tables:
+                values = [
+                    str(row["comfy_origin"])
+                    for row in db.execute(
+                        f'SELECT DISTINCT comfy_origin FROM "{table}" '
+                        "WHERE comfy_origin IS NOT NULL"
+                    ).fetchall()
+                ]
+                for value in values:
+                    if value == target or not value.startswith(
+                        _LOOPBACK_ORIGIN_PREFIXES
+                    ):
+                        continue
+                    # OR IGNORE keeps a same-instance A->B->A port flap from
+                    # aborting startup: raylight_runtime_state keys on the
+                    # origin, and the fresher target row wins the conflict.
+                    cursor = db.execute(
+                        f'UPDATE OR IGNORE "{table}" SET comfy_origin = ? '
+                        "WHERE comfy_origin = ?",
+                        (target, value),
+                    )
+                    if cursor.rowcount:
+                        migrated[table] = migrated.get(table, 0) + cursor.rowcount
+        if migrated:
+            logger.info(
+                "migrated loopback comfy_origin rows to %s: %s",
+                target,
+                ", ".join(f"{table}={count}" for table, count in sorted(migrated.items())),
+            )
 
     def get_settings_authority(self) -> tuple[RuntimeSettings, str]:
         with self.connect() as db:
