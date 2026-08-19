@@ -20,9 +20,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   backend:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: ["ubuntu-latest", "windows-latest"]
         python: ["3.12"]
     steps:
       - uses: actions/checkout@v7
@@ -34,8 +35,12 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - run: uv sync --frozen --all-groups
       - run: uv run pytest backend/tests -q
-      - run: python tools/check_release.py
-      - run: bash -n install.sh director.sh
+      # Release privacy scan and Linux installer syntax check validate
+      # platform-independent release artifacts; run them once on Linux.
+      - if: matrix.os == 'ubuntu-latest'
+        run: python tools/check_release.py
+      - if: matrix.os == 'ubuntu-latest'
+        run: bash -n install.sh director.sh
 
   frontend:
     runs-on: ubuntu-latest
