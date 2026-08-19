@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -193,7 +194,9 @@ def test_raylight_recovery_publishes_only_one_valid_final_backup(
 
     assert _recovery_artifacts(database) == [backup_path]
     assert backup_path.name.endswith(".sqlite3")
-    assert backup_path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        # Windows st_mode does not carry Unix permission bits.
+        assert backup_path.stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(backup_path) as backup_connection:
         assert backup_connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     assert Database(backup_path).get_raylight_runtime_state(origin) == before

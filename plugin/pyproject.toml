@@ -1,0 +1,19 @@
+[project]
+name = "comfyui-director"
+description = "Director long-video studio embedded in ComfyUI"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.116.*",
+    "uvicorn[standard]",
+    "httpx",
+    "pydantic>=2",
+    "python-multipart",
+    "websockets>=16,<19",
+    "anyio<4.10",
+]
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "Director"
+Icon = ""

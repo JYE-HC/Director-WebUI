@@ -9,10 +9,13 @@ import {
   type DeviceTarget,
   type DiffusionModelBinding,
   type GPUResource,
+  type MediaToolsStatus,
   type ModelInventory,
   type ModelRole,
   type RayLightProfile,
+  type RayLightInstallSnapshot,
   type RayLightRuntimeStatus,
+  type RayLightSetupStatus,
   type RuntimeSettings,
   type StandardLoraLoader,
   type StorageConfiguration,
@@ -220,6 +223,10 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     result: ConnectionTestResult | null;
   } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [rayLightSetup, setRayLightSetup] = useState<RayLightSetupStatus | null>(null);
+  const [rayLightInstallBusy, setRayLightInstallBusy] = useState(false);
+  const [mediaSetup, setMediaSetup] = useState<MediaToolsStatus | null>(null);
+  const [ffmpegInstallBusy, setFfmpegInstallBusy] = useState(false);
   const [residencyNotice, setResidencyNotice] = useState<string | null>(null);
   const [storageConfiguration, setStorageConfiguration] = useState<StorageConfiguration | null>(null);
   const [storageTarget, setStorageTarget] = useState("");
@@ -440,6 +447,104 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
       if (editRevision.current !== revision || !mountedRef.current) return;
       setMessage(reason instanceof Error ? reason.message : "系统设置自动同步失败");
     });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void directorApi.getRayLightSetup().then((status) => {
+      if (!cancelled) setRayLightSetup(status);
+    }).catch(() => {
+      if (!cancelled) setRayLightSetup(null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (rayLightSetup?.install.state !== "running") return;
+    const timer = window.setTimeout(() => {
+      void directorApi.getRayLightSetup().then((status) => {
+        if (mountedRef.current) setRayLightSetup(status);
+      }).catch(() => undefined);
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [rayLightSetup]);
+
+  const startRayLightInstall = async () => {
+    const confirmed = window.confirm(
+      "将安装多卡组件：ray、xfuser 等 Python 包。\n" +
+      "执行方式：在 ComfyUI 的 Python 环境中运行 pip install -r requirements-raylight.txt（torch 版本固定不变）。\n" +
+      "安装完成后需要重启 ComfyUI 才能生效。继续？",
+    );
+    if (!confirmed) return;
+    setRayLightInstallBusy(true);
+    try {
+      await directorApi.installRayLight();
+      setRayLightSetup(await directorApi.getRayLightSetup());
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : "多卡组件安装启动失败");
+    } finally {
+      setRayLightInstallBusy(false);
+    }
+  };
+
+  const cancelRayLightInstall = async () => {
+    try {
+      await directorApi.cancelRayLightInstall();
+      setRayLightSetup(await directorApi.getRayLightSetup());
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : "取消安装失败");
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void directorApi.getMediaSetup().then((status) => {
+      if (!cancelled) setMediaSetup(status);
+    }).catch(() => {
+      if (!cancelled) setMediaSetup(null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (mediaSetup?.install.state !== "running") return;
+    const timer = window.setTimeout(() => {
+      void directorApi.getMediaSetup().then((status) => {
+        if (mountedRef.current) setMediaSetup(status);
+      }).catch(() => undefined);
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [mediaSetup]);
+
+  const startFfmpegInstall = async () => {
+    const confirmed = window.confirm(
+      "将安装媒体组件：static-ffmpeg（含 ffmpeg 与 ffprobe，全编码器）。\n" +
+      "执行方式：在 ComfyUI 的 Python 环境中运行 pip install static-ffmpeg。\n" +
+      "安装完成立即生效，无需重启。继续？",
+    );
+    if (!confirmed) return;
+    setFfmpegInstallBusy(true);
+    try {
+      await directorApi.installFfmpeg();
+      setMediaSetup(await directorApi.getMediaSetup());
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : "ffmpeg 安装启动失败");
+    } finally {
+      setFfmpegInstallBusy(false);
+    }
+  };
+
+  const cancelFfmpegInstall = async () => {
+    try {
+      await directorApi.cancelFfmpegInstall();
+      setMediaSetup(await directorApi.getMediaSetup());
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : "取消安装失败");
+    }
   };
   const test = async () => {
     if (effectiveRuntimeEditingDisabled) return;
@@ -879,6 +984,36 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
             <small className="storage-warning">路径保存或迁移成功后，当前进程保持读取旧库并停止修改；请重启 Director 后继续。</small>
             {storageMessage && <div className={`notice ${storageMessage.kind === "error" ? "notice--error" : ""}`} role={storageMessage.kind === "error" ? "alert" : "status"}>{storageMessage.text}</div>}
           </Panel>
+          <Panel eyebrow="媒体" title="媒体工具 (ffmpeg)" description="素材探测、代理转码与长片拼接依赖 ffmpeg/ffprobe；缺失时可在此一键安装，立即生效无需重启。">
+            {mediaSetup === null ? <p className="muted">正在检测媒体工具…</p> : (
+              <>
+                <div className="connection-card">
+                  <StatusDot state={mediaSetup.ready ? "online" : "offline"} />
+                  <div>
+                    <strong>{mediaSetup.ready ? "ffmpeg 可用" : "ffmpeg 未就绪"}</strong>
+                    <small>{mediaSetup.ready
+                      ? mediaSetup.ffmpeg_path ?? "已就绪"
+                      : mediaSetup.ffmpeg_available
+                        ? "已找到 ffmpeg，但缺少 libx264/aac 编码器或 ffprobe"
+                        : "未检测到 ffmpeg/ffprobe"}</small>
+                  </div>
+                  {!mediaSetup.ready && mediaSetup.install.state !== "running" && (
+                    <button type="button" className="button button--ghost" disabled={ffmpegInstallBusy} onClick={() => void startFfmpegInstall()}>{ffmpegInstallBusy ? "正在启动…" : "安装 ffmpeg"}</button>
+                  )}
+                </div>
+                {mediaSetup.install.state === "running" && (
+                  <div className="raylight-setup">
+                    <p><Spinner /> 正在安装 ffmpeg，请稍候…</p>
+                    <button type="button" className="button button--ghost" onClick={() => void cancelFfmpegInstall()}>取消安装</button>
+                  </div>
+                )}
+                {mediaSetup.install.state === "failed" && <div className="notice notice--error" role="alert">ffmpeg 安装失败：{mediaSetup.install.error ?? "未知错误"}。可重试，或按平台指引手动安装。</div>}
+                {mediaSetup.install.log_tail.length > 0 && (
+                  <details className="raylight-setup-log"><summary>安装日志</summary><pre>{mediaSetup.install.log_tail.join("\n")}</pre></details>
+                )}
+              </>
+            )}
+          </Panel>
           <Panel eyebrow="界面" title="界面主题" description="主题仅作用于当前浏览器，不写入 Director 或 ComfyUI 设置。">
             <fieldset className="theme-options" aria-label="界面主题">
               <label className={`theme-option ${theme === "light" ? "is-active" : ""}`}><input type="radio" name="ui-theme" value="light" checked={theme === "light"} onChange={() => onThemeChange("light")} /><span className="theme-option__swatch theme-option__swatch--light" aria-hidden="true" /><strong>暖色浅色</strong><small>纸张暖白与橙棕强调</small></label>
@@ -912,6 +1047,38 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
             </Field>
             {residencyNotice && <div className="notice" role="status">{residencyNotice}</div>}
             {!residencyNotice && working.raylight_residency_policy === "release_after_sampling" && rayLightFamilies.length > 0 && <div className="notice" role="status">当前 {rayLightFamilies.join("、")} 已使用 RayLight，但设置为任务后释放：每次任务完成都会卸载模型，下次任务需要重新加载。</div>}
+          </Panel>
+          <Panel eyebrow="运行" title="多卡推理" description="RayLight 多卡组件默认不安装；开启后按提示安装一次并重启 ComfyUI 生效。关闭不会卸载组件，下次开启可直接使用。">
+            <label className="check-field">
+              <input
+                type="checkbox"
+                aria-label="启用多卡推理"
+                disabled={effectiveRuntimeEditingDisabled || rayLightSetup?.platform_supported === false}
+                checked={working.multi_gpu_enabled}
+                onChange={(event) => change({ ...working, multi_gpu_enabled: event.target.checked })}
+              />
+              <span><strong>启用多卡推理（RayLight）</strong><small>GPU 池配置 2 张及以上逻辑卡时自动使用 RayLight 执行</small></span>
+            </label>
+            {rayLightSetup?.platform_supported === false && <div className="notice" role="status">多卡推理目前仅支持 Linux。</div>}
+            {working.multi_gpu_enabled && rayLightSetup && !rayLightSetup.dependencies_installed && rayLightSetup.install.state !== "running" && rayLightSetup.install.state !== "needs_restart" && (
+              <div className="raylight-setup">
+                <p>多卡组件（ray、xfuser）尚未安装：将在 ComfyUI 的 Python 环境中执行 pip install -r requirements-raylight.txt，完成后需重启 ComfyUI。</p>
+                <button type="button" className="button" disabled={!rayLightSetup.requirements_available || rayLightInstallBusy} onClick={() => void startRayLightInstall()}>{rayLightInstallBusy ? "正在启动…" : "安装多卡组件"}</button>
+                {!rayLightSetup.requirements_available && <small className="inline-error">当前安装缺少 requirements-raylight.txt；请手动安装后重启。</small>}
+              </div>
+            )}
+            {rayLightSetup?.install.state === "running" && (
+              <div className="raylight-setup">
+                <p><Spinner /> 正在安装多卡组件，请稍候…</p>
+                <button type="button" className="button button--ghost" onClick={() => void cancelRayLightInstall()}>取消安装</button>
+              </div>
+            )}
+            {rayLightSetup?.install.state === "needs_restart" && <div className="notice" role="status">多卡组件已安装完成。重启 ComfyUI 后多卡生效。</div>}
+            {rayLightSetup?.install.state === "failed" && <div className="notice notice--error" role="alert">多卡组件安装失败：{rayLightSetup.install.error ?? "未知错误"}。可重试，或按日志中的命令手动安装后重启。</div>}
+            {working.multi_gpu_enabled && rayLightSetup?.dependencies_installed && <div className="notice" role="status">多卡组件已安装；节点注册状态见各模型族的执行能力标记。</div>}
+            {rayLightSetup && rayLightSetup.install.log_tail.length > 0 && (
+              <details className="raylight-setup-log"><summary>安装日志</summary><pre>{rayLightSetup.install.log_tail.join("\n")}</pre></details>
+            )}
           </Panel>
           <Panel eyebrow="模型" title="模型与运行设备" description="填写有效 ComfyUI 地址后自动读取资源；模型和设备修改也会自动应用。VAE 只允许 default 或 GPU。" action={loadingModels ? <Spinner label="读取模型" /> : undefined}>
             {!runtimeConfigured && <div className="notice">填写有效 ComfyUI 地址后，模型和运行设备选项会自动启用。</div>}

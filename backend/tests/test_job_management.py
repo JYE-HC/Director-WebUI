@@ -202,6 +202,7 @@ async def test_generation_details_are_typed_lazy_and_exclude_runtime_secrets(
 ) -> None:
     settings = (await client.get("/api/settings")).json()
     settings["client_id"] = "private-client-id"
+    settings["multi_gpu_enabled"] = True
     settings["models"]["fl2va"].update(
         lora_name=(
             "minimax_h3_fl2v_turbo_4step_v1.0_768p_"

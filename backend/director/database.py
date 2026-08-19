@@ -135,11 +135,19 @@ def _sqlite_quick_check_is_ok(connection: sqlite3.Connection) -> bool:
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as stream:
+    # Windows os.fsync (_commit) requires a writable handle; a read-only
+    # descriptor fails with EBADF.  POSIX fsync accepts either, so open
+    # read-write on every platform.
+    with path.open("r+b") as stream:
         os.fsync(stream.fileno())
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows cannot fsync a directory (os.open on a directory fails
+        # outright), so the post-rename metadata flush is POSIX-only.  The
+        # file payload itself was fsynced before the atomic replace.
+        return
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(descriptor)

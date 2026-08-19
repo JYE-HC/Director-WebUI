@@ -1114,6 +1114,79 @@ describe("共享设置表单", () => {
     expect(fsdp).not.toBeChecked();
   });
 
+  it("多卡开关只认显式 true，其余一律视为关闭", () => {
+    const enabled = structuredClone(CONFIGURED_SETTINGS);
+    enabled.multi_gpu_enabled = true;
+    expect(sanitizeRuntimeSettings(enabled).multi_gpu_enabled).toBe(true);
+    const missing = structuredClone(CONFIGURED_SETTINGS) as unknown as Record<string, unknown>;
+    delete missing.multi_gpu_enabled;
+    expect(sanitizeRuntimeSettings(missing).multi_gpu_enabled).toBe(false);
+    const bogus = structuredClone(CONFIGURED_SETTINGS) as unknown as Record<string, unknown>;
+    bogus.multi_gpu_enabled = "yes";
+    expect(sanitizeRuntimeSettings(bogus).multi_gpu_enabled).toBe(false);
+  });
+
+  it("多卡推理开关随设置渲染并提交切换", async () => {
+    const user = userEvent.setup();
+    const saved: RuntimeSettings[] = [];
+    vi.spyOn(directorApi, "getRayLightSetup").mockResolvedValue({
+      enabled: false,
+      platform_supported: true,
+      dependencies_installed: false,
+      requirements_available: true,
+      install: { state: "idle", log_tail: [], returncode: null, error: null, started_at: null },
+    });
+    render(
+      <SettingsPage
+        settings={CONFIGURED_SETTINGS}
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[]}
+        models={MODEL_INVENTORY}
+        loadingModels={false}
+        onSaved={async (next) => { saved.push(next); return next; }}
+      />,
+    );
+    const toggle = await screen.findByLabelText("启用多卡推理");
+    expect(toggle).not.toBeChecked();
+    await user.click(toggle);
+    await waitFor(() => expect(saved.length).toBeGreaterThan(0));
+    expect(saved.at(-1)?.multi_gpu_enabled).toBe(true);
+  });
+
+  it("开启多卡后可从设置页发起组件安装", async () => {
+    const user = userEvent.setup();
+    const enabled = structuredClone(CONFIGURED_SETTINGS);
+    enabled.multi_gpu_enabled = true;
+    vi.spyOn(directorApi, "getRayLightSetup").mockResolvedValue({
+      enabled: true,
+      platform_supported: true,
+      dependencies_installed: false,
+      requirements_available: true,
+      install: { state: "idle", log_tail: [], returncode: null, error: null, started_at: null },
+    });
+    const install = vi.spyOn(directorApi, "installRayLight").mockResolvedValue({
+      state: "running",
+      log_tail: [],
+      returncode: null,
+      error: null,
+      started_at: 1,
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(
+      <SettingsPage
+        settings={enabled}
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[]}
+        models={MODEL_INVENTORY}
+        loadingModels={false}
+        onSaved={confirmConfiguredSettings}
+      />,
+    );
+    const installButton = await screen.findByRole("button", { name: "安装多卡组件" });
+    await user.click(installButton);
+    expect(install).toHaveBeenCalledTimes(1);
+  });
+
   it("多卡 GPU 池自动使用 RayLight 并清除隐藏旧设置", async () => {
     const user = userEvent.setup();
     const configured = structuredClone(CONFIGURED_SETTINGS);

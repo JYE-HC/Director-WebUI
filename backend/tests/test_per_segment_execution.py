@@ -3064,6 +3064,7 @@ async def test_confirm_comfy_restart_rejects_live_director_dispatcher(
 
 def _raylight_settings_document() -> dict:
     document = default_settings("http://comfy.test:8188").model_dump(mode="json")
+    document["multi_gpu_enabled"] = True
     for family in ("fl2va", "ref2va"):
         document["models"][family].update(
             backend="raylight",

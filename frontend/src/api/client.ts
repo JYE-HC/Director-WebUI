@@ -30,11 +30,14 @@ import type {
   GPUResource,
   JobClearResponse,
   JobDeleteResponse,
+  MediaToolsStatus,
   ModelInventory,
   ProjectDeleteResponse,
   ProjectListResponse,
   ProjectSummary,
+  RayLightInstallSnapshot,
   RayLightRuntimeStatus,
+  RayLightSetupStatus,
   RV2VShotDetectionRequest,
   RV2VShotDetectionResponse,
   RuntimeSettings,
@@ -51,7 +54,14 @@ import type {
   TimelineTaskRequest,
 } from "./types";
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
+// When the SPA is served by the ComfyUI plugin under /director/, the API is
+// proxied at /director/api on the same origin; standalone mode keeps /api.
+const API_BASE = (
+  import.meta.env.VITE_API_BASE_URL ||
+  (typeof window !== "undefined" && window.location.pathname.startsWith("/director/")
+    ? "/director/api"
+    : "/api")
+).replace(/\/$/, "");
 export const DATABASE_IDENTITY_STALE_EVENT = "director:stale-database-identity";
 let latchedDatabaseIdentity: string | null = null;
 
@@ -1650,6 +1660,18 @@ export const directorApi = {
     request<unknown>("/settings/authority", { signal }).then(parseRuntimeSettingsAuthority),
   updateSettings: (settings: RuntimeSettings) =>
     request<RuntimeSettings>("/settings", { method: "PUT", body: JSON.stringify(settings) }),
+  getRayLightSetup: (signal?: AbortSignal) =>
+    request<RayLightSetupStatus>("/raylight/setup", { signal }),
+  installRayLight: () =>
+    request<RayLightInstallSnapshot>("/raylight/setup/install", { method: "POST" }),
+  cancelRayLightInstall: () =>
+    request<RayLightInstallSnapshot>("/raylight/setup/cancel", { method: "POST" }),
+  getMediaSetup: (signal?: AbortSignal) =>
+    request<MediaToolsStatus>("/media/setup", { signal }),
+  installFfmpeg: () =>
+    request<RayLightInstallSnapshot>("/media/ffmpeg/install", { method: "POST" }),
+  cancelFfmpegInstall: () =>
+    request<RayLightInstallSnapshot>("/media/ffmpeg/cancel", { method: "POST" }),
   getStorage: (signal?: AbortSignal) =>
     request<unknown>("/storage", { signal }).then(parseStorageConfiguration),
   updateStorage: (databasePath: string) =>

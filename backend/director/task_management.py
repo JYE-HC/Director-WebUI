@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from .comfy import ComfyClientProtocol
 from .media import create_24fps_proxy_bytes
+from .public_url import public_api_url
 from .schemas import AssetReference, RuntimeSettings, UnifiedTimelineDraft
 
 
@@ -285,7 +286,7 @@ async def import_job_output_as_asset(
                 "id": asset_id,
                 "filename": name,
                 "path": path,
-                "preview_url": f"/api/assets/{asset_id}/preview",
+                "preview_url": public_api_url(f"/api/assets/{asset_id}/preview"),
                 "content_hash": f"sha256:{hashlib.sha256(proxy.content).hexdigest()}",
                 "metadata": proxy.metadata.model_dump(mode="json"),
             }

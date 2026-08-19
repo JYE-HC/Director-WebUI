@@ -38,3 +38,4 @@ ComfyUI/
 .director-install/
 .tools/
 .tmp/
+build/

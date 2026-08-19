@@ -153,6 +153,15 @@ def _requested_absolute_path(value: str | Path) -> Path:
         raise StoragePathError("database path is invalid")
     try:
         expanded = Path(raw).expanduser()
+        if raw.startswith("~") and raw != "~" and raw[:2] not in ("~/", "~\\"):
+            # ``~user`` expansion is platform-dependent: POSIX expanduser
+            # raises RuntimeError for an unknown user (converted below),
+            # while Windows (3.12+) fabricates a sibling profile path.
+            # Require the resolved home directory to exist so an unknown
+            # user fails closed on every platform.
+            first_segment = raw.split("/", 1)[0].split("\\", 1)[0]
+            if not Path(first_segment).expanduser().is_dir():
+                raise StoragePathError("database path is invalid")
         if not expanded.is_absolute():
             raise StoragePathError(
                 "database path must be absolute (a leading ~ is supported)"
@@ -208,6 +217,11 @@ def _read_bootstrap(config_path: Path) -> Path | None:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows cannot fsync a directory (os.open on a directory fails
+        # outright), so the post-rename metadata flush is POSIX-only.  The
+        # file payload itself was fsynced before the atomic replace.
+        return
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(descriptor)
@@ -244,7 +258,10 @@ def _write_bootstrap(config_path: Path, database_path: Path) -> None:
             dir=config_path.parent,
         )
         temporary_path = Path(temporary_name)
-        os.fchmod(descriptor, 0o600)
+        # mkstemp already creates the file 0o600 on POSIX; os.fchmod does not
+        # exist on Windows, where the user profile temp dir is ACL-scoped.
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
         payload = json.dumps(
             {
                 "version": _BOOTSTRAP_VERSION,
@@ -593,7 +610,9 @@ class StorageController:
             source_connection = None
 
             validate_director_database(temporary_path)
-            with temporary_path.open("rb") as stream:
+            # Windows os.fsync (_commit) requires a writable handle; open
+            # read-write on every platform.
+            with temporary_path.open("r+b") as stream:
                 os.fsync(stream.fileno())
             # A same-directory hard link publishes without ever replacing a file
             # another process may have created after the preflight check.

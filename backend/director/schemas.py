@@ -224,6 +224,12 @@ class RuntimeSettings(StrictModel):
         "release_after_sampling",
         "keep_until_switch",
     ] = "keep_until_switch"
+    # Multi-GPU inference (RayLight) is opt-in. Enabling installs the optional
+    # RayLight python dependencies and takes effect after a ComfyUI restart;
+    # while disabled, a >=2 GPU pool fails closed instead of compiling RayLight
+    # graphs. Capability (platform/deps/registered nodes) is always probed at
+    # runtime, never persisted.
+    multi_gpu_enabled: bool = False
     models: SettingsModels
 
     @field_validator("comfy_url", mode="after")

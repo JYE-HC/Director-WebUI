@@ -114,6 +114,20 @@ Standard 提交会失败封闭，不能把“旧账本无法描述”误当成�
 
 ## 安装与启动
 
+> **新：ComfyUI 插件形态（推荐方向，当前处于 P1 完成、待发布状态）。**
+> Director 可以作为 ComfyUI 插件运行：后端内嵌进 ComfyUI 进程，前端由
+> ComfyUI 托管在 `/director/`，数据库位于 ComfyUI `user/director/`。
+> 在本仓库构建并软链到 ComfyUI：
+>
+> ```bash
+> cd frontend && npm ci && npm run build && cd ..
+> python3 tools/build_plugin.py --link /path/to/ComfyUI
+> # 重启 ComfyUI 后，侧栏 Director 面板打开导演台
+> ```
+>
+> 多卡（RayLight）与 ffmpeg 均为插件内按需安装：系统设置中开启多卡推理
+> 或在媒体工具面板点击安装即可。独立部署形态（下文）仍保留可用。
+
 这是 Linux 本地部署的首个 alpha 发布候选。精确兼容基线和依赖来源见
 [发布说明](RELEASE.md)。模型权重、LoRA 和用户素材不随本仓库分发。
 

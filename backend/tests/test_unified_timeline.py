@@ -1138,6 +1138,7 @@ async def test_timeline_preflight_rejects_unavailable_logical_gpu(
 ) -> None:
     settings = (await client.get("/api/settings")).json()
     if raylight:
+        settings["multi_gpu_enabled"] = True
         settings["models"]["fl2va"].update(
             backend="raylight",
             device="default",

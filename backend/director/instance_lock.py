@@ -1,13 +1,58 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import os
 import socket
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
+
+_IS_WINDOWS = os.name == "nt"
+
+if _IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
+# flock reports a conflicting owner as EACCES/EAGAIN, msvcrt.locking as
+# EACCES/EDEADLK; all of them take the same owner-diagnostic failure path.
+_LOCK_CONFLICT_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EDEADLK})
+
+
+# The owner diagnostic JSON is written at the start of the lock file.  On
+# Windows the byte-range lock must sit past that payload: a locked range
+# denies reads from every other handle (even in the same process), so locking
+# offset 0 would hide the owner diagnostic from the conflicting process —
+# exactly the process that needs to read it.  msvcrt explicitly permits
+# locking a range beyond EOF, so one byte at this offset is enough because
+# every Director process locks the same range.
+_WINDOWS_LOCK_OFFSET = 4096
+
+
+def _lock_exclusive_nb(descriptor: int) -> None:
+    """Take the non-blocking exclusive kernel lock on the lock file.
+
+    POSIX locks the whole file with flock; Windows locks one byte at
+    ``_WINDOWS_LOCK_OFFSET``, past the diagnostic payload.  The OS drops
+    either lock when the owning process exits, so the kernel lock — never
+    the leftover file — represents ownership.
+    """
+    if _IS_WINDOWS:
+        # msvcrt locks a byte range starting at the current file offset.
+        os.lseek(descriptor, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(descriptor: int) -> None:
+    if _IS_WINDOWS:
+        # LK_UNLCK must start at the same offset the lock was taken at.
+        os.lseek(descriptor, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 class DirectorInstanceLockError(RuntimeError):
@@ -17,8 +62,9 @@ class DirectorInstanceLockError(RuntimeError):
 class DirectorInstanceLock:
     """Process lifetime lock for one canonical SQLite database path.
 
-    The lock file is deliberately persistent.  Ownership is represented by
-    ``flock(2)``, not by the file's existence, so a crash cannot leave a stale
+    The lock file is deliberately persistent.  Ownership is represented by a
+    kernel lock (``flock(2)`` on POSIX, an ``msvcrt`` byte-range lock on
+    Windows), not by the file's existence, so a crash cannot leave a stale
     marker that prevents the next process from starting. The key is the
     canonical path spelling; hard-link or bind-mount aliases are not claimed
     to share this sidecar lock.
@@ -79,9 +125,9 @@ class DirectorInstanceLock:
                 f"Director instance lock could not be secured: {self.path}"
             ) from exc
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_exclusive_nb(descriptor)
         except OSError as exc:
-            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+            if exc.errno not in _LOCK_CONFLICT_ERRNOS:
                 os.close(descriptor)
                 raise
             owner = self._read_diagnostic(descriptor)
@@ -105,7 +151,7 @@ class DirectorInstanceLock:
             os.write(descriptor, payload)
             os.fsync(descriptor)
         except BaseException:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _unlock(descriptor)
             os.close(descriptor)
             raise
 
@@ -117,7 +163,7 @@ class DirectorInstanceLock:
             return
         self._descriptor = None
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _unlock(descriptor)
         finally:
             os.close(descriptor)
 

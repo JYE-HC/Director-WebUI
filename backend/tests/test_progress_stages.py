@@ -18,6 +18,7 @@ async def test_raylight_native_events_persist_all_visible_execution_stages(
     raw_settings = default_settings(
         "http://comfy.test:8188"
     ).model_dump(mode="json")
+    raw_settings["multi_gpu_enabled"] = True
     raw_settings["models"]["fl2va"].update(
         {
             "backend": "raylight",
@@ -167,6 +168,7 @@ async def test_immediate_raylight_execution_before_submit_response_is_preserved(
     raw_settings = default_settings(
         "http://comfy.test:8188"
     ).model_dump(mode="json")
+    raw_settings["multi_gpu_enabled"] = True
     raw_settings["models"]["fl2va"].update(
         {
             "backend": "raylight",
