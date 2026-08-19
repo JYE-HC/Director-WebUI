@@ -1025,7 +1025,10 @@ function isStoragePath(value: unknown, allowHomeRelative = false): value is stri
     value.length > 1 &&
     value.length <= 4096 &&
     !/[\u0000-\u001f\u007f]/.test(value) &&
-    (value.startsWith("/") || (allowHomeRelative && value.startsWith("~/")));
+    (value.startsWith("/") ||
+      /^[A-Za-z]:[\\/]/.test(value) ||
+      value.startsWith("\\\\") ||
+      (allowHomeRelative && value.startsWith("~/")));
 }
 
 function parseStorageConfiguration(value: unknown): StorageConfiguration {

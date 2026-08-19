@@ -30,6 +30,7 @@ import os
 import socket
 import sys
 import threading
+import tomllib
 from pathlib import Path
 
 from aiohttp import web
@@ -229,6 +230,15 @@ def _comfyui_version_check() -> str | None:
     return None
 
 
+def _plugin_version() -> str | None:
+    """Read the plugin package version from the bundled pyproject.toml."""
+    try:
+        with (_PLUGIN_ROOT / "pyproject.toml").open("rb") as stream:
+            return str(tomllib.load(stream)["project"]["version"])
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return None
+
+
 def _run_backend(database_path: Path) -> None:
     try:
         if str(_BACKEND_PATH) not in sys.path:
@@ -261,7 +271,7 @@ def _run_backend(database_path: Path) -> None:
             public_api_prefix="/directordeck",
             raylight_requirements_path=_PLUGIN_ROOT / "requirements-raylight.txt",
         )
-        _state.version = app.version
+        _state.version = _plugin_version()
         port = _internal_port()
         config = uvicorn.Config(
             app=app,

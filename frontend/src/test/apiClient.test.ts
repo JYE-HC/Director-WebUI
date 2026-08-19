@@ -285,6 +285,15 @@ describe("Director REST 契约", () => {
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/directordeck/api/storage"]);
   });
 
+  it("数据存储 GET 接受 Windows 绝对路径", async () => {
+    const active = "D:\\Programs\\ComfyUI\\user\\directordeck\\database\\directordeck.sqlite3";
+    fetchMock.mockResolvedValueOnce(jsonResponse({ active_database_path: active }));
+
+    await expect(directorApi.getStorage()).resolves.toEqual({
+      active_database_path: active,
+    });
+  });
+
   it("数据存储响应拒绝额外字段与相对路径", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({
