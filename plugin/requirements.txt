@@ -1,0 +1,7 @@
+anyio>=4.6,<4.10
+fastapi>=0.116,<0.117
+httpx>=0.28,<1
+pydantic>=2.11,<3
+python-multipart>=0.0.20,<1
+uvicorn[standard]>=0.35,<1
+websockets>=16,<18

@@ -40,6 +40,9 @@ def assemble() -> None:
 
     shutil.copy2(PROJECT_ROOT / "plugin" / "__init__.py", BUILD_DIR / "__init__.py")
     shutil.copy2(PROJECT_ROOT / "plugin" / "pyproject.toml", BUILD_DIR / "pyproject.toml")
+    shutil.copy2(
+        PROJECT_ROOT / "plugin" / "requirements.txt", BUILD_DIR / "requirements.txt"
+    )
     shutil.copytree(PROJECT_ROOT / "plugin" / "web", BUILD_DIR / "web", ignore=IGNORE)
     shutil.copytree(
         PROJECT_ROOT / "backend" / "director", BUILD_DIR / "backend" / "director",
