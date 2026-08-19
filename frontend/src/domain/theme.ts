@@ -1,6 +1,6 @@
 export type UiTheme = "dark" | "light";
 
-export const THEME_STORAGE_KEY = "director-web:theme";
+export const THEME_STORAGE_KEY = "directordeck:theme";
 
 export function readUiTheme(): UiTheme {
   try {

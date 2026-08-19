@@ -3189,29 +3189,29 @@ export function validateTimelineProject(
  * v2 was historically a durable mirror, so its mere presence cannot prove
  * that the browser owns a write newer than SQLite. Never replay it as a WAL.
  */
-export const LEGACY_TIMELINE_STORAGE_KEY = "director-web:v2:timeline";
-export const QUARANTINED_TIMELINE_STORAGE_KEY = "director-web:v2:timeline-quarantine";
-export const UNBOUND_TIMELINE_WAL_STORAGE_KEY = "director-web:v3:timeline-wal";
-export const QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY = "director-web:v3:timeline-wal-quarantine";
+export const LEGACY_TIMELINE_STORAGE_KEY = "directordeck:v2:timeline";
+export const QUARANTINED_TIMELINE_STORAGE_KEY = "directordeck:v2:timeline-quarantine";
+export const UNBOUND_TIMELINE_WAL_STORAGE_KEY = "directordeck:v3:timeline-wal";
+export const QUARANTINED_UNBOUND_TIMELINE_WAL_STORAGE_KEY = "directordeck:v3:timeline-wal-quarantine";
 // v4 carried a single unscoped pending timeline (pre-multi-project). Its bytes
 // are quarantined rather than replayed because they cannot name a project.
-export const LEGACY_V4_TIMELINE_WAL_STORAGE_KEY = "director-web:v4:timeline-wal";
+export const LEGACY_V4_TIMELINE_WAL_STORAGE_KEY = "directordeck:v4:timeline-wal";
 // v5 proved database/project ownership but did not record the exact server
 // revision and base document. It is evidence only and must never be promoted.
-export const LEGACY_V5_TIMELINE_WAL_STORAGE_KEY = "director-web:v5:timeline-wal";
+export const LEGACY_V5_TIMELINE_WAL_STORAGE_KEY = "directordeck:v5:timeline-wal";
 export const QUARANTINED_LEGACY_V5_TIMELINE_WAL_STORAGE_KEY =
-  "director-web:v5:timeline-wal-quarantine";
+  "directordeck:v5:timeline-wal-quarantine";
 /**
  * The v6 WAL used one process-wide key. Keep it byte-for-byte as foreign
  * evidence: a v7 page must never promote, overwrite, or silently quarantine
  * it merely because another page has opened the same project.
  */
-export const LEGACY_V6_TIMELINE_WAL_STORAGE_KEY = "director-web:v6:timeline-wal";
+export const LEGACY_V6_TIMELINE_WAL_STORAGE_KEY = "directordeck:v6:timeline-wal";
 /** @deprecated This is a v7 key prefix, not a complete localStorage key. */
-export const TIMELINE_WAL_STORAGE_KEY = "director-web:v7:timeline-wal:";
+export const TIMELINE_WAL_STORAGE_KEY = "directordeck:v7:timeline-wal:";
 export const TIMELINE_WAL_STORAGE_PREFIX = TIMELINE_WAL_STORAGE_KEY;
 export const QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY =
-  "director-web:v6:timeline-wal-quarantine";
+  "directordeck:v6:timeline-wal-quarantine";
 export const TIMELINE_WAL_FORMAT = "director-revision-aware-timeline-wal";
 const LEGACY_V6_TIMELINE_WAL_VERSION = 1;
 export const TIMELINE_WAL_VERSION = 2;
@@ -3222,7 +3222,7 @@ interface TimelineWalStorageToken {
 }
 let latestTimelineWalToken: TimelineWalStorageToken | null = null;
 const timelineWalTokenByValue = new WeakMap<LocalTimelineWal, TimelineWalStorageToken>();
-const ASSET_LAYOUT_STORAGE_KEY = "director-web:v2:asset-layout";
+const ASSET_LAYOUT_STORAGE_KEY = "directordeck:v2:asset-layout";
 
 export interface AssetLayoutPreference {
   size: AssetGridSize;
@@ -3334,7 +3334,6 @@ function isActiveDatabaseIdentity(value: unknown): value is string {
 
 export interface TimelineWalDatabaseIdentity {
   active_database_path: string;
-  active_database_identity: string;
 }
 
 export interface LocalTimelineWal {
@@ -3344,7 +3343,6 @@ export interface LocalTimelineWal {
   pending: true;
   project_id: string;
   active_database_path: string;
-  active_database_identity: string;
   written_at_ms: number;
   base_server_revision: number;
   base_document_hash: string;
@@ -3414,8 +3412,7 @@ export type LocalTimelineWalResolution =
     };
 
 function isTimelineWalDatabaseIdentity(value: TimelineWalDatabaseIdentity): boolean {
-  return isActiveDatabaseIdentity(value.active_database_path) &&
-    /^[0-9a-f]{64}$/.test(value.active_database_identity);
+  return isActiveDatabaseIdentity(value.active_database_path);
 }
 
 function validTimelineWalOwner(value: unknown): value is string {
@@ -3532,7 +3529,6 @@ function timelineWalScopeDigest(
 ): string {
   const canonicalScope = JSON.stringify([
     database.active_database_path,
-    database.active_database_identity,
     projectId,
   ]);
   // Two independently seeded 64-bit hashes keep the physical key opaque and
@@ -3563,7 +3559,6 @@ function parseTimelineWalValue(
 ): LocalTimelineWal | null {
   if (!isRecord(value)) return null;
   if (Object.keys(value).sort().join("|") !== [
-    "active_database_identity",
     "active_database_path",
     "base_document_hash",
     "base_project",
@@ -3584,8 +3579,6 @@ function parseTimelineWalValue(
     !validTimelineWalOwner(value.owner_id) ||
     !validTimelineWalProjectId(value.project_id) ||
     !isActiveDatabaseIdentity(value.active_database_path) ||
-    typeof value.active_database_identity !== "string" ||
-    !/^[0-9a-f]{64}$/.test(value.active_database_identity) ||
     !Number.isSafeInteger(value.written_at_ms) ||
     (value.written_at_ms as number) <= 0 ||
     !Number.isSafeInteger(value.base_server_revision) ||
@@ -3611,7 +3604,6 @@ function parseTimelineWalValue(
     pending: true,
     project_id: value.project_id,
     active_database_path: value.active_database_path,
-    active_database_identity: value.active_database_identity,
     written_at_ms: value.written_at_ms as number,
     base_server_revision: value.base_server_revision as number,
     base_document_hash: value.base_document_hash,
@@ -3645,7 +3637,6 @@ function timelineWalMatchesScope(
   projectId: string,
 ): boolean {
   return wal.active_database_path === database.active_database_path &&
-    wal.active_database_identity === database.active_database_identity &&
     wal.project_id === projectId;
 }
 
@@ -3817,7 +3808,6 @@ export function saveLocalTimelineWal(input: SaveLocalTimelineWalInput): LocalTim
       pending: true,
       project_id: input.project_id,
       active_database_path: database.active_database_path,
-      active_database_identity: database.active_database_identity,
       written_at_ms: writtenAt,
       base_server_revision: input.base_server_revision,
       base_document_hash: timelineProjectDocumentHash(baseProject),

@@ -16,12 +16,11 @@ import {
 
 const scope: TimelinePersistenceScope = {
   databasePath: "/srv/director/data/director.sqlite3",
-  databaseIdentity: "b".repeat(64),
   projectId: "project-history",
   ownerId: "session-owner-a",
 };
 
-const DATABASE_NAME = "director-web-timeline-history";
+const DATABASE_NAME = "directordeck-timeline-history";
 const STORE_NAME = "journals";
 
 async function openTestDatabase(): Promise<IDBDatabase> {
@@ -219,12 +218,11 @@ describe("timeline IndexedDB persistence", () => {
   it("用 opaque scope digest + owner 隔离物理 key", () => {
     const key = timelineHistoryJournalKey(scope);
     expect(key).toBe(
-      "director-web:v2:timeline-history:" +
-        "f9b07d1abcd1853158e94a0aee5e3319e4b06d9bcbc42adbb1a0e4d350141144:" +
+      "directordeck:v2:timeline-history:" +
+        "0124c138950f13c515ddf3414748689064af9b775ed120eb06a32bcedcb04b6d:" +
         "session-owner-a",
     );
     expect(key).not.toContain(scope.databasePath);
-    expect(key).not.toContain(scope.databaseIdentity);
     expect(key).not.toContain(scope.projectId);
     expect(timelineHistoryJournalKey({ ...scope, ownerId: "session-owner-b" })).not.toBe(key);
     expect(timelineHistoryJournalKey({
@@ -410,7 +408,6 @@ describe("timeline IndexedDB persistence", () => {
     raw.key = legacyTimelineHistoryJournalKey(scope);
     raw.scope = {
       databasePath: scope.databasePath,
-      databaseIdentity: scope.databaseIdentity,
       projectId: scope.projectId,
     };
     await putRawJournal(raw);

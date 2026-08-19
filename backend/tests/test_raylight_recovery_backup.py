@@ -6,12 +6,9 @@ from pathlib import Path
 
 import pytest
 
-import director.database as database_module
-from director.database import Database
-from director.schemas import default_settings
-
-
-_COMFY_ORIGIN = "http://comfy.test:8188"
+import directordeck.database as database_module
+from directordeck.database import Database
+from directordeck.schemas import default_settings
 
 
 def _stale_runtime_state() -> dict:
@@ -49,15 +46,14 @@ def _stale_runtime_state() -> dict:
     }
 
 
-def _database_with_stale_runtime(tmp_path: Path) -> tuple[Database, str, dict]:
-    database = Database(tmp_path / "director.sqlite3")
+def _database_with_stale_runtime(tmp_path: Path) -> tuple[Database, dict]:
+    database = Database(tmp_path / "directordeck.sqlite3")
     database.initialize()
-    database.put_settings(default_settings(_COMFY_ORIGIN))
-    origin = database.canonical_comfy_origin(_COMFY_ORIGIN)
-    database.put_raylight_runtime_state(origin, _stale_runtime_state())
-    state = database.get_raylight_runtime_state(origin)
+    database.put_settings(default_settings())
+    database.put_raylight_runtime_state(_stale_runtime_state())
+    state = database.get_raylight_runtime_state()
     assert state is not None
-    return database, origin, state
+    return database, state
 
 
 def _recovery_artifacts(database: Database) -> list[Path]:
@@ -77,7 +73,7 @@ def test_raylight_recovery_backup_stage_failure_is_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     failure_point: str,
 ) -> None:
-    database, origin, before = _database_with_stale_runtime(tmp_path)
+    database, before = _database_with_stale_runtime(tmp_path)
 
     if failure_point == "backup":
         def fail_backup(*_args, **_kwargs) -> None:
@@ -114,14 +110,12 @@ def test_raylight_recovery_backup_stage_failure_is_fail_closed(
         RuntimeError,
         match="could not create the RayLight recovery backup",
     ):
-        database.confirm_raylight_runtime_restart(
-            origin,
-            expected_epoch=7,
+        database.confirm_raylight_runtime_restart(expected_epoch=7,
             expected_runtime_state=before,
             visible_gpu_count=2,
         )
 
-    assert database.get_raylight_runtime_state(origin) == before
+    assert database.get_raylight_runtime_state() == before
     assert _recovery_artifacts(database) == []
     with database.connect() as connection:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
@@ -130,7 +124,7 @@ def test_raylight_recovery_backup_stage_failure_is_fail_closed(
 def test_raylight_recovery_update_failure_retracts_published_backup(
     tmp_path: Path,
 ) -> None:
-    database, origin, before = _database_with_stale_runtime(tmp_path)
+    database, before = _database_with_stale_runtime(tmp_path)
     with database.connect() as connection:
         connection.execute(
             "CREATE TRIGGER reject_raylight_recovery_update "
@@ -139,14 +133,12 @@ def test_raylight_recovery_update_failure_retracts_published_backup(
         )
 
     with pytest.raises(sqlite3.IntegrityError, match="injected runtime update failure"):
-        database.confirm_raylight_runtime_restart(
-            origin,
-            expected_epoch=7,
+        database.confirm_raylight_runtime_restart(expected_epoch=7,
             expected_runtime_state=before,
             visible_gpu_count=2,
         )
 
-    assert database.get_raylight_runtime_state(origin) == before
+    assert database.get_raylight_runtime_state() == before
     assert _recovery_artifacts(database) == []
 
 
@@ -154,7 +146,7 @@ def test_raylight_recovery_keeps_backup_after_ambiguous_commit_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database, origin, before = _database_with_stale_runtime(tmp_path)
+    database, before = _database_with_stale_runtime(tmp_path)
 
     def commit_then_fail(connection: sqlite3.Connection) -> None:
         connection.commit()
@@ -165,29 +157,25 @@ def test_raylight_recovery_keeps_backup_after_ambiguous_commit_error(
         sqlite3.OperationalError,
         match="injected post-commit transport failure",
     ):
-        database.confirm_raylight_runtime_restart(
-            origin,
-            expected_epoch=7,
+        database.confirm_raylight_runtime_restart(expected_epoch=7,
             expected_runtime_state=before,
             visible_gpu_count=2,
         )
 
-    recovered = database.get_raylight_runtime_state(origin)
+    recovered = database.get_raylight_runtime_state()
     assert recovered is not None
     assert recovered["current"] is None
     artifacts = _recovery_artifacts(database)
     assert len(artifacts) == 1
-    assert Database(artifacts[0]).get_raylight_runtime_state(origin) == before
+    assert Database(artifacts[0]).get_raylight_runtime_state() == before
 
 
 def test_raylight_recovery_publishes_only_one_valid_final_backup(
     tmp_path: Path,
 ) -> None:
-    database, origin, before = _database_with_stale_runtime(tmp_path)
+    database, before = _database_with_stale_runtime(tmp_path)
 
-    recovered, backup_path = database.confirm_raylight_runtime_restart(
-        origin,
-        expected_epoch=7,
+    recovered, backup_path = database.confirm_raylight_runtime_restart(expected_epoch=7,
         expected_runtime_state=before,
         visible_gpu_count=2,
     )
@@ -199,5 +187,5 @@ def test_raylight_recovery_publishes_only_one_valid_final_backup(
         assert backup_path.stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(backup_path) as backup_connection:
         assert backup_connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-    assert Database(backup_path).get_raylight_runtime_state(origin) == before
-    assert database.get_raylight_runtime_state(origin) == recovered
+    assert Database(backup_path).get_raylight_runtime_state() == before
+    assert database.get_raylight_runtime_state() == recovered

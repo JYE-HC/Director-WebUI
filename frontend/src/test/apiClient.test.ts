@@ -1,4 +1,4 @@
-import { ApiError, DATABASE_IDENTITY_STALE_EVENT, detectEmbeddedComfyUi, directorApi } from "../api/client";
+import { ApiError, directorApi } from "../api/client";
 import { DEFAULT_SETTINGS, type GenerationTask } from "../api/types";
 import { createInitialDrafts, MODE_ORDER } from "../domain/modes";
 import { createTimelineProject } from "../domain/timelineProject";
@@ -6,7 +6,6 @@ import { createTimelineProject } from "../domain/timelineProject";
 const fetchMock = vi.fn<typeof fetch>();
 const CONFIGURED_SETTINGS = {
   ...DEFAULT_SETTINGS,
-  comfy_url: "http://comfy.test:8188",
 };
 const RUNTIME_AUTHORITY_TOKEN = "f".repeat(64);
 
@@ -46,7 +45,6 @@ const job: GenerationTask = {
 
 beforeEach(() => {
   fetchMock.mockReset();
-  directorApi.resetDatabaseIdentityForTests();
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -77,10 +75,10 @@ describe("Director REST 契约", () => {
     await directorApi.getSettings();
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/capabilities",
-      "/api/gpus",
-      "/api/models",
-      "/api/settings",
+      "/directordeck/api/capabilities",
+      "/directordeck/api/gpus",
+      "/directordeck/api/models",
+      "/directordeck/api/settings",
     ]);
     expect(fetchMock.mock.calls.every(([, init]) => !init?.method || init.method === "GET")).toBe(true);
   });
@@ -106,7 +104,7 @@ describe("Director REST 契约", () => {
     });
     await directorApi.getCapabilities(undefined, token);
 
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/settings/authority");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/settings/authority");
     expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get(
       "X-Director-Runtime-Authority",
     )).toBe(token);
@@ -141,19 +139,17 @@ describe("Director REST 契约", () => {
       RUNTIME_AUTHORITY_TOKEN,
     )).resolves.toEqual(blocked);
     await expect(directorApi.confirmRayLightRuntimeRecovery(
-      "http://comfy.test:8188",
       36,
       "a".repeat(64),
       controller.signal,
     )).resolves.toEqual(recovered);
 
     expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
-      ["/api/raylight/runtime", "GET"],
-      ["/api/raylight/runtime/recovery/confirm-comfy-restart", "POST"],
+      ["/directordeck/api/raylight/runtime", "GET"],
+      ["/directordeck/api/raylight/runtime/recovery/confirm-comfy-restart", "POST"],
     ]);
     expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
       confirmation: "comfyui_process_restarted",
-      expected_comfy_origin: "http://comfy.test:8188",
       expected_epoch: 36,
       expected_recovery_token: "a".repeat(64),
     });
@@ -178,7 +174,6 @@ describe("Director REST 契约", () => {
       }, 409));
 
     const retryable = await directorApi.confirmRayLightRuntimeRecovery(
-      "http://comfy.test:8188",
       36,
       "a".repeat(64),
     ).then(
@@ -198,7 +193,6 @@ describe("Director REST 契约", () => {
     expect(JSON.stringify(retryable.details)).not.toContain("secret-owner");
 
     const definitive = await directorApi.confirmRayLightRuntimeRecovery(
-      "http://comfy.test:8188",
       36,
       "a".repeat(64),
     ).then(
@@ -214,7 +208,6 @@ describe("Director REST 契约", () => {
     fetchMock.mockResolvedValueOnce(new Response("proxy conflict", { status: 409 }));
 
     const error = await directorApi.confirmRayLightRuntimeRecovery(
-      "http://comfy.test:8188",
       36,
       "a".repeat(64),
     ).then(
@@ -235,7 +228,6 @@ describe("Director REST 契约", () => {
     } as unknown as Response);
 
     const error = await directorApi.confirmRayLightRuntimeRecovery(
-      "http://comfy.test:8188",
       36,
       "a".repeat(64),
     ).then(
@@ -282,144 +274,29 @@ describe("Director REST 契约", () => {
     }
   });
 
-  it("数据存储 GET、路径保存与迁移使用独立严格契约", async () => {
-    const active = "/srv/director/data/director.sqlite3";
-    const target = "/srv/director/data/director-next.sqlite3";
-    const configured = {
+  it("数据存储 GET 只返回固定数据库路径", async () => {
+    const active = "/srv/directordeck/data/directordeck.sqlite3";
+    fetchMock.mockResolvedValueOnce(jsonResponse({ active_database_path: active }));
+
+    await expect(directorApi.getStorage()).resolves.toEqual({
       active_database_path: active,
-      active_database_identity: "a".repeat(64),
-      configured_database_path: active,
-      recommended_database_path: "/srv/director/.data/database/director.sqlite3",
-      source: "explicit" as const,
-      restart_required: false,
-    };
-    const pendingRestart = {
-      ...configured,
-      configured_database_path: target,
-      restart_required: true,
-    };
+    });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/directordeck/api/storage"]);
+  });
+
+  it("数据存储响应拒绝额外字段与相对路径", async () => {
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(configured))
-      .mockResolvedValueOnce(jsonResponse(pendingRestart))
       .mockResolvedValueOnce(jsonResponse({
-        ...pendingRestart,
-        migrated_from: active,
-        migrated_to: target,
+        active_database_path: "/srv/directordeck/data/directordeck.sqlite3",
+        unexpected: true,
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        active_database_path: "data/directordeck.sqlite3",
       }));
 
-    await expect(directorApi.getStorage()).resolves.toEqual(configured);
-    await expect(directorApi.updateStorage(target)).resolves.toEqual(pendingRestart);
-    await expect(directorApi.migrateStorage(target)).resolves.toMatchObject({
-      migrated_from: active,
-      migrated_to: target,
-      restart_required: true,
-    });
-
-    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/storage",
-      "/api/storage",
-      "/api/storage/migrate",
-    ]);
-    expect(fetchMock.mock.calls[1][1]?.method).toBe("PUT");
-    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({ database_path: target });
-    expect(fetchMock.mock.calls[2][1]?.method).toBe("POST");
-    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({ target_path: target });
-  });
-
-  it("数据存储响应拒绝额外字段、相对路径和未知来源，并隐藏非白名单错误细节", async () => {
-    const valid = {
-      active_database_path: "/srv/director/data/director.sqlite3",
-      active_database_identity: "a".repeat(64),
-      configured_database_path: "/srv/director/data/director.sqlite3",
-      recommended_database_path: "/srv/director/.data/database/director.sqlite3",
-      source: "default",
-      restart_required: false,
-    };
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ ...valid, unexpected: true }))
-      .mockResolvedValueOnce(jsonResponse({ ...valid, active_database_path: "data/director.sqlite3" }))
-      .mockResolvedValueOnce(jsonResponse({ ...valid, active_database_identity: "not-a-sha256" }))
-      .mockResolvedValueOnce(jsonResponse({ ...valid, source: "foreign" }))
-      .mockResolvedValueOnce(jsonResponse({
-        detail: {
-          message: "目标不是有效的 Director 数据库",
-          internal_path: "/secret/server/path",
-          traceback: "sensitive traceback",
-        },
-      }, 422));
-
     await expect(directorApi.getStorage()).rejects.toThrow("数据存储响应结构无效");
     await expect(directorApi.getStorage()).rejects.toThrow("数据存储响应结构无效");
-    await expect(directorApi.getStorage()).rejects.toThrow("数据存储响应结构无效");
-    await expect(directorApi.getStorage()).rejects.toThrow("数据存储响应结构无效");
-    const failure = await directorApi.updateStorage("/invalid.sqlite3").then(
-      () => { throw new Error("预期无效存储路径请求失败"); },
-      (reason): ApiError => reason as ApiError,
-    );
-    expect(failure).toMatchObject({
-      name: "ApiError",
-      status: 422,
-      message: "目标不是有效的 Director 数据库",
-    });
-    expect(JSON.stringify(failure.details)).not.toContain("secret");
-    expect(JSON.stringify(failure.details)).not.toContain("traceback");
-  });
-
-  it("所有 mutation（包括 storage）自动携带首次锁定的数据库身份", async () => {
-    const identity = "a".repeat(64);
-    const otherIdentity = "b".repeat(64);
-    const active = "/srv/director/data/director.sqlite3";
-    const project = createTimelineProject();
-    const storage = {
-      active_database_path: active,
-      active_database_identity: identity,
-      configured_database_path: active,
-      recommended_database_path: "/srv/director/.data/database/director.sqlite3",
-      source: "default" as const,
-      restart_required: false,
-    };
-    expect(directorApi.latchDatabaseIdentity(identity)).toBe(identity);
-    expect(directorApi.latchDatabaseIdentity(otherIdentity)).toBe(identity);
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse(project))
-      .mockResolvedValueOnce(jsonResponse(storage));
-
-    await directorApi.updateTimeline(project);
-    await directorApi.updateStorage(active);
-
-    const timelineHeaders = new Headers(fetchMock.mock.calls[0][1]?.headers);
-    const storageHeaders = new Headers(fetchMock.mock.calls[1][1]?.headers);
-    expect(timelineHeaders.get("X-Director-Database-Identity")).toBe(identity);
-    expect(storageHeaders.get("X-Director-Database-Identity")).toBe(identity);
-  });
-
-  it("只有精确 stale_database_identity 409 才广播整页失效事件", async () => {
-    const project = createTimelineProject();
-    directorApi.latchDatabaseIdentity("a".repeat(64));
-    const onStale = vi.fn();
-    window.addEventListener(DATABASE_IDENTITY_STALE_EVENT, onStale);
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({
-        code: "stale_database_identity",
-        detail: "the browser is editing a different Director database; refresh before making changes",
-      }, 409))
-      .mockResolvedValueOnce(jsonResponse({ detail: "普通状态冲突" }, 409));
-
-    try {
-      await expect(directorApi.updateTimeline(project)).rejects.toMatchObject({
-        name: "ApiError",
-        status: 409,
-      });
-      expect(onStale).toHaveBeenCalledTimes(1);
-
-      await expect(directorApi.updateTimeline(project)).rejects.toMatchObject({
-        name: "ApiError",
-        status: 409,
-      });
-      expect(onStale).toHaveBeenCalledTimes(1);
-    } finally {
-      window.removeEventListener(DATABASE_IDENTITY_STALE_EVENT, onStale);
-    }
   });
 
   it("时间线 API 严格解析并往返 beta 调度器", async () => {
@@ -482,10 +359,10 @@ describe("Director REST 契约", () => {
       .resolves.toEqual(secondAuthority);
 
     expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
-      ["/api/timeline/authority", "GET"],
-      ["/api/timeline/authority", "PUT"],
-      ["/api/projects/project%2Fone/timeline/authority", "GET"],
-      ["/api/projects/project%2Fone/timeline/authority", "PUT"],
+      ["/directordeck/api/timeline/authority", "GET"],
+      ["/directordeck/api/timeline/authority", "PUT"],
+      ["/directordeck/api/projects/project%2Fone/timeline/authority", "GET"],
+      ["/directordeck/api/projects/project%2Fone/timeline/authority", "PUT"],
     ]);
     expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
       document: project,
@@ -700,8 +577,8 @@ describe("Director REST 契约", () => {
     await directorApi.getDraft(mode);
     await directorApi.updateDraft(mode, draft);
 
-    expect(fetchMock.mock.calls[0][0]).toBe(`/api/drafts/${mode}`);
-    expect(fetchMock.mock.calls[1][0]).toBe(`/api/drafts/${mode}`);
+    expect(fetchMock.mock.calls[0][0]).toBe(`/directordeck/api/drafts/${mode}`);
+    expect(fetchMock.mock.calls[1][0]).toBe(`/directordeck/api/drafts/${mode}`);
     expect(fetchMock.mock.calls[1][1]?.method).toBe("PUT");
     expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual(draft);
   });
@@ -712,16 +589,14 @@ describe("Director REST 契约", () => {
       .mockResolvedValueOnce(jsonResponse({ ok: true, message: "连接成功" }));
 
     await directorApi.updateSettings(CONFIGURED_SETTINGS);
-    await directorApi.testConnection("http://comfy.test:8188");
+    await directorApi.testConnection();
 
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/settings");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/settings");
     expect(fetchMock.mock.calls[0][1]?.method).toBe("PUT");
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual(CONFIGURED_SETTINGS);
-    expect(fetchMock.mock.calls[1][0]).toBe("/api/capabilities");
+    expect(fetchMock.mock.calls[1][0]).toBe("/directordeck/api/capabilities");
     expect(fetchMock.mock.calls[1][1]?.method).toBe("POST");
-    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
-      comfy_url: "http://comfy.test:8188",
-    });
+    expect(fetchMock.mock.calls[1][1]?.body).toBeUndefined();
   });
 
   it("RV2V 智能分镜发送完整素材 ID 与显式检测参数", async () => {
@@ -742,7 +617,7 @@ describe("Director REST 契约", () => {
       shot_count: 2,
       warnings: [],
     });
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/rv2v/detect-shots");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/rv2v/detect-shots");
     expect(fetchMock.mock.calls[0][1]?.method).toBe("POST");
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual(payload);
   });
@@ -754,7 +629,7 @@ describe("Director REST 契约", () => {
         asset: {
           id: "asset-1",
           name: "frame.png",
-          subfolder: "director-web",
+          subfolder: "directordeck",
           type: "input",
           kind: "image",
         },
@@ -762,7 +637,7 @@ describe("Director REST 契约", () => {
     );
     await expect(directorApi.uploadAsset(file, "image")).resolves.toMatchObject({ id: "asset-1" });
     const body = fetchMock.mock.calls[0][1]?.body as FormData;
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/assets");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/assets");
     expect(body.get("kind")).toBe("image");
     expect(body.get("file")).toBeInstanceOf(File);
 
@@ -789,7 +664,7 @@ describe("Director REST 契约", () => {
         asset: {
           id: "asset-video-1",
           name: "source.mp4",
-          subfolder: "director-web",
+          subfolder: "directordeck",
           type: "input",
           kind: "video",
           metadata,
@@ -807,7 +682,7 @@ describe("Director REST 契约", () => {
         asset: {
           id: "asset-video-2",
           name: "source.mp4",
-          subfolder: "director-web",
+          subfolder: "directordeck",
           type: "input",
           kind: "video",
         },
@@ -834,7 +709,7 @@ describe("Director REST 契约", () => {
         asset: {
           id: "asset-progress",
           name: "frame.png",
-          subfolder: "director-web",
+          subfolder: "directordeck",
           type: "input",
           kind: "image",
         },
@@ -886,18 +761,17 @@ describe("Director REST 契约", () => {
       outputs_preserved: true,
       unbound_usages: ["timeline.segments[0].first_image"],
     });
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/assets/asset%2F1?cascade=true");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/assets/asset%2F1?cascade=true");
     expect(fetchMock.mock.calls[0][1]?.method).toBe("DELETE");
     expect(fetchMock.mock.calls[0][1]?.body).toBeUndefined();
     expect(new Headers(fetchMock.mock.calls[0][1]?.headers).has("Content-Type")).toBe(false);
   });
 
-  it("素材与回收站列表解析同一 database/origin scope 并兼容旧两键响应", async () => {
-    const identity = "a".repeat(64);
+  it("素材与回收站列表使用固定路由并严格解析", async () => {
     const assetValue = {
       id: "asset-scoped",
       name: "scoped.png",
-      subfolder: "director-web",
+      subfolder: "directordeck",
       type: "input",
       kind: "image",
     };
@@ -905,18 +779,6 @@ describe("Director REST 契约", () => {
       .mockResolvedValueOnce(jsonResponse({
         assets: [assetValue],
         outputs_preserved: true,
-        active_database_identity: identity,
-        comfy_origin: "http://comfy.test:8188",
-      }))
-      .mockResolvedValueOnce(jsonResponse({
-        assets: [assetValue],
-        outputs_preserved: true,
-      }))
-      .mockResolvedValueOnce(jsonResponse({
-        batches: [],
-        remote_files_preserved: true,
-        active_database_identity: identity,
-        comfy_origin: "http://comfy.test:8188",
       }))
       .mockResolvedValueOnce(jsonResponse({
         batches: [],
@@ -926,73 +788,39 @@ describe("Director REST 契约", () => {
     await expect(directorApi.listAssets("image")).resolves.toEqual({
       assets: [assetValue],
       outputs_preserved: true,
-      active_database_identity: identity,
-      comfy_origin: "http://comfy.test:8188",
-    });
-    await expect(directorApi.listAssets()).resolves.toEqual({
-      assets: [assetValue],
-      outputs_preserved: true,
-    });
-    await expect(directorApi.listAssetTrash()).resolves.toEqual({
-      batches: [],
-      remote_files_preserved: true,
-      active_database_identity: identity,
-      comfy_origin: "http://comfy.test:8188",
     });
     await expect(directorApi.listAssetTrash()).resolves.toEqual({
       batches: [],
       remote_files_preserved: true,
     });
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/assets?kind=image",
-      "/api/assets",
-      "/api/asset-trash",
-      "/api/asset-trash",
+      "/directordeck/api/assets?kind=image",
+      "/directordeck/api/asset-trash",
     ]);
   });
 
-  it("素材 scope metadata 必须成对、规范且与回收批次 origin 一致", async () => {
-    const identity = "b".repeat(64);
+  it("素材与回收站列表拒绝额外 envelope 字段", async () => {
     const assetValue = {
       id: "asset-1",
       name: "one.png",
-      subfolder: "director-web",
+      subfolder: "directordeck",
       type: "input",
       kind: "image",
-    };
-    const batch = {
-      batch_id: "batch-1",
-      comfy_origin: "http://comfy.test:8188",
-      asset_ids: [assetValue.id],
-      assets: [assetValue],
-      cascade: false,
-      unbound_usages: [],
-      unbound_usages_by_asset: { [assetValue.id]: [] },
-      created_at: "2026-08-16T12:00:00Z",
-      remote_files_preserved: true,
     };
     fetchMock
       .mockResolvedValueOnce(jsonResponse({
         assets: [assetValue],
         outputs_preserved: true,
-        active_database_identity: identity,
+        active_database_identity: "a".repeat(64),
       }))
       .mockResolvedValueOnce(jsonResponse({
-        batches: [batch],
+        batches: [],
         remote_files_preserved: true,
-        active_database_identity: identity,
-        comfy_origin: "http://other-comfy.test:8188",
-      }))
-      .mockResolvedValueOnce(jsonResponse({
-        assets: [assetValue],
-        outputs_preserved: true,
-        active_database_identity: "not-a-database-identity",
         comfy_origin: "http://comfy.test:8188",
       }));
 
     await expect(directorApi.listAssets()).rejects.toThrow("素材列表响应结构无效");
     await expect(directorApi.listAssetTrash()).rejects.toThrow("素材回收站响应结构无效");
-    await expect(directorApi.listAssets()).rejects.toThrow("素材列表响应结构无效");
   });
 
   it("保留非级联素材删除方法的旧路由契约", async () => {
@@ -1005,7 +833,7 @@ describe("Director REST 契约", () => {
       deleted_asset_id: "asset/1",
       outputs_preserved: true,
     });
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/assets/asset%2F1");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/assets/asset%2F1");
     expect(fetchMock.mock.calls[0][1]?.method).toBe("DELETE");
     expect(fetchMock.mock.calls[0][1]?.body).toBeUndefined();
   });
@@ -1044,20 +872,19 @@ describe("Director REST 契约", () => {
     const first = {
       id: "asset/one",
       name: "one.png",
-      subfolder: "director-web",
+      subfolder: "directordeck",
       type: "input",
       kind: "image",
     };
     const second = {
       id: "asset-two",
       name: "two.wav",
-      subfolder: "director-web",
+      subfolder: "directordeck",
       type: "input",
       kind: "audio",
     };
     const batch = {
       batch_id: "batch/one",
-      comfy_origin: "http://comfy.test:8188",
       asset_ids: [first.id, second.id],
       assets: [first, second],
       cascade: true,
@@ -1103,10 +930,10 @@ describe("Director REST 契约", () => {
     await expect(directorApi.purgeAssetTrash(batch.batch_id)).resolves.toEqual(purged);
 
     expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
-      ["/api/asset-trash", "POST"],
-      ["/api/asset-trash", "GET"],
-      ["/api/asset-trash/batch%2Fone/restore", "POST"],
-      ["/api/asset-trash/batch%2Fone", "DELETE"],
+      ["/directordeck/api/asset-trash", "POST"],
+      ["/directordeck/api/asset-trash", "GET"],
+      ["/directordeck/api/asset-trash/batch%2Fone/restore", "POST"],
+      ["/directordeck/api/asset-trash/batch%2Fone", "DELETE"],
     ]);
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
       asset_ids: [first.id, second.id],
@@ -1122,13 +949,12 @@ describe("Director REST 契约", () => {
     const assetValue = {
       id: "asset-1",
       name: "one.png",
-      subfolder: "director-web",
+      subfolder: "directordeck",
       type: "input",
       kind: "image",
     };
     const batch = {
       batch_id: "batch-1",
-      comfy_origin: "http://comfy.test:8188",
       asset_ids: [assetValue.id],
       assets: [assetValue],
       cascade: true,
@@ -1266,79 +1092,6 @@ describe("Director REST 契约", () => {
     expect(JSON.stringify((error as ApiError).details)).not.toContain("secret sql");
   });
 
-  it("素材上传 endpoint CAS 冲突保留可判定错误码但过滤内部字段", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({
-      detail: {
-        code: "asset_upload_origin_changed",
-        message: "endpoint changed; remote file was preserved",
-        remote_files_preserved: true,
-        old_origin: "secret-old-origin",
-      },
-    }, 409));
-
-    const error = await directorApi.uploadAsset(
-      new File(["image"], "frame.png", { type: "image/png" }),
-      "image",
-    ).catch((reason: unknown) => reason);
-
-    expect(error).toMatchObject({
-      status: 409,
-      code: "asset_upload_origin_changed",
-      message: "endpoint changed; remote file was preserved",
-      details: {
-        detail: {
-          code: "asset_upload_origin_changed",
-          message: "endpoint changed; remote file was preserved",
-          remote_files_preserved: true,
-        },
-      },
-    });
-    expect(JSON.stringify((error as ApiError).details)).not.toContain("secret-old-origin");
-  });
-
-  it("带进度上传也保留 endpoint CAS 冲突码", async () => {
-    class FailedXMLHttpRequest {
-      upload = {
-        onprogress: null as ((event: ProgressEvent) => void) | null,
-        onload: null as (() => void) | null,
-      };
-      status = 409;
-      response: unknown = {
-        detail: {
-          code: "asset_upload_origin_changed",
-          message: "endpoint changed during upload",
-          remote_files_preserved: true,
-        },
-      };
-      responseType = "";
-      onload: (() => void) | null = null;
-      onerror: (() => void) | null = null;
-      onabort: (() => void) | null = null;
-      open() {}
-      setRequestHeader() {}
-      send() { this.onload?.(); }
-    }
-    vi.stubGlobal("XMLHttpRequest", FailedXMLHttpRequest);
-
-    const error = await directorApi.uploadAsset(
-      new File(["image"], "frame.png", { type: "image/png" }),
-      "image",
-      vi.fn(),
-    ).catch((reason: unknown) => reason);
-
-    expect(error).toMatchObject({
-      status: 409,
-      code: "asset_upload_origin_changed",
-      details: {
-        detail: {
-          code: "asset_upload_origin_changed",
-          message: "endpoint changed during upload",
-          remote_files_preserved: true,
-        },
-      },
-    });
-  });
-
   it("HTTP detail 对象只暴露可读 message/usages，不泄漏其他字段", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({
       detail: {
@@ -1381,10 +1134,10 @@ describe("Director REST 契约", () => {
     await directorApi.cancelTask("job-1");
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/jobs",
-      "/api/jobs?limit=256&offset=0&sort_by=created_at&sort_order=asc",
-      "/api/jobs/job-1",
-      "/api/jobs/job-1/cancel",
+      "/directordeck/api/jobs",
+      "/directordeck/api/jobs?limit=256&offset=0&sort_by=created_at&sort_order=asc",
+      "/directordeck/api/jobs/job-1",
+      "/directordeck/api/jobs/job-1/cancel",
     ]);
     expect(fetchMock.mock.calls[0][1]?.method).toBe("POST");
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({ mode: "t2v", config });
@@ -1419,7 +1172,7 @@ describe("Director REST 契约", () => {
     ).resolves.toMatchObject({ id: job.id, status: "cancelled" });
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "/api/jobs/job-1/recovery/confirm-comfy-restart",
+      "/directordeck/api/jobs/job-1/recovery/confirm-comfy-restart",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ confirmation: "comfyui_process_restarted" }),
@@ -1446,8 +1199,8 @@ describe("Director REST 契约", () => {
 
     expect(result.jobs.map((task) => task.id)).toEqual([job.id, second.id]);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/jobs?limit=256&offset=0&sort_by=created_at&sort_order=asc",
-      "/api/jobs?limit=256&offset=1&sort_by=created_at&sort_order=asc",
+      "/directordeck/api/jobs?limit=256&offset=0&sort_by=created_at&sort_order=asc",
+      "/directordeck/api/jobs?limit=256&offset=1&sort_by=created_at&sort_order=asc",
     ]);
   });
 
@@ -1459,10 +1212,10 @@ describe("Director REST 契约", () => {
       name: "take_24fps.mp4",
       filename: "take_24fps.mp4",
       path: "director-web/take_24fps.mp4",
-      subfolder: "director-web",
+      subfolder: "directordeck",
       type: "input",
       kind: "video",
-      preview_url: "/api/assets/imported-video/preview",
+      preview_url: "/directordeck/api/assets/imported-video/preview",
       content_hash: `sha256:${"a".repeat(64)}`,
       metadata: {
         duration: 5,
@@ -1522,10 +1275,10 @@ describe("Director REST 契约", () => {
     })).resolves.toMatchObject({ id: "imported-video", kind: "video" });
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/jobs/cancel",
-      "/api/jobs/job-1/project",
-      "/api/jobs/job-1/diagnostic",
-      "/api/jobs/job-1/import-output",
+      "/directordeck/api/jobs/cancel",
+      "/directordeck/api/jobs/job-1/project",
+      "/directordeck/api/jobs/job-1/diagnostic",
+      "/directordeck/api/jobs/job-1/import-output",
     ]);
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
       job_ids: [job.id],
@@ -1605,8 +1358,8 @@ describe("Director REST 契约", () => {
     });
     await expect(directorApi.getTaskGenerationDetails(job.id)).rejects.toBeInstanceOf(ApiError);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/jobs/job-1/generation-details",
-      "/api/jobs/job-1/generation-details",
+      "/directordeck/api/jobs/job-1/generation-details",
+      "/directordeck/api/jobs/job-1/generation-details",
     ]);
   });
 
@@ -1650,7 +1403,7 @@ describe("Director REST 契约", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(report));
 
     await expect(directorApi.compileTimeline({ config: project })).resolves.toEqual(report);
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/timeline/compile");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/timeline/compile");
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({ config: project });
 
     fetchMock.mockResolvedValueOnce(jsonResponse({
@@ -1888,8 +1641,8 @@ describe("Director REST 契约", () => {
       outputs_preserved: true,
     });
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/api/jobs/job%2F1",
-      "/api/jobs",
+      "/directordeck/api/jobs/job%2F1",
+      "/directordeck/api/jobs",
     ]);
     expect(fetchMock.mock.calls.every(([, init]) => init?.method === "DELETE")).toBe(true);
   });
@@ -1925,12 +1678,10 @@ describe("Director REST 契约", () => {
       segment_count: 1,
     };
     const project = createTimelineProject();
-    const activeDatabaseIdentity = "a".repeat(64);
 
     fetchMock
       .mockResolvedValueOnce(jsonResponse({
         projects: [summary],
-        active_database_identity: activeDatabaseIdentity,
       }))
       .mockResolvedValueOnce(jsonResponse(summary))
       .mockResolvedValueOnce(jsonResponse(summary))
@@ -1944,7 +1695,6 @@ describe("Director REST 契约", () => {
 
     await expect(directorApi.listProjects()).resolves.toEqual({
       projects: [summary],
-      active_database_identity: activeDatabaseIdentity,
     });
     await expect(directorApi.createProject("第二部影片")).resolves.toEqual(summary);
     await expect(directorApi.renameProject("project-1", "改名")).resolves.toEqual(summary);
@@ -1957,30 +1707,22 @@ describe("Director REST 契约", () => {
     await expect(directorApi.updateProjectTimeline("project-1", project)).resolves.toEqual(project);
 
     expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
-      ["/api/projects", "GET"],
-      ["/api/projects", "POST"],
-      ["/api/projects/project-1", "PATCH"],
-      ["/api/projects/project-1", "DELETE"],
-      ["/api/projects/project-1/timeline", "GET"],
-      ["/api/projects/project-1/timeline", "PUT"],
+      ["/directordeck/api/projects", "GET"],
+      ["/directordeck/api/projects", "POST"],
+      ["/directordeck/api/projects/project-1", "PATCH"],
+      ["/directordeck/api/projects/project-1", "DELETE"],
+      ["/directordeck/api/projects/project-1/timeline", "GET"],
+      ["/directordeck/api/projects/project-1/timeline", "PUT"],
     ]);
   });
 
-  it("项目列表拒绝缺失、错误或多余的数据库身份元数据", async () => {
+  it("项目列表拒绝多余的 envelope 字段", async () => {
     fetchMock
-      .mockResolvedValueOnce(jsonResponse({ projects: [] }))
       .mockResolvedValueOnce(jsonResponse({
         projects: [],
-        active_database_identity: "not-a-database-identity",
-      }))
-      .mockResolvedValueOnce(jsonResponse({
-        projects: [],
-        active_database_identity: "a".repeat(64),
         extra: true,
       }));
 
-    await expect(directorApi.listProjects()).rejects.toThrow("项目列表响应结构无效");
-    await expect(directorApi.listProjects()).rejects.toThrow("项目列表响应结构无效");
     await expect(directorApi.listProjects()).rejects.toThrow("项目列表响应结构无效");
   });
 
@@ -1997,39 +1739,11 @@ describe("Director REST 契约", () => {
 
     await expect(directorApi.importProject({ title: "历史来源", document: project }))
       .resolves.toEqual(summary);
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/projects/import");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/projects/import");
     expect(fetchMock.mock.calls[0][1]?.method).toBe("POST");
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
       title: "历史来源",
       document: project,
     });
-  });
-});
-
-describe("插件内嵌模式探测", () => {
-  it("仅 /director/status 返回含 backend 字段的 JSON 时判定为插件模式", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ backend: "ready" }));
-
-    await expect(detectEmbeddedComfyUi()).resolves.toBe(true);
-    expect(fetchMock.mock.calls[0][0]).toBe("/director/status");
-    expect(fetchMock.mock.calls[0][1]?.cache).toBe("no-store");
-  });
-
-  it("404、HTML 回退和网络失败都按独立部署处理", async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ error: "not found" }, 404))
-      .mockResolvedValueOnce(
-        new Response("<!doctype html><title>Director</title>", {
-          status: 200,
-          headers: { "Content-Type": "text/html" },
-        }),
-      )
-      .mockResolvedValueOnce(jsonResponse({ status: "ok" }))
-      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
-
-    await expect(detectEmbeddedComfyUi()).resolves.toBe(false);
-    await expect(detectEmbeddedComfyUi()).resolves.toBe(false);
-    await expect(detectEmbeddedComfyUi()).resolves.toBe(false);
-    await expect(detectEmbeddedComfyUi()).resolves.toBe(false);
   });
 });

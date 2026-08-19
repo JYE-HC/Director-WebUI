@@ -5,9 +5,9 @@ import asyncio
 import pytest
 from starlette.requests import Request
 
-from director.app import _sync_job
-from director.progress import ComfyExecutionEvent, ComfyProgressEvent
-from director.schemas import RuntimeSettings, default_settings
+from directordeck.app import _sync_job
+from directordeck.progress import ComfyExecutionEvent, ComfyProgressEvent
+from directordeck.schemas import RuntimeSettings, default_settings
 
 from .conftest import runnable_draft
 
@@ -15,9 +15,7 @@ from .conftest import runnable_draft
 async def test_raylight_native_events_persist_all_visible_execution_stages(
     client,
 ) -> None:
-    raw_settings = default_settings(
-        "http://comfy.test:8188"
-    ).model_dump(mode="json")
+    raw_settings = default_settings().model_dump(mode="json")
     raw_settings["multi_gpu_enabled"] = True
     raw_settings["models"]["fl2va"].update(
         {
@@ -84,14 +82,6 @@ async def test_raylight_native_events_persist_all_visible_execution_stages(
             "片段 1/1 · 加载 RayLight 生成模型",
         ),
     ]
-    unchanged = database.get_job_child(child["id"])
-    assert unchanged is not None
-    await sink(
-        "http://another-comfy.test:8188",
-        ComfyExecutionEvent(prompt_id=prompt_id, node_id=stages[1][0]),
-    )
-    assert database.get_job_child(child["id"]) == unchanged
-
     for current_node, expected_progress, expected_stage in stages:
         await sink(
             origin,
@@ -165,9 +155,7 @@ async def test_raylight_native_events_persist_all_visible_execution_stages(
 async def test_immediate_raylight_execution_before_submit_response_is_preserved(
     client, fake_comfy, monkeypatch
 ) -> None:
-    raw_settings = default_settings(
-        "http://comfy.test:8188"
-    ).model_dump(mode="json")
+    raw_settings = default_settings().model_dump(mode="json")
     raw_settings["multi_gpu_enabled"] = True
     raw_settings["models"]["fl2va"].update(
         {

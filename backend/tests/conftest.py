@@ -7,10 +7,10 @@ from typing import Any
 import httpx
 import pytest
 
-from director.app import create_app
-from director.comfy import ComfyClient, ComfyError
-from director.media import MediaToolError, VideoProxyResult
-from director.schemas import RuntimeSettings, VideoMetadata, default_settings
+from directordeck.app import create_app
+from directordeck.comfy import ComfyClient, ComfyError
+from directordeck.media import MediaToolError, VideoProxyResult
+from directordeck.schemas import VideoMetadata, default_settings
 
 
 VIDEO_METADATA: dict[str, Any] = {
@@ -22,6 +22,10 @@ VIDEO_METADATA: dict[str, Any] = {
     "probe_method": "fake_ffprobe",
     "has_audio": True,
 }
+
+# The embedded backend's single ComfyUI endpoint; create_app requires it and
+# the FakeComfy factory ignores it.
+TEST_COMFY_URL = "http://comfy.test:8188"
 
 
 class FakeComfy:
@@ -74,7 +78,7 @@ class FakeComfy:
             "MiniMaxH3AddGuide",
             "TrimAudioDuration",
         ]
-        from director.native_templates import EXPECTED_NATIVE_NODE_MODULES
+        from directordeck.native_templates import EXPECTED_NATIVE_NODE_MODULES
 
         self.node_provenance = {
             node: EXPECTED_NATIVE_NODE_MODULES[node]
@@ -153,7 +157,7 @@ class FakeComfy:
         self.uploads.append(
             {"filename": filename, "content": materialized, "content_type": content_type, "kind": kind}
         )
-        return {"name": filename, "subfolder": "" if kind == "video" else "director-web", "type": "input"}
+        return {"name": filename, "subfolder": "" if kind == "video" else "directordeck", "type": "input"}
 
     async def upload_output(
         self, filename: str, content: bytes, content_type: str, subfolder: str
@@ -330,15 +334,19 @@ async def client(tmp_path: Path, fake_comfy: FakeComfy, monkeypatch):
             strategy="transcode",
         )
 
-    monkeypatch.setattr("director.app.anyio.to_thread.run_sync", run_sync)
-    monkeypatch.setattr("director.app.create_24fps_proxy_file", create_proxy)
-    app = create_app(database_path=tmp_path / "director.sqlite3", comfy_factory=lambda _settings: fake_comfy)
+    monkeypatch.setattr("directordeck.app.anyio.to_thread.run_sync", run_sync)
+    monkeypatch.setattr("directordeck.app.create_24fps_proxy_file", create_proxy)
+    app = create_app(
+        database_path=tmp_path / "directordeck.sqlite3",
+        comfy_url=TEST_COMFY_URL,
+        comfy_factory=lambda _comfy_url: fake_comfy,
+    )
     # httpx.AsyncClient + ASGITransport is intentionally used instead of
     # Starlette TestClient. Some sandboxed Python builds cannot start its
     # blocking portal even for an empty ASGI app. Initialize persistence
     # explicitly because ASGITransport does not drive lifespan hooks.
     app.state.database.initialize()
-    app.state.database.put_settings(default_settings("http://comfy.test:8188"))
+    app.state.database.put_settings(default_settings())
     for name, kind in (
         ("first.png", "image"),
         ("last.png", "image"),
@@ -352,7 +360,6 @@ async def client(tmp_path: Path, fake_comfy: FakeComfy, monkeypatch):
         app.state.database.put_asset(
             document["id"],
             document,
-            comfy_origin="http://comfy.test:8188",
         )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
@@ -365,7 +372,7 @@ async def client(tmp_path: Path, fake_comfy: FakeComfy, monkeypatch):
 def asset(name: str, kind: str, *, slot: int | None = None) -> dict[str, Any]:
     value: dict[str, Any] = {
         "name": name,
-        "subfolder": "director-web",
+        "subfolder": "directordeck",
         "type": "input",
         "kind": kind,
         "id": f"fixture-{kind}-{name}",

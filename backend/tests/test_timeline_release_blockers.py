@@ -7,15 +7,15 @@ import httpx
 import pytest
 from starlette.requests import Request
 
-from director.app import (
+from directordeck.app import (
     _is_full_timeline_selection,
     _segment_results,
     _sync_timeline_job,
     create_app,
 )
-from director.media import VideoProxy
-from director.progress import ComfyPreviewEvent, ComfyProgressEvent
-from director.schemas import (
+from directordeck.media import VideoProxy
+from directordeck.progress import ComfyPreviewEvent, ComfyProgressEvent
+from directordeck.schemas import (
     RuntimeSettings,
     VideoMetadata,
     default_settings,
@@ -367,7 +367,7 @@ async def test_full_multisegment_success_assembles_exact_timeline_order(
         metadata=VideoMetadata.model_validate(VIDEO_METADATA),
     )
     assemble = Mock(return_value=assembled)
-    monkeypatch.setattr("director.app.assemble_video_bytes", assemble)
+    monkeypatch.setattr("directordeck.app.assemble_video_bytes", assemble)
 
     database = client.director_app.state.database
     background_result = await _sync_timeline_job(
@@ -385,7 +385,7 @@ async def test_full_multisegment_success_assembles_exact_timeline_order(
     assert job["outputs"] == [f"/api/jobs/{parent['id']}/outputs/0"]
     assert len(job["output_files"]) == 1
     assert job["output_files"][0].startswith(
-        "output/director-web/timelines/Director_timeline_"
+        "output/directordeck/timelines/DirectorDeck_timeline_"
     )
     assert viewed == ["ref-first.mp4", "fl-second.mp4"]
     assemble.assert_called_once_with(
@@ -402,7 +402,7 @@ async def test_full_multisegment_success_assembles_exact_timeline_order(
         {
             "node_id": "assembly",
             "filename": fake_comfy.uploads[-1]["filename"],
-            "subfolder": "director-web/timelines",
+            "subfolder": "directordeck/timelines",
             "type": "output",
         }
     ]
@@ -437,7 +437,7 @@ async def test_background_status_pass_can_reconcile_without_starting_assembly(
         fake_comfy.histories[child["prompt_id"]] = _success_history(child)
     fake_comfy.pending = []
     assemble = AsyncMock(side_effect=AssertionError("HTTP read must not assemble"))
-    monkeypatch.setattr("director.app._assemble_timeline_output", assemble)
+    monkeypatch.setattr("directordeck.app._assemble_timeline_output", assemble)
 
     await _reconcile_timeline(client, parent)
     response = await client.get(f"/api/jobs/{parent['id']}")
@@ -460,7 +460,7 @@ async def test_single_segment_success_reuses_exact_native_output_without_assembl
     fake_comfy.histories[child["prompt_id"]] = _success_history(child)
     fake_comfy.pending = []
     assemble = Mock(side_effect=AssertionError("single segment must not be re-encoded"))
-    monkeypatch.setattr("director.app.assemble_video_bytes", assemble)
+    monkeypatch.setattr("directordeck.app.assemble_video_bytes", assemble)
 
     await _reconcile_timeline(client, parent)
     response = await client.get(f"/api/jobs/{parent['id']}")
@@ -513,7 +513,7 @@ async def test_selection_or_output_policy_can_keep_results_as_individual_segment
         fake_comfy.histories[child["prompt_id"]] = _success_history(child)
     fake_comfy.pending = []
     assemble = Mock(side_effect=AssertionError("individual segments must not assemble"))
-    monkeypatch.setattr("director.app.assemble_video_bytes", assemble)
+    monkeypatch.setattr("directordeck.app.assemble_video_bytes", assemble)
 
     result = await _sync_timeline_job(
         _background_request(client.director_app),
@@ -537,7 +537,7 @@ async def test_multisegment_missing_output_fails_before_assembly(
         )
     fake_comfy.pending = []
     assemble = Mock(side_effect=AssertionError("assembly must not start"))
-    monkeypatch.setattr("director.app.assemble_video_bytes", assemble)
+    monkeypatch.setattr("directordeck.app.assemble_video_bytes", assemble)
 
     await _reconcile_timeline(client, parent)
     response = await client.get(f"/api/jobs/{parent['id']}")
@@ -562,7 +562,7 @@ async def test_multisegment_duplicate_output_fails_before_assembly(
         )
     fake_comfy.pending = []
     assemble = Mock(side_effect=AssertionError("assembly must not start"))
-    monkeypatch.setattr("director.app.assemble_video_bytes", assemble)
+    monkeypatch.setattr("directordeck.app.assemble_video_bytes", assemble)
 
     await _reconcile_timeline(client, parent)
     response = await client.get(f"/api/jobs/{parent['id']}")
@@ -593,11 +593,11 @@ async def test_http_reads_do_not_wait_for_background_timeline_assembly(
         return {
             "node_id": "assembly",
             "filename": "assembled.mp4",
-            "subfolder": "director-web/timelines",
+            "subfolder": "directordeck/timelines",
             "type": "output",
         }
 
-    monkeypatch.setattr("director.app._assemble_timeline_output", blocked_assembly)
+    monkeypatch.setattr("directordeck.app._assemble_timeline_output", blocked_assembly)
     database = client.director_app.state.database
     background = asyncio.create_task(
         _sync_timeline_job(
@@ -642,13 +642,13 @@ async def test_unexpected_assembly_exception_releases_claim_for_one_later_retry(
     assembled_output = {
         "node_id": "assembly",
         "filename": "retried.mp4",
-        "subfolder": "director-web/timelines",
+        "subfolder": "directordeck/timelines",
         "type": "output",
     }
     assemble = AsyncMock(
         side_effect=[RuntimeError("unexpected assembler bug"), assembled_output]
     )
-    monkeypatch.setattr("director.app._assemble_timeline_output", assemble)
+    monkeypatch.setattr("directordeck.app._assemble_timeline_output", assemble)
 
     with pytest.raises(RuntimeError, match="unexpected assembler bug"):
         await _reconcile_timeline(client, parent, allow_assembly=True)
@@ -686,11 +686,11 @@ async def test_cancel_wins_while_multisegment_assembly_is_in_flight(
         return {
             "node_id": "assembly",
             "filename": "orphaned-after-cancel.mp4",
-            "subfolder": "director-web/timelines",
+            "subfolder": "directordeck/timelines",
             "type": "output",
         }
 
-    monkeypatch.setattr("director.app._assemble_timeline_output", blocked_assembly)
+    monkeypatch.setattr("directordeck.app._assemble_timeline_output", blocked_assembly)
     database = client.director_app.state.database
     refresh = asyncio.create_task(
         _sync_timeline_job(
@@ -1009,8 +1009,8 @@ async def test_job_read_hides_preview_from_terminal_child_while_parent_is_active
     assert client.director_app.state.live_preview_cache.get(parent["id"]) is not None
 
 
-def _settings_for(comfy_url: str, client_id: str) -> RuntimeSettings:
-    document = default_settings(comfy_url).model_dump(mode="json")
+def _settings_for(client_id: str) -> RuntimeSettings:
+    document = default_settings().model_dump(mode="json")
     document["client_id"] = client_id
     return RuntimeSettings.model_validate(document)
 
@@ -1041,13 +1041,13 @@ def _insert_lifecycle_job(database, job_id: str, status: str, settings: RuntimeS
 async def test_lifespan_restores_progress_monitors_for_historical_active_endpoints(
     tmp_path, monkeypatch
 ) -> None:
-    app = create_app(database_path=tmp_path / "lifespan.sqlite3")
+    app = create_app(comfy_url="http://comfy.test:8188", database_path=tmp_path / "lifespan.sqlite3")
     database = app.state.database
     database.initialize()
-    current = _settings_for("http://current.test:8188", "current-client")
-    historical_a = _settings_for("http://historical-a.test:8188", "client-a")
-    historical_b = _settings_for("https://historical-b.test/comfy", "client-b")
-    terminal = _settings_for("http://terminal.test:8188", "terminal-client")
+    current = _settings_for("current-client")
+    historical_a = _settings_for("client-a")
+    historical_b = _settings_for("client-b")
+    terminal = _settings_for("terminal-client")
     database.put_settings(current)
     _insert_lifecycle_job(database, "active-a", "queued", historical_a)
     _insert_lifecycle_job(database, "active-b", "running", historical_b)
@@ -1065,17 +1065,21 @@ async def test_lifespan_restores_progress_monitors_for_historical_active_endpoin
         (str(call.args[0]).rstrip("/"), call.args[1])
         for call in ensure.call_args_list
     }
+    # The embedded app owns exactly one ComfyUI URL; historical jobs only add
+    # their distinct client ids on that same host.
     assert (
-        "http://current.test:8188",
+        "http://comfy.test:8188",
         "current-client",
     ) in monitored
     assert (
-        "http://historical-a.test:8188",
+        "http://comfy.test:8188",
         "client-a",
     ) in monitored
     assert (
-        "https://historical-b.test/comfy",
+        "http://comfy.test:8188",
         "client-b",
     ) in monitored
-    assert all(origin != "http://terminal.test:8188" for origin, _ in monitored)
+    assert all(
+        client_id != "terminal-client" for _origin, client_id in monitored
+    )
     close.assert_awaited_once_with()

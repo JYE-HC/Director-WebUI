@@ -5,8 +5,8 @@ from copy import deepcopy
 import pytest
 from pydantic import ValidationError
 
-import director.native_templates as native_templates_module
-from director.native_templates import (
+import directordeck.native_templates as native_templates_module
+from directordeck.native_templates import (
     EXPECTED_NATIVE_NODE_MODULES,
     NativeCompileResult,
     NativeHistoricalTake,
@@ -21,13 +21,13 @@ from director.native_templates import (
     validate_native_capabilities,
     validate_native_workflow_ready,
 )
-from director.schemas import RuntimeSettings, UnifiedTimelineDraft, default_settings
+from directordeck.schemas import RuntimeSettings, UnifiedTimelineDraft, default_settings
 
 
 def _asset(kind: str, name: str, *, slot: int | None = None) -> dict:
     value = {
         "name": name,
-        "subfolder": "director-web",
+        "subfolder": "directordeck",
         "type": "input",
         "kind": kind,
         "id": f"asset-{name}",
@@ -110,7 +110,7 @@ def _draft(*modes: str, audio_mode: str = "generate") -> UnifiedTimelineDraft:
 def _settings(
     *, fl_backend: str = "standard", ref_backend: str = "standard"
 ) -> RuntimeSettings:
-    value = default_settings("http://comfy.test:8188").model_dump(mode="json")
+    value = default_settings().model_dump(mode="json")
     if "raylight" in (fl_backend, ref_backend):
         value["multi_gpu_enabled"] = True
     for family, backend in (("fl2va", fl_backend), ("ref2va", ref_backend)):
@@ -858,7 +858,7 @@ def test_gpu_pool_is_the_only_backend_route_and_hidden_lora_flags_are_ignored() 
 
 
 def test_auto_backend_and_explicit_standard_device_are_fail_closed() -> None:
-    one_gpu = default_settings("http://comfy.test:8188")
+    one_gpu = default_settings()
     assert one_gpu.models.fl2va.backend == "auto"
     assert one_gpu.models.fl2va.raylight.fsdp is False
     standard = compile_native_timeline(_draft("t2v"), one_gpu, "job-auto-standard")
@@ -895,7 +895,7 @@ def test_auto_backend_and_explicit_standard_device_are_fail_closed() -> None:
 
 
 def test_raylight_pool_requires_multi_gpu_enabled() -> None:
-    raw = default_settings("http://comfy.test:8188").model_dump(mode="json")
+    raw = default_settings().model_dump(mode="json")
     raw["models"]["fl2va"]["raylight"].update(
         gpu_select=[0, 1], ulysses_degree=2
     )
@@ -1046,7 +1046,7 @@ def test_continuity_builds_unresolved_predecessor_graph_and_binds_output() -> No
     bound = bind_native_workflow_predecessor_output(
         successor,
         {
-            "filename": "Director_timeline_00001_.mp4",
+            "filename": "DirectorDeck_timeline_00001_.mp4",
             "subfolder": "video",
             "type": "output",
         },
@@ -1055,7 +1055,7 @@ def test_continuity_builds_unresolved_predecessor_graph_and_binds_output() -> No
     assert bound.continuity is not None and bound.continuity.resolved is True
     assert (
         bound.prompt[bound.continuity.load_video_node_id]["inputs"]["file"]
-        == "video/Director_timeline_00001_.mp4 [output]"
+        == "video/DirectorDeck_timeline_00001_.mp4 [output]"
     )
     assert "UNBOUND_PREDECESSOR_OUTPUT" in dependency_loader["inputs"]["file"]
 
@@ -1374,7 +1374,6 @@ def test_unknown_standard_lora_uses_remote_generic_metadata_or_scoped_override()
         "loader": "bypass_model_only",
         "lora_name": "renamed_generic.safetensors",
         "model_filename": value["models"]["fl2va"]["filename"],
-        "comfy_origin": value["comfy_url"],
     }
     explicit = compile_native_timeline(
         _draft("t2v"),

@@ -5,10 +5,12 @@ declare const process: { env: Record<string, string | undefined> };
 
 const frontendHost = process.env.DIRECTOR_FRONTEND_HOST || "127.0.0.1";
 const frontendPort = Number(process.env.DIRECTOR_FRONTEND_PORT || "4173");
-const apiOrigin = process.env.DIRECTOR_API_ORIGIN || "http://127.0.0.1:8787";
+// Dev proxy targets the host ComfyUI process, which reverse-proxies the
+// embedded DirectorDeck backend under /directordeck.
+const apiOrigin = process.env.DIRECTOR_API_ORIGIN || "http://127.0.0.1:8188";
 
 export default defineConfig(({ command }) => ({
-  // Built assets are served by the ComfyUI plugin under /director/; a
+  // Built assets are served by the ComfyUI plugin under /directordeck/; a
   // relative base keeps the same dist usable from any mount point.
   base: command === "build" ? "./" : "/",
   plugins: [react()],
@@ -17,7 +19,7 @@ export default defineConfig(({ command }) => ({
     port: frontendPort,
     strictPort: true,
     proxy: {
-      "/api": apiOrigin,
+      "/directordeck": apiOrigin,
     },
   },
   test: {

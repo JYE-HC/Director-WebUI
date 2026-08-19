@@ -1,10 +1,9 @@
 """Public URL prefix for browser-facing API URLs embedded in responses.
 
-Standalone deployments keep the historical absolute ``/api/...`` paths. When
-the backend runs embedded behind a reverse-proxy mount point (ComfyUI plugin
-mode mounts the Director API under ``/director/api``), the host calls
-``set_public_api_prefix`` so response URLs point at the public mount instead
-of colliding with the host's own ``/api`` namespace.
+The backend runs embedded behind the ComfyUI plugin's reverse-proxy mount
+point (``/directordeck/api``); the host calls ``set_public_api_prefix`` so
+response URLs point at the public mount instead of colliding with the host's
+own ``/api`` namespace.
 
 The prefix is process-global because the single-instance database lock
 already guarantees at most one Director app per process.

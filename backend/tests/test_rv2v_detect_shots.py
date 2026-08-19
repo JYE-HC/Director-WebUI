@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from director.media import MediaToolError
-from director.schemas import DetectShotsResponse
+from directordeck.media import MediaToolError
+from directordeck.schemas import DetectShotsResponse
 
 
 @pytest.fixture(autouse=True)
@@ -13,7 +13,7 @@ def synchronous_media_worker(monkeypatch):
     async def run_sync(function):
         return function()
 
-    monkeypatch.setattr("director.app.anyio.to_thread.run_sync", run_sync)
+    monkeypatch.setattr("directordeck.app.anyio.to_thread.run_sync", run_sync)
 
 
 async def test_rv2v_shot_detection_uses_registered_asset_and_local_media_tool(
@@ -29,7 +29,7 @@ async def test_rv2v_shot_detection_uses_registered_asset_and_local_media_tool(
             warnings=["low contrast"],
         )
 
-    monkeypatch.setattr("director.app.detect_shots_bytes", detect)
+    monkeypatch.setattr("directordeck.app.detect_shots_bytes", detect)
     response = await client.post(
         "/api/rv2v/detect-shots",
         json={
@@ -57,7 +57,7 @@ async def test_rv2v_shot_detection_surfaces_local_media_error(
     def fail(*_args, **_kwargs):
         raise MediaToolError("PySceneDetect is unavailable")
 
-    monkeypatch.setattr("director.app.detect_shots_bytes", fail)
+    monkeypatch.setattr("directordeck.app.detect_shots_bytes", fail)
     response = await client.post(
         "/api/rv2v/detect-shots",
         json={
@@ -106,23 +106,6 @@ async def test_rv2v_shot_detection_requires_registered_video(
     )
     assert response.status_code == status
     assert message in response.text
-
-
-async def test_rv2v_shot_detection_blocks_inactive_endpoint(client) -> None:
-    settings = (await client.get("/api/settings")).json()
-    settings["comfy_url"] = "http://other-comfy.test:8188"
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
-    response = await client.post(
-        "/api/rv2v/detect-shots",
-        json={
-            "asset_id": "fixture-video-source.mp4",
-            "frame_rate": 24.0,
-            "sensitivity": "low",
-            "min_shot_frames": 12,
-        },
-    )
-    assert response.status_code == 409
-    assert "not the active endpoint" in response.text
 
 
 @pytest.mark.parametrize(

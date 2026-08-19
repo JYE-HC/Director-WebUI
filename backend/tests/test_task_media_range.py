@@ -6,8 +6,8 @@ import httpx
 import pytest
 from starlette.requests import ClientDisconnect
 
-from director.app import _media_response, _proxy_comfy_media
-from director.comfy import ComfyClient, ComfyMediaStream
+from directordeck.app import _media_response, _proxy_comfy_media
+from directordeck.comfy import ComfyClient, ComfyMediaStream
 
 
 def _upstream(content: bytes = b"0123456789") -> httpx.Response:

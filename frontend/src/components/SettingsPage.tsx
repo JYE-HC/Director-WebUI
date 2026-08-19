@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, directorApi } from "../api/client";
+import { directorApi } from "../api/client";
 import {
-  isConfiguredComfyUrl,
   rayLightResidencyPolicyAfterBindingChange,
   resolveExecutionBackend,
   type CapabilityReport,
@@ -30,24 +29,6 @@ import { DeferredNumberInput, Field, formatBytes, Panel, Spinner, StatusDot } fr
 function sameSettings(left: RuntimeSettings, right: RuntimeSettings): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
-
-export function validateDatabasePathInput(value: string): string | null {
-  const path = value.trim();
-  if (!path) return "请填写数据库目标路径";
-  if (path.length > 4096) return "数据库路径不能超过 4096 个字符";
-  if (/[\u0000-\u001f\u007f]/.test(path)) return "数据库路径不能包含控制字符";
-  if (!path.startsWith("/") && !path.startsWith("~/"))
-    return "数据库路径必须是绝对路径或以 ~/ 开头";
-  return null;
-}
-
-const STORAGE_SOURCE_LABEL: Record<StorageConfiguration["source"], string> = {
-  explicit: "启动参数",
-  environment: "环境变量",
-  bootstrap: "启动引导配置",
-  legacy: "旧版路径兼容",
-  default: "默认路径",
-};
 
 const HIDDEN_PATH_VALUE = "••••••••••••••••";
 
@@ -83,14 +64,6 @@ function VisibilityToggle({
   );
 }
 
-function safeStorageError(reason: unknown, fallback: string): string {
-  return reason instanceof ApiError ? reason.message : fallback;
-}
-
-function storageRequestWasDefinitivelyRejected(reason: unknown): boolean {
-  return reason instanceof ApiError && reason.status >= 400 && reason.status < 500;
-}
-
 const MODEL_META: Record<ModelRole, { label: string; description: string; allowCpu: boolean }> = {
   fl2va: { label: "FL2VA 扩散模型", description: "按首尾帧素材自动选择生成配方", allowCpu: true },
   ref2va: { label: "REF2VA 扩散模型", description: "按源视频与参考素材自动选择生成配方", allowCpu: true },
@@ -107,12 +80,6 @@ const STANDARD_LORA_LOADER_LABELS: Record<StandardLoraLoader, string> = {
 
 export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[] {
   const errors: string[] = [];
-  try {
-    const url = new URL(settings.comfy_url);
-    if (url.protocol !== "http:" && url.protocol !== "https:") errors.push("ComfyUI 地址必须使用 HTTP 或 HTTPS");
-  } catch {
-    errors.push("ComfyUI 地址不是有效 URL");
-  }
   if (!/^[A-Za-z0-9._:-]{1,128}$/.test(settings.client_id))
     errors.push("客户端 ID 只能包含字母、数字、点、下划线、冒号和连字符");
   if (settings.memory_policy !== "keep_resident")
@@ -143,10 +110,8 @@ export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[]
         diffusion.lora_name === null ||
         override.lora_name !== diffusion.lora_name ||
         override.model_filename !== diffusion.filename ||
-        typeof override.comfy_origin !== "string" ||
-        override.comfy_origin.replace(/\/+$/, "") !== settings.comfy_url.replace(/\/+$/, "") ||
         resolveExecutionBackend(diffusion) !== "standard"
-      )) errors.push(`${MODEL_META[role].label}的 Standard LoRA 加载器覆盖与当前地址、底模或 LoRA 不匹配`);
+      )) errors.push(`${MODEL_META[role].label}的 Standard LoRA 加载器覆盖与底模或 LoRA 不匹配`);
       if (diffusion.backend !== "auto")
         errors.push(`${MODEL_META[role].label}的执行后端必须由逻辑 GPU 池自动选择`);
       const raylight = diffusion.raylight;
@@ -179,9 +144,10 @@ export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[]
   return errors;
 }
 
-export function SettingsPage({ settings, confirmedSettings = settings, resourcesOrigin = confirmedSettings.comfy_url, capabilities, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, storageOperationsDisabled = false, overlay = false, theme = "dark", embeddedComfyUi = false, onThemeChange = () => undefined, onDraftChange = () => undefined, onSaved, onBeforeStorageChange = async () => undefined, onStorageOperationStarted = () => undefined, onStorageOperationAborted = () => undefined, onStorageOperationUncertain = async () => { throw new Error("无法核对数据库存储状态"); }, onStorageConfigurationChanged = () => undefined, onStorageSwitchCancelled = async () => undefined, onConnectionTestSucceeded = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
+export function SettingsPage({ settings, confirmedSettings = settings, resourcesReady = false, capabilities, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, overlay = false, theme = "dark", onThemeChange = () => undefined, onDraftChange = () => undefined, onSaved, onConnectionTestSucceeded = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
   settings: RuntimeSettings; confirmedSettings?: RuntimeSettings; capabilities: CapabilityReport; gpus: GPUResource[];
-  resourcesOrigin?: string | null;
+  /** True once App has confirmed the four runtime resources against the host. */
+  resourcesReady?: boolean;
   models: ModelInventory;
   rayLightRuntimeStatus?: RayLightRuntimeStatus | null;
   rayLightRecoveryPending?: boolean;
@@ -190,40 +156,21 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   loadingModels: boolean;
   syncError?: string | null;
   runtimeEditingDisabled?: boolean;
-  /** A stale live-page database identity makes every storage action unsafe until reload. */
-  storageOperationsDisabled?: boolean;
   overlay?: boolean;
   theme?: UiTheme;
-  /** Plugin-embedded mode pins comfy_url server-side; the field is read-only. */
-  embeddedComfyUi?: boolean;
   onThemeChange?: (theme: UiTheme) => void;
   onDraftChange?: (settings: RuntimeSettings) => void;
   onRequestClose?: (restoreFocus?: boolean) => void;
   /** App-owned whole-document write followed by its authoritative runtime GET. */
   onSaved: (settings: RuntimeSettings) => Promise<RuntimeSettings>;
-  /** App-owned timeline flush. Storage mutation must not start unless it resolves. */
-  onBeforeStorageChange?: () => Promise<void>;
-  /** Establishes a global fail-closed boundary before a storage request can begin. */
-  onStorageOperationStarted?: () => void;
-  /** Releases that boundary only when no storage request was sent or a 4xx rejected it. */
-  onStorageOperationAborted?: () => void;
-  /** Reconciles an ambiguous network/5xx result until GET /storage is authoritative. */
-  onStorageOperationUncertain?: () => Promise<StorageConfiguration>;
-  /** Notifies App so a pending database switch can freeze all ordinary writes. */
-  onStorageConfigurationChanged?: (configuration: StorageConfiguration) => void;
-  /** Drains database-scoped WALs after PUT active has unfrozen the backend. */
-  onStorageSwitchCancelled?: () => Promise<void>;
-  /** App decides whether this exact probed URL is the current authoritative endpoint. */
-  onConnectionTestSucceeded?: (testedUrl: string) => void;
+  /** App re-reads capabilities/GPU/models after a successful host probe. */
+  onConnectionTestSucceeded?: () => void;
   /** App-owned explicit restart certificate followed by authoritative refresh. */
   onConfirmRayLightRuntimeRecovery?: () => Promise<void>;
 }) {
   const [working, setWorking] = useState<RuntimeSettings>(() => structuredClone(settings));
   const [testing, setTesting] = useState(false);
-  const [connectionProbe, setConnectionProbe] = useState<{
-    url: string;
-    result: ConnectionTestResult | null;
-  } | null>(null);
+  const [probeResult, setProbeResult] = useState<ConnectionTestResult | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [rayLightSetup, setRayLightSetup] = useState<RayLightSetupStatus | null>(null);
   const [rayLightInstallBusy, setRayLightInstallBusy] = useState(false);
@@ -231,47 +178,28 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   const [ffmpegInstallBusy, setFfmpegInstallBusy] = useState(false);
   const [residencyNotice, setResidencyNotice] = useState<string | null>(null);
   const [storageConfiguration, setStorageConfiguration] = useState<StorageConfiguration | null>(null);
-  const [storageTarget, setStorageTarget] = useState("");
-  const [comfyUrlVisible, setComfyUrlVisible] = useState(false);
   const [currentDatabaseVisible, setCurrentDatabaseVisible] = useState(false);
-  const [storageTargetVisible, setStorageTargetVisible] = useState(false);
   const [storageLoading, setStorageLoading] = useState(true);
-  const [storageOperation, setStorageOperation] = useState<"save" | "migrate" | null>(null);
-  const [storageMessage, setStorageMessage] = useState<{
-    kind: "success" | "error";
-    text: string;
-  } | null>(null);
   const editRevision = useRef(0);
   const workingRef = useRef(working);
   const confirmedRef = useRef(structuredClone(confirmedSettings));
   const hasLocalChanges = useRef(false);
   const onSavedRef = useRef(onSaved);
   const mountedRef = useRef(true);
-  const connectionProbeRevision = useRef(0);
-  const storageRequestRevision = useRef(0);
-  const storageTargetEdited = useRef(false);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const connectionStatusRef = useRef<HTMLDivElement>(null);
   const rayLightRecoveryRequestRef = useRef(false);
   const overlayRef = useRef<HTMLDivElement>(null);
   const pageRef = useRef<HTMLElement>(null);
   const validationErrors = validateRuntimeSettingsForm(working);
-  const runtimeConfigured = isConfiguredComfyUrl(working.comfy_url);
-  const effectiveRuntimeEditingDisabled = runtimeEditingDisabled || storageOperation !== null ||
-    storageConfiguration?.restart_required === true;
-  const runtimeResourcesReady = !effectiveRuntimeEditingDisabled && runtimeConfigured && capabilities.connection === "online" &&
-    resourcesOrigin === working.comfy_url;
-  const awaitingCurrentEndpoint = runtimeConfigured && resourcesOrigin !== working.comfy_url;
-  const currentRayLightRuntimeStatus = resourcesOrigin === working.comfy_url
-    ? rayLightRuntimeStatus
-    : null;
+  const effectiveRuntimeEditingDisabled = runtimeEditingDisabled;
+  const runtimeResourcesReady = !effectiveRuntimeEditingDisabled && capabilities.connection === "online" &&
+    resourcesReady;
+  const currentRayLightRuntimeStatus = resourcesReady ? rayLightRuntimeStatus : null;
   const diffusionModels = [...new Set([...models.fl2va, ...models.ref2va])].sort();
   const rayLightFamilies = (["fl2va", "ref2va"] as const)
     .filter((role) => resolveExecutionBackend(working.models[role]) === "raylight")
     .map((role) => role === "fl2va" ? "FL2VA" : "Ref2VA");
-  const storagePathError = validateDatabasePathInput(storageTarget);
-  const cancellingPendingStorageSwitch = storageConfiguration?.restart_required === true &&
-    storageTarget.trim() === storageConfiguration.active_database_path;
 
   onSavedRef.current = onSaved;
   workingRef.current = working;
@@ -282,30 +210,16 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   }, [onRequestClose]);
 
   const loadStorageConfiguration = useCallback(async (signal?: AbortSignal) => {
-    const revision = ++storageRequestRevision.current;
     setStorageLoading(true);
     try {
       const configuration = await directorApi.getStorage(signal);
-      if (signal?.aborted || storageRequestRevision.current !== revision) return;
+      if (signal?.aborted) return;
       setStorageConfiguration(configuration);
-      if (!storageTargetEdited.current) {
-        setStorageTarget(
-          configuration.restart_required
-            ? configuration.active_database_path
-            : configuration.source === "legacy"
-              ? configuration.recommended_database_path
-              : configuration.configured_database_path,
-        );
-      }
-      setStorageMessage(null);
-    } catch (reason) {
-      if (signal?.aborted || storageRequestRevision.current !== revision) return;
-      setStorageMessage({
-        kind: "error",
-        text: safeStorageError(reason, "无法读取数据库存储配置"),
-      });
+    } catch {
+      if (signal?.aborted) return;
+      setStorageConfiguration(null);
     } finally {
-      if (!signal?.aborted && storageRequestRevision.current === revision) setStorageLoading(false);
+      if (!signal?.aborted) setStorageLoading(false);
     }
   }, []);
 
@@ -394,8 +308,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     // An older confirmation must not overwrite a newer local draft; the exact
     // final confirmation clears the draft ownership.
     if (!hasLocalChanges.current || sameSettings(confirmedSettings, workingRef.current)) {
-      connectionProbeRevision.current += 1;
-      setConnectionProbe(null);
+      setProbeResult(null);
       setTesting(false);
       const confirmed = structuredClone(confirmedSettings);
       confirmedRef.current = confirmed;
@@ -419,32 +332,13 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   const change = (next: RuntimeSettings) => {
     if (effectiveRuntimeEditingDisabled) return;
     const revision = ++editRevision.current;
-    const endpointChanged = next.comfy_url !== working.comfy_url;
-    const nextSettings = endpointChanged
-      ? {
-          ...next,
-          models: {
-            ...next.models,
-            fl2va: { ...next.models.fl2va, standard_lora_loader_override: null },
-            ref2va: { ...next.models.ref2va, standard_lora_loader_override: null },
-          },
-        }
-      : next;
-    if (endpointChanged) {
-      // A result belongs only to the exact URL snapshot that was probed.
-      // Invalidating the request token prevents a slow response from making a
-      // newly edited, untested address look online.
-      connectionProbeRevision.current += 1;
-      setConnectionProbe(null);
-      setTesting(false);
-    }
-    workingRef.current = nextSettings;
-    hasLocalChanges.current = !sameSettings(nextSettings, confirmedRef.current);
-    setWorking(nextSettings);
-    onDraftChange(structuredClone(nextSettings));
+    workingRef.current = next;
+    hasLocalChanges.current = !sameSettings(next, confirmedRef.current);
+    setWorking(next);
+    onDraftChange(structuredClone(next));
     setMessage(null);
-    if (validateRuntimeSettingsForm(nextSettings).length > 0) return;
-    const snapshot = structuredClone(nextSettings);
+    if (validateRuntimeSettingsForm(next).length > 0) return;
+    const snapshot = structuredClone(next);
     void Promise.resolve(onSavedRef.current(snapshot)).catch((reason) => {
       if (editRevision.current !== revision || !mountedRef.current) return;
       setMessage(reason instanceof Error ? reason.message : "系统设置自动同步失败");
@@ -550,30 +444,21 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   };
   const test = async () => {
     if (effectiveRuntimeEditingDisabled) return;
-    const snapshot = working.comfy_url.trim();
-    try {
-      const url = new URL(snapshot);
-      if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error();
-    } catch {
-      setMessage("请先填写有效的 ComfyUI HTTP/HTTPS 地址");
-      return;
-    }
-    const requestRevision = ++connectionProbeRevision.current;
     setTesting(true); setMessage(null);
-    setConnectionProbe({ url: snapshot, result: null });
+    setProbeResult(null);
     try {
-      const result = await directorApi.testConnection(snapshot);
-      if (connectionProbeRevision.current !== requestRevision) return;
-      setConnectionProbe({ url: snapshot, result });
-      if (result.ok) onConnectionTestSucceeded(snapshot);
+      const result = await directorApi.testConnection();
+      if (!mountedRef.current) return;
+      setProbeResult(result);
+      if (result.ok) onConnectionTestSucceeded();
     }
     catch (reason) {
-      if (connectionProbeRevision.current !== requestRevision) return;
+      if (!mountedRef.current) return;
       const failure = reason instanceof Error ? reason.message : "连接失败";
-      setConnectionProbe({ url: snapshot, result: { ok: false, message: failure } });
+      setProbeResult({ ok: false, message: failure });
     }
     finally {
-      if (connectionProbeRevision.current === requestRevision) setTesting(false);
+      if (mountedRef.current) setTesting(false);
     }
   };
   const recoverRayLightRuntime = async () => {
@@ -599,193 +484,6 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
       setMessage(reason instanceof Error ? `RayLight 恢复失败：${reason.message}` : "RayLight 恢复失败");
     } finally {
       rayLightRecoveryRequestRef.current = false;
-    }
-  };
-  const flushTimelineBeforeStorageChange = async (): Promise<boolean> => {
-    try {
-      await onBeforeStorageChange();
-      return true;
-    } catch (reason) {
-      const detail = reason instanceof ApiError && reason.message ? `：${reason.message}` : "";
-      setStorageMessage({
-        kind: "error",
-        text: `当前时间线未能同步，未执行数据库操作${detail}`,
-      });
-      return false;
-    }
-  };
-  const saveStoragePath = async () => {
-    if (storageOperationsDisabled) return;
-    const target = storageTarget.trim();
-    const validation = validateDatabasePathInput(target);
-    if (validation) {
-      setStorageMessage({ kind: "error", text: validation });
-      return;
-    }
-    const confirmation = cancellingPendingStorageSwitch
-      ? `将取消待重启的数据库切换，并继续使用当前数据库。后端解除写入冻结后，会继续同步本页保留的修改。\n\n当前数据库：${target}\n\n确认取消切换吗？`
-      : `仅保存数据库路径不会复制当前数据。目标必须已经是有效的 Director 数据库，否则后端会拒绝。保存成功后，当前进程将继续读取旧库并停止修改，必须重启 Director 才会切换。\n\n目标：${target}\n\n确认仅保存此路径吗？`;
-    if (!window.confirm(confirmation)) return;
-    setStorageOperation("save");
-    setStorageMessage(null);
-    onStorageOperationStarted();
-    try {
-      // PUT active is the recovery escape hatch for an ambiguous/lost storage
-      // response. It must run before ordinary WAL flushes because the backend
-      // intentionally rejects those writes while a switch is pending.
-      if (!cancellingPendingStorageSwitch && !await flushTimelineBeforeStorageChange()) {
-        onStorageOperationAborted();
-        return;
-      }
-      const configuration = await directorApi.updateStorage(target);
-      setStorageConfiguration(configuration);
-      onStorageConfigurationChanged(configuration);
-      storageTargetEdited.current = false;
-      setStorageTarget(configuration.restart_required
-        ? configuration.active_database_path
-        : configuration.configured_database_path);
-      if (cancellingPendingStorageSwitch && !configuration.restart_required) {
-        try {
-          await onStorageSwitchCancelled();
-          setStorageMessage({
-            kind: "success",
-            text: "已取消数据库切换，继续使用当前数据库；本页待同步修改已恢复。",
-          });
-        } catch {
-          setStorageMessage({
-            kind: "error",
-            text: "已取消数据库切换，但本页待同步修改暂未恢复；数据仍保留在本地并会自动重试。",
-          });
-        }
-        return;
-      }
-      setStorageMessage({
-        kind: "success",
-        text: configuration.restart_required
-          ? "数据库路径已保存。当前进程保持读取原数据库并停止修改；请重启 Director 后切换。"
-          : "数据库路径已确认，当前进程已经使用该数据库。",
-      });
-    } catch (reason) {
-      if (!storageRequestWasDefinitivelyRejected(reason)) {
-        if (mountedRef.current) {
-          setStorageMessage({
-            kind: "error",
-            text: "数据库操作响应尚未确认，正在自动核对服务器状态；确认前当前页面保持锁定。",
-          });
-        }
-        try {
-          const configuration = await onStorageOperationUncertain();
-          if (mountedRef.current) {
-            setStorageConfiguration(configuration);
-            storageTargetEdited.current = false;
-            setStorageTarget(configuration.restart_required
-              ? configuration.active_database_path
-              : configuration.configured_database_path);
-          }
-          if (cancellingPendingStorageSwitch && !configuration.restart_required) {
-            try {
-              await onStorageSwitchCancelled();
-              if (mountedRef.current) setStorageMessage({
-                kind: "success",
-                text: "已确认数据库切换取消成功；本页待同步修改已恢复。",
-              });
-            } catch {
-              if (mountedRef.current) setStorageMessage({
-                kind: "error",
-                text: "已确认数据库切换取消成功，但本页待同步修改暂未恢复；数据仍保留在本地并会自动重试。",
-              });
-            }
-          } else if (mountedRef.current) {
-            setStorageMessage({
-              kind: configuration.restart_required ? "error" : "success",
-              text: configuration.restart_required
-                ? "服务器确认数据库切换正在等待重启。当前页面保持锁定；如需继续使用当前库，请先取消切换并恢复待同步修改。"
-                : "服务器已确认没有待重启的数据库切换，当前页面已恢复修改。",
-            });
-          }
-        } catch {
-          if (mountedRef.current) setStorageMessage({
-            kind: "error",
-            text: "暂时无法确认数据库操作结果；当前页面保持锁定并会继续自动核对，请勿重启或继续修改。",
-          });
-        }
-        return;
-      }
-      onStorageOperationAborted();
-      setStorageMessage({
-        kind: "error",
-        text: safeStorageError(reason, "保存数据库路径失败"),
-      });
-    } finally {
-      if (mountedRef.current) setStorageOperation(null);
-    }
-  };
-  const migrateStorage = async () => {
-    if (storageOperationsDisabled) return;
-    const target = storageTarget.trim();
-    const validation = validateDatabasePathInput(target);
-    if (validation) {
-      setStorageMessage({ kind: "error", text: validation });
-      return;
-    }
-    if (!window.confirm(
-      `将复制并校验当前 Director 数据库，然后保存新路径。迁移成功后，当前进程将继续读取旧库并停止修改，必须重启 Director 才会切换。\n\n目标：${target}\n\n确认迁移吗？`,
-    )) return;
-    setStorageOperation("migrate");
-    setStorageMessage(null);
-    onStorageOperationStarted();
-    try {
-      if (!await flushTimelineBeforeStorageChange()) {
-        onStorageOperationAborted();
-        return;
-      }
-      const result = await directorApi.migrateStorage(target);
-      setStorageConfiguration(result);
-      onStorageConfigurationChanged(result);
-      storageTargetEdited.current = false;
-      setStorageTarget(result.restart_required
-        ? result.active_database_path
-        : result.configured_database_path);
-      setStorageMessage({
-        kind: "success",
-        text: `数据库已从 ${result.migrated_from} 迁移到 ${result.migrated_to}。当前进程保持读取原数据库并停止修改；请重启 Director 后切换。`,
-      });
-    } catch (reason) {
-      if (!storageRequestWasDefinitivelyRejected(reason)) {
-        if (mountedRef.current) setStorageMessage({
-          kind: "error",
-          text: "数据库迁移响应尚未确认，正在自动核对服务器状态；确认前当前页面保持锁定。",
-        });
-        try {
-          const configuration = await onStorageOperationUncertain();
-          if (mountedRef.current) {
-            setStorageConfiguration(configuration);
-            storageTargetEdited.current = false;
-            setStorageTarget(configuration.restart_required
-              ? configuration.active_database_path
-              : configuration.configured_database_path);
-            setStorageMessage({
-              kind: configuration.restart_required ? "error" : "success",
-              text: configuration.restart_required
-                ? "服务器确认数据库迁移或路径切换正在等待重启。当前页面保持锁定；如需继续使用当前库，请先取消切换并恢复待同步修改。"
-                : "服务器已确认没有待重启的数据库切换，当前页面已恢复修改。",
-            });
-          }
-        } catch {
-          if (mountedRef.current) setStorageMessage({
-            kind: "error",
-            text: "暂时无法确认数据库迁移结果；当前页面保持锁定并会继续自动核对，请勿重启或继续修改。",
-          });
-        }
-        return;
-      }
-      onStorageOperationAborted();
-      setStorageMessage({
-        kind: "error",
-        text: safeStorageError(reason, "数据库迁移失败，当前数据库未切换"),
-      });
-    } finally {
-      if (mountedRef.current) setStorageOperation(null);
     }
   };
   const setModel = (role: ModelRole, key: "filename" | "device", value: string) => {
@@ -899,16 +597,12 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
       <header className="settings-hero"><div><h1 id={overlay ? "system-settings-title" : undefined}>系统设置</h1><p>共享连接和模型资源。有效修改会自动应用，并刷新该实例的模型与 GPU。</p></div><div className="settings-hero__actions">{overlay && <button ref={closeButtonRef} type="button" className="icon-button settings-overlay__close" aria-label="关闭系统设置" onClick={() => requestClose(true)}>×</button>}</div></header>
       {hasLocalChanges.current && validationErrors.length > 0 && <div className="notice" role="alert">{validationErrors.join("；")}</div>}
       {syncError && <div className="notice" role="alert">服务器拒绝当前系统设置：{syncError}。请修改；有效修改后自动应用。</div>}
-      {effectiveRuntimeEditingDisabled && <div className="notice" role="status">{storageOperationsDisabled
-          ? "数据库身份与时间线尚未确认，或本页身份已过期；恢复或刷新整个页面前设置保持锁定。"
-        : storageConfiguration?.restart_required
-          ? "数据库切换正在等待重启；运行设置已锁定。可在“数据存储”中把路径改回当前数据库以取消切换。"
-          : "运行设置暂时锁定。"}</div>}
+      {effectiveRuntimeEditingDisabled && <div className="notice" role="status">运行设置暂时锁定。</div>}
       {message && <div className="notice" role="alert">{message}</div>}
       <div className="settings-layout">
         <div className="settings-main">
           <Panel eyebrow="连接" title="ComfyUI" description="浏览器仅连接导演台后端，由后端代理 ComfyUI。">
-            <div ref={connectionStatusRef} className="connection-card" tabIndex={-1}><StatusDot state={connectionProbe ? connectionProbe.result === null ? "checking" : connectionProbe.result.ok ? "online" : "offline" : awaitingCurrentEndpoint ? "checking" : capabilities.connection} /><div><strong>{connectionProbe ? connectionProbe.result === null ? "正在测试连接" : connectionProbe.result.ok ? "当前填写地址可连接" : "当前填写地址连接失败" : awaitingCurrentEndpoint ? "等待当前地址确认" : capabilities.connection === "offline" ? "ComfyUI 离线" : !runtimeConfigured ? "ComfyUI 尚未配置" : capabilities.connection === "online" ? "ComfyUI 在线" : "等待检测"}</strong><small>{connectionProbe ? connectionProbe.result === null ? "正在等待 ComfyUI 响应" : connectionProbe.result.latency_ms === undefined ? connectionProbe.result.message : `${connectionProbe.result.message} · 响应 ${connectionProbe.result.latency_ms} ms` : awaitingCurrentEndpoint ? working.comfy_url : capabilities.connection === "offline" ? capabilities.message || "无法读取运行环境" : !runtimeConfigured ? "填写有效地址后自动启用运行资源" : capabilities.latency_ms === undefined ? "尚未读取延迟" : `响应 ${capabilities.latency_ms} ms`}</small></div><button type="button" className="button button--ghost" onClick={() => void test()} disabled={testing || effectiveRuntimeEditingDisabled}>{testing ? <><Spinner />测试中…</> : "测试连接"}</button></div>
+            <div ref={connectionStatusRef} className="connection-card" tabIndex={-1}><StatusDot state={testing || probeResult === null && capabilities.connection === "checking" ? "checking" : probeResult ? probeResult.ok ? "online" : "offline" : capabilities.connection} /><div><strong>{testing ? "正在测试连接" : probeResult ? probeResult.ok ? "当前实例可连接" : "当前实例连接失败" : capabilities.connection === "offline" ? "ComfyUI 离线" : capabilities.connection === "online" ? "ComfyUI 在线" : "等待检测"}</strong><small>{testing ? "正在等待 ComfyUI 响应" : probeResult ? probeResult.latency_ms === undefined ? probeResult.message : `${probeResult.message} · 响应 ${probeResult.latency_ms} ms` : capabilities.connection === "offline" ? capabilities.message || "无法读取运行环境" : capabilities.latency_ms === undefined ? "尚未读取延迟" : `响应 ${capabilities.latency_ms} ms`}</small></div><button type="button" className="button button--ghost" onClick={() => void test()} disabled={testing || effectiveRuntimeEditingDisabled}>{testing ? <><Spinner />测试中…</> : "测试连接"}</button></div>
             {currentRayLightRuntimeStatus?.recovery_required && <div className="raylight-recovery-alert" role="alert" aria-labelledby="raylight-recovery-title" aria-describedby="raylight-recovery-description">
               <strong id="raylight-recovery-title">旧 RayLight 运行状态引用了当前不可见 GPU</strong>
               <div id="raylight-recovery-description" className="raylight-recovery-alert__details">
@@ -930,19 +624,9 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                 {rayLightRecoveryPending ? <><Spinner />恢复中…</> : "确认 ComfyUI 已重启并恢复 RayLight"}
               </button>
             </div>}
-            <div className="field-grid field-grid--two">
-              <div className="field">
-                <label className="field__label" htmlFor="comfy-url">ComfyUI 地址</label>
-                <div className="sensitive-value">
-                  <input id="comfy-url" type={comfyUrlVisible ? "url" : "password"} required disabled={effectiveRuntimeEditingDisabled} readOnly={embeddedComfyUi} aria-describedby={embeddedComfyUi ? "comfy-url-pinned-hint" : undefined} autoComplete="off" value={working.comfy_url} placeholder="http://comfyui-host:8188" onChange={(event) => change({ ...working, comfy_url: event.target.value })} />
-                  <VisibilityToggle label="ComfyUI 地址显示状态" visible={comfyUrlVisible} onToggle={() => setComfyUrlVisible((current) => !current)} />
-                </div>
-                {embeddedComfyUi && <small id="comfy-url-pinned-hint">插件模式：自动指向当前 ComfyUI 实例，无需设置。</small>}
-              </div>
-              <Field label="客户端 ID"><input required disabled={effectiveRuntimeEditingDisabled} maxLength={128} pattern="[A-Za-z0-9._:-]+" value={working.client_id} onChange={(event) => change({ ...working, client_id: event.target.value })} /></Field>
-            </div>
+            <Field label="客户端 ID"><input required disabled={effectiveRuntimeEditingDisabled} maxLength={128} pattern="[A-Za-z0-9._:-]+" value={working.client_id} onChange={(event) => change({ ...working, client_id: event.target.value })} /></Field>
           </Panel>
-          <Panel eyebrow="数据" title="数据存储" description="数据库路径独立于 ComfyUI 运行设置；路径保存或迁移后都不会热切换当前进程。" action={storageLoading ? <Spinner label="读取数据存储配置" /> : undefined}>
+          <Panel eyebrow="数据" title="数据存储" description="数据库固定在宿主 ComfyUI 的用户目录下，随安装走；运行时不可切换。" action={storageLoading ? <Spinner label="读取数据存储配置" /> : undefined}>
             {storageConfiguration && <div className="storage-current" aria-label="当前数据库存储配置">
               <div className="storage-current__path">
                 <span>当前数据库</span>
@@ -951,41 +635,8 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                   <VisibilityToggle label="当前数据库路径显示状态" visible={currentDatabaseVisible} onToggle={() => setCurrentDatabaseVisible((current) => !current)} />
                 </div>
               </div>
-              <div><span>配置来源</span><strong>{STORAGE_SOURCE_LABEL[storageConfiguration.source]}</strong></div>
-              {storageConfiguration.configured_database_path !== storageConfiguration.active_database_path && <div className="storage-current__path"><span>重启后路径</span><code title={currentDatabaseVisible ? storageConfiguration.configured_database_path : undefined}>{currentDatabaseVisible ? storageConfiguration.configured_database_path : HIDDEN_PATH_VALUE}</code></div>}
-              <div><span>切换状态</span><strong>{storageConfiguration.restart_required ? "等待重启" : "当前已生效"}</strong></div>
             </div>}
-            {!storageConfiguration && !storageLoading && <div className="notice notice--error" role="alert">无法确认当前数据库，存储操作保持禁用。</div>}
-            <div className="field">
-              <label className="field__label" htmlFor="database-target-path">数据库目标路径</label>
-              <div className="sensitive-value">
-                <input
-                  id="database-target-path"
-                  type={storageTargetVisible ? "text" : "password"}
-                  disabled={storageOperationsDisabled || storageOperation !== null}
-                  spellCheck={false}
-                  autoComplete="off"
-                  value={storageTarget}
-                  placeholder="/path/to/director.sqlite3 或 ~/director.sqlite3"
-                  aria-invalid={storageTargetEdited.current && Boolean(storagePathError) || undefined}
-                  aria-describedby={storageTargetEdited.current && storagePathError ? "database-path-error database-path-hint" : "database-path-hint"}
-                  onChange={(event) => {
-                    storageTargetEdited.current = true;
-                    setStorageTarget(event.target.value);
-                    setStorageMessage(null);
-                  }}
-                />
-                <VisibilityToggle label="数据库目标路径显示状态" visible={storageTargetVisible} onToggle={() => setStorageTargetVisible((current) => !current)} />
-              </div>
-              {storageTargetEdited.current && storagePathError && <small id="database-path-error" className="inline-error">{storagePathError}</small>}
-              <small id="database-path-hint">只接受绝对路径或以 ~/ 开头的路径。推荐迁移当前数据库，避免重启后进入空库。</small>
-            </div>
-            <div className="storage-actions" role="group" aria-label="数据库存储操作">
-              <button type="button" className="button button--ghost" disabled={storageOperationsDisabled || storageLoading || storageOperation !== null || !storageConfiguration || Boolean(storagePathError)} onClick={() => void saveStoragePath()}>{storageOperation === "save" ? <><Spinner />保存中…</> : cancellingPendingStorageSwitch ? "取消切换并继续使用当前库" : "保存路径（重启后切换）"}</button>
-              <button type="button" className="button button--primary" disabled={storageOperationsDisabled || storageLoading || storageOperation !== null || !storageConfiguration || Boolean(storagePathError)} onClick={() => void migrateStorage()}>{storageOperation === "migrate" ? <><Spinner />迁移中…</> : "迁移当前数据库并切换"}</button>
-            </div>
-            <small className="storage-warning">路径保存或迁移成功后，当前进程保持读取旧库并停止修改；请重启 Director 后继续。</small>
-            {storageMessage && <div className={`notice ${storageMessage.kind === "error" ? "notice--error" : ""}`} role={storageMessage.kind === "error" ? "alert" : "status"}>{storageMessage.text}</div>}
+            {!storageConfiguration && !storageLoading && <div className="notice notice--error" role="alert">无法读取当前数据库路径。</div>}
           </Panel>
           <Panel eyebrow="媒体" title="媒体工具 (ffmpeg)" description="素材探测、代理转码与长片拼接依赖 ffmpeg/ffprobe；缺失时可在此一键安装，立即生效无需重启。">
             {mediaSetup === null ? <p className="muted">正在检测媒体工具…</p> : (
@@ -1083,8 +734,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
               <details className="raylight-setup-log"><summary>安装日志</summary><pre>{rayLightSetup.install.log_tail.join("\n")}</pre></details>
             )}
           </Panel>
-          <Panel eyebrow="模型" title="模型与运行设备" description="填写有效 ComfyUI 地址后自动读取资源；模型和设备修改也会自动应用。VAE 只允许 default 或 GPU。" action={loadingModels ? <Spinner label="读取模型" /> : undefined}>
-            {!runtimeConfigured && <div className="notice">填写有效 ComfyUI 地址后，模型和运行设备选项会自动启用。</div>}
+          <Panel eyebrow="模型" title="模型与运行设备" description="模型和设备修改会自动应用。VAE 只允许 default 或 GPU。" action={loadingModels ? <Spinner label="读取模型" /> : undefined}>
             <div className="model-bindings">
               {(Object.keys(MODEL_META) as ModelRole[]).map((role) => {
                 const meta = MODEL_META[role]; const binding = working.models[role];
@@ -1160,7 +810,6 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                               loader,
                               lora_name: diffusion.lora_name,
                               model_filename: diffusion.filename,
-                              comfy_origin: working.comfy_url,
                             }
                           : null,
                       });
@@ -1172,7 +821,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
           </Panel>
         </div>
         <aside className="settings-aside">
-          <Panel eyebrow="资源" title="GPU 状态"><div className="gpu-list">{gpus.length === 0 && <p className="muted">{runtimeConfigured ? "尚未读取 GPU 数据" : "填写有效 ComfyUI 地址后读取 GPU 状态"}</p>}{gpus.map((gpu) => { const used = gpu.vram_total ? Math.round((1 - gpu.vram_free / gpu.vram_total) * 100) : 0; return <div className="gpu-card" key={gpu.index}><header><span>GPU {gpu.index}</span><small>ComfyUI 逻辑编号</small></header><strong>{gpu.name}</strong><div className="progress"><span style={{ width: `${used}%` }} /></div><footer><span>显存 {used}%</span><span>{formatBytes(gpu.vram_free)} 可用</span></footer></div>;})}</div></Panel>
+          <Panel eyebrow="资源" title="GPU 状态"><div className="gpu-list">{gpus.length === 0 && <p className="muted">尚未读取 GPU 数据</p>}{gpus.map((gpu) => { const used = gpu.vram_total ? Math.round((1 - gpu.vram_free / gpu.vram_total) * 100) : 0; return <div className="gpu-card" key={gpu.index}><header><span>GPU {gpu.index}</span><small>ComfyUI 逻辑编号</small></header><strong>{gpu.name}</strong><div className="progress"><span style={{ width: `${used}%` }} /></div><footer><span>显存 {used}%</span><span>{formatBytes(gpu.vram_free)} 可用</span></footer></div>;})}</div></Panel>
           <Panel eyebrow="能力" title="模型族就绪情况"><ul className="capability-list">{TIMELINE_MODE_ORDER.map((mode) => { const familyAvailable = capabilities.native_timeline?.supported === true && capabilities.native_timeline.modes.includes(mode); const ready = runtimeResourcesReady && familyAvailable; return <li key={mode}><span className={ready ? "capability-ok" : "capability-missing"}>{ready ? "✓" : "!"}</span><span><strong>{TIMELINE_MODE_META[mode].shortLabel}</strong><small>{TIMELINE_MODE_META[mode].label}</small></span><em>{ready ? "可用" : "未就绪"}</em></li>; })}</ul>{capabilities.missing_nodes.length > 0 && <div className="missing-nodes"><strong>缺少节点</strong><code>{capabilities.missing_nodes.join(", ")}</code></div>}</Panel>
         </aside>
       </div>

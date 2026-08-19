@@ -11,21 +11,21 @@ import {
 const image = (id: string): AssetReference => ({
   id,
   name: `${id}.png`,
-  subfolder: "director-web",
+  subfolder: "directordeck",
   type: "input",
   kind: "image",
 });
 const audio = (id: string): AssetReference => ({
   id,
   name: `${id}.wav`,
-  subfolder: "director-web",
+  subfolder: "directordeck",
   type: "input",
   kind: "audio",
 });
 const video = (id: string): AssetReference => ({
   id,
   name: `${id}.mp4`,
-  subfolder: "director-web",
+  subfolder: "directordeck",
   type: "input",
   kind: "video",
   metadata: {

@@ -10,19 +10,18 @@ import {
   type TimelineHistoryState,
 } from "./timelineHistory";
 
-const TIMELINE_HISTORY_DATABASE = "director-web-timeline-history";
+const TIMELINE_HISTORY_DATABASE = "directordeck-timeline-history";
 const TIMELINE_HISTORY_DATABASE_VERSION = 1;
 const TIMELINE_HISTORY_STORE = "journals";
 const TIMELINE_HISTORY_JOURNAL_FORMAT = "director-timeline-history-journal";
 const LEGACY_TIMELINE_HISTORY_JOURNAL_VERSION = 1;
 const TIMELINE_HISTORY_JOURNAL_VERSION = 2;
-const TIMELINE_HISTORY_JOURNAL_KEY_PREFIX = "director-web:v2:timeline-history:";
+const TIMELINE_HISTORY_JOURNAL_KEY_PREFIX = "directordeck:v2:timeline-history:";
 const OWNER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const WRITE_TOKEN_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export interface TimelinePersistenceProjectScope {
   databasePath: string;
-  databaseIdentity: string;
   projectId: string;
 }
 
@@ -157,7 +156,6 @@ function sameProjectScope(
   right: TimelinePersistenceProjectScope,
 ): boolean {
   return left.databasePath === right.databasePath &&
-    left.databaseIdentity === right.databaseIdentity &&
     left.projectId === right.projectId;
 }
 
@@ -169,7 +167,6 @@ export function timelineHistoryJournalKey(scope: TimelinePersistenceScope): stri
 function timelineHistoryProjectScopeDigest(scope: TimelinePersistenceProjectScope): string {
   return sha256Hex(JSON.stringify([
     scope.databasePath,
-    scope.databaseIdentity,
     scope.projectId,
   ]));
 }
@@ -177,7 +174,7 @@ function timelineHistoryProjectScopeDigest(scope: TimelinePersistenceProjectScop
 export function legacyTimelineHistoryJournalKey(
   scope: TimelinePersistenceProjectScope,
 ): string {
-  return JSON.stringify([scope.databasePath, scope.databaseIdentity, scope.projectId]);
+  return JSON.stringify([scope.databasePath, scope.projectId]);
 }
 
 function validProjectScope(scope: TimelinePersistenceProjectScope): boolean {
@@ -185,7 +182,6 @@ function validProjectScope(scope: TimelinePersistenceProjectScope): boolean {
     scope.databasePath.startsWith("/") &&
     scope.databasePath.length <= 4096 &&
     !/[\u0000-\u001f\u007f]/.test(scope.databasePath) &&
-    /^[0-9a-f]{64}$/.test(scope.databaseIdentity) &&
     /^[A-Za-z0-9._:-]{1,128}$/.test(scope.projectId);
 }
 
@@ -225,12 +221,11 @@ function parseLegacyJournalKey(value: unknown): TimelinePersistenceProjectScope 
   } catch {
     return null;
   }
-  if (!Array.isArray(parts) || parts.length !== 3) return null;
-  const [databasePath, databaseIdentity, projectId] = parts;
-  const projectScope = { databasePath, databaseIdentity, projectId };
+  if (!Array.isArray(parts) || parts.length !== 2) return null;
+  const [databasePath, projectId] = parts;
+  const projectScope = { databasePath, projectId };
   if (
     typeof databasePath !== "string" ||
-    typeof databaseIdentity !== "string" ||
     typeof projectId !== "string" ||
     !validProjectScope(projectScope)
   ) return null;
@@ -538,12 +533,10 @@ function parseJournalV2(
     !WRITE_TOKEN_PATTERN.test(value.writeToken) ||
     !hasExactKeys(value.scope, [
       "databasePath",
-      "databaseIdentity",
       "projectId",
       "ownerId",
     ]) ||
     value.scope.databasePath !== expectedScope.databasePath ||
-    value.scope.databaseIdentity !== expectedScope.databaseIdentity ||
     value.scope.projectId !== expectedScope.projectId ||
     value.scope.ownerId !== expectedScope.ownerId
   ) return null;
@@ -579,9 +572,8 @@ function parseLegacyJournalV1(
     value.format !== TIMELINE_HISTORY_JOURNAL_FORMAT ||
     value.version !== LEGACY_TIMELINE_HISTORY_JOURNAL_VERSION ||
     value.key !== legacyTimelineHistoryJournalKey(expectedScope) ||
-    !hasExactKeys(value.scope, ["databasePath", "databaseIdentity", "projectId"]) ||
+    !hasExactKeys(value.scope, ["databasePath", "projectId"]) ||
     value.scope.databasePath !== expectedScope.databasePath ||
-    value.scope.databaseIdentity !== expectedScope.databaseIdentity ||
     value.scope.projectId !== expectedScope.projectId
   ) return null;
   const common = parseCommonJournalFields(value);
@@ -799,7 +791,6 @@ async function classifyBranchEvidence(
   };
   const projectScope: TimelinePersistenceProjectScope = {
     databasePath: currentScope.databasePath,
-    databaseIdentity: currentScope.databaseIdentity,
     projectId: currentScope.projectId,
   };
   const record = ownerId === null

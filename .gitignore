@@ -24,7 +24,6 @@ coverage/
 # Local settings
 .env
 .env.*
-!.env.example
 
 # Editors and operating systems
 .idea/

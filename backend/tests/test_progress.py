@@ -4,7 +4,7 @@ import asyncio
 import json
 import struct
 
-from director.progress import (
+from directordeck.progress import (
     MAX_PREVIEW_MESSAGE_BYTES,
     ComfyExecutionEvent,
     ComfyPreviewEvent,
@@ -76,7 +76,7 @@ async def test_progress_manager_can_bounded_wait_for_websocket_handshake(
             raise StopAsyncIteration
 
     monkeypatch.setattr(
-        "director.progress.websockets.connect", lambda *_args, **_kwargs: FakeSocket()
+        "directordeck.progress.websockets.connect", lambda *_args, **_kwargs: FakeSocket()
     )
 
     async def sink(_origin, _event) -> None:
@@ -107,7 +107,7 @@ async def test_progress_manager_bounded_wait_times_out_before_handshake(
             return None
 
     monkeypatch.setattr(
-        "director.progress.websockets.connect",
+        "directordeck.progress.websockets.connect",
         lambda *_args, **_kwargs: StalledSocket(),
     )
 
@@ -159,7 +159,7 @@ async def test_progress_manager_forwards_reconcile_hints(monkeypatch) -> None:
                 raise StopAsyncIteration
 
     monkeypatch.setattr(
-        "director.progress.websockets.connect", lambda *_args, **_kwargs: FakeSocket()
+        "directordeck.progress.websockets.connect", lambda *_args, **_kwargs: FakeSocket()
     )
 
     async def progress_sink(_origin, _event) -> None:

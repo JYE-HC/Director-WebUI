@@ -49,7 +49,7 @@ VALIDATION_OUTPUT_VIDEO = os.environ.get("NATIVE_VALIDATION_OUTPUT_VIDEO", "")
 sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 sys.path.insert(0, str(COMFY_ROOT))
 
-from director.native_templates import (  # noqa: E402
+from directordeck.native_templates import (  # noqa: E402
     EXPECTED_NATIVE_NODE_MODULES,
     bind_native_workflow_predecessor_output,
     build_raylight_shutdown_unit,
@@ -57,8 +57,8 @@ from director.native_templates import (  # noqa: E402
     raylight_runtime_descriptor,
     validate_native_workflow_ready,
 )
-from director.h3_capabilities import H3_REFERENCE_LIMITS  # noqa: E402
-from director.schemas import (  # noqa: E402
+from directordeck.h3_capabilities import H3_REFERENCE_LIMITS  # noqa: E402
+from directordeck.schemas import (  # noqa: E402
     RuntimeSettings,
     UnifiedTimelineDraft,
     default_settings,
@@ -239,7 +239,7 @@ def _maximum_reference_draft(*, with_source_video: bool) -> UnifiedTimelineDraft
 
 
 def _raylight_settings() -> RuntimeSettings:
-    value = default_settings("http://127.0.0.1:8188").model_dump(mode="json")
+    value = default_settings().model_dump(mode="json")
     for family in ("fl2va", "ref2va"):
         value["models"][family].update(
             backend="raylight",
@@ -289,7 +289,7 @@ def _standard_lora_settings(loader: str) -> RuntimeSettings:
 def _standard_settings() -> RuntimeSettings:
     """Exercise the official explicit-device selectors while backend=auto."""
 
-    value = default_settings("http://127.0.0.1:8188").model_dump(mode="json")
+    value = default_settings().model_dump(mode="json")
     for family in ("fl2va", "ref2va"):
         value["models"][family]["device"] = "gpu:0"
     value["models"]["clip"]["device"] = "gpu:0"

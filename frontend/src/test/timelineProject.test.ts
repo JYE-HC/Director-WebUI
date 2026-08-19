@@ -68,7 +68,7 @@ import {
 const image: AssetReference = {
   id: "image-a",
   name: "image.png",
-  subfolder: "director-web",
+  subfolder: "directordeck",
   type: "input",
   kind: "image",
   preview_url: "/api/assets/image-a/preview",
@@ -77,7 +77,7 @@ const image: AssetReference = {
 const audio: AssetReference = {
   id: "audio-a",
   name: "voice.wav",
-  subfolder: "director-web",
+  subfolder: "directordeck",
   type: "input",
   kind: "audio",
 };
@@ -85,7 +85,7 @@ const audio: AssetReference = {
 const video: AssetReference = {
   id: "video-a",
   name: "source.mp4",
-  subfolder: "director-web",
+  subfolder: "directordeck",
   type: "input",
   kind: "video",
   metadata: {
@@ -101,7 +101,6 @@ const video: AssetReference = {
 
 const ACTIVE_DATABASE = {
   active_database_path: "/srv/director/data/director.sqlite3",
-  active_database_identity: "a".repeat(64),
 };
 
 function writeTimelineWal(
@@ -2221,7 +2220,6 @@ describe("统一 timeline domain", () => {
       pending: true,
       project_id: "default",
       active_database_path: ACTIVE_DATABASE.active_database_path,
-      active_database_identity: ACTIVE_DATABASE.active_database_identity,
       written_at_ms: Date.now(),
       project,
     });
@@ -2249,7 +2247,6 @@ describe("统一 timeline domain", () => {
       pending: true,
       project_id: "default",
       active_database_path: ACTIVE_DATABASE.active_database_path,
-      active_database_identity: ACTIVE_DATABASE.active_database_identity,
       base_server_revision: 7,
       base_document_hash: timelineProjectDocumentHash(base),
       head_document_hash: timelineProjectDocumentHash(pending),
@@ -2377,8 +2374,7 @@ describe("统一 timeline domain", () => {
     expect(key).not.toContain("project-a");
     expect(loadLocalTimelineWal(ACTIVE_DATABASE, "project-b", "tab-owner-a")).toBeNull();
     expect(loadLocalTimelineWal({
-      active_database_path: "/srv/director/data/other.sqlite3",
-      active_database_identity: "b".repeat(64),
+      active_database_path: "/srv/director/data/other.sqlite3".repeat(64),
     }, "project-a", "tab-owner-a")).toBeNull();
     expect(localStorage.getItem(key)).toBe(raw);
   });

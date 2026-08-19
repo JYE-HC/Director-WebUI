@@ -5,15 +5,14 @@ from typing import Any
 import httpx
 import pytest
 
-from director.media import VideoProxy
-from director.schemas import (
-    RuntimeSettings,
+from directordeck.media import VideoProxy
+from directordeck.schemas import (
     VideoMetadata,
     default_settings,
     mode_draft_to_timeline,
     validate_mode_draft,
 )
-from director.task_management import (
+from directordeck.task_management import (
     TaskManagementError,
     import_job_output_as_asset,
     resolve_job_output,
@@ -27,7 +26,7 @@ def _timeline() -> dict[str, Any]:
     return mode_draft_to_timeline(draft, title="来源项目").model_dump(mode="json")
 
 
-def _job(*, source_url: str = "http://source.test:8188") -> dict[str, Any]:
+def _job() -> dict[str, Any]:
     timeline = _timeline()
     segment_id = timeline["segments"][0]["id"]
     return {
@@ -41,13 +40,13 @@ def _job(*, source_url: str = "http://source.test:8188") -> dict[str, Any]:
             {
                 "node_id": "assembly",
                 "filename": "Director_full.mp4",
-                "subfolder": "director-web/timelines",
+                "subfolder": "directordeck/timelines",
                 "type": "output",
             }
         ],
         "error": None,
         "config_snapshot": {"timeline": timeline, "segment_ids": [segment_id]},
-        "settings_snapshot": default_settings(source_url).model_dump(mode="json"),
+        "settings_snapshot": default_settings().model_dump(mode="json"),
         "prompt_snapshot": {"do_not": "leak"},
         "created_at": "2026-08-13T00:00:00+00:00",
         "updated_at": "2026-08-13T00:01:00+00:00",
@@ -68,7 +67,7 @@ def _job(*, source_url: str = "http://source.test:8188") -> dict[str, Any]:
                     {
                         "node_id": "save-1",
                         "filename": "segment-1.mp4",
-                        "subfolder": "director-web/segments",
+                        "subfolder": "directordeck/segments",
                         "type": "output",
                     }
                 ],
@@ -103,29 +102,14 @@ def test_output_resolution_uses_only_persisted_index_or_stable_segment_map() -> 
 
 class _Registry:
     def __init__(self) -> None:
-        self.records: list[tuple[str, dict[str, Any], str]] = []
-        self.accept_current_origin = True
+        self.records: list[tuple[str, dict[str, Any]]] = []
 
     def put_asset(
         self,
         asset_id: str,
         document: dict[str, Any],
-        *,
-        comfy_origin: str,
     ) -> None:
-        self.records.append((asset_id, document, comfy_origin))
-
-    def put_asset_if_current_origin(
-        self,
-        asset_id: str,
-        document: dict[str, Any],
-        *,
-        expected_comfy_origin: str,
-    ) -> bool:
-        if not self.accept_current_origin:
-            return False
-        self.records.append((asset_id, document, expected_comfy_origin))
-        return True
+        self.records.append((asset_id, document))
 
 
 class _Comfy:
@@ -158,18 +142,13 @@ class _Comfy:
                 "kind": kind,
             }
         )
-        return {"name": filename, "subfolder": "director-web", "type": "input"}
+        return {"name": filename, "subfolder": "directordeck", "type": "input"}
 
 
-async def test_import_output_reads_snapshot_origin_and_registers_at_live_origin(
+async def test_import_output_reads_normalizes_uploads_and_registers(
     monkeypatch,
 ) -> None:
-    source = _Comfy()
-    target = _Comfy()
-    clients = {
-        "http://source.test:8188": source,
-        "http://target.test:8288": target,
-    }
+    comfy = _Comfy()
     registry = _Registry()
 
     def proxy(content: bytes, _suffix: str) -> VideoProxy:
@@ -183,28 +162,24 @@ async def test_import_output_reads_snapshot_origin_and_registers_at_live_origin(
     async def run_sync(function):
         return function()
 
-    monkeypatch.setattr("director.task_management.anyio.to_thread.run_sync", run_sync)
-    monkeypatch.setattr("director.task_management.create_24fps_proxy_bytes", proxy)
-
-    def factory(settings: RuntimeSettings):
-        return clients[str(settings.comfy_url).rstrip("/")]
+    monkeypatch.setattr("directordeck.task_management.anyio.to_thread.run_sync", run_sync)
+    monkeypatch.setattr("directordeck.task_management.create_24fps_proxy_bytes", proxy)
 
     asset = await import_job_output_as_asset(
         registry=registry,
-        comfy_factory=factory,
+        client=comfy,
         job=_job(),
-        target_settings=default_settings("http://target.test:8288"),
         output_index=0,
     )
 
-    assert source.views == [
+    assert comfy.views == [
         {
             "filename": "Director_full.mp4",
-            "subfolder": "director-web/timelines",
+            "subfolder": "directordeck/timelines",
             "type": "output",
         }
     ]
-    assert target.uploads == [
+    assert comfy.uploads == [
         {
             "filename": "Director_full_24fps.mp4",
             "content": b"normalized-24fps",
@@ -216,106 +191,6 @@ async def test_import_output_reads_snapshot_origin_and_registers_at_live_origin(
     assert asset.kind == "video"
     assert asset.metadata is not None and asset.metadata.native_fps == 24
     assert registry.records[0][0] == asset.id
-    assert registry.records[0][2] == "http://target.test:8288"
-
-
-async def test_same_origin_import_still_reads_normalizes_and_uploads(monkeypatch) -> None:
-    comfy = _Comfy()
-    registry = _Registry()
-    async def run_sync(function):
-        return function()
-
-    monkeypatch.setattr("director.task_management.anyio.to_thread.run_sync", run_sync)
-    monkeypatch.setattr(
-        "director.task_management.create_24fps_proxy_bytes",
-        lambda content, _suffix: VideoProxy(
-            content=b"normalized",
-            filename_suffix=".mp4",
-            metadata=VideoMetadata.model_validate(VIDEO_METADATA),
-        ),
-    )
-
-    await import_job_output_as_asset(
-        registry=registry,
-        comfy_factory=lambda _settings: comfy,
-        job=_job(),
-        target_settings=default_settings("http://source.test:8188"),
-        output_index=0,
-    )
-
-    assert len(comfy.views) == 1
-    assert len(comfy.uploads) == 1
-
-
-async def test_import_does_not_register_if_live_target_changes(monkeypatch) -> None:
-    source = _Comfy()
-    target = _Comfy()
-    registry = _Registry()
-
-    async def run_sync(function):
-        return function()
-
-    monkeypatch.setattr("director.task_management.anyio.to_thread.run_sync", run_sync)
-    monkeypatch.setattr(
-        "director.task_management.create_24fps_proxy_bytes",
-        lambda content, _suffix: VideoProxy(
-            content=b"normalized",
-            filename_suffix=".mp4",
-            metadata=VideoMetadata.model_validate(VIDEO_METADATA),
-        ),
-    )
-
-    def factory(settings: RuntimeSettings):
-        origin = str(settings.comfy_url).rstrip("/")
-        return source if origin == "http://source.test:8188" else target
-
-    with pytest.raises(TaskManagementError, match="地址已变更"):
-        await import_job_output_as_asset(
-            registry=registry,
-            comfy_factory=factory,
-            job=_job(),
-            target_settings=default_settings("http://target.test:8288"),
-            current_settings=lambda: default_settings("http://new.test:8388"),
-            output_index=0,
-        )
-
-    assert len(source.views) == 1
-    assert len(target.uploads) == 1
-    assert registry.records == []
-
-
-async def test_import_atomically_rejects_endpoint_change_at_asset_insert(
-    monkeypatch,
-) -> None:
-    comfy = _Comfy()
-    registry = _Registry()
-    registry.accept_current_origin = False
-
-    async def run_sync(function):
-        return function()
-
-    monkeypatch.setattr("director.task_management.anyio.to_thread.run_sync", run_sync)
-    monkeypatch.setattr(
-        "director.task_management.create_24fps_proxy_bytes",
-        lambda content, _suffix: VideoProxy(
-            content=b"normalized",
-            filename_suffix=".mp4",
-            metadata=VideoMetadata.model_validate(VIDEO_METADATA),
-        ),
-    )
-
-    with pytest.raises(TaskManagementError, match="地址已变更"):
-        await import_job_output_as_asset(
-            registry=registry,
-            comfy_factory=lambda _settings: comfy,
-            job=_job(),
-            target_settings=default_settings("http://source.test:8188"),
-            current_settings=lambda: default_settings("http://source.test:8188"),
-            output_index=0,
-        )
-
-    assert len(comfy.uploads) == 1
-    assert registry.records == []
 
 
 @pytest.mark.parametrize(
@@ -338,9 +213,9 @@ async def test_import_rejects_invalid_comfy_upload_contract(
         return function()
 
     comfy.upload = bad_upload  # type: ignore[method-assign]
-    monkeypatch.setattr("director.task_management.anyio.to_thread.run_sync", run_sync)
+    monkeypatch.setattr("directordeck.task_management.anyio.to_thread.run_sync", run_sync)
     monkeypatch.setattr(
-        "director.task_management.create_24fps_proxy_bytes",
+        "directordeck.task_management.create_24fps_proxy_bytes",
         lambda content, _suffix: VideoProxy(
             content=b"normalized",
             filename_suffix=".mp4",
@@ -351,9 +226,8 @@ async def test_import_rejects_invalid_comfy_upload_contract(
     with pytest.raises(TaskManagementError) as raised:
         await import_job_output_as_asset(
             registry=_Registry(),
-            comfy_factory=lambda _settings: comfy,
+            client=comfy,
             job=_job(),
-            target_settings=default_settings("http://source.test:8188"),
             output_index=0,
         )
     assert raised.value.status_code == 502

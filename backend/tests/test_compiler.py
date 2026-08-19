@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from director.compiler import DraftNotRunnable, compile_prompt
-from director.schemas import MODEL_ROUTE, RuntimeSettings, default_settings, validate_mode_draft
+from directordeck.compiler import DraftNotRunnable, compile_prompt
+from directordeck.schemas import MODEL_ROUTE, RuntimeSettings, default_settings, validate_mode_draft
 
 from .conftest import runnable_draft
 
@@ -48,7 +48,7 @@ def test_legacy_compiler_has_no_negative_conditioning_and_resolves_random_seed(
 ) -> None:
     value = runnable_draft("t2v")
     value["sampling"]["seed"] = -1
-    monkeypatch.setattr("director.schemas.secrets.randbelow", lambda limit: 4306)
+    monkeypatch.setattr("directordeck.schemas.secrets.randbelow", lambda limit: 4306)
 
     prompt = compile_prompt(
         validate_mode_draft("t2v", value), default_settings(), job_id="seed-job"

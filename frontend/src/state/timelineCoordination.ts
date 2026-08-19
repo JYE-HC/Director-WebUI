@@ -1,5 +1,5 @@
 export interface TimelineCoordinationScope {
-  databaseIdentity: string;
+  databasePath: string;
   projectId: string;
 }
 
@@ -33,7 +33,7 @@ function fnv1a(value: string, seed: number): string {
 
 /** Opaque scope name: database paths and project ids never enter browser lock names. */
 export function timelineCoordinationScopeKey(scope: TimelineCoordinationScope): string {
-  const source = `${scope.databaseIdentity}\u0000${scope.projectId}`;
+  const source = `${scope.databasePath}\u0000${scope.projectId}`;
   return `${fnv1a(source, 0x811c9dc5)}${fnv1a(source, 0x9e3779b9)}`;
 }
 

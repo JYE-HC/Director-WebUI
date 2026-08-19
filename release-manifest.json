@@ -14,7 +14,7 @@
       "upstream_commit": "4085a37b62d7504cf7746f50c9d59e4fd1495b2b",
       "version": "1.8.0-director.1",
       "license": "Apache-2.0",
-      "tree_sha256": "53d15dee97fa93c501b04ecb4acba740a1a80fab4f16c6b5c070405fbf64baa8"
+      "tree_sha256": "1d2bb642eede885557e7773ddbd3962c70b4b7dddc1f2e3d90fbbd2e91661247"
     },
     {
       "name": "ComfyUI-MiniMax-H3-Turbo",

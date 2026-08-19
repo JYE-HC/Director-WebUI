@@ -6,12 +6,11 @@ from pathlib import Path
 
 import pytest
 
-import director.raylight_setup as raylight_setup
-from director.raylight_setup import (
+import directordeck.raylight_setup as raylight_setup
+from directordeck.raylight_setup import (
     RayLightInstallConflict,
     RayLightInstallManager,
     RayLightInstallUnavailable,
-    default_requirements_path,
     dependencies_installed,
     platform_supported,
 )
@@ -43,11 +42,6 @@ def test_platform_supported_matches_host() -> None:
 
 def test_dependencies_installed_is_boolean() -> None:
     assert isinstance(dependencies_installed(), bool)
-
-
-def test_default_requirements_path_points_at_repo_layout() -> None:
-    assert default_requirements_path().name == "requirements.txt"
-    assert default_requirements_path().parent.name == "raylight"
 
 
 def test_select_installer_falls_back_to_uv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -110,6 +104,28 @@ async def test_double_start_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
     assert manager.state == "idle"
 
 
+async def test_cancel_before_subprocess_spawn_still_terminates_the_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel that lands before the spawn assigns ``_process`` must not be lost.
+
+    ``cancel()`` contains no await, so calling it immediately after ``start()``
+    deterministically reproduces the pre-spawn window: the install task has not
+    run yet and ``_process`` is still None. Without the post-spawn re-check in
+    ``_execute`` the subprocess would run orphaned and the task would hang.
+    """
+    _patch_command(
+        monkeypatch,
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    manager = RayLightInstallManager()
+    await manager.start(Path("/tmp/fake-requirements.txt"))
+    await manager.cancel()
+    assert manager._process is None
+    await asyncio.wait_for(_wait_for_task(manager), timeout=10)
+    assert manager.state == "idle"
+
+
 async def test_setup_endpoint_reports_capability_shape(client) -> None:
     response = await client.get("/api/raylight/setup")
     assert response.status_code == 200, response.text
@@ -124,7 +140,7 @@ async def test_setup_install_rejects_unsupported_platform(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "director.app.raylight_platform_supported", lambda: False
+        "directordeck.app.raylight_platform_supported", lambda: False
     )
     response = await client.post("/api/raylight/setup/install")
     assert response.status_code == 400, response.text
@@ -147,7 +163,7 @@ async def test_setup_install_and_cancel_flow(
     # The endpoint consults the name imported into the app namespace; lift the
     # Linux-only release gate so the install/cancel flow runs on Windows CI.
     monkeypatch.setattr(
-        "director.app.raylight_platform_supported", lambda: True
+        "directordeck.app.raylight_platform_supported", lambda: True
     )
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("# fake\n")

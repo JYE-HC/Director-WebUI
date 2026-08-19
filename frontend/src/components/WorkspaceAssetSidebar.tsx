@@ -33,7 +33,6 @@ export interface WorkspaceAssetSidebarProps {
   gridSize: AssetGridSize;
   runtimeEnabled: boolean;
   connection: CapabilityReport["connection"];
-  runtimeConfigured: boolean;
   settingsActive: boolean;
   settingsNavigationDisabled?: boolean;
   deleting?: boolean;
@@ -90,7 +89,6 @@ export function WorkspaceAssetSidebar({
   gridSize,
   runtimeEnabled,
   connection,
-  runtimeConfigured,
   settingsActive,
   settingsNavigationDisabled = false,
   deleting = false,
@@ -215,18 +213,12 @@ export function WorkspaceAssetSidebar({
 
   const runtimeLabel = connection === "offline"
     ? "ComfyUI 离线"
-    : !runtimeConfigured
-      ? "ComfyUI 尚未配置"
-      : connection === "online"
-        ? "ComfyUI 已连接"
-        : connection === "checking"
-          ? "正在检测 ComfyUI"
-          : "等待 ComfyUI 状态";
-  const runtimeDotState = connection === "offline"
-    ? "offline"
-    : runtimeConfigured
-      ? connection
-      : "unknown";
+    : connection === "online"
+      ? "ComfyUI 已连接"
+      : connection === "checking"
+        ? "正在检测 ComfyUI"
+        : "等待 ComfyUI 状态";
+  const runtimeDotState = connection === "offline" ? "offline" : connection;
 
   const deleteSelected = () => {
     if (!runtimeEnabled || !selectedIds.length || deleting) return;

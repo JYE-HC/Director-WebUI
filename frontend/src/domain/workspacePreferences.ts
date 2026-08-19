@@ -5,11 +5,11 @@ import {
 } from "./timelineProject";
 
 export const TIMELINE_WORKSPACE_PREFERENCES_KEY =
-  "director-web:v1:timeline-workspace-preferences";
+  "directordeck:v1:timeline-workspace-preferences";
 const TIMELINE_SEGMENT_SELECTION_KEY_PREFIX =
-  "director-web:v2:timeline-segment-selection";
+  "directordeck:v2:timeline-segment-selection";
 export const TIMELINE_SEGMENT_COPY_OPTIONS_KEY =
-  "director-web:v1:timeline-segment-copy-options";
+  "directordeck:v1:timeline-segment-copy-options";
 
 export interface TimelineWorkspacePreferences {
   version: 1;
@@ -29,7 +29,6 @@ export interface TimelineWorkspacePreferences {
 
 export interface TimelinePreferenceDatabase {
   active_database_path: string;
-  active_database_identity: string;
 }
 
 const DEFAULT_TIMELINE_WORKSPACE_PREFERENCES: TimelineWorkspacePreferences = {
@@ -183,15 +182,14 @@ export function saveTimelineSegmentCopyOptions(
 }
 
 function validDatabase(database: TimelinePreferenceDatabase): boolean {
-  return database.active_database_path.startsWith("/") &&
-    /^[0-9a-f]{64}$/.test(database.active_database_identity);
+  return database.active_database_path.startsWith("/");
 }
 
 function segmentSelectionKey(
   database: TimelinePreferenceDatabase,
   projectId: string,
 ): string {
-  return `${TIMELINE_SEGMENT_SELECTION_KEY_PREFIX}:${database.active_database_identity}:${projectId}`;
+  return `${TIMELINE_SEGMENT_SELECTION_KEY_PREFIX}:${database.active_database_path}:${projectId}`;
 }
 
 export function saveTimelineSegmentSelectionPreference(
@@ -208,7 +206,6 @@ export function saveTimelineSegmentSelectionPreference(
     window.localStorage.setItem(segmentSelectionKey(database, projectId), JSON.stringify({
       version: 2,
       active_database_path: database.active_database_path,
-      active_database_identity: database.active_database_identity,
       active_project_id: projectId,
       mode,
       project_segment_ids: projectIds,
@@ -233,7 +230,6 @@ export function loadTimelineSegmentSelectionPreference(
       !isRecord(value) ||
       value.version !== 2 ||
       value.active_database_path !== database.active_database_path ||
-      value.active_database_identity !== database.active_database_identity ||
       value.active_project_id !== projectId ||
       (value.mode !== "all" && value.mode !== "explicit") ||
       !Array.isArray(value.project_segment_ids) ||

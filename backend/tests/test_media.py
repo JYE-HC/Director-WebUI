@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from director.media import (
+from directordeck.media import (
     MediaToolError,
     _scene_frames,
     assemble_video_bytes,
@@ -15,7 +15,7 @@ from director.media import (
     detect_shots_path,
     probe_video_bytes,
 )
-from director.schemas import VideoMetadata
+from directordeck.schemas import VideoMetadata
 
 
 def _sample_video(tmp_path: Path, *, fps: int = 30, audio: bool = True) -> bytes:
@@ -96,7 +96,7 @@ def test_noncompliant_proxy_uses_veryfast_transcode(tmp_path: Path, monkeypatch)
     source = tmp_path / "source.mp4"
     source.write_bytes(_sample_video(tmp_path, fps=30))
     destination = tmp_path / "proxy.mp4"
-    import director.media as media_module
+    import directordeck.media as media_module
     commands: list[list[str]] = []
     original = media_module._run_command
 

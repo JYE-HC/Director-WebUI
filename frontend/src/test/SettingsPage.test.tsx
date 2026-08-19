@@ -2,21 +2,15 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { directorApi } from "../api/client";
 import { DEFAULT_SETTINGS, EMPTY_CAPABILITIES, EMPTY_MODELS, resolveExecutionBackend, sanitizeRuntimeSettings, type ModelInventory, type RayLightRuntimeStatus, type RuntimeSettings } from "../api/types";
-import { SettingsPage, validateDatabasePathInput, validateRuntimeSettingsForm } from "../components/SettingsPage";
+import { SettingsPage, validateRuntimeSettingsForm } from "../components/SettingsPage";
 
 const CONFIGURED_SETTINGS: RuntimeSettings = {
   ...DEFAULT_SETTINGS,
-  comfy_url: "http://comfy.test:8188",
 };
 const ONLINE_CAPABILITIES = { ...EMPTY_CAPABILITIES, connection: "online" as const };
 const confirmConfiguredSettings = async () => CONFIGURED_SETTINGS;
 const STORAGE_CONFIGURATION = {
-  active_database_path: "/srv/director/data/director.sqlite3",
-  active_database_identity: "a".repeat(64),
-  configured_database_path: "/srv/director/data/director.sqlite3",
-  recommended_database_path: "/srv/director/.data/database/director.sqlite3",
-  source: "explicit" as const,
-  restart_required: false,
+  active_database_path: "/srv/directordeck/data/directordeck.sqlite3",
 };
 const MODEL_INVENTORY: ModelInventory = {
   fl2va: [DEFAULT_SETTINGS.models.fl2va.filename],
@@ -52,6 +46,7 @@ describe("共享设置表单", () => {
     const view = render(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={MODEL_INVENTORY}
@@ -85,6 +80,7 @@ describe("共享设置表单", () => {
     view.rerender(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={MODEL_INVENTORY}
@@ -104,6 +100,7 @@ describe("共享设置表单", () => {
     view.rerender(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={MODEL_INVENTORY}
@@ -122,32 +119,7 @@ describe("共享设置表单", () => {
     expect(screen.queryByRole("alert", { name: "旧 RayLight 运行状态引用了当前不可见 GPU" })).not.toBeInTheDocument();
   });
 
-  it("首次未配置时地址为空并禁用运行资源控件", () => {
-    render(
-      <SettingsPage
-        settings={DEFAULT_SETTINGS}
-        capabilities={ONLINE_CAPABILITIES}
-        gpus={[]}
-        models={EMPTY_MODELS}
-        loadingModels={false}
-        onSaved={confirmConfiguredSettings}
-      />,
-    );
-
-    expect(screen.getByLabelText("ComfyUI 地址")).toHaveValue("");
-    expect(screen.getByLabelText("ComfyUI 地址")).toHaveAttribute("placeholder", "http://comfyui-host:8188");
-    expect(screen.getByText("ComfyUI 尚未配置")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("FL2VA 扩散模型模型")).toBeDisabled();
-    expect(screen.getByLabelText("FL2VA 扩散模型设备")).toBeDisabled();
-    const modePanel = screen.getByRole("heading", { name: "模型族就绪情况" }).closest("section");
-    if (!modePanel) throw new Error("mode readiness panel missing");
-    expect(within(modePanel).getAllByRole("listitem")).toHaveLength(2);
-    expect(within(modePanel).getByText("FL2VA")).toBeInTheDocument();
-    expect(within(modePanel).getByText("Ref2VA")).toBeInTheDocument();
-  });
-
-  it("插件内嵌模式下 ComfyUI 地址只读且保留测试连接", () => {
+  it("连接卡为只读状态并保留测试连接按钮", () => {
     render(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
@@ -155,39 +127,16 @@ describe("共享设置表单", () => {
         gpus={[]}
         models={MODEL_INVENTORY}
         loadingModels={false}
-        embeddedComfyUi
         onSaved={confirmConfiguredSettings}
       />,
     );
 
-    const input = screen.getByLabelText("ComfyUI 地址");
-    expect(input).toHaveAttribute("readonly");
-    expect(input).not.toBeDisabled();
-    expect(input).toHaveValue(CONFIGURED_SETTINGS.comfy_url);
-    expect(input).toHaveAccessibleDescription("插件模式：自动指向当前 ComfyUI 实例，无需设置。");
+    expect(screen.queryByLabelText("ComfyUI 地址")).not.toBeInTheDocument();
+    expect(screen.getByText("ComfyUI 在线")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "测试连接" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "ComfyUI 地址显示状态" })).toBeEnabled();
   });
 
-  it("独立部署下 ComfyUI 地址可编辑且无插件提示", () => {
-    render(
-      <SettingsPage
-        settings={CONFIGURED_SETTINGS}
-        capabilities={ONLINE_CAPABILITIES}
-        gpus={[]}
-        models={MODEL_INVENTORY}
-        loadingModels={false}
-        onSaved={confirmConfiguredSettings}
-      />,
-    );
-
-    const input = screen.getByLabelText("ComfyUI 地址");
-    expect(input).not.toHaveAttribute("readonly");
-    expect(input).not.toHaveAttribute("aria-describedby");
-    expect(screen.queryByText(/插件模式/)).not.toBeInTheDocument();
-  });
-
-  it("三个敏感设置默认隐藏，并可独立显示且不改动字段值", async () => {
+  it("数据库路径默认隐藏，显示切换不改动只读值", async () => {
     const user = userEvent.setup();
     vi.mocked(directorApi.getStorage).mockResolvedValue(STORAGE_CONFIGURATION);
     render(
@@ -201,16 +150,6 @@ describe("共享设置表单", () => {
       />,
     );
 
-    const comfyUrl = screen.getByLabelText("ComfyUI 地址");
-    const comfyVisibility = screen.getByRole("button", { name: "ComfyUI 地址显示状态" });
-    expect(comfyUrl).toHaveAttribute("type", "password");
-    expect(comfyUrl).toHaveValue(CONFIGURED_SETTINGS.comfy_url);
-    expect(comfyVisibility).toHaveAttribute("aria-pressed", "false");
-    await user.click(comfyVisibility);
-    expect(comfyUrl).toHaveAttribute("type", "url");
-    expect(comfyUrl).toHaveValue(CONFIGURED_SETTINGS.comfy_url);
-    expect(comfyVisibility).toHaveAttribute("aria-pressed", "true");
-
     const currentStorage = await screen.findByLabelText("当前数据库存储配置");
     const currentVisibility = screen.getByRole("button", { name: "当前数据库路径显示状态" });
     expect(currentStorage).not.toHaveTextContent(STORAGE_CONFIGURATION.active_database_path);
@@ -218,22 +157,13 @@ describe("共享设置表单", () => {
     await user.click(currentVisibility);
     expect(currentStorage).toHaveTextContent(STORAGE_CONFIGURATION.active_database_path);
     expect(currentVisibility).toHaveAttribute("aria-pressed", "true");
-
-    const storageTarget = screen.getByLabelText("数据库目标路径");
-    const targetVisibility = screen.getByRole("button", { name: "数据库目标路径显示状态" });
-    expect(storageTarget).toHaveAttribute("type", "password");
-    expect(storageTarget).toHaveValue(STORAGE_CONFIGURATION.configured_database_path);
-    expect(targetVisibility).toHaveAttribute("aria-pressed", "false");
-    await user.click(targetVisibility);
-    expect(storageTarget).toHaveAttribute("type", "text");
-    expect(storageTarget).toHaveValue(STORAGE_CONFIGURATION.configured_database_path);
-    expect(targetVisibility).toHaveAttribute("aria-pressed", "true");
   });
 
   it("模型族就绪只读取两族原生时间线能力，不把旧六配方当成可选模式", () => {
     render(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
+        resourcesReady
         capabilities={{
           ...ONLINE_CAPABILITIES,
           supported_modes: ["t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v"],
@@ -263,123 +193,8 @@ describe("共享设置表单", () => {
     }
   });
 
-  it("数据库路径只接受绝对路径或 ~/，并拒绝控制字符", () => {
-    expect(validateDatabasePathInput("/srv/director/director.sqlite3")).toBeNull();
-    expect(validateDatabasePathInput("~/director/director.sqlite3")).toBeNull();
-    expect(validateDatabasePathInput("data/director.sqlite3")).toContain("绝对路径");
-    expect(validateDatabasePathInput("/srv/director\ndirector.sqlite3")).toContain("控制字符");
-  });
-
-  it("数据存储迁移与仅保存路径是独立确认动作，不进入 RuntimeSettings 自动 PUT", async () => {
-    const user = userEvent.setup();
+  it("数据存储面板只读展示当前数据库路径", async () => {
     vi.mocked(directorApi.getStorage).mockResolvedValue(STORAGE_CONFIGURATION);
-    const onSaved = vi.fn(confirmConfiguredSettings);
-    const onBeforeStorageChange = vi.fn(async () => undefined);
-    const onStorageOperationStarted = vi.fn();
-    const onStorageConfigurationChanged = vi.fn();
-    const target = "/srv/director/data/director-next.sqlite3";
-    const savedOnlyTarget = "/srv/director/data/existing.sqlite3";
-    const migrate = vi.spyOn(directorApi, "migrateStorage").mockResolvedValue({
-      ...STORAGE_CONFIGURATION,
-      configured_database_path: target,
-      restart_required: true,
-      migrated_from: STORAGE_CONFIGURATION.active_database_path,
-      migrated_to: target,
-    });
-    const save = vi.spyOn(directorApi, "updateStorage").mockResolvedValue({
-      ...STORAGE_CONFIGURATION,
-      configured_database_path: savedOnlyTarget,
-      restart_required: true,
-    });
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
-    render(
-      <SettingsPage
-        settings={CONFIGURED_SETTINGS}
-        capabilities={ONLINE_CAPABILITIES}
-        gpus={[]}
-        models={MODEL_INVENTORY}
-        loadingModels={false}
-        onSaved={onSaved}
-        onBeforeStorageChange={onBeforeStorageChange}
-        onStorageOperationStarted={onStorageOperationStarted}
-        onStorageConfigurationChanged={onStorageConfigurationChanged}
-      />,
-    );
-
-    const currentStorage = await screen.findByLabelText("当前数据库存储配置");
-    expect(currentStorage).not.toHaveTextContent(STORAGE_CONFIGURATION.active_database_path);
-    await user.click(screen.getByRole("button", { name: "当前数据库路径显示状态" }));
-    expect(currentStorage).toHaveTextContent(STORAGE_CONFIGURATION.active_database_path);
-    expect(currentStorage).toHaveTextContent("启动参数");
-    const path = screen.getByLabelText("数据库目标路径");
-    await user.clear(path);
-    await user.type(path, "data/director.sqlite3");
-    expect(screen.getByText(/数据库路径必须是绝对路径/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "迁移当前数据库并切换" })).toBeDisabled();
-
-    await user.clear(path);
-    await user.type(path, target);
-    await user.click(screen.getByRole("button", { name: "迁移当前数据库并切换" }));
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining(`目标：${target}`));
-    expect(onStorageOperationStarted).toHaveBeenCalledTimes(1);
-    expect(onStorageOperationStarted.mock.invocationCallOrder[0]).toBeLessThan(onBeforeStorageChange.mock.invocationCallOrder[0]);
-    expect(onBeforeStorageChange).toHaveBeenCalledTimes(1);
-    expect(onBeforeStorageChange.mock.invocationCallOrder[0]).toBeLessThan(migrate.mock.invocationCallOrder[0]);
-    expect(migrate).toHaveBeenCalledWith(target);
-    expect(await screen.findByText(/数据库已从 .* 迁移到/)).toHaveTextContent("停止修改；请重启 Director 后切换");
-    expect(onSaved).not.toHaveBeenCalled();
-
-    await user.clear(path);
-    await user.type(path, savedOnlyTarget);
-    await user.click(screen.getByRole("button", { name: "保存路径（重启后切换）" }));
-    expect(confirm).toHaveBeenLastCalledWith(expect.stringContaining("仅保存数据库路径不会复制当前数据"));
-    expect(onStorageOperationStarted).toHaveBeenCalledTimes(2);
-    expect(onBeforeStorageChange).toHaveBeenCalledTimes(2);
-    expect(onBeforeStorageChange.mock.invocationCallOrder[1]).toBeLessThan(save.mock.invocationCallOrder[0]);
-    expect(save).toHaveBeenCalledWith(savedOnlyTarget);
-    expect(await screen.findByText(/数据库路径已保存/)).toHaveTextContent("停止修改；请重启 Director 后切换");
-    expect(onSaved).not.toHaveBeenCalled();
-    expect(onStorageConfigurationChanged).toHaveBeenCalledTimes(2);
-  });
-
-  it("切库前时间线同步失败时不发送保存或迁移请求", async () => {
-    const user = userEvent.setup();
-    vi.mocked(directorApi.getStorage).mockResolvedValue(STORAGE_CONFIGURATION);
-    const migrate = vi.spyOn(directorApi, "migrateStorage");
-    const save = vi.spyOn(directorApi, "updateStorage");
-    const operationAborted = vi.fn();
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    render(
-      <SettingsPage
-        settings={CONFIGURED_SETTINGS}
-        capabilities={ONLINE_CAPABILITIES}
-        gpus={[]}
-        models={MODEL_INVENTORY}
-        loadingModels={false}
-        onSaved={confirmConfiguredSettings}
-        onBeforeStorageChange={vi.fn().mockRejectedValue(new Error("internal detail"))}
-        onStorageOperationAborted={operationAborted}
-      />,
-    );
-
-    const path = await screen.findByLabelText("数据库目标路径");
-    await user.clear(path);
-    await user.type(path, "/srv/director/data/blocked.sqlite3");
-    await user.click(screen.getByRole("button", { name: "迁移当前数据库并切换" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("当前时间线未能同步，未执行数据库操作");
-    expect(screen.getByRole("alert")).not.toHaveTextContent("internal detail");
-    expect(migrate).not.toHaveBeenCalled();
-    expect(save).not.toHaveBeenCalled();
-    expect(operationAborted).toHaveBeenCalledTimes(1);
-  });
-
-  it("legacy 存储来源默认采用后端提供的项目推荐迁移路径", async () => {
-    const user = userEvent.setup();
-    vi.mocked(directorApi.getStorage).mockResolvedValue({
-      ...STORAGE_CONFIGURATION,
-      source: "legacy",
-    });
     render(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
@@ -391,207 +206,79 @@ describe("共享设置表单", () => {
       />,
     );
 
-    expect(await screen.findByLabelText("数据库目标路径")).toHaveValue(
-      STORAGE_CONFIGURATION.recommended_database_path,
-    );
-    await user.click(screen.getByRole("button", { name: "当前数据库路径显示状态" }));
-    expect(screen.getByLabelText("当前数据库存储配置")).toHaveTextContent(
-      STORAGE_CONFIGURATION.active_database_path,
-    );
+    expect(await screen.findByLabelText("当前数据库存储配置")).toBeInTheDocument();
+    expect(screen.queryByLabelText("数据库目标路径")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /迁移/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /保存路径/ })).not.toBeInTheDocument();
   });
 
-  it("pending switch 默认提供取消动作，先 PUT active 解冻再恢复本地 WAL", async () => {
-    const user = userEvent.setup();
-    const pending = {
-      ...STORAGE_CONFIGURATION,
-      configured_database_path: "/srv/director/data/next.sqlite3",
-      restart_required: true,
-    };
-    vi.mocked(directorApi.getStorage).mockResolvedValue(pending);
-    const update = vi.spyOn(directorApi, "updateStorage").mockResolvedValue(STORAGE_CONFIGURATION);
-    const preflight = vi.fn().mockRejectedValue(new Error("冻结期间不能 preflight"));
-    const recover = vi.fn(async () => undefined);
-    const changed = vi.fn();
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    render(
-      <SettingsPage
-        settings={CONFIGURED_SETTINGS}
-        capabilities={ONLINE_CAPABILITIES}
-        gpus={[]}
-        models={MODEL_INVENTORY}
-        loadingModels={false}
-        onSaved={confirmConfiguredSettings}
-        onBeforeStorageChange={preflight}
-        onStorageConfigurationChanged={changed}
-        onStorageSwitchCancelled={recover}
-      />,
-    );
-
-    expect(await screen.findByLabelText("数据库目标路径")).toHaveValue(
-      STORAGE_CONFIGURATION.active_database_path,
-    );
-    await user.click(screen.getByRole("button", { name: "取消切换并继续使用当前库" }));
-
-    expect(preflight).not.toHaveBeenCalled();
-    expect(update).toHaveBeenCalledWith(STORAGE_CONFIGURATION.active_database_path);
-    expect(changed).toHaveBeenCalledWith(STORAGE_CONFIGURATION);
-    expect(update.mock.invocationCallOrder[0]).toBeLessThan(recover.mock.invocationCallOrder[0]);
-    expect(await screen.findByText(/已取消数据库切换/)).toHaveTextContent("待同步修改已恢复");
-  });
-
-  it("首次填写的地址可立即测试，完整有效稿同时交给上层自动同步队列", async () => {
+  it("测试连接探测当前宿主实例并触发资源重核对", async () => {
     const user = userEvent.setup();
     let resolveProbe!: (result: { ok: boolean; latency_ms?: number; message: string }) => void;
     const probe = vi.spyOn(directorApi, "testConnection").mockImplementation(
       () => new Promise((resolve) => { resolveProbe = resolve; }),
     );
-    const onSaved = vi.fn(confirmConfiguredSettings);
     const onConnectionTestSucceeded = vi.fn();
     render(
-      <SettingsPage
-        settings={DEFAULT_SETTINGS}
-        capabilities={EMPTY_CAPABILITIES}
-        gpus={[]}
-        models={EMPTY_MODELS}
-        loadingModels={false}
-        onSaved={onSaved}
-        onConnectionTestSucceeded={onConnectionTestSucceeded}
-      />,
-    );
-
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.type(endpoint, "http://probe-comfy.test:8188");
-    await user.click(screen.getByRole("button", { name: "测试连接" }));
-
-    expect(probe).toHaveBeenCalledWith("http://probe-comfy.test:8188");
-    const connectionCard = screen.getByText("正在测试连接").closest(".connection-card");
-    expect(connectionCard).not.toBeNull();
-    expect(connectionCard).toHaveTextContent("正在等待 ComfyUI 响应");
-    expect(connectionCard).not.toHaveTextContent("http://probe-comfy.test:8188");
-    expect(screen.getByRole("button", { name: /测试中/ })).toBeDisabled();
-    expect(onSaved).toHaveBeenLastCalledWith(
-      expect.objectContaining({ comfy_url: "http://probe-comfy.test:8188" }),
-    );
-    expect(onConnectionTestSucceeded).not.toHaveBeenCalled();
-    expect(screen.getByLabelText("FL2VA 扩散模型模型")).toBeDisabled();
-
-    await act(async () => resolveProbe({ ok: true, latency_ms: 2.5, message: "连接成功" }));
-
-    expect(await screen.findByText("当前填写地址可连接")).toBeInTheDocument();
-    expect(screen.getByText("连接成功 · 响应 2.5 ms")).toBeInTheDocument();
-    expect(onSaved).toHaveBeenLastCalledWith(
-      expect.objectContaining({ comfy_url: "http://probe-comfy.test:8188" }),
-    );
-    expect(onConnectionTestSucceeded).toHaveBeenCalledOnce();
-    expect(onConnectionTestSucceeded).toHaveBeenCalledWith("http://probe-comfy.test:8188");
-    expect(screen.getByLabelText("FL2VA 扩散模型模型")).toBeDisabled();
-  });
-
-  it("临时连接失败直接显示在连接卡且不影响地址进入自动同步队列", async () => {
-    const user = userEvent.setup();
-    vi.spyOn(directorApi, "testConnection").mockResolvedValue({
-      ok: false,
-      message: "连接被拒绝",
-    });
-    const onSaved = vi.fn(confirmConfiguredSettings);
-    const onConnectionTestSucceeded = vi.fn();
-    render(
-      <SettingsPage
-        settings={DEFAULT_SETTINGS}
-        capabilities={EMPTY_CAPABILITIES}
-        gpus={[]}
-        models={EMPTY_MODELS}
-        loadingModels={false}
-        onSaved={onSaved}
-        onConnectionTestSucceeded={onConnectionTestSucceeded}
-      />,
-    );
-
-    await user.type(screen.getByLabelText("ComfyUI 地址"), "http://offline-comfy.test:8188");
-    await user.click(screen.getByRole("button", { name: "测试连接" }));
-
-    expect(await screen.findByText("当前填写地址连接失败")).toBeInTheDocument();
-    expect(screen.getByText("连接被拒绝")).toBeInTheDocument();
-    expect(onSaved).toHaveBeenLastCalledWith(
-      expect.objectContaining({ comfy_url: "http://offline-comfy.test:8188" }),
-    );
-    expect(onConnectionTestSucceeded).not.toHaveBeenCalled();
-  });
-
-  it("编辑地址会丢弃上一地址尚未返回的测试结果", async () => {
-    const user = userEvent.setup();
-    let resolveProbe!: (result: { ok: boolean; message: string }) => void;
-    vi.spyOn(directorApi, "testConnection").mockImplementation(
-      () => new Promise((resolve) => { resolveProbe = resolve; }),
-    );
-    const onConnectionTestSucceeded = vi.fn();
-    render(
-      <SettingsPage
-        settings={DEFAULT_SETTINGS}
-        capabilities={EMPTY_CAPABILITIES}
-        gpus={[]}
-        models={EMPTY_MODELS}
-        loadingModels={false}
-        onSaved={confirmConfiguredSettings}
-        onConnectionTestSucceeded={onConnectionTestSucceeded}
-      />,
-    );
-
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.type(endpoint, "http://old-comfy.test:8188");
-    await user.click(screen.getByRole("button", { name: "测试连接" }));
-    await user.clear(endpoint);
-    await user.type(endpoint, "http://new-comfy.test:8188");
-    await act(async () => resolveProbe({ ok: true, message: "旧地址连接成功" }));
-
-    expect(endpoint).toHaveValue("http://new-comfy.test:8188");
-    expect(screen.queryByText("当前填写地址可连接")).not.toBeInTheDocument();
-    expect(screen.queryByText("旧地址连接成功")).not.toBeInTheDocument();
-    expect(screen.getByText("等待当前地址确认")).toBeInTheDocument();
-    expect(onConnectionTestSucceeded).not.toHaveBeenCalled();
-  });
-
-  it("新的服务器权威地址会清除旧地址的临时测试状态", async () => {
-    const user = userEvent.setup();
-    vi.spyOn(directorApi, "testConnection").mockResolvedValue({
-      ok: true,
-      message: "连接成功",
-    });
-    const { rerender } = render(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
-        confirmedSettings={CONFIGURED_SETTINGS}
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={MODEL_INVENTORY}
         loadingModels={false}
         onSaved={confirmConfiguredSettings}
+        onConnectionTestSucceeded={onConnectionTestSucceeded}
       />,
     );
 
     await user.click(screen.getByRole("button", { name: "测试连接" }));
-    expect(await screen.findByText("当前填写地址可连接")).toBeInTheDocument();
 
-    rerender(
+    expect(probe).toHaveBeenCalledWith();
+    const connectionCard = screen.getByText("正在测试连接").closest(".connection-card");
+    expect(connectionCard).not.toBeNull();
+    expect(connectionCard).toHaveTextContent("正在等待 ComfyUI 响应");
+    expect(screen.getByRole("button", { name: /测试中/ })).toBeDisabled();
+    expect(onConnectionTestSucceeded).not.toHaveBeenCalled();
+
+    await act(async () => resolveProbe({ ok: true, latency_ms: 2.5, message: "连接成功" }));
+
+    expect(await screen.findByText("当前实例可连接")).toBeInTheDocument();
+    expect(screen.getByText("连接成功 · 响应 2.5 ms")).toBeInTheDocument();
+    expect(onConnectionTestSucceeded).toHaveBeenCalledOnce();
+    expect(onConnectionTestSucceeded).toHaveBeenCalledWith();
+  });
+
+  it("测试连接失败直接显示在连接卡且不触发资源重核对", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(directorApi, "testConnection").mockResolvedValue({
+      ok: false,
+      message: "连接被拒绝",
+    });
+    const onConnectionTestSucceeded = vi.fn();
+    render(
       <SettingsPage
-        settings={{ ...CONFIGURED_SETTINGS, comfy_url: "http://authoritative-comfy.test:8188" }}
-        capabilities={{ ...EMPTY_CAPABILITIES, connection: "offline", message: "新地址不可用" }}
+        settings={CONFIGURED_SETTINGS}
+        capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
-        models={EMPTY_MODELS}
+        models={MODEL_INVENTORY}
         loadingModels={false}
         onSaved={confirmConfiguredSettings}
+        onConnectionTestSucceeded={onConnectionTestSucceeded}
       />,
     );
 
-    expect(await screen.findByText("ComfyUI 离线")).toBeInTheDocument();
-    expect(screen.getByText("新地址不可用")).toBeInTheDocument();
-    expect(screen.queryByText("当前填写地址可连接")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+    expect(await screen.findByText("当前实例连接失败")).toBeInTheDocument();
+    expect(screen.getByText("连接被拒绝")).toBeInTheDocument();
+    expect(onConnectionTestSucceeded).not.toHaveBeenCalled();
   });
 
   it("父级权威模型清单到达后启用模型控件", () => {
     const { rerender } = render(
       <SettingsPage
         settings={DEFAULT_SETTINGS}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={EMPTY_MODELS}
@@ -603,6 +290,7 @@ describe("共享设置表单", () => {
     rerender(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={MODEL_INVENTORY}
@@ -659,6 +347,7 @@ describe("共享设置表单", () => {
     render(
       <SettingsPage
         settings={settings}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={models}
@@ -713,6 +402,7 @@ describe("共享设置表单", () => {
     render(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={models}
@@ -758,7 +448,7 @@ describe("共享设置表单", () => {
 
     rerender(
       <SettingsPage
-        settings={{ ...CONFIGURED_SETTINGS, comfy_url: "http://new-comfy.test:8188" }}
+        settings={{ ...CONFIGURED_SETTINGS, client_id: "changed-client" }}
         capabilities={{ ...EMPTY_CAPABILITIES, connection: "checking" }}
         gpus={[]}
         models={EMPTY_MODELS}
@@ -799,15 +489,13 @@ describe("共享设置表单", () => {
     expect(audioVaeValues).toEqual(["default", "gpu:0"]);
   });
 
-  it("在调用设置 API 前校验 URL、client_id、模型文件和 VAE 设备", () => {
+  it("在调用设置 API 前校验 client_id、模型文件和 VAE 设备", () => {
     const invalid = structuredClone(DEFAULT_SETTINGS) as RuntimeSettings;
-    invalid.comfy_url = "ftp://localhost";
     invalid.client_id = "包含 空格";
     invalid.models.fl2va.filename = "";
     (invalid.models.video_vae as { device: string }).device = "cpu";
 
     const errors = validateRuntimeSettingsForm(invalid);
-    expect(errors).toContain("ComfyUI 地址必须使用 HTTP 或 HTTPS");
     expect(errors).toContain("客户端 ID 只能包含字母、数字、点、下划线、冒号和连字符");
     expect(errors).toContain("FL2VA 扩散模型必须选择有效模型文件");
     expect(errors).toContain("视频 VAE不允许放在 CPU");
@@ -911,6 +599,7 @@ describe("共享设置表单", () => {
     render(
       <SettingsPage
         settings={settings}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[
           { index: 0, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
@@ -962,6 +651,7 @@ describe("共享设置表单", () => {
     render(
       <SettingsPage
         settings={settings}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[
           { index: 0, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
@@ -986,6 +676,7 @@ describe("共享设置表单", () => {
     render(
       <SettingsPage
         settings={settings}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[
           { index: 0, name: "A6000", vram_total: 48, vram_free: 40, visible: true },
@@ -1041,6 +732,7 @@ describe("共享设置表单", () => {
     render(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
+        resourcesReady
         capabilities={ONLINE_CAPABILITIES}
         gpus={[]}
         models={MODEL_INVENTORY}
@@ -1074,7 +766,6 @@ describe("共享设置表单", () => {
             loader: "model_only",
             lora_name: "style.safetensors",
             model_filename: CONFIGURED_SETTINGS.models.fl2va.filename,
-            comfy_origin: CONFIGURED_SETTINGS.comfy_url,
           },
           lora_low_vram: false,
         }),
@@ -1117,20 +808,19 @@ describe("共享设置表单", () => {
     expect(resolveExecutionBackend(normalized.models.ref2va)).toBe("raylight");
   });
 
-  it("只保留与 endpoint、底模和 LoRA 完全匹配的 Standard loader 覆盖", () => {
+  it("只保留与底模和 LoRA 完全匹配的 Standard loader 覆盖", () => {
     const settings = structuredClone(CONFIGURED_SETTINGS);
     settings.models.fl2va.lora_name = "style.safetensors";
     settings.models.fl2va.standard_lora_loader_override = {
       loader: "model_only",
       lora_name: "style.safetensors",
       model_filename: settings.models.fl2va.filename,
-      comfy_origin: settings.comfy_url,
     };
     expect(sanitizeRuntimeSettings(settings).models.fl2va.standard_lora_loader_override).toEqual(
       settings.models.fl2va.standard_lora_loader_override,
     );
 
-    settings.models.fl2va.standard_lora_loader_override.model_filename = "stale.safetensors";
+    settings.models.fl2va.standard_lora_loader_override!.model_filename = "stale.safetensors";
     expect(sanitizeRuntimeSettings(settings).models.fl2va.standard_lora_loader_override).toBeNull();
   });
 
@@ -1278,6 +968,7 @@ describe("共享设置表单", () => {
     render(
       <SettingsPage
         settings={CONFIGURED_SETTINGS}
+        resourcesReady
         capabilities={{
           ...ONLINE_CAPABILITIES,
           execution_backends: {
@@ -1389,11 +1080,11 @@ describe("共享设置表单", () => {
     expect(screen.queryByText(/运行设置(?:已保存|未保存)/)).not.toBeInTheDocument();
   });
 
-  it("自动同步完成前仍保留新地址，直到权威 GET 返回", async () => {
+  it("自动同步完成前仍保留新客户端 ID，直到权威 GET 返回", async () => {
     const user = userEvent.setup();
     const nextSettings = {
       ...CONFIGURED_SETTINGS,
-      comfy_url: "http://new-comfy.test:8188",
+      client_id: "new-client",
     };
     vi.spyOn(directorApi, "updateSettings").mockResolvedValue(nextSettings);
     let resolveRefresh!: (settings: RuntimeSettings) => void;
@@ -1411,26 +1102,25 @@ describe("共享设置表单", () => {
       />,
     );
 
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, nextSettings.comfy_url);
+    const clientId = screen.getByLabelText("客户端 ID");
+    await user.clear(clientId);
+    await user.type(clientId, nextSettings.client_id);
     await waitFor(() => expect(onSaved).toHaveBeenLastCalledWith(
-      expect.objectContaining({ comfy_url: nextSettings.comfy_url }),
+      expect.objectContaining({ client_id: nextSettings.client_id }),
     ));
-    expect(endpoint).toHaveValue(nextSettings.comfy_url);
+    expect(clientId).toHaveValue(nextSettings.client_id);
     expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
 
     await act(async () => resolveRefresh(nextSettings));
-    await waitFor(() => expect(endpoint).toHaveValue(nextSettings.comfy_url));
-    expect(screen.queryByText(/运行设置(?:已保存|未保存)/)).not.toBeInTheDocument();
+    await waitFor(() => expect(clientId).toHaveValue(nextSettings.client_id));
   });
 
   it("权威 GET 失败时保留表单值并明确提示未确认", async () => {
     const user = userEvent.setup();
-    const nextUrl = "http://unconfirmed-comfy.test:8188";
+    const nextClientId = "unconfirmed-client";
     vi.spyOn(directorApi, "updateSettings").mockResolvedValue({
       ...CONFIGURED_SETTINGS,
-      comfy_url: nextUrl,
+      client_id: nextClientId,
     });
     const onSaved = vi.fn().mockRejectedValue(
       new Error("修改可能已写入，但无法从 Director 后端重新确认；请检查服务后重试"),
@@ -1446,12 +1136,12 @@ describe("共享设置表单", () => {
       />,
     );
 
-    const endpoint = screen.getByLabelText("ComfyUI 地址");
-    await user.clear(endpoint);
-    await user.type(endpoint, nextUrl);
+    const clientId = screen.getByLabelText("客户端 ID");
+    await user.clear(clientId);
+    await user.type(clientId, nextClientId);
 
     expect(await screen.findByText(/修改可能已写入，但无法从 Director 后端重新确认/)).toBeInTheDocument();
-    expect(endpoint).toHaveValue(nextUrl);
+    expect(clientId).toHaveValue(nextClientId);
     expect(screen.queryByRole("button", { name: "保存设置" })).not.toBeInTheDocument();
   });
 
@@ -1508,13 +1198,13 @@ describe("共享设置表单", () => {
     await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
     expect(onRequestClose).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(onSaved).toHaveBeenCalledWith(
-      expect.objectContaining({ client_id: "director-web-dirty" }),
+      expect.objectContaining({ client_id: "directordeck-dirty" }),
     ));
 
     await user.click(container.querySelector(".settings-overlay__backdrop")!);
     expect(onRequestClose).toHaveBeenCalledTimes(2);
     expect(onSaved).toHaveBeenLastCalledWith(
-      expect.objectContaining({ client_id: "director-web-dirty" }),
+      expect.objectContaining({ client_id: "directordeck-dirty" }),
     );
   });
 
@@ -1538,7 +1228,7 @@ describe("共享设置表单", () => {
       />,
     );
 
-    fireEvent.pointerDown(screen.getByLabelText("ComfyUI 地址"));
+    fireEvent.pointerDown(screen.getByLabelText("客户端 ID"));
     fireEvent.pointerDown(toggle);
     expect(onRequestClose).not.toHaveBeenCalled();
     fireEvent.pointerDown(outside);

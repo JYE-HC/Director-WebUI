@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import uuid
 
-from director.compiler import timeline_segment_take_fingerprint
-from director.schemas import (
+from directordeck.compiler import timeline_segment_take_fingerprint
+from directordeck.schemas import (
     UnifiedTimelineDraft,
     default_settings,
     default_timeline_draft,
@@ -16,9 +16,6 @@ async def test_project_list_create_rename_delete(client) -> None:
     database = client.director_app.state.database
 
     listed = (await client.get("/api/projects")).json()
-    assert listed["active_database_identity"] == (
-        client.director_app.state.storage.active_database_identity
-    )
     ids = [project["id"] for project in listed["projects"]]
     assert database.LEGACY_DEFAULT_PROJECT_ID in ids
 
@@ -50,25 +47,6 @@ async def test_project_list_create_rename_delete(client) -> None:
 
     refused = await client.delete(f"/api/projects/{database.LEGACY_DEFAULT_PROJECT_ID}")
     assert refused.status_code == 409
-
-
-async def test_project_list_fails_closed_if_database_identity_changes(
-    client, monkeypatch
-) -> None:
-    storage_type = type(client.director_app.state.storage)
-    identities = iter(("a" * 64, "b" * 64))
-    monkeypatch.setattr(
-        storage_type,
-        "active_database_identity",
-        property(lambda _storage: next(identities)),
-    )
-
-    response = await client.get("/api/projects")
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": "the active Director database changed while listing projects"
-    }
 
 
 async def test_project_timeline_roundtrip_isolated_from_default(client) -> None:
@@ -135,7 +113,7 @@ async def test_segment_take_lookup_scoped_by_project(client) -> None:
 
     job_id = str(uuid.uuid4())
     child_id = str(uuid.uuid4())
-    settings = default_settings("http://comfy.test:8188")
+    settings = default_settings()
     now = "2026-08-12T00:00:00+00:00"
     database.create_job(
         {
@@ -187,12 +165,11 @@ async def test_segment_take_lookup_scoped_by_project(client) -> None:
         }
     )
 
-    origin = "http://comfy.test:8188"
     assert database.find_latest_segment_take(
-        "shared-segment", fingerprint, comfy_origin=origin, project_id=created_a["id"]
+        "shared-segment", fingerprint, project_id=created_a["id"]
     ) is not None
     assert database.find_latest_segment_take(
-        "shared-segment", fingerprint, comfy_origin=origin, project_id=created_b["id"]
+        "shared-segment", fingerprint, project_id=created_b["id"]
     ) is None
 
 

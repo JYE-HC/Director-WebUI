@@ -7,8 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from director.database import Database, TimelineRevisionConflict
-from director.schemas import (
+from directordeck.database import Database, TimelineRevisionConflict
+from directordeck.schemas import (
     MAX_TIMELINE_REVISION,
     UnifiedTimelineDraft,
     default_settings,
@@ -231,142 +231,6 @@ async def test_revision_exhaustion_is_an_explicit_409_for_default_and_project(
         assert (await client.get(endpoint)).json() == before
 
 
-@pytest.mark.parametrize("scoped", [False, True], ids=["default", "project"])
-async def test_authority_rechecks_comfy_origin_after_route_snapshot(
-    client,
-    monkeypatch,
-    scoped: bool,
-) -> None:
-    database = client.director_app.state.database
-    if scoped:
-        created = (
-            await client.post("/api/projects", json={"title": "endpoint race"})
-        ).json()
-        project_id = created["id"]
-        endpoint = f"/api/projects/{project_id}/timeline/authority"
-        method_name = "validate_and_put_project_timeline_authority"
-    else:
-        project_id = "default"
-        endpoint = "/api/timeline/authority"
-        method_name = "validate_and_put_timeline_authority"
-
-    before = (await client.get(endpoint)).json()
-    edited = json.loads(json.dumps(before["document"]))
-    edited["segments"][0]["prompt"] = "旧 endpoint 快照不得提交"
-    original = getattr(database, method_name)
-    route_entered_database_call = threading.Event()
-    settings_switched = threading.Event()
-    switch_errors: list[Exception] = []
-    switched_settings = default_settings("http://switched-comfy.test:8188")
-
-    def switch_settings_after_route_snapshot() -> None:
-        try:
-            if not route_entered_database_call.wait(timeout=2):
-                raise TimeoutError("timeline route did not capture its settings snapshot")
-            database.put_settings(switched_settings)
-        except Exception as exc:  # surfaced in the request thread below
-            switch_errors.append(exc)
-        finally:
-            settings_switched.set()
-
-    def delayed_authority_write(*args, **kwargs):
-        # The route evaluates database.get_settings() before invoking this
-        # method, so this boundary is exactly after snapshot capture and before
-        # BEGIN IMMEDIATE in the real CAS implementation.
-        route_entered_database_call.set()
-        if not settings_switched.wait(timeout=2):
-            raise TimeoutError("concurrent settings switch did not finish")
-        if switch_errors:
-            raise switch_errors[0]
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(database, method_name, delayed_authority_write)
-    switch_thread = threading.Thread(target=switch_settings_after_route_snapshot)
-    switch_thread.start()
-    try:
-        refused = await client.put(
-            endpoint,
-            json={"document": edited, "expected_revision": before["revision"]},
-        )
-    finally:
-        switch_thread.join(timeout=2)
-    assert not switch_thread.is_alive()
-
-    assert refused.status_code == 409, refused.text
-    assert refused.json() == {
-        "detail": {
-            "code": "timeline_comfy_origin_conflict",
-            "message": (
-                "ComfyUI endpoint changed before the timeline write acquired its "
-                "transaction; fetch current settings and timeline authorities "
-                "before retrying"
-            ),
-            "project_id": project_id,
-        }
-    }
-    assert (await client.get(endpoint)).json() == before
-    # The settings document keeps the user's spelling verbatim; the origin
-    # comparison helpers rstrip("/") where the distinction matters.
-    assert str(database.get_settings().comfy_url) == "http://switched-comfy.test:8188"
-
-
-def test_origin_check_and_cas_update_share_one_write_transaction(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    database = Database(tmp_path / "timeline-origin-transaction.sqlite3")
-    database.initialize()
-    first_origin = "http://first-comfy.test:8188"
-    second_origin = "http://second-comfy.test:8188"
-    database.put_settings(default_settings(first_origin))
-    original_validate = database._validate_asset_iterator_in_connection
-    validation_started = threading.Event()
-    release_validation = threading.Event()
-    settings_write_started = threading.Event()
-    settings_write_finished = threading.Event()
-
-    def blocked_validate(connection, references, *, comfy_origin: str) -> None:
-        validation_started.set()
-        if not release_validation.wait(timeout=2):
-            raise TimeoutError("test did not release timeline validation")
-        original_validate(connection, references, comfy_origin=comfy_origin)
-
-    def switch_settings() -> None:
-        settings_write_started.set()
-        database.put_settings(default_settings(second_origin))
-        settings_write_finished.set()
-
-    monkeypatch.setattr(
-        database,
-        "_validate_asset_iterator_in_connection",
-        blocked_validate,
-    )
-    timeline = _titled_timeline("CAS transaction winner")
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        cas_future = executor.submit(
-            database.validate_and_put_timeline_authority,
-            timeline,
-            expected_revision=0,
-            comfy_origin=first_origin,
-        )
-        assert validation_started.wait(timeout=2)
-        settings_future = executor.submit(switch_settings)
-        assert settings_write_started.wait(timeout=2)
-        try:
-            # BEGIN IMMEDIATE is still held while asset validation is blocked,
-            # so settings cannot switch between the origin check and CAS write.
-            assert not settings_write_finished.wait(timeout=0.1)
-        finally:
-            release_validation.set()
-        saved, revision = cas_future.result(timeout=2)
-        settings_future.result(timeout=2)
-
-    assert revision == 1
-    assert saved.title == "CAS transaction winner"
-    assert database.get_timeline_authority() == (timeline, 1)
-    assert str(database.get_settings().comfy_url) == second_origin
-
-
 async def test_asset_cascade_advances_only_changed_project_revisions(client) -> None:
     first = asset("first.png", "image")
     default_document = (await client.get("/api/timeline")).json()
@@ -510,7 +374,6 @@ def test_two_concurrent_cas_writers_have_exactly_one_winner(tmp_path) -> None:
             return database.validate_and_put_timeline_authority(
                 _titled_timeline(title),
                 expected_revision=0,
-                comfy_origin="",
             )
         except TimelineRevisionConflict as exc:
             return exc

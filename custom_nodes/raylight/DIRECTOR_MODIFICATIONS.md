@@ -17,8 +17,8 @@ Director-specific changes include:
 
 Files changed from upstream carry a `Modified for Director Web` header. New
 files carry an `Added for Director Web` header. The tests in this directory are
-upstream/fork maintenance tests; ordinary users should run the release-level
-`install.sh verify` command instead.
+upstream/fork maintenance tests; ordinary users should rely on the backend
+test suite and `tools/validate_native_comfy_prompts.py` instead.
 
 Known limitation: the RayLight loader rejects a pruned/curve MiniMax H3 base
 when a LoRA contains AdaLN weights. The bundled Standard Turbo loader supports

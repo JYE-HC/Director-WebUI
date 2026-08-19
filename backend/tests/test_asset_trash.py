@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -8,12 +7,11 @@ from typing import Any
 
 import pytest
 
-import director.database as database_module
-from director.database import Database
-from director.schemas import default_settings, default_timeline_draft
+import directordeck.database as database_module
+from directordeck.database import Database
+from directordeck.schemas import default_settings, default_timeline_draft
 
 from .conftest import asset, runnable_draft
-from .test_assets_and_jobs import media_bytes
 
 
 def timeline_with_anchors(*, first: bool = True, last: bool = True) -> dict[str, Any]:
@@ -25,29 +23,12 @@ def timeline_with_anchors(*, first: bool = True, last: bool = True) -> dict[str,
     return document
 
 
-async def test_asset_read_envelopes_expose_exact_database_and_origin_scope(
-    client,
-) -> None:
-    expected_scope = {
-        "active_database_identity": (
-            client.director_app.state.storage.active_database_identity
-        ),
-        "comfy_origin": "http://comfy.test:8188",
-    }
-
+async def test_asset_read_envelopes(client) -> None:
     assets_response = await client.get("/api/assets?kind=image")
     assert assets_response.status_code == 200, assets_response.text
     assets_payload = assets_response.json()
-    assert set(assets_payload) == {
-        "assets",
-        "outputs_preserved",
-        "active_database_identity",
-        "comfy_origin",
-    }
-    assert {
-        key: assets_payload[key]
-        for key in ("outputs_preserved", "active_database_identity", "comfy_origin")
-    } == {"outputs_preserved": True, **expected_scope}
+    assert set(assets_payload) == {"assets", "outputs_preserved"}
+    assert assets_payload["outputs_preserved"] is True
     assert assets_payload["assets"]
 
     trash_response = await client.get("/api/asset-trash")
@@ -55,7 +36,6 @@ async def test_asset_read_envelopes_expose_exact_database_and_origin_scope(
     assert trash_response.json() == {
         "batches": [],
         "remote_files_preserved": True,
-        **expected_scope,
     }
 
 
@@ -314,9 +294,7 @@ def test_multi_asset_cascade_validation_failure_rolls_back_batch_and_documents(
     database = client.director_app.state.database
     document = default_timeline_draft()
     raw = timeline_with_anchors()
-    database.validate_and_put_timeline(
-        document.model_validate(raw), comfy_origin="http://comfy.test:8188"
-    )
+    database.validate_and_put_timeline(document.model_validate(raw))
     before, before_revision = database.get_timeline_authority()
     original = database_module.validate_timeline_draft
 
@@ -339,7 +317,6 @@ def test_multi_asset_cascade_validation_failure_rolls_back_batch_and_documents(
         database.trash_assets(
             [asset("first.png", "image")["id"], asset("last.png", "image")["id"]],
             cascade=True,
-            expected_comfy_origin="http://comfy.test:8188",
         )
 
     after, after_revision = database.get_timeline_authority()
@@ -390,41 +367,9 @@ async def test_purge_removes_only_director_registration_and_recovery_bundle(
     assert (await client.delete(f"/api/asset-trash/{batch_id}")).status_code == 404
 
 
-async def test_trash_batches_are_isolated_by_active_comfy_origin(client) -> None:
-    reference = asset("reference.png", "image")
-    trashed = (
-        await client.post(
-            "/api/asset-trash",
-            json={"asset_ids": [reference["id"]], "cascade": False},
-        )
-    ).json()
-    settings = (await client.get("/api/settings")).json()
-    settings["comfy_url"] = "http://other-comfy.test:8188"
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
-
-    assert (await client.get("/api/asset-trash")).json()["batches"] == []
-    restore = await client.post(
-        f"/api/asset-trash/{trashed['batch_id']}/restore",
-        json={"mode": "registration_only"},
-    )
-    purge = await client.delete(f"/api/asset-trash/{trashed['batch_id']}")
-    assert restore.status_code == 409
-    assert purge.status_code == 409
-    assert restore.json()["detail"]["code"] == "asset_trash_origin_conflict"
-    assert purge.json()["detail"]["remote_files_preserved"] is True
-
-    settings["comfy_url"] = "http://comfy.test:8188"
-    await client.put("/api/settings", json=settings)
-    restored = await client.post(
-        f"/api/asset-trash/{trashed['batch_id']}/restore",
-        json={"mode": "registration_only"},
-    )
-    assert restored.status_code == 200
-
-
 def test_asset_trash_schema_migrates_legacy_assets_as_live(tmp_path: Path) -> None:
     path = tmp_path / "legacy-trash.sqlite3"
-    settings = default_settings("http://legacy-comfy.test:8188")
+    settings = default_settings()
     legacy_asset = asset("legacy.png", "image")
     with sqlite3.connect(path) as connection:
         connection.executescript(
@@ -464,67 +409,11 @@ def test_asset_trash_schema_migrates_legacy_assets_as_live(tmp_path: Path) -> No
             )
         }
         row = connection.execute(
-            "SELECT comfy_origin, trashed_at, trash_batch_id FROM assets WHERE id = ?",
+            "SELECT trashed_at, trash_batch_id FROM assets WHERE id = ?",
             (legacy_asset["id"],),
         ).fetchone()
-    assert {"comfy_origin", "trashed_at", "trash_batch_id"} <= columns
+    assert {"trashed_at", "trash_batch_id"} <= columns
     assert {"asset_trash_batches", "asset_trash_document_changes"} <= tables
-    assert tuple(row) == ("http://legacy-comfy.test:8188", None, None)
-    listed = database.list_assets(
-        comfy_origin="http://legacy-comfy.test:8188"
-    )
+    assert tuple(row) == (None, None)
+    listed = database.list_assets()
     assert [item["id"] for item in listed] == [legacy_asset["id"]]
-
-
-async def test_upload_endpoint_switch_after_remote_write_does_not_register_asset(
-    client, fake_comfy, monkeypatch
-) -> None:
-    upload_started = asyncio.Event()
-    release_upload = asyncio.Event()
-    original_upload = fake_comfy.upload
-
-    async def blocked_upload(
-        filename: str,
-        content: bytes | Path,
-        content_type: str,
-        kind: str,
-    ) -> dict[str, Any]:
-        upload_started.set()
-        await release_upload.wait()
-        return await original_upload(filename, content, content_type, kind)
-
-    monkeypatch.setattr(fake_comfy, "upload", blocked_upload)
-    request = asyncio.create_task(
-        client.post(
-            "/api/assets",
-            data={"kind": "image"},
-            files={
-                "file": (
-                    "origin-race.png",
-                    media_bytes("origin-race.png"),
-                    "image/png",
-                )
-            },
-        )
-    )
-    await asyncio.wait_for(upload_started.wait(), timeout=2)
-    settings = (await client.get("/api/settings")).json()
-    settings["comfy_url"] = "http://switched-comfy.test:8188"
-    switched = await client.put("/api/settings", json=settings)
-    assert switched.status_code == 200
-    release_upload.set()
-    response = await asyncio.wait_for(request, timeout=2)
-
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"] == {
-        "code": "asset_upload_origin_changed",
-        "message": (
-            "ComfyUI endpoint changed while the upload was in progress; the remote "
-            "file was preserved but was not registered in Director"
-        ),
-        "remote_files_preserved": True,
-    }
-    assert any(item["filename"] == "origin-race.png" for item in fake_comfy.uploads)
-    with client.director_app.state.database.connect() as connection:
-        rows = connection.execute("SELECT document FROM assets").fetchall()
-    assert all("origin-race.png" not in str(row["document"]) for row in rows)

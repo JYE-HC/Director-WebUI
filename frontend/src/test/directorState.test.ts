@@ -14,7 +14,7 @@ import {
 const validImage: AssetReference = {
   id: "asset-image-1",
   name: "valid.png",
-  subfolder: "director-web",
+  subfolder: "directordeck",
   type: "input",
   kind: "image",
 };
@@ -22,7 +22,7 @@ const validImage: AssetReference = {
 const validVideo: AssetReference = {
   id: "asset-video-1",
   name: "valid.mp4",
-  subfolder: "director-web",
+  subfolder: "directordeck",
   type: "input",
   kind: "video",
   metadata: {
@@ -67,13 +67,13 @@ describe("六种模式草稿隔离", () => {
     const state = createInitialDirectorState();
     const legacyImage = {
       name: "legacy.png",
-      subfolder: "director-web",
+      subfolder: "directordeck",
       type: "input",
       kind: "image",
     } as unknown as AssetReference;
     const legacyVideo = {
       name: "legacy.mp4",
-      subfolder: "director-web",
+      subfolder: "directordeck",
       type: "input",
       kind: "video",
     } as unknown as AssetReference;
@@ -125,7 +125,7 @@ describe("六种模式草稿隔离", () => {
     const initial = createInitialDirectorState();
     const state = directorReducer(initial, {
       type: "settings/replace",
-      settings: { ...initial.settings, comfy_url: "http://stale-comfy.test:8188" },
+      settings: { ...initial.settings, client_id: "stale-client" },
     });
     saveDirectorState(state);
     const key = localStorage.key(0)!;
@@ -134,13 +134,13 @@ describe("六种模式草稿隔离", () => {
 
     stored.settings = {
       ...state.settings,
-      comfy_url: "http://legacy-local.test:8188",
+      client_id: "legacy-local",
       raylight: { gpu_ids: [0, 1] },
     };
     localStorage.setItem(key, JSON.stringify(stored));
 
     const hydrated = loadDirectorState();
-    expect(hydrated.settings.comfy_url).toBe("");
+    expect(hydrated.settings.client_id).toBe("directordeck");
     expect(hydrated.settings).not.toHaveProperty("raylight");
   });
 

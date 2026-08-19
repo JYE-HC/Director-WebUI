@@ -5,9 +5,9 @@ from typing import Any
 
 import pytest
 
-import director.database as database_module
-from director.compiler import DraftNotRunnable, validate_unified_runnable
-from director.schemas import UnifiedTimelineDraft, default_timeline_draft
+import directordeck.database as database_module
+from directordeck.compiler import DraftNotRunnable, validate_unified_runnable
+from directordeck.schemas import UnifiedTimelineDraft, default_timeline_draft
 
 from .conftest import asset, runnable_draft
 
@@ -562,9 +562,9 @@ def test_atomic_validate_and_put_cannot_resurrect_asset_after_cascade_delete(
     release_validation = threading.Event()
     original = database._validate_asset_iterator_in_connection
 
-    def block_after_asset_lookup(connection, references, *, comfy_origin):
+    def block_after_asset_lookup(connection, references):
         materialized = list(references)
-        original(connection, materialized, comfy_origin=comfy_origin)
+        original(connection, materialized)
         entered_validation.set()
         assert release_validation.wait(timeout=2)
 
@@ -579,16 +579,12 @@ def test_atomic_validate_and_put_cannot_resurrect_asset_after_cascade_delete(
                 value = UnifiedTimelineDraft.model_validate(
                     timeline(segment("i2v", "atomic", first_image=first))
                 )
-                database.validate_and_put_timeline(
-                    value, comfy_origin="http://comfy.test:8188"
-                )
+                database.validate_and_put_timeline(value)
             else:
                 value = database_module.validate_mode_draft(
                     "i2v", runnable_draft("i2v")
                 )
-                database.validate_and_put_draft(
-                    "i2v", value, comfy_origin="http://comfy.test:8188"
-                )
+                database.validate_and_put_draft("i2v", value)
         except BaseException as exc:
             error.append(exc)
 
@@ -636,7 +632,7 @@ def persisted_rows(database) -> tuple[Any, Any, Any]:
             "SELECT mode, document, updated_at FROM mode_drafts ORDER BY mode"
         ).fetchall()
         asset_rows = connection.execute(
-            "SELECT id, document, created_at, comfy_origin FROM assets ORDER BY id"
+            "SELECT id, document, created_at FROM assets ORDER BY id"
         ).fetchall()
     assert timeline_row is not None
     return (

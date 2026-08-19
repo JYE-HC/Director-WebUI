@@ -66,16 +66,6 @@ def _select_installer() -> list[str]:
     )
 
 
-def default_requirements_path() -> Path:
-    """Standalone repo layout; the ComfyUI plugin passes its packaged copy."""
-    return (
-        Path(__file__).resolve().parents[2]
-        / "custom_nodes"
-        / "raylight"
-        / "requirements.txt"
-    )
-
-
 class RayLightInstallConflict(RuntimeError):
     """An install is already running."""
 
@@ -200,6 +190,10 @@ class RayLightInstallManager:
                 env=env,
             )
             self._process = process
+            # A cancel that landed before the spawn assigned ``_process``
+            # would otherwise be lost and the subprocess would run orphaned.
+            if self._cancel_requested and process.returncode is None:
+                process.terminate()
             assert process.stdout is not None
             try:
                 async with asyncio.timeout(_PIP_TIMEOUT_SECONDS):

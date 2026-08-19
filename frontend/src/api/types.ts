@@ -23,7 +23,6 @@ export interface StandardLoraLoaderOverride {
   loader: StandardLoraLoader;
   lora_name: string;
   model_filename: string;
-  comfy_origin: string;
 }
 export type MemoryPolicy = "keep_resident";
 export type RayLightResidencyPolicy =
@@ -83,7 +82,6 @@ export interface SettingsModels {
 
 /** Exact GET/PUT /api/settings payload. */
 export interface RuntimeSettings {
-  comfy_url: string;
   client_id: string;
   memory_policy: MemoryPolicy;
   raylight_residency_policy: RayLightResidencyPolicy;
@@ -96,27 +94,9 @@ export interface RuntimeSettingsAuthority {
   authority_token: string;
 }
 
-/** Exact GET/PUT /api/storage payload. Storage changes never belong to RuntimeSettings. */
-export type StorageConfigurationSource =
-  | "explicit"
-  | "environment"
-  | "bootstrap"
-  | "legacy"
-  | "default";
-
+/** Exact GET /api/storage payload: the fixed database location of the host. */
 export interface StorageConfiguration {
   active_database_path: string;
-  active_database_identity: string;
-  configured_database_path: string;
-  recommended_database_path: string;
-  source: StorageConfigurationSource;
-  restart_required: boolean;
-}
-
-/** Exact POST /api/storage/migrate response. */
-export interface StorageMigrationResult extends StorageConfiguration {
-  migrated_from: string;
-  migrated_to: string;
 }
 
 /**
@@ -314,10 +294,6 @@ export interface TimelineCompileReport {
 export interface AssetListResponse {
   assets: import("../domain/modes").AssetReference[];
   outputs_preserved: true;
-  /** Missing only when talking to a pre-scope-metadata Director backend. */
-  active_database_identity?: string;
-  /** Canonical active ComfyUI origin; paired with active_database_identity. */
-  comfy_origin?: string;
 }
 
 export type AssetUploadStage =
@@ -351,7 +327,6 @@ export type AssetTrashRestoreMode = "registration_only" | "with_references";
 
 export interface AssetTrashBatch {
   batch_id: string;
-  comfy_origin: string;
   asset_ids: string[];
   assets: AssetReference[];
   cascade: boolean;
@@ -364,10 +339,6 @@ export interface AssetTrashBatch {
 export interface AssetTrashListResponse {
   batches: AssetTrashBatch[];
   remote_files_preserved: true;
-  /** Missing only when talking to a pre-scope-metadata Director backend. */
-  active_database_identity?: string;
-  /** Canonical active ComfyUI origin; paired with active_database_identity. */
-  comfy_origin?: string;
 }
 
 export interface AssetTrashRestoreResponse {
@@ -443,7 +414,6 @@ export interface ProjectSummary {
 
 export interface ProjectListResponse {
   projects: ProjectSummary[];
-  active_database_identity: string;
 }
 
 export interface ProjectDeleteResponse {
@@ -583,8 +553,7 @@ export interface RV2VShotDetectionResponse {
 }
 
 export const DEFAULT_SETTINGS: RuntimeSettings = {
-  comfy_url: "",
-  client_id: "director-web",
+  client_id: "directordeck",
   memory_policy: "keep_resident",
   raylight_residency_policy: "keep_until_switch",
   multi_gpu_enabled: false,
@@ -632,26 +601,6 @@ export const DEFAULT_SETTINGS: RuntimeSettings = {
     audio_vae: { filename: "minimax_h3_audio_vae_fp32.safetensors", device: "default" },
   },
 };
-
-/**
- * Mirrors the backend's `Database.canonical_comfy_origin` (trailing slashes
- * stripped). Asset list/trash responses carry this canonical origin while
- * runtime settings keep the user-entered URL verbatim, so every comparison
- * between the two must normalize first.
- */
-export function canonicalComfyOrigin(value: string): string {
-  return value.replace(/\/+$/, "");
-}
-
-export function isConfiguredComfyUrl(value: string): boolean {
-  if (!value.trim()) return false;
-  try {
-    const parsed = new URL(value);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -717,10 +666,6 @@ export function sanitizeRuntimeSettings(value: unknown): RuntimeSettings {
   const fallback = structuredClone(DEFAULT_SETTINGS);
   if (!isRecord(value)) return fallback;
 
-  const comfyUrl =
-    typeof value.comfy_url === "string" && isConfiguredComfyUrl(value.comfy_url)
-      ? value.comfy_url
-      : fallback.comfy_url;
   const clientId =
     typeof value.client_id === "string" &&
     /^[A-Za-z0-9._:-]{1,128}$/.test(value.client_id)
@@ -769,14 +714,11 @@ export function sanitizeRuntimeSettings(value: unknown): RuntimeSettings {
       loraName !== null &&
       ["dedicated", "bypass_model_only", "model_only"].includes(String(overrideLoader)) &&
       overrideCandidate?.lora_name === loraName &&
-      overrideCandidate?.model_filename === binding.filename &&
-      typeof overrideCandidate?.comfy_origin === "string" &&
-      overrideCandidate.comfy_origin.replace(/\/+$/, "") === comfyUrl.replace(/\/+$/, "")
+      overrideCandidate?.model_filename === binding.filename
         ? {
             loader: overrideLoader as StandardLoraLoader,
             lora_name: loraName,
             model_filename: binding.filename,
-            comfy_origin: comfyUrl,
           }
         : null;
     const normalized: DiffusionModelBinding = {
@@ -806,7 +748,6 @@ export function sanitizeRuntimeSettings(value: unknown): RuntimeSettings {
   };
 
   return {
-    comfy_url: comfyUrl,
     client_id: clientId,
     memory_policy: memoryPolicy,
     raylight_residency_policy: raylightResidencyPolicy,

@@ -439,7 +439,7 @@ export function directorReducer(state: DirectorState, action: DirectorAction): D
   }
 }
 
-const STORAGE_KEY = "director-web:v1:workspace";
+const STORAGE_KEY = "directordeck:v1:workspace";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

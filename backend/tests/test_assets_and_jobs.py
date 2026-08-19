@@ -8,10 +8,10 @@ from pathlib import Path
 import pytest
 from starlette.requests import Request
 
-from director.app import _sync_job
-from director.comfy import ComfyError
-from director.media import MediaToolError, VideoProxy, VideoProxyResult
-from director.schemas import VideoMetadata
+from directordeck.app import _sync_job
+from directordeck.comfy import ComfyError
+from directordeck.media import MediaToolError, VideoProxy, VideoProxyResult
+from directordeck.schemas import VideoMetadata
 
 from .conftest import runnable_draft, wait_for_submission_tasks
 
@@ -52,7 +52,7 @@ async def test_asset_upload_returns_stable_identity_and_preview(client, fake_com
     assert response.status_code == 200, response.text
     asset = response.json()["asset"]
     assert asset["name"] == "hero_image.png"
-    assert asset["path"] == "director-web/hero_image.png"
+    assert asset["path"] == "directordeck/hero_image.png"
     assert asset["id"]
     assert asset["preview_url"] == f"/api/assets/{asset['id']}/preview"
     assert fake_comfy.uploads[0]["filename"] == "hero_image.png"
@@ -72,7 +72,7 @@ async def test_create_job_submits_api_prompt_and_syncs_history(client, fake_comf
     assert job["status"] == "queued"
     assert job["prompt_id"] == fake_comfy.prompts[0]["prompt_id"]
     submitted = fake_comfy.prompts[0]
-    assert submitted["client_id"] == "director-web"
+    assert submitted["client_id"] == "directordeck"
     save_id = next(
         node_id
         for node_id, node in submitted["prompt"].items()
@@ -144,7 +144,7 @@ async def test_completed_job_output_can_be_safely_imported_as_input_asset(
     }
     await _reconcile(client, job["id"])
     monkeypatch.setattr(
-        "director.task_management.create_24fps_proxy_bytes",
+        "directordeck.task_management.create_24fps_proxy_bytes",
         lambda _content, _suffix: VideoProxy(
             content=b"normalized-24fps",
             filename_suffix=".mp4",
@@ -569,7 +569,6 @@ async def test_scoped_standard_lora_override_handles_missing_metadata(
         "loader": "model_only",
         "lora_name": "style.safetensors",
         "model_filename": binding["filename"],
-        "comfy_origin": settings["comfy_url"],
     }
     saved = await client.put("/api/settings", json=settings)
     assert saved.status_code == 200, saved.text
@@ -658,7 +657,7 @@ async def test_create_job_can_use_saved_mode_draft(client, fake_comfy) -> None:
         for node in fake_comfy.prompts[-1]["prompt"].values()
         if node["class_type"] == "LoadImage"
     )
-    assert load_image["inputs"]["image"] == "director-web/first.png"
+    assert load_image["inputs"]["image"] == "directordeck/first.png"
 
 
 async def test_cancel_job_targets_comfy_prompt(client, fake_comfy) -> None:
@@ -1162,7 +1161,7 @@ async def test_upload_accepts_allowlisted_extension_mime_pairs(
         probe_method="test_proxy",
     )
     monkeypatch.setattr(
-        "director.app.create_24fps_proxy_file",
+        "directordeck.app.create_24fps_proxy_file",
         lambda source, destination: (
             destination.write_bytes(b"proxy-video"),
             VideoProxyResult(metadata=proxy_metadata, strategy="transcode"),
@@ -1233,7 +1232,7 @@ async def test_upload_rejects_unapproved_or_mismatched_media_metadata(
 
 
 async def test_upload_stops_at_the_per_kind_size_limit(client, fake_comfy, monkeypatch) -> None:
-    import director.app as app_module
+    import directordeck.app as app_module
 
     monkeypatch.setitem(app_module._UPLOAD_LIMITS, "image", 4)
     response = await client.post(
@@ -1249,12 +1248,12 @@ async def test_upload_stops_at_the_per_kind_size_limit(client, fake_comfy, monke
 async def test_failed_video_proxy_does_not_upload_or_register_asset(
     client, fake_comfy, tmp_path, monkeypatch
 ) -> None:
-    with sqlite3.connect(tmp_path / "director.sqlite3") as database:
+    with sqlite3.connect(tmp_path / "directordeck.sqlite3") as database:
         before = database.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
     def fail_proxy(source: Path, destination: Path) -> VideoProxyResult:
         raise MediaToolError("invalid video")
 
-    monkeypatch.setattr("director.app.create_24fps_proxy_file", fail_proxy)
+    monkeypatch.setattr("directordeck.app.create_24fps_proxy_file", fail_proxy)
 
     response = await client.post(
         "/api/assets",
@@ -1264,7 +1263,7 @@ async def test_failed_video_proxy_does_not_upload_or_register_asset(
 
     assert response.status_code == 422
     assert fake_comfy.uploads == []
-    with sqlite3.connect(tmp_path / "director.sqlite3") as database:
+    with sqlite3.connect(tmp_path / "directordeck.sqlite3") as database:
         after = database.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
     assert after == before
 

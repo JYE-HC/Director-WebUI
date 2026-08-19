@@ -10,10 +10,10 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-import director.instance_lock as instance_lock_module
-from director.app import create_app
-from director.instance_lock import DirectorInstanceLock, DirectorInstanceLockError
-from director.schemas import default_settings
+import directordeck.instance_lock as instance_lock_module
+from directordeck.app import create_app
+from directordeck.instance_lock import DirectorInstanceLock, DirectorInstanceLockError
+from directordeck.schemas import default_settings
 
 
 def _silence_progress_manager(app) -> None:
@@ -27,7 +27,7 @@ def _silence_progress_manager(app) -> None:
 def test_instance_lock_rejects_symlink_without_touching_its_target(
     tmp_path: Path,
 ) -> None:
-    database_path = tmp_path / "director.sqlite3"
+    database_path = tmp_path / "directordeck.sqlite3"
     diagnostic_target = tmp_path / "must-not-be-truncated.txt"
     diagnostic_target.write_text("keep this content\n", encoding="utf-8")
     instance_lock = DirectorInstanceLock(database_path)
@@ -43,7 +43,7 @@ def test_instance_lock_rejects_symlink_without_touching_its_target(
 def test_instance_lock_rejects_hardlink_without_truncating_shared_file(
     tmp_path: Path,
 ) -> None:
-    database_path = tmp_path / "director.sqlite3"
+    database_path = tmp_path / "directordeck.sqlite3"
     shared_target = tmp_path / "must-not-be-truncated.txt"
     shared_target.write_text("keep hard-linked content\n", encoding="utf-8")
     instance_lock = DirectorInstanceLock(database_path)
@@ -64,7 +64,7 @@ def test_instance_lock_rejects_hardlink_without_truncating_shared_file(
 )
 def test_instance_lock_creates_private_parent_and_file(tmp_path: Path) -> None:
     instance_lock = DirectorInstanceLock(
-        tmp_path / "private-storage" / "director.sqlite3"
+        tmp_path / "private-storage" / "directordeck.sqlite3"
     )
     previous_umask = os.umask(0o002)
     try:
@@ -80,7 +80,7 @@ def test_instance_lock_creates_private_parent_and_file(tmp_path: Path) -> None:
 def test_instance_lock_rejects_second_acquire_in_same_process(
     tmp_path: Path,
 ) -> None:
-    instance_lock = DirectorInstanceLock(tmp_path / "director.sqlite3")
+    instance_lock = DirectorInstanceLock(tmp_path / "directordeck.sqlite3")
     instance_lock.acquire()
     try:
         with pytest.raises(DirectorInstanceLockError, match="already held"):
@@ -92,7 +92,7 @@ def test_instance_lock_rejects_second_acquire_in_same_process(
 def test_independent_locks_on_one_path_are_mutually_exclusive(
     tmp_path: Path,
 ) -> None:
-    database_path = tmp_path / "director.sqlite3"
+    database_path = tmp_path / "directordeck.sqlite3"
     first = DirectorInstanceLock(database_path)
     second = DirectorInstanceLock(database_path)
     first.acquire()
@@ -112,7 +112,7 @@ def test_independent_locks_on_one_path_are_mutually_exclusive(
 
 
 def test_instance_lock_can_be_reacquired_after_release(tmp_path: Path) -> None:
-    database_path = tmp_path / "director.sqlite3"
+    database_path = tmp_path / "directordeck.sqlite3"
     first = DirectorInstanceLock(database_path)
     first.acquire()
     first.release()
@@ -127,7 +127,7 @@ def test_instance_lock_can_be_reacquired_after_release(tmp_path: Path) -> None:
 
 
 def test_instance_lock_writes_owner_diagnostic_json(tmp_path: Path) -> None:
-    database_path = tmp_path / "director.sqlite3"
+    database_path = tmp_path / "directordeck.sqlite3"
     instance_lock = DirectorInstanceLock(database_path)
     instance_lock.acquire()
     try:
@@ -187,7 +187,7 @@ def test_windows_branch_excludes_second_owner_and_recovers(
     tmp_path: Path,
     fake_windows_locking: _FakeMsvcrt,
 ) -> None:
-    first = DirectorInstanceLock(tmp_path / "director.sqlite3")
+    first = DirectorInstanceLock(tmp_path / "directordeck.sqlite3")
     second = DirectorInstanceLock(first.database_path)
     first.acquire()
     try:
@@ -221,7 +221,7 @@ def test_windows_lock_conflict_maps_to_owner_diagnostic(
     fake = Mock(LK_NBLCK=1, LK_UNLCK=2, locking=reject_locking)
     monkeypatch.setattr(instance_lock_module, "_IS_WINDOWS", True)
     monkeypatch.setattr(instance_lock_module, "msvcrt", fake, raising=False)
-    instance_lock = DirectorInstanceLock(tmp_path / "director.sqlite3")
+    instance_lock = DirectorInstanceLock(tmp_path / "directordeck.sqlite3")
     instance_lock.path.write_text(
         json.dumps({"pid": 4242, "hostname": "other-host"}) + "\n",
         encoding="utf-8",
@@ -241,12 +241,12 @@ async def test_second_lifespan_for_same_database_fails_before_database_or_comfy_
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "shared.sqlite3"
-    first = create_app(database_path=database_path)
+    first = create_app(database_path=database_path, comfy_url="http://comfy.test:8188")
     first.state.database.initialize()
-    first.state.database.put_settings(default_settings("http://comfy.invalid:8188"))
+    first.state.database.put_settings(default_settings())
     _silence_progress_manager(first)
 
-    second = create_app(database_path=database_path)
+    second = create_app(database_path=database_path, comfy_url="http://comfy.test:8188")
     original_initialize = second.state.database.initialize
     second.state.database.initialize = Mock(wraps=original_initialize)
     _silence_progress_manager(second)
@@ -275,8 +275,8 @@ async def test_second_lifespan_for_same_database_fails_before_database_or_comfy_
 
 
 async def test_different_database_lifespans_can_run_together(tmp_path: Path) -> None:
-    first = create_app(database_path=tmp_path / "first.sqlite3")
-    second = create_app(database_path=tmp_path / "second.sqlite3")
+    first = create_app(database_path=tmp_path / "first.sqlite3", comfy_url="http://comfy.test:8188")
+    second = create_app(database_path=tmp_path / "second.sqlite3", comfy_url="http://comfy.test:8188")
     _silence_progress_manager(first)
     _silence_progress_manager(second)
 
@@ -288,10 +288,10 @@ async def test_different_database_lifespans_can_run_together(tmp_path: Path) -> 
 
 
 async def test_residual_lock_file_does_not_block_startup(tmp_path: Path) -> None:
-    database_path = tmp_path / "director.sqlite3"
+    database_path = tmp_path / "directordeck.sqlite3"
     lock_path = Path(f"{database_path.resolve()}.instance.lock")
     lock_path.write_text("stale owner from a crashed process\n", encoding="utf-8")
-    app = create_app(database_path=database_path)
+    app = create_app(database_path=database_path, comfy_url="http://comfy.test:8188")
     _silence_progress_manager(app)
 
     async with app.router.lifespan_context(app):
@@ -305,7 +305,7 @@ async def test_residual_lock_file_does_not_block_startup(tmp_path: Path) -> None
 
 
 async def test_instance_lock_is_released_after_managed_shutdown(tmp_path: Path) -> None:
-    app = create_app(database_path=tmp_path / "director.sqlite3")
+    app = create_app(database_path=tmp_path / "directordeck.sqlite3", comfy_url="http://comfy.test:8188")
     app.state.progress_manager.ensure = Mock()
 
     async def close_progress() -> None:

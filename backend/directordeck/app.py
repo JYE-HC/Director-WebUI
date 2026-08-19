@@ -29,7 +29,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 
 from .comfy import ComfyClient, ComfyClientProtocol, ComfyError, default_comfy_factory
@@ -42,10 +42,8 @@ from .compiler import (
 )
 from .database import (
     AssetTrashInUse,
-    AssetTrashOriginConflict,
     AssetTrashRestoreConflict,
     Database,
-    TimelineComfyOriginConflict,
     TimelineRevisionConflict,
     TimelineRevisionExhausted,
 )
@@ -55,7 +53,6 @@ from .raylight_setup import (
     RayLightInstallConflict,
     RayLightInstallManager,
     RayLightInstallUnavailable,
-    default_requirements_path as raylight_default_requirements_path,
     dependencies_installed as raylight_dependencies_installed,
     platform_supported as raylight_platform_supported,
 )
@@ -107,7 +104,6 @@ from .schemas import (
     AssetTrashRequest,
     AssetTrashRestoreRead,
     AssetTrashRestoreRequest,
-    ComfyURLRequest,
     CreateJobRequest,
     DetectShotsRequest,
     DetectShotsResponse,
@@ -136,13 +132,9 @@ from .schemas import (
     RayLightRuntimeStatusRead,
     RuntimeSettings,
     RuntimeSettingsAuthorityRead,
-    StorageConfigureRequest,
-    StorageMigrateRequest,
-    StorageMigrationRead,
     StorageStatusRead,
     TimelineAuthorityRead,
     TimelineAuthorityWriteRequest,
-    TimelineComfyOriginConflictRead,
     TimelineCompileRead,
     TimelineJobRequest,
     TimelineRevisionConflictRead,
@@ -156,19 +148,11 @@ from .schemas import (
     validate_mode_draft,
     validate_timeline_draft,
 )
-from .storage import (
-    StorageConfigurationError,
-    StorageConflictError,
-    StorageController,
-    StorageOperationError,
-    StoragePathError,
-    StorageStatus,
-    StorageValidationError,
-)
+from .storage import StorageController
 from .task_management import TaskManagementError, import_job_output_as_asset
 
 
-ComfyFactory = Callable[[RuntimeSettings], ComfyClientProtocol]
+ComfyFactory = Callable[[str], ComfyClientProtocol]
 _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._\-()\u4e00-\u9fff]+")
 _TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 _RAYLIGHT_GENERATION_POLL_SECONDS = 1.0
@@ -202,8 +186,10 @@ _DIRECTOR_CANCEL_STAGES = _SUBMISSION_CLEANUP_CANCEL_STAGES | {
     "restart_cancelled_not_submitted",
     "cancelled_after_confirmed_comfy_restart",
 }
-_COMFY_NOT_CONFIGURED = "ComfyUI 地址尚未配置，请先在系统设置中保存地址"
 _UPLOAD_READ_CHUNK = 1024 * 1024
+# The embedded backend serves exactly one ComfyUI instance (the host process),
+# so endpoint-scoped submission serialization uses one fixed key.
+_EMBEDDED_ENDPOINT_KEY = "embedded"
 _UPLOAD_PROGRESS_TTL_SECONDS = 15 * 60
 _UPLOAD_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -414,12 +400,6 @@ def _validate_upload_signature(filename: str, content: bytes) -> None:
         )
 
 
-def _origin_settings(settings: RuntimeSettings, comfy_origin: str) -> RuntimeSettings:
-    document = settings.model_dump(mode="json")
-    document["comfy_url"] = comfy_origin
-    return RuntimeSettings.model_validate(document)
-
-
 def _media_response(
     upstream: httpx.Response,
     *,
@@ -613,38 +593,8 @@ def _db(request: Request) -> Database:
     return request.app.state.database
 
 
-def _storage_status_read(status: StorageStatus) -> StorageStatusRead:
-    return StorageStatusRead(
-        active_database_path=str(status.active_database_path),
-        active_database_identity=status.active_database_identity,
-        configured_database_path=str(status.configured_database_path),
-        recommended_database_path=str(status.recommended_database_path),
-        source=status.source,
-        restart_required=status.restart_required,
-    )
-
-
-def _storage_http_error(
-    exc: StorageConfigurationError
-    | StoragePathError
-    | StorageValidationError
-    | StorageConflictError
-    | StorageOperationError,
-) -> HTTPException:
-    if isinstance(exc, (StoragePathError, StorageValidationError)):
-        return HTTPException(status_code=422, detail=str(exc))
-    if isinstance(exc, StorageConflictError):
-        return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, StorageConfigurationError):
-        return HTTPException(status_code=500, detail="storage configuration is invalid")
-    return HTTPException(status_code=500, detail="database storage operation failed")
-
-
-def _comfy(request: Request, settings: RuntimeSettings | None = None) -> ComfyClientProtocol:
-    settings = settings or _db(request).get_settings()
-    if not str(settings.comfy_url).strip():
-        raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
-    return request.app.state.comfy_factory(settings)
+def _comfy(request: Request) -> ComfyClientProtocol:
+    return request.app.state.comfy_factory(request.app.state.comfy_url)
 
 
 def _runtime_authority_changed() -> HTTPException:
@@ -712,20 +662,6 @@ def _timeline_revision_exhausted(exc: TimelineRevisionExhausted) -> HTTPExceptio
         ),
         project_id=exc.project_id,
         revision=exc.revision,
-    )
-    return HTTPException(status_code=409, detail=detail.model_dump(mode="json"))
-
-
-def _timeline_comfy_origin_conflict(
-    exc: TimelineComfyOriginConflict,
-) -> HTTPException:
-    detail = TimelineComfyOriginConflictRead(
-        message=(
-            "ComfyUI endpoint changed before the timeline write acquired its "
-            "transaction; fetch current settings and timeline authorities "
-            "before retrying"
-        ),
-        project_id=exc.project_id,
     )
     return HTTPException(status_code=409, detail=detail.model_dump(mode="json"))
 
@@ -1440,7 +1376,7 @@ async def _sync_job(
     terminal = job["status"] in _TERMINAL_STATUSES
     if terminal or not job.get("prompt_id"):
         return job
-    client = _comfy(request, RuntimeSettings.model_validate(job["settings_snapshot"]))
+    client = _comfy(request)
 
     def apply_history(entry: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(entry, dict):
@@ -1724,9 +1660,7 @@ async def _sync_timeline_children_batch(
     if not active:
         return children
     database = _db(request)
-    client = _comfy(
-        request, RuntimeSettings.model_validate(job["settings_snapshot"])
-    )
+    client = _comfy(request)
     queue: dict[str, Any] = {}
     queue_available = False
     try:
@@ -1925,8 +1859,7 @@ async def _assemble_timeline_output(
 ) -> dict[str, str]:
     """Download exact child takes, assemble them, then register one Comfy output."""
 
-    settings = RuntimeSettings.model_validate(job["settings_snapshot"])
-    client = _comfy(request, settings)
+    client = _comfy(request)
     segment_bytes: list[bytes] = []
     for output in segment_outputs:
         response = await client.view(
@@ -1951,12 +1884,12 @@ async def _assemble_timeline_output(
             height=int(timeline["render"]["height"]),
         )
     )
-    filename = f"Director_timeline_{job['id'][:8]}_full.mp4"
+    filename = f"DirectorDeck_timeline_{job['id'][:8]}_full.mp4"
     uploaded = await client.upload_output(
         filename,
         proxy.content,
         "video/mp4",
-        "director-web/timelines",
+        "directordeck/timelines",
     )
     return {
         "node_id": "assembly",
@@ -2042,10 +1975,6 @@ async def _sync_timeline_job_once(
         # already advanced the endpoint ledger, so Database performs the
         # prompt-id match and update atomically. Control/barrier children have
         # no segment ids and manage their state synchronously at the barrier.
-        settings_snapshot = RuntimeSettings.model_validate(job["settings_snapshot"])
-        comfy_origin = Database.canonical_comfy_origin(
-            settings_snapshot.comfy_url
-        )
         for child in children:
             if (
                 child["backend"] == "raylight"
@@ -2053,7 +1982,6 @@ async def _sync_timeline_job_once(
                 and child.get("prompt_id")
             ):
                 database.settle_raylight_runtime_prompt(
-                    comfy_origin,
                     str(child["prompt_id"]),
                     succeeded=child["status"] == "succeeded",
                     terminal_history_certified=(
@@ -2784,9 +2712,7 @@ async def _cancel_timeline_job(
             )
         job = latest
 
-    client = _comfy(
-        request, RuntimeSettings.model_validate(job["settings_snapshot"])
-    )
+    client = _comfy(request)
     dispatch_errors: list[str] = []
     recovery_error_prefixes: set[str] = set()
     for child in database.list_job_children(job["id"]):
@@ -2999,13 +2925,11 @@ def _visible_logical_gpu_indexes(stats: dict[str, Any]) -> tuple[int, ...]:
 
 
 def _raylight_runtime_recovery_token(
-    comfy_origin: str,
     state: dict[str, Any],
     visible: tuple[int, ...],
 ) -> str:
     payload = {
         "version": 1,
-        "comfy_origin": Database.canonical_comfy_origin(comfy_origin),
         "runtime_state": state,
         "available_gpu_indexes": list(visible),
     }
@@ -3020,17 +2944,15 @@ def _raylight_runtime_recovery_token(
 
 def _raylight_runtime_status(
     database: Database,
-    comfy_origin: str,
     stats: dict[str, Any],
     *,
     state: dict[str, Any] | None = None,
 ) -> RayLightRuntimeStatusRead:
     try:
-        origin = Database.canonical_comfy_origin(comfy_origin)
         runtime = (
             state
             if state is not None
-            else database.get_raylight_runtime_state(origin)
+            else database.get_raylight_runtime_state()
         )
         visible = _visible_logical_gpu_indexes(stats)
         if runtime is None:
@@ -3060,7 +2982,7 @@ def _raylight_runtime_status(
             invalid_gpu_indexes=list(invalid),
             tainted=bool(runtime.get("tainted")),
             recovery_token=(
-                _raylight_runtime_recovery_token(origin, runtime, visible)
+                _raylight_runtime_recovery_token(runtime, visible)
                 if invalid
                 else None
             ),
@@ -3191,9 +3113,7 @@ async def _preflight_timeline(
             },
         )
     try:
-        runtime_status = _raylight_runtime_status(
-            database, str(settings.comfy_url), stats
-        )
+        runtime_status = _raylight_runtime_status(database, stats)
     except NativeTemplateError as exc:
         raise HTTPException(
             status_code=409,
@@ -3213,7 +3133,6 @@ async def _preflight_raylight_transition(
     client: ComfyClientProtocol,
     unit: NativeWorkflowUnit,
     database: Database,
-    comfy_origin: str,
 ) -> None:
     """Verify the server-owned RayKill barrier before it enters ComfyUI."""
 
@@ -3262,7 +3181,7 @@ async def _preflight_raylight_transition(
         ) from exc
     stats = await client.system_stats()
     try:
-        runtime_status = _raylight_runtime_status(database, comfy_origin, stats)
+        runtime_status = _raylight_runtime_status(database, stats)
     except NativeTemplateError as exc:
         raise HTTPException(
             status_code=409,
@@ -3611,7 +3530,6 @@ async def _await_raylight_generation(
 async def _refresh_raylight_runtime_tail(
     client: ComfyClientProtocol,
     database: Database,
-    comfy_origin: str,
     state: dict[str, Any],
 ) -> dict[str, Any]:
     """Refresh the persisted Ray queue tail before planning another batch.
@@ -3631,7 +3549,7 @@ async def _refresh_raylight_runtime_tail(
     if not isinstance(tail_prompt_id, str) or not tail_prompt_id:
         state = dict(state)
         state["tainted"] = True
-        database.put_raylight_runtime_state(comfy_origin, state)
+        database.put_raylight_runtime_state(state)
         return state
     tail_children = database.find_any_job_children_by_prompt_id(tail_prompt_id)
     ambiguous_tail = (
@@ -3668,19 +3586,18 @@ async def _refresh_raylight_runtime_tail(
                 tainted=True,
             )
             recovered.pop("tail_terminal_certificate", None)
-            database.put_raylight_runtime_state(comfy_origin, recovered)
+            database.put_raylight_runtime_state(recovered)
             return recovered
         database.settle_raylight_runtime_prompt(
-            comfy_origin,
             tail_prompt_id,
             succeeded=result,
             terminal_history_certified=terminal_history_certified,
         )
-        return database.get_raylight_runtime_state(comfy_origin) or state
+        return database.get_raylight_runtime_state() or state
 
     def keep_ambiguous_tail() -> dict[str, Any]:
         guarded = dict(state, tainted=True)
-        database.put_raylight_runtime_state(comfy_origin, guarded)
+        database.put_raylight_runtime_state(guarded)
         return guarded
 
     history = await client.history(tail_prompt_id)
@@ -3714,7 +3631,7 @@ async def _refresh_raylight_runtime_tail(
         # to the strict terminal-gated contract on first observation.
         if not state.get("tainted"):
             state = dict(state, tainted=True)
-            database.put_raylight_runtime_state(comfy_origin, state)
+            database.put_raylight_runtime_state(state)
         return state
 
     # The first history lookup preceded the queue snapshot. Close the normal
@@ -3747,24 +3664,14 @@ async def _refresh_raylight_runtime_tail(
 
 def _endpoint_recovery_blockers(
     database: Database,
-    comfy_origin: str,
     *,
     dispatch_job_id: str,
 ) -> list[dict[str, Any]]:
-    """Return old ambiguous submissions that can still enqueue on an endpoint."""
+    """Return old ambiguous submissions that can still enqueue on the endpoint."""
 
     blockers: list[dict[str, Any]] = []
     for parent in database.list_interrupted_preparing_jobs():
         if str(parent["id"]) == dispatch_job_id:
-            continue
-        try:
-            settings = RuntimeSettings.model_validate(parent["settings_snapshot"])
-        except ValidationError as exc:
-            raise ComfyError(
-                "an interrupted submission has an invalid endpoint snapshot; "
-                "refusing to enqueue newer work"
-            ) from exc
-        if Database.canonical_comfy_origin(settings.comfy_url) != comfy_origin:
             continue
         for child in database.list_job_children(str(parent["id"])):
             if (
@@ -3779,7 +3686,6 @@ def _endpoint_recovery_blockers(
 async def _await_endpoint_submission_recovery(
     request: Request,
     database: Database,
-    comfy_origin: str,
     *,
     dispatch_job_id: str,
 ) -> None:
@@ -3793,7 +3699,7 @@ async def _await_endpoint_submission_recovery(
     """
 
     while _endpoint_recovery_blockers(
-        database, comfy_origin, dispatch_job_id=dispatch_job_id
+        database, dispatch_job_id=dispatch_job_id
     ):
         parent = database.get_job(dispatch_job_id)
         if parent is None:
@@ -4064,7 +3970,6 @@ def _resolve_historical_continuity_takes(
     draft: UnifiedTimelineDraft,
     *,
     segment_ids: list[str] | None,
-    comfy_origin: str,
     project_id: str | None = None,
 ) -> dict[str, NativeHistoricalTake]:
     """Resolve every omitted direct predecessor using server-owned state."""
@@ -4087,7 +3992,6 @@ def _resolve_historical_continuity_takes(
             take = database.find_latest_segment_take(
                 predecessor.id,
                 fingerprint,
-                comfy_origin=comfy_origin,
                 require_audio=require_audio,
                 project_id=project_id,
             )
@@ -4099,7 +4003,6 @@ def _resolve_historical_continuity_takes(
         if take is None:
             if require_audio and database.has_segment_take(
                 predecessor.id,
-                comfy_origin=comfy_origin,
                 content_fingerprint=fingerprint,
                 project_id=project_id,
             ):
@@ -4109,7 +4012,6 @@ def _resolve_historical_continuity_takes(
                 )
             if database.has_segment_take(
                 predecessor.id,
-                comfy_origin=comfy_origin,
                 project_id=project_id,
             ):
                 raise DraftNotRunnable(
@@ -4118,7 +4020,7 @@ def _resolve_historical_continuity_takes(
                 )
             raise DraftNotRunnable(
                 f"片段 '{segment.id}' 的直接前驱 '{predecessor.id}' "
-                "在当前 ComfyUI 地址下没有可用的历史成功成片"
+                "没有可用的历史成功成片"
             )
         resolved[segment.id] = NativeHistoricalTake(
             id=str(take["id"]),
@@ -4176,7 +4078,6 @@ async def _compile_timeline_report(
     try:
         database.validate_timeline_assets(
             draft,
-            comfy_origin=str(settings.comfy_url),
             segment_ids=body.segment_ids,
         )
         validate_unified_runnable(draft, segment_ids=body.segment_ids)
@@ -4184,10 +4085,9 @@ async def _compile_timeline_report(
             database,
             draft,
             segment_ids=body.segment_ids,
-            comfy_origin=str(settings.comfy_url),
             project_id=owner_project_id,
         )
-        client = _comfy(request, settings)
+        client = _comfy(request)
         standard_lora_metadata = await _standard_lora_metadata_for_timeline(
             client,
             draft,
@@ -4410,13 +4310,12 @@ async def _create_timeline_job_impl(
 ) -> JobRead:
     database = _db(request)
     settings = database.get_settings()
-    client = _comfy(request, settings)
+    client = _comfy(request)
     owner_project_id = project_id or database.LEGACY_DEFAULT_PROJECT_ID
     draft = body.config or database.get_project_timeline(owner_project_id)
     try:
         database.validate_timeline_assets(
             draft,
-            comfy_origin=str(settings.comfy_url),
             segment_ids=body.segment_ids,
         )
     except (ValidationError, ValueError) as exc:
@@ -4428,7 +4327,6 @@ async def _create_timeline_job_impl(
             database,
             draft,
             segment_ids=body.segment_ids,
-            comfy_origin=str(settings.comfy_url),
             project_id=owner_project_id,
         )
         standard_lora_metadata = await _standard_lora_metadata_for_timeline(
@@ -4541,7 +4439,7 @@ async def _create_timeline_job_impl(
                 raise HTTPException(status_code=404, detail="job disappeared during submission")
             latest["children"] = database.list_job_children(job_id)
             return _job_read_for_request(request, latest)
-        endpoint_key = Database.canonical_comfy_origin(settings.comfy_url)
+        endpoint_key = _EMBEDDED_ENDPOINT_KEY
         loop = asyncio.get_running_loop()
         submission_ticket = loop.create_future()
         async with request.app.state.submission_ticket_lock:
@@ -4562,7 +4460,7 @@ async def _create_timeline_job_impl(
         # lifecycle fallback if the optional websocket is unavailable.
         if isinstance(client, ComfyClient):
             await request.app.state.progress_manager.ensure_ready(
-                str(settings.comfy_url),
+                request.app.state.comfy_url,
                 settings.client_id,
                 timeout_seconds=1.0,
             )
@@ -4574,7 +4472,6 @@ async def _create_timeline_job_impl(
         await _await_endpoint_submission_recovery(
             request,
             database,
-            endpoint_key,
             dispatch_job_id=job_id,
         )
         # This is a conservative queue-tail ledger, not a claim that CUDA
@@ -4584,7 +4481,7 @@ async def _create_timeline_job_impl(
         # a later incompatible request through another barrier. Epoch never
         # resets, including across Standard, so A -> B -> A cannot hit A's old
         # cached initializer output containing actor handles killed by B.
-        runtime_state = database.get_raylight_runtime_state(endpoint_key) or {
+        runtime_state = database.get_raylight_runtime_state() or {
             "version": 2,
             "epoch": 0,
             "current": None,
@@ -4599,7 +4496,6 @@ async def _create_timeline_job_impl(
         try:
             locked_runtime_status = _raylight_runtime_status(
                 database,
-                endpoint_key,
                 await client.system_stats(),
                 state=runtime_state,
             )
@@ -4617,7 +4513,7 @@ async def _create_timeline_job_impl(
                 detail=_raylight_runtime_recovery_detail(locked_runtime_status),
             )
         runtime_state = await _refresh_raylight_runtime_tail(
-            client, database, endpoint_key, runtime_state
+            client, database, runtime_state
         )
         if runtime_state.get("legacy_unknown") and any(
             unit.backend == "standard" for unit in compiled.workflows
@@ -4661,7 +4557,6 @@ async def _create_timeline_job_impl(
                 )
                 succeeded = terminal["status"] == "succeeded"
                 database.settle_raylight_runtime_prompt(
-                    endpoint_key,
                     tail_prompt_id,
                     succeeded=succeeded,
                     terminal_history_certified=(
@@ -4672,7 +4567,7 @@ async def _create_timeline_job_impl(
             else:
                 current_tainted = True
                 runtime_state = dict(runtime_state, tainted=True)
-                database.put_raylight_runtime_state(endpoint_key, runtime_state)
+                database.put_raylight_runtime_state(runtime_state)
         elif isinstance(tail_prompt_id, str) and tail_action == "shutdown":
             # A durable queued barrier is itself the serialization point. Wait
             # for positive exact history before treating the previous pool as
@@ -4704,7 +4599,6 @@ async def _create_timeline_job_impl(
             else:
                 await _await_raylight_transition(client, tail_prompt_id)
                 database.settle_raylight_runtime_prompt(
-                    endpoint_key,
                     tail_prompt_id,
                     succeeded=True,
                     terminal_history_certified=True,
@@ -4941,7 +4835,7 @@ async def _create_timeline_job_impl(
                 continue
             if unit.id in transition_unit_ids:
                 await _preflight_raylight_transition(
-                    client, unit, database, endpoint_key
+                    client, unit, database
                 )
             current = database.get_job(job_id)
             if current is None:
@@ -4962,7 +4856,7 @@ async def _create_timeline_job_impl(
             validate_native_workflow_ready(unit)
             if planned_ray_state is not None:
                 database.put_raylight_runtime_state(
-                    endpoint_key, planned_ray_state
+                    planned_ray_state
                 )
             before_claim = getattr(
                 request.app.state, "before_submission_claim", None
@@ -5197,7 +5091,7 @@ async def _create_timeline_job_impl(
                 )
                 if not transitioned:
                     database.settle_raylight_runtime_prompt(
-                        endpoint_key, prompt_id, succeeded=False
+                        prompt_id, succeeded=False
                     )
                     latest_parent = database.get_job(job_id)
                     if latest_parent is None:
@@ -5223,7 +5117,6 @@ async def _create_timeline_job_impl(
                     ) is not None:
                         break
                 database.settle_raylight_runtime_prompt(
-                    endpoint_key,
                     prompt_id,
                     succeeded=True,
                     terminal_history_certified=True,
@@ -5245,7 +5138,6 @@ async def _create_timeline_job_impl(
                 )
                 succeeded = terminal["status"] == "succeeded"
                 database.settle_raylight_runtime_prompt(
-                    endpoint_key,
                     prompt_id,
                     succeeded=succeeded,
                     terminal_history_certified=(
@@ -5642,9 +5534,7 @@ async def _recover_interrupted_submission(
     job = database.get_job(str(snapshot["id"]))
     if job is None or job["status"] in _TERMINAL_STATUSES:
         return
-    client = _comfy(
-        request, RuntimeSettings.model_validate(job["settings_snapshot"])
-    )
+    client = _comfy(request)
     dispatch_errors: list[str] = []
     has_unconfirmed = False
     for child in database.list_job_children(job["id"]):
@@ -5820,23 +5710,18 @@ async def _run_interrupted_submission_recovery(request: Request) -> None:
 
 def create_app(
     *,
-    database_path: str | Path | None = None,
+    database_path: str | Path,
+    comfy_url: str,
     comfy_factory: ComfyFactory | None = None,
-    storage_config_path: str | Path | None = None,
-    legacy_database_path: str | Path | None = None,
     public_api_prefix: str = "",
     raylight_requirements_path: str | Path | None = None,
-    pinned_comfy_url: str | None = None,
 ) -> FastAPI:
     set_public_api_prefix(public_api_prefix)
-    storage = StorageController.resolve(
-        database_path,
-        storage_config_path=storage_config_path,
-        legacy_database_path=legacy_database_path,
-    )
-    database = Database(
-        storage.active_database_path, pinned_comfy_url=pinned_comfy_url
-    )
+    comfy_url = comfy_url.rstrip("/")
+    if not comfy_url:
+        raise ValueError("create_app requires the host ComfyUI loopback URL")
+    storage = StorageController.resolve(database_path)
+    database = Database(storage.active_database_path)
     instance_lock = DirectorInstanceLock(storage.active_database_path)
     live_preview_cache = LivePreviewCache()
     reconcile_wake_event = asyncio.Event()
@@ -5847,29 +5732,15 @@ def create_app(
     timeline_sync_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
     timeline_sync_all_tasks: set[asyncio.Task[dict[str, Any]]] = set()
     timeline_sync_lock = asyncio.Lock()
-    storage_operation_lock = asyncio.Lock()
-    storage_gate = asyncio.Condition()
     submission_ticket_lock = asyncio.Lock()
     submission_tails: dict[str, asyncio.Future[None]] = {}
 
     async def persist_native_progress(
-        comfy_origin: str, event: ComfyProgressEvent | ComfyExecutionEvent
+        _comfy_origin: str, event: ComfyProgressEvent | ComfyExecutionEvent
     ) -> None:
-        expected_origin = Database.canonical_comfy_origin(comfy_origin)
         for child in database.find_job_children_by_prompt_id(event.prompt_id):
             parent = database.get_job(child["job_id"])
             if parent is None or parent["status"] in _TERMINAL_STATUSES:
-                continue
-            try:
-                snapshot_settings = RuntimeSettings.model_validate(
-                    parent["settings_snapshot"]
-                )
-            except ValidationError:
-                continue
-            if (
-                Database.canonical_comfy_origin(snapshot_settings.comfy_url)
-                != expected_origin
-            ):
                 continue
             snapshot = (
                 child_progress_snapshot(child, event)
@@ -5896,23 +5767,11 @@ def create_app(
                 continue
 
     async def persist_native_preview(
-        comfy_origin: str, event: ComfyPreviewEvent
+        _comfy_origin: str, event: ComfyPreviewEvent
     ) -> None:
-        expected_origin = Database.canonical_comfy_origin(comfy_origin)
         for child in database.find_job_children_by_prompt_id(event.prompt_id):
             parent = database.get_job(child["job_id"])
             if parent is None or parent["status"] in _TERMINAL_STATUSES:
-                continue
-            try:
-                snapshot_settings = RuntimeSettings.model_validate(
-                    parent["settings_snapshot"]
-                )
-            except ValidationError:
-                continue
-            if (
-                Database.canonical_comfy_origin(snapshot_settings.comfy_url)
-                != expected_origin
-            ):
                 continue
             segment_id = sampler_segment_for_node(child, event.node_id)
             if segment_id is None:
@@ -5990,17 +5849,15 @@ def create_app(
             # created below, after the app can yield.
             database.prepare_interrupted_submissions_for_recovery()
             settings = database.get_settings()
-            if str(settings.comfy_url).strip():
-                progress_manager.ensure(str(settings.comfy_url), settings.client_id)
+            progress_manager.ensure(app.state.comfy_url, settings.client_id)
             for snapshot in database.list_active_job_settings():
                 try:
                     active_settings = RuntimeSettings.model_validate(snapshot)
                 except ValidationError:
                     continue
-                if str(active_settings.comfy_url).strip():
-                    progress_manager.ensure(
-                        str(active_settings.comfy_url), active_settings.client_id
-                    )
+                progress_manager.ensure(
+                    app.state.comfy_url, active_settings.client_id
+                )
             reconciler_task = asyncio.create_task(
                 _run_timeline_reconciler(recovery_request),
                 name="timeline-reconciler",
@@ -6057,20 +5914,16 @@ def create_app(
     app.state.database = database
     app.state.instance_lock = instance_lock
     app.state.storage = storage
-    app.state.storage_operation_lock = storage_operation_lock
-    app.state.storage_gate = storage_gate
-    app.state.storage_write_frozen = False
-    app.state.storage_transitioning = False
-    app.state.storage_inflight_mutations = 0
+    app.state.comfy_url = comfy_url
     app.state.comfy_factory = comfy_factory or default_comfy_factory
     app.state.progress_manager = progress_manager
     app.state.live_preview_cache = live_preview_cache
     app.state.raylight_install_manager = RayLightInstallManager()
     app.state.ffmpeg_install_manager = FFmpegInstallManager()
+    # The plugin always passes its bundled requirements file; an absent path
+    # only means RayLight installation is unavailable for this build.
     app.state.raylight_requirements_path = (
-        Path(raylight_requirements_path)
-        if raylight_requirements_path is not None
-        else raylight_default_requirements_path()
+        Path(raylight_requirements_path) if raylight_requirements_path is not None else None
     )
     app.state.reconcile_wake_event = reconcile_wake_event
     app.state.prompt_terminal_events = prompt_terminal_events
@@ -6102,277 +5955,17 @@ def create_app(
     # from concurrent HTTP requests cannot interleave in the global queue.
     app.state.submission_locks = {}
 
-    async def begin_storage_transition() -> bool:
-        """Stop admitting new writes and drain already-admitted requests."""
-
-        entered = False
-        previous_frozen = False
-        try:
-            async with storage_gate:
-                previous_frozen = bool(app.state.storage_write_frozen)
-                app.state.storage_transitioning = True
-                entered = True
-                while app.state.storage_inflight_mutations:
-                    await storage_gate.wait()
-                return previous_frozen
-        except BaseException:
-            if entered:
-                await finish_storage_transition(frozen=previous_frozen)
-            raise
-
-    async def _finish_storage_transition(*, frozen: bool) -> None:
-        async with storage_gate:
-            app.state.storage_write_frozen = frozen
-            app.state.storage_transitioning = False
-            storage_gate.notify_all()
-
-    async def _complete_storage_cleanup(operation: Awaitable[None]) -> None:
-        """Finish gate bookkeeping even if this request is being cancelled."""
-
-        cleanup = asyncio.ensure_future(operation)
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            # shield keeps the cleanup alive. Awaiting it after consuming the
-            # cancellation makes the state transition observable before the
-            # request exits. Do not turn a response already produced by
-            # call_next into CancelledError merely because cancellation landed
-            # on this final bookkeeping await. If call_next itself was
-            # cancelled, its original exception still propagates after the
-            # surrounding finally block completes.
-            await cleanup
-
-    async def finish_storage_transition(*, frozen: bool) -> None:
-        await _complete_storage_cleanup(
-            _finish_storage_transition(frozen=frozen)
-        )
-
-    async def release_storage_mutation() -> None:
-        async def release() -> None:
-            async with storage_gate:
-                app.state.storage_inflight_mutations -= 1
-                if app.state.storage_inflight_mutations == 0:
-                    storage_gate.notify_all()
-
-        await _complete_storage_cleanup(release())
-
-    async def storage_has_active_owner() -> bool:
-        has_active_work = await anyio.to_thread.run_sync(database.has_active_work)
-        has_background_owner = any(
-            not task.done() for task in (*submission_tasks, *timeline_sync_all_tasks)
-        )
-        return has_active_work or has_background_owner
-
-    class StorageRestartWriteGateMiddleware:
-        """Pure ASGI write gate that preserves the caller's asyncio task.
-
-        Starlette's decorator-style HTTP middleware dispatches the route in a
-        child task. Several lifecycle paths intentionally use task ownership
-        while coordinating cancellation, so this gate stays at the ASGI layer
-        and never adds a task boundary around the endpoint.
-        """
-
-        def __init__(self, asgi_app: Any) -> None:
-            self.asgi_app = asgi_app
-
-        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-            if scope.get("type") != "http":
-                await self.asgi_app(scope, receive, send)
-                return
-            method = str(scope.get("method") or "").upper()
-            path = str(scope.get("path") or "")
-            is_user_mutation = method in {"POST", "PUT", "PATCH", "DELETE"}
-            is_storage_operation = path == "/api/storage" or path.startswith(
-                "/api/storage/"
-            )
-            if not is_user_mutation:
-                await self.asgi_app(scope, receive, send)
-                return
-
-            presented_identity: str | None = None
-            for raw_name, raw_value in scope.get("headers") or ():
-                if raw_name.lower() == b"x-director-database-identity":
-                    presented_identity = raw_value.decode("latin-1")
-                    break
-            if (
-                presented_identity is not None
-                and presented_identity != storage.active_database_identity
-            ):
-                response = JSONResponse(
-                    status_code=409,
-                    content={
-                        "code": "stale_database_identity",
-                        "detail": (
-                            "the browser is editing a different Director database; "
-                            "refresh before making changes"
-                        ),
-                    },
-                )
-                await response(scope, receive, send)
-                return
-
-            # Storage operations remain available while an earlier selection
-            # has frozen ordinary writes, but they are not exempt from stale
-            # browser identity. This prevents an old session from cancelling
-            # a newer session's pending B→C selection by submitting PUT B.
-            if is_storage_operation:
-                await self.asgi_app(scope, receive, send)
-                return
-
-            blocked_by_transition = False
-            async with storage_gate:
-                blocked_by_transition = bool(
-                    app.state.storage_transitioning
-                    or app.state.storage_write_frozen
-                )
-                if not blocked_by_transition:
-                    app.state.storage_inflight_mutations += 1
-            if blocked_by_transition:
-                response = JSONResponse(
-                    status_code=409,
-                    content={
-                        "detail": (
-                            "a database storage change is pending; restart "
-                            "Director before making further changes"
-                        )
-                    },
-                )
-                await response(scope, receive, send)
-                return
-            try:
-                await self.asgi_app(scope, receive, send)
-            finally:
-                await release_storage_mutation()
-
-    app.add_middleware(StorageRestartWriteGateMiddleware)
-
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/api/storage", response_model=StorageStatusRead)
     async def get_storage() -> StorageStatusRead:
-        try:
-            status = storage.status()
-        except StorageConfigurationError as exc:
-            raise _storage_http_error(exc) from exc
-        return _storage_status_read(status)
-
-    @app.put("/api/storage", response_model=StorageStatusRead)
-    async def configure_storage(body: StorageConfigureRequest) -> StorageStatusRead:
-        async with storage_operation_lock:
-            if not instance_lock.acquired:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Director storage ownership is not active",
-                )
-            try:
-                targets_active = storage.targets_active_database(
-                    body.database_path
-                )
-            except StoragePathError as exc:
-                raise _storage_http_error(exc) from exc
-            # Do this before closing the write gate. A job can be waiting in a
-            # cancellable ComfyUI preflight while its create request is still
-            # in flight; transitioning first would reject the cancel request
-            # and wait forever for that create request to finish.
-            if not targets_active and await storage_has_active_owner():
-                raise HTTPException(
-                    status_code=409,
-                    detail="database selection requires all jobs to be terminal",
-                )
-            previous_frozen = await begin_storage_transition()
-            next_frozen = previous_frozen
-            try:
-                try:
-                    targets_active = storage.targets_active_database(
-                        body.database_path
-                    )
-                    if not targets_active and await storage_has_active_owner():
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "database selection requires all jobs to be terminal"
-                            ),
-                        )
-                    status = await anyio.to_thread.run_sync(
-                        partial(storage.configure_existing, body.database_path)
-                    )
-                except (
-                    StorageConfigurationError,
-                    StoragePathError,
-                    StorageValidationError,
-                    StorageConflictError,
-                    StorageOperationError,
-                ) as exc:
-                    raise _storage_http_error(exc) from exc
-                # Selecting a different authority is a restart boundary. The
-                # active path explicitly cancels a pending switch and unfreezes.
-                next_frozen = status.restart_required
-            finally:
-                await finish_storage_transition(frozen=next_frozen)
-        return _storage_status_read(status)
-
-    @app.post("/api/storage/migrate", response_model=StorageMigrationRead)
-    async def migrate_storage(body: StorageMigrateRequest) -> StorageMigrationRead:
-        async with storage_operation_lock:
-            if not instance_lock.acquired:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Director storage ownership is not active",
-                )
-            try:
-                # Validate user-controlled expansion/resolution before doing
-                # either the idle preflight or changing admission state.
-                storage.targets_active_database(body.target_path)
-            except StoragePathError as exc:
-                raise _storage_http_error(exc) from exc
-            if await storage_has_active_owner():
-                raise HTTPException(
-                    status_code=409,
-                    detail="database migration requires all jobs to be terminal",
-                )
-            previous_frozen = await begin_storage_transition()
-            next_frozen = previous_frozen
-            try:
-                if previous_frozen:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "a database storage change is already pending; "
-                            "restart Director or select the active database"
-                        ),
-                    )
-                if await storage_has_active_owner():
-                    raise HTTPException(
-                        status_code=409,
-                        detail="database migration requires all jobs to be terminal",
-                    )
-                try:
-                    status, migrated_from, migrated_to = (
-                        await anyio.to_thread.run_sync(
-                            partial(storage.migrate, body.target_path)
-                        )
-                    )
-                except (
-                    StorageConfigurationError,
-                    StoragePathError,
-                    StorageValidationError,
-                    StorageConflictError,
-                    StorageOperationError,
-                ) as exc:
-                    raise _storage_http_error(exc) from exc
-                # The copied database and bootstrap selection now form the next
-                # instance's authority. Keep this process read-only so the
-                # source cannot diverge after its final consistent snapshot.
-                next_frozen = True
-            finally:
-                await finish_storage_transition(frozen=next_frozen)
-        current = _storage_status_read(status)
-        return StorageMigrationRead(
-            **current.model_dump(),
-            migrated_from=str(migrated_from),
-            migrated_to=str(migrated_to),
+        # The embedded plugin fixes the database below the host ComfyUI user
+        # directory. There is no runtime selection or migration; this read
+        # only reports the fixed location.
+        return StorageStatusRead(
+            active_database_path=str(storage.active_database_path)
         )
 
     @app.get("/api/settings", response_model=RuntimeSettings)
@@ -6398,43 +5991,9 @@ def create_app(
 
     @app.get("/api/capabilities")
     async def get_capabilities(request: Request) -> dict[str, Any]:
-        settings, authority = _runtime_authority_snapshot(request)
-        if not str(settings.comfy_url).strip():
-            report = {
-                "connection": "offline",
-                "supported_modes": [],
-                "supports_cancel": False,
-                "available_nodes": [],
-                "missing_nodes": list(ComfyClient.STANDARD_REQUIRED_NODES),
-                "native_timeline": {
-                    "supported": False,
-                    "modes": [],
-                    "continuity": False,
-                },
-                "execution_backends": {
-                    "standard": {
-                        "available": False,
-                        "missing_nodes": list(ComfyClient.STANDARD_REQUIRED_NODES),
-                    },
-                    "raylight": {
-                        "available": False,
-                        "missing_nodes": list(ComfyClient.RAYLIGHT_REQUIRED_NODES),
-                        "conditional_requirements": {
-                            "lora": {
-                                "available": False,
-                                "missing_nodes": list(
-                                    ComfyClient.RAYLIGHT_LORA_REQUIRED_NODES
-                                ),
-                            }
-                        },
-                    },
-                },
-                "message": _COMFY_NOT_CONFIGURED,
-            }
-            _assert_runtime_authority(request, authority)
-            return report
+        _settings, authority = _runtime_authority_snapshot(request)
         try:
-            report = await _comfy(request, settings).capabilities()
+            report = await _comfy(request).capabilities()
             report.setdefault("message", "ComfyUI connection is ready")
         except (ComfyError, httpx.HTTPError) as exc:
             report = {
@@ -6472,13 +6031,12 @@ def create_app(
         return report
 
     @app.post("/api/capabilities")
-    async def test_capabilities(request: Request, body: ComfyURLRequest) -> dict[str, Any]:
+    async def test_capabilities(request: Request) -> dict[str, Any]:
+        """Re-probe the embedded host ComfyUI instance (the only endpoint)."""
+
         started = __import__("time").monotonic()
         try:
-            probe_settings = _origin_settings(
-                _db(request).get_settings(), str(body.comfy_url)
-            )
-            report = await _comfy(request, probe_settings).capabilities()
+            report = await _comfy(request).capabilities()
             missing = report.get("missing_nodes") or []
             return {
                 # Reaching the capability endpoint is a successful connection
@@ -6493,9 +6051,9 @@ def create_app(
 
     @app.get("/api/models")
     async def get_models(request: Request) -> dict[str, list[str]]:
-        settings, authority = _runtime_authority_snapshot(request)
+        _settings, authority = _runtime_authority_snapshot(request)
         try:
-            models = await _comfy(request, settings).models()
+            models = await _comfy(request).models()
         except ComfyError as exc:
             detail = exc.detail if isinstance(exc.detail, str) and exc.detail.strip() else str(exc)
             raise HTTPException(status_code=502, detail=detail) from exc
@@ -6577,12 +6135,10 @@ def create_app(
         request: Request,
     ) -> RayLightRuntimeStatusRead:
         database = _db(request)
-        settings, authority = _runtime_authority_snapshot(request)
+        _settings, authority = _runtime_authority_snapshot(request)
         try:
-            stats = await _comfy(request, settings).system_stats()
-            status = _raylight_runtime_status(
-                database, str(settings.comfy_url), stats
-            )
+            stats = await _comfy(request).system_stats()
+            status = _raylight_runtime_status(database, stats)
         except NativeTemplateError as exc:
             raise HTTPException(
                 status_code=409,
@@ -6617,16 +6173,7 @@ def create_app(
 
         assert body.confirmation == "comfyui_process_restarted"
         database = _db(request)
-        settings = database.get_settings()
-        origin = Database.canonical_comfy_origin(settings.comfy_url)
-        expected_origin = Database.canonical_comfy_origin(
-            body.expected_comfy_origin
-        )
-        if not origin or expected_origin != origin:
-            raise HTTPException(
-                status_code=409,
-                detail="ComfyUI endpoint changed before RayLight recovery started",
-            )
+        endpoint_key = _EMBEDDED_ENDPOINT_KEY
         if any(
             not task.done() for task in request.app.state.submission_tasks
         ):
@@ -6634,13 +6181,13 @@ def create_app(
                 "RayLight recovery requires all Director submissions to finish"
             )
         async with request.app.state.submission_ticket_lock:
-            tail = request.app.state.submission_tails.get(origin)
+            tail = request.app.state.submission_tails.get(endpoint_key)
             if tail is not None and not tail.done():
                 raise _raylight_recovery_in_flight(
                     "RayLight recovery is waiting for an endpoint submission"
                 )
         submission_lock = request.app.state.submission_locks.setdefault(
-            origin, anyio.Lock()
+            endpoint_key, anyio.Lock()
         )
         if submission_lock.locked():
             raise _raylight_recovery_in_flight(
@@ -6648,24 +6195,12 @@ def create_app(
             )
         await submission_lock.acquire()
         try:
-            current_settings = database.get_settings()
-            if (
-                Database.canonical_comfy_origin(current_settings.comfy_url)
-                != expected_origin
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="ComfyUI endpoint changed before RayLight recovery completed",
-                )
-            client = _comfy(request, current_settings)
+            client = _comfy(request)
             try:
-                runtime_state = database.get_raylight_runtime_state(
-                    expected_origin
-                )
+                runtime_state = database.get_raylight_runtime_state()
                 stats = await client.system_stats()
                 status = _raylight_runtime_status(
                     database,
-                    expected_origin,
                     stats,
                     state=runtime_state,
                 )
@@ -6780,7 +6315,6 @@ def create_app(
                 )
             try:
                 recovered, backup_path = database.confirm_raylight_runtime_restart(
-                    expected_origin,
                     expected_epoch=body.expected_epoch,
                     expected_runtime_state=runtime_state,
                     visible_gpu_count=len(status.available_gpu_indexes),
@@ -6795,7 +6329,6 @@ def create_app(
             )
             return _raylight_runtime_status(
                 database,
-                expected_origin,
                 stats,
                 state=recovered,
             )
@@ -6804,9 +6337,9 @@ def create_app(
 
     @app.get("/api/gpus")
     async def get_gpus(request: Request) -> dict[str, Any]:
-        settings, authority = _runtime_authority_snapshot(request)
+        _settings, authority = _runtime_authority_snapshot(request)
         try:
-            stats = await _comfy(request, settings).system_stats()
+            stats = await _comfy(request).system_stats()
         except (ComfyError, httpx.HTTPError) as exc:
             raise _invalid_comfy_payload(
                 "comfy_system_stats_unavailable",
@@ -6852,7 +6385,6 @@ def create_app(
             return database.validate_and_put_draft(
                 mode,
                 draft,
-                comfy_origin=str(database.get_settings().comfy_url),
             )
         except (ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
@@ -6867,10 +6399,7 @@ def create_app(
     ) -> UnifiedTimelineDraft:
         database = _db(request)
         try:
-            return database.validate_and_put_timeline(
-                body,
-                comfy_origin=str(database.get_settings().comfy_url),
-            )
+            return database.validate_and_put_timeline(body)
         except (ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
 
@@ -6889,14 +6418,11 @@ def create_app(
             document, revision = database.validate_and_put_timeline_authority(
                 body.document,
                 expected_revision=body.expected_revision,
-                comfy_origin=str(database.get_settings().comfy_url),
             )
         except TimelineRevisionConflict as exc:
             raise _timeline_revision_conflict(exc) from None
         except TimelineRevisionExhausted as exc:
             raise _timeline_revision_exhausted(exc) from None
-        except TimelineComfyOriginConflict as exc:
-            raise _timeline_comfy_origin_conflict(exc) from None
         except (ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
         return TimelineAuthorityRead(document=document, revision=revision)
@@ -6918,18 +6444,7 @@ def create_app(
     @app.get("/api/projects", response_model=ProjectListRead)
     async def list_projects(request: Request) -> ProjectListRead:
         database = _db(request)
-        storage = request.app.state.storage
-        active_database_identity = storage.active_database_identity
-        projects = database.list_projects()
-        if storage.active_database_identity != active_database_identity:
-            raise HTTPException(
-                status_code=409,
-                detail="the active Director database changed while listing projects",
-            )
-        return ProjectListRead(
-            projects=projects,
-            active_database_identity=active_database_identity,
-        )
+        return ProjectListRead(projects=database.list_projects())
 
     @app.post("/api/projects", response_model=ProjectSummaryRead)
     async def create_project(
@@ -7010,7 +6525,6 @@ def create_app(
             return database.validate_and_put_project_timeline(
                 project_id,
                 body,
-                comfy_origin=str(database.get_settings().comfy_url),
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="project not found") from None
@@ -7048,7 +6562,6 @@ def create_app(
                     project_id,
                     body.document,
                     expected_revision=body.expected_revision,
-                    comfy_origin=str(database.get_settings().comfy_url),
                 )
             )
         except KeyError:
@@ -7057,8 +6570,6 @@ def create_app(
             raise _timeline_revision_conflict(exc) from None
         except TimelineRevisionExhausted as exc:
             raise _timeline_revision_exhausted(exc) from None
-        except TimelineComfyOriginConflict as exc:
-            raise _timeline_comfy_origin_conflict(exc) from None
         except (ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
         return TimelineAuthorityRead(document=document, revision=revision)
@@ -7090,48 +6601,18 @@ def create_app(
         request: Request, kind: AssetKind | None = None
     ) -> AssetListRead:
         database = _db(request)
-        settings = database.get_settings()
-        if not str(settings.comfy_url).strip():
-            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
-        comfy_origin = Database.canonical_comfy_origin(settings.comfy_url)
-        active_database_identity = request.app.state.storage.active_database_identity
         try:
-            assets = database.list_assets(
-                comfy_origin=comfy_origin, kind=kind
-            )
+            assets = database.list_assets(kind=kind)
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return AssetListRead(
-            assets=assets,
-            active_database_identity=active_database_identity,
-            comfy_origin=comfy_origin,
-        )
+        return AssetListRead(assets=assets)
 
     @app.get("/api/asset-trash", response_model=AssetTrashListRead)
     async def list_asset_trash(request: Request) -> AssetTrashListRead:
         database = _db(request)
-        settings = database.get_settings()
-        if not str(settings.comfy_url).strip():
-            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
-        comfy_origin = Database.canonical_comfy_origin(settings.comfy_url)
-        active_database_identity = request.app.state.storage.active_database_identity
-        try:
-            batches = database.list_asset_trash_batches(
-                comfy_origin=comfy_origin
-            )
-        except AssetTrashOriginConflict as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "asset_trash_origin_conflict",
-                    "message": str(exc),
-                    "remote_files_preserved": True,
-                },
-            ) from exc
+        batches = database.list_asset_trash_batches()
         return AssetTrashListRead(
             batches=[AssetTrashBatchRead.model_validate(item) for item in batches],
-            active_database_identity=active_database_identity,
-            comfy_origin=comfy_origin,
         )
 
     @app.post("/api/asset-trash", response_model=AssetTrashBatchRead)
@@ -7139,14 +6620,10 @@ def create_app(
         request: Request, body: AssetTrashRequest
     ) -> AssetTrashBatchRead:
         database = _db(request)
-        settings = database.get_settings()
-        if not str(settings.comfy_url).strip():
-            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
         try:
             result = database.trash_assets(
                 body.asset_ids,
                 cascade=body.cascade,
-                expected_comfy_origin=str(settings.comfy_url),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="asset not found") from exc
@@ -7158,15 +6635,6 @@ def create_app(
                     "message": "one or more assets are still referenced by saved drafts",
                     "usages": exc.usages,
                     "usages_by_asset": exc.usages_by_asset,
-                    "remote_files_preserved": True,
-                },
-            ) from exc
-        except AssetTrashOriginConflict as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "asset_trash_origin_conflict",
-                    "message": str(exc),
                     "remote_files_preserved": True,
                 },
             ) from exc
@@ -7184,27 +6652,14 @@ def create_app(
         body: AssetTrashRestoreRequest,
     ) -> AssetTrashRestoreRead:
         database = _db(request)
-        settings = database.get_settings()
-        if not str(settings.comfy_url).strip():
-            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
         try:
             result = database.restore_asset_trash_batch(
                 batch_id,
                 mode=body.mode,
-                expected_comfy_origin=str(settings.comfy_url),
             )
         except KeyError as exc:
             raise HTTPException(
                 status_code=404, detail="asset trash batch not found"
-            ) from exc
-        except AssetTrashOriginConflict as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "asset_trash_origin_conflict",
-                    "message": str(exc),
-                    "remote_files_preserved": True,
-                },
             ) from exc
         except AssetTrashRestoreConflict as exc:
             raise HTTPException(
@@ -7225,25 +6680,11 @@ def create_app(
         request: Request, batch_id: str
     ) -> AssetTrashPurgeRead:
         database = _db(request)
-        settings = database.get_settings()
-        if not str(settings.comfy_url).strip():
-            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
         try:
-            result = database.purge_asset_trash_batch(
-                batch_id, expected_comfy_origin=str(settings.comfy_url)
-            )
+            result = database.purge_asset_trash_batch(batch_id)
         except KeyError as exc:
             raise HTTPException(
                 status_code=404, detail="asset trash batch not found"
-            ) from exc
-        except AssetTrashOriginConflict as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "asset_trash_origin_conflict",
-                    "message": str(exc),
-                    "remote_files_preserved": True,
-                },
             ) from exc
         except AssetTrashRestoreConflict as exc:
             raise HTTPException(
@@ -7297,8 +6738,7 @@ def create_app(
             output_bytes=0,
         )
         try:
-            settings = _db(request).get_settings()
-            comfy = _comfy(request, settings)
+            comfy = _comfy(request)
             content_type = _validate_upload_metadata(kind, filename, file.content_type)
             with tempfile.TemporaryDirectory(prefix="director-upload-") as directory:
                 source_path = Path(directory) / f"source{Path(filename).suffix or '.bin'}"
@@ -7376,25 +6816,7 @@ def create_app(
                     ),
                 }
                 asset = AssetReference.model_validate(document).model_dump(mode="json")
-                if not _db(request).put_asset_if_current_origin(
-                    asset_id,
-                    asset,
-                    expected_comfy_origin=Database.canonical_comfy_origin(
-                        settings.comfy_url
-                    ),
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "asset_upload_origin_changed",
-                            "message": (
-                                "ComfyUI endpoint changed while the upload was in "
-                                "progress; the remote file was preserved but was not "
-                                "registered in Director"
-                            ),
-                            "remote_files_preserved": True,
-                        },
-                    )
+                _db(request).put_asset(asset_id, asset)
                 timings["persist"] = time.monotonic() - phase_started
                 elapsed = time.monotonic() - started_at
                 _upload_progress(
@@ -7472,43 +6894,13 @@ def create_app(
         request: Request, asset_id: str, cascade: bool = False
     ) -> AssetDeleteRead:
         database = _db(request)
-        settings = database.get_settings()
-        if not str(settings.comfy_url).strip():
-            raise HTTPException(status_code=409, detail=_COMFY_NOT_CONFIGURED)
-        try:
-            record = database.get_asset_record(asset_id)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if record is None:
-            raise HTTPException(status_code=404, detail="asset not found")
-        _document, asset_origin = record
-        active_origin = Database.canonical_comfy_origin(settings.comfy_url)
-        if asset_origin != active_origin:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"asset id '{asset_id}' belongs to ComfyUI '{asset_origin}', "
-                    f"not the active endpoint '{active_origin}'"
-                ),
-            )
         try:
             usages = database.delete_asset_if_unused(
                 asset_id,
                 cascade=cascade,
-                expected_comfy_origin=active_origin,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="asset not found") from exc
-        except AssetTrashOriginConflict as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "asset_trash_origin_conflict",
-                    "message": str(exc),
-                    "outputs_preserved": True,
-                    "remote_files_preserved": True,
-                },
-            ) from exc
         if usages and not cascade:
             raise HTTPException(
                 status_code=409,
@@ -7526,14 +6918,12 @@ def create_app(
     @app.get("/api/assets/{asset_id}/preview")
     async def preview_asset(request: Request, asset_id: str) -> Response:
         database = _db(request)
-        record = database.get_asset_record(asset_id)
-        if record is None:
+        asset = database.get_asset_record(asset_id)
+        if asset is None:
             raise HTTPException(status_code=404, detail="asset not found")
-        asset, comfy_origin = record
-        origin_settings = _origin_settings(database.get_settings(), comfy_origin)
         try:
             return await _proxy_comfy_media(
-                _comfy(request, origin_settings),
+                _comfy(request),
                 {"filename": asset["name"], "subfolder": asset["subfolder"], "type": asset["type"]},
                 filename=asset["name"],
                 cache_control="private, max-age=60",
@@ -7549,26 +6939,10 @@ def create_app(
         """Proxy smart splitting without accepting a client-supplied ComfyUI path."""
 
         database = _db(request)
-        settings = database.get_settings()
-        # Constructing the active client first preserves the same explicit
-        # first-run guard as uploads and jobs.
-        comfy = _comfy(request, settings)
-        try:
-            record = database.get_asset_record(body.asset_id)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if record is None:
+        comfy = _comfy(request)
+        document = database.get_asset_record(body.asset_id)
+        if document is None:
             raise HTTPException(status_code=404, detail="asset not found")
-        document, asset_origin = record
-        active_origin = Database.canonical_comfy_origin(settings.comfy_url)
-        if asset_origin != active_origin:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"asset id '{body.asset_id}' belongs to ComfyUI '{asset_origin}', "
-                    f"not the active endpoint '{active_origin}'"
-                ),
-            )
         try:
             asset = AssetReference.model_validate(document)
         except ValidationError as exc:
@@ -7611,10 +6985,6 @@ def create_app(
         if isinstance(body, TimelineJobRequest):
             return await _create_timeline_job(request, body)
         database = _db(request)
-        settings = database.get_settings()
-        # Guard before compiling or inserting a local job so first-run
-        # configuration mistakes never leave orphaned ``preparing`` rows.
-        client = _comfy(request, settings)
         try:
             draft = (
                 validate_mode_draft(body.mode, body.config)
@@ -7626,7 +6996,7 @@ def create_app(
             # the v2 family shape first could otherwise make missing media
             # derive a different runnable recipe (for example I2V -> T2V).
             validate_runnable(draft)
-            database.validate_draft_assets(draft, comfy_origin=str(settings.comfy_url))
+            database.validate_draft_assets(draft)
         except (DraftNotRunnable, ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
         # Legacy clients retain their request/response mode, but the hidden
@@ -7881,11 +7251,11 @@ def create_app(
         job_id: str,
         body: JobOutputImportRequest,
     ) -> JobOutputImportRead:
-        """Copy one persisted generated video into the active input library.
+        """Copy one persisted generated video into the host's input library.
 
         The browser supplies only a parent-local output index or a stable
         timeline segment ID. Source paths are resolved from durable Director
-        rows and read through the job's immutable ComfyUI origin; arbitrary
+        rows and read through the embedded ComfyUI connection; arbitrary
         client paths and URLs never cross this boundary.
         """
 
@@ -7894,17 +7264,11 @@ def create_app(
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         job["children"] = database.list_job_children(job_id)
-        target_settings = database.get_settings()
-        # Preserve the normal explicit first-run guard before doing any source
-        # download or potentially expensive 24fps normalization.
-        _comfy(request, target_settings)
         try:
             asset = await import_job_output_as_asset(
                 registry=database,
-                comfy_factory=request.app.state.comfy_factory,
+                client=_comfy(request),
                 job=job,
-                target_settings=target_settings,
-                current_settings=database.get_settings,
                 output_index=body.output_index,
                 segment_id=body.segment_id,
             )
@@ -8080,7 +7444,7 @@ def create_app(
             job = latest
         if job.get("prompt_id"):
             try:
-                client = _comfy(request, RuntimeSettings.model_validate(job["settings_snapshot"]))
+                client = _comfy(request)
                 # The local ComfyUI endpoint atomically classifies this prompt
                 # as running/pending/terminal and performs exactly the matching
                 # action. ComfyClient retains a two-call fallback only for an
@@ -8203,7 +7567,7 @@ def create_app(
         _child, output = matches[0]
         try:
             return await _proxy_comfy_media(
-                _comfy(request, RuntimeSettings.model_validate(job["settings_snapshot"])),
+                _comfy(request),
                 {
                     "filename": output["filename"],
                     "subfolder": output.get("subfolder", ""),
@@ -8230,7 +7594,7 @@ def create_app(
         output = job["outputs"][index]
         try:
             return await _proxy_comfy_media(
-                _comfy(request, RuntimeSettings.model_validate(job["settings_snapshot"])),
+                _comfy(request),
                 {
                     "filename": output["filename"],
                     "subfolder": output.get("subfolder", ""),
@@ -8243,6 +7607,3 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
-
-
-app = create_app()

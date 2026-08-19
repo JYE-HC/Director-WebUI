@@ -5,7 +5,7 @@ import re
 import httpx
 import pytest
 
-from director.comfy import ComfyClient, ComfyError
+from directordeck.comfy import ComfyClient, ComfyError
 
 
 def _director_raylight_initializer_info() -> dict[str, object]:

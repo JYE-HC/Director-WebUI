@@ -1,13 +1,13 @@
 // DirectorDeck sidebar entry: open the Director workspace in a new tab,
 // show embedded-backend status, and link to documentation. The workspace
-// itself is a full-page SPA served at /director/.
+// itself is a full-page SPA served at /directordeck/.
 import { app } from "../../../scripts/app.js";
 
 app.registerExtension({
   name: "DirectorDeck",
   setup() {
     app.extensionManager.registerSidebarTab({
-      id: "director",
+      id: "directordeck",
       icon: "pi pi-video",
       title: "Director",
       tooltip: "Director 长视频导演台",
@@ -31,10 +31,10 @@ app.registerExtension({
           <a class="director-link" href="https://github.com/JYE-HC/Director-WebUI" target="_blank" rel="noreferrer">文档</a>
         `;
         el.querySelector(".director-open").addEventListener("click", () => {
-          window.open("/director/", "_blank", "noopener");
+          window.open("/directordeck/", "_blank", "noopener");
         });
         const statusEl = el.querySelector(".director-status");
-        fetch("/director/status")
+        fetch("/directordeck/status")
           .then((resp) => resp.json())
           .then((data) => {
             if (data.backend === "ready") {

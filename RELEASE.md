@@ -1,52 +1,47 @@
-# Director Web 0.1.0 release candidate
+# Director release notes (plugin form)
 
-This branch is a clean release candidate assembled from Director source commit
-`6622bae10e6031368860a3dc266776d9a4dff430`. It intentionally has new Git
-history so local development notes, runtime databases, media, logs and the
-maintainer's previous commit identity are not published.
+Director ships as **DirectorDeck**, a ComfyUI plugin published to the ComfyUI
+Registry (registry id `director-deck`). The backend embeds in the ComfyUI
+process, the SPA is served by ComfyUI under `/directordeck/`, and the database
+lives in ComfyUI's `user/directordeck/database/` directory. Model weights, LoRAs
+and user assets are not distributed. The former standalone deployment form
+(three-process install, bootstrap/installer scripts, systemd units) was
+removed; no migration path is provided for pre-plugin installs.
 
 ## Compatibility matrix
 
-| Component | Requirement | Tested baseline |
-| --- | --- | --- |
-| Platform | Linux; user systemd for `director.sh` | Linux + systemd 249 |
-| Python | 3.12+; 3.13+ not yet in CI | 3.12.13 |
-| Node.js | `^22.13` or `>=24` | 25.2.1 |
-| ComfyUI | tested commit or an official Git descendant | `8f37cf8c833a8f2d3c62e2adbccebfd165623481` |
-| Ray | 2.48.0+ | 2.56.1 |
-| xFuser | 0.4.4+ | 0.4.5 |
-| yunchang | 0.6.0+ | 0.6.4 |
-| comfy-kitchen | 0.2.31+ with INT8 attention API | 0.2.31 |
-| comfy-aimdo | 0.4.13+ | 0.4.13 |
+| Component | Requirement |
+| --- | --- |
+| ComfyUI | v0.33.0 or newer; tested baseline `8f37cf8c833a8f2d3c62e2adbccebfd165623481` |
+| Platform | Linux; Windows portable ComfyUI is supported for single-GPU Standard inference |
+| Multi-GPU (RayLight) | Linux only; dependencies install on demand from the settings page |
+| Python | the host ComfyUI environment (3.12+ recommended) |
 
-The tested ComfyUI commit is newer than the `v0.33.0` tag while retaining that
-version string. The installer accepts that commit and every official descendant,
-then checks live node/API contracts instead of requiring one exact SHA. It never
-changes the ComfyUI checkout; a dirty worktree is reported but not blocked.
-
-## Bundled custom nodes
-
-- `raylight`: a Director-modified RayLight 1.8.0 snapshot based on upstream
-  commit `4085a37b...`. Required only when a model pool selects two or more
-  GPUs. See its `DIRECTOR_MODIFICATIONS.md` and retained Apache-2.0 license.
-- `ComfyUI-MiniMax-H3-Turbo`: upstream v1.2.3 at `55fee864...`, Apache-2.0.
-  Required only for the dedicated legacy H3 Turbo LoRA loader. The stale
-  upstream `node.zip` (v1.2.0) is deliberately not bundled.
-
-Standard inference without the legacy Turbo LoRA uses only ComfyUI core and
-official extras. The old `MiniMaxH3Director` custom node is neither bundled nor
-supported.
+The plugin package bundles the Director-maintained RayLight fork and the
+`ComfyUI-MiniMax-H3-Turbo` node. Standard inference without the legacy Turbo
+LoRA uses only ComfyUI core and official extras. The old `MiniMaxH3Director`
+custom node is neither bundled nor supported.
 
 ## Validation boundary
 
-`install.sh verify` imports nodes in CPU mode, validates provenance and input
-schemas, and does not load models, queue prompts or start a Ray cluster. A real
-release still needs one Standard GPU generation and one generation for every
-supported RayLight topology on the maintainer's hardware.
+`tools/validate_native_comfy_prompts.py` imports nodes in CPU mode and
+validates registry provenance and prompt structure; it does not load models,
+queue prompts or start a Ray cluster. A real release still needs one Standard
+GPU generation and one generation for every supported RayLight topology on
+the maintainer's hardware.
 
-## License and final release gate
+## Release flow
 
-Director Web is licensed under GPL-3.0-only, matching ComfyUI's project license.
-Bundled third-party Apache-2.0 licenses remain preserved independently. Real GPU
-smoke tests are still required before promoting this candidate to the final
-`v0.1.0` release.
+1. Mirror this repository to Director-WebUI (`develop` → PR → `main`) and run
+   `python tools/check_release.py` in the mirror.
+2. Build the plugin package from the mirror: `python tools/build_plugin.py`.
+3. Push the assembled package to the DirectorDeck repository
+   (`develop` → PR → `main`).
+4. Trigger the manual publish workflow in DirectorDeck to submit the release
+   to the ComfyUI Registry (PublisherId `jye-hc`).
+
+## License
+
+Director Web is licensed under GPL-3.0-only, matching ComfyUI's project
+license. Bundled third-party Apache-2.0 licenses remain preserved
+independently (see `THIRD_PARTY_NOTICES.md`).

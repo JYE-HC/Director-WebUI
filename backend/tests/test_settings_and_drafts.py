@@ -5,9 +5,9 @@ import sqlite3
 
 import pytest
 
-from director.app import _raylight_recovery_history_state
-from director.database import Database
-from director.schemas import RuntimeSettings, default_settings, default_timeline_draft
+from directordeck.app import _raylight_recovery_history_state
+from directordeck.database import Database
+from directordeck.schemas import RuntimeSettings, default_settings, default_timeline_draft
 
 from .conftest import runnable_draft, runtime_authority_headers
 
@@ -49,11 +49,11 @@ async def test_runtime_resource_authority_token_rejects_aba_settings_switch(
     client, fake_comfy, monkeypatch, endpoint: str, upstream_method: str, payload: object
 ) -> None:
     monkeypatch.setattr(
-        "director.database.utc_now",
+        "directordeck.database.utc_now",
         lambda: "2026-08-15T20:00:00+00:00",
     )
     initial = (await client.get("/api/settings/authority")).json()
-    assert initial["settings"]["comfy_url"] == "http://comfy.test:8188"
+    assert "comfy_url" not in initial["settings"]
     assert len(initial["authority_token"]) == 64
     database = client.director_app.state.database
     original = database.get_settings()
@@ -62,7 +62,7 @@ async def test_runtime_resource_authority_token_rejects_aba_settings_switch(
         changed = RuntimeSettings.model_validate(
             {
                 **original.model_dump(mode="json"),
-                "comfy_url": "http://temporary.test:8188",
+                "client_id": "temporary-switch",
             }
         )
         database.put_settings(changed)
@@ -80,7 +80,7 @@ async def test_runtime_resource_authority_token_rejects_aba_settings_switch(
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "runtime_authority_changed"
     refreshed = (await client.get("/api/settings/authority")).json()
-    assert refreshed["settings"]["comfy_url"] == initial["settings"]["comfy_url"]
+    assert refreshed["settings"] == initial["settings"]
     assert refreshed["authority_token"] != initial["authority_token"]
 
 
@@ -147,7 +147,6 @@ async def test_settings_preserve_only_a_scoped_visible_standard_lora_override(
         "loader": "model_only",
         "lora_name": "style.safetensors",
         "model_filename": binding["filename"],
-        "comfy_origin": settings["comfy_url"],
     }
 
     response = await client.put("/api/settings", json=settings)
@@ -159,15 +158,10 @@ async def test_settings_preserve_only_a_scoped_visible_standard_lora_override(
         "loader": "model_only",
         "lora_name": "style.safetensors",
         "model_filename": binding["filename"],
-        "comfy_origin": settings["comfy_url"],
     }
 
     stale = response.json()
     stale["models"]["fl2va"]["lora_name"] = "renamed_generic.safetensors"
-    assert (await client.put("/api/settings", json=stale)).status_code == 422
-
-    stale = response.json()
-    stale["comfy_url"] = "http://other-comfy.test:8188"
     assert (await client.put("/api/settings", json=stale)).status_code == 422
 
 
@@ -291,7 +285,7 @@ def test_source_range_allows_only_machine_epsilon_at_video_end() -> None:
     draft["shots"][0]["source_start_seconds"] = 0.26576
     draft["shots"][0]["source_duration_seconds"] = 2.7542400000000002
 
-    from director.schemas import validate_mode_draft
+    from directordeck.schemas import validate_mode_draft
 
     validate_mode_draft("rv2v", draft)
     draft["shots"][0]["source_duration_seconds"] += 1e-4
@@ -393,7 +387,7 @@ def test_initialize_migrates_legacy_negative_prompts_and_new_defaults(tmp_path) 
 
 
 def _fl_raylight_settings(*, residency_policy: str) -> RuntimeSettings:
-    document = default_settings("http://comfy.test:8188").model_dump(mode="json")
+    document = default_settings().model_dump(mode="json")
     document["raylight_residency_policy"] = residency_policy
     document["multi_gpu_enabled"] = True
     document["models"]["fl2va"].update(
@@ -511,7 +505,6 @@ def test_legacy_raylight_runtime_descriptor_is_discarded_not_falsely_replayed(
     path = tmp_path / "legacy-raylight-runtime.sqlite3"
     database = Database(path)
     database.initialize()
-    origin = "http://comfy.test:8188"
     legacy_descriptor = {
         "version": 1,
         "family": "fl2va",
@@ -527,24 +520,12 @@ def test_legacy_raylight_runtime_descriptor_is_discarded_not_falsely_replayed(
     }
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "INSERT INTO raylight_runtime_state(comfy_origin, descriptor, updated_at) "
-            "VALUES(?, ?, ?)",
-            (origin, json.dumps(legacy_descriptor), "2026-08-13T00:00:00+00:00"),
-        )
-        connection.execute(
-            "INSERT INTO raylight_runtime_state(comfy_origin, descriptor, updated_at) "
-            "VALUES(?, ?, ?)",
-            (
-                "http://comfy-v1.test:8188",
-                json.dumps(legacy_envelope),
-                "2026-08-13T00:00:00+00:00",
-            ),
+            "INSERT INTO raylight_runtime_state(singleton, descriptor, updated_at) "
+            "VALUES(1, ?, ?)",
+            (json.dumps(legacy_descriptor), "2026-08-13T00:00:00+00:00"),
         )
 
-    state = database.get_raylight_runtime_state(origin)
-    envelope_state = database.get_raylight_runtime_state(
-        "http://comfy-v1.test:8188"
-    )
+    state = database.get_raylight_runtime_state()
 
     assert state == {
         "version": 2,
@@ -555,7 +536,14 @@ def test_legacy_raylight_runtime_descriptor_is_discarded_not_falsely_replayed(
         "tainted": True,
         "legacy_unknown": True,
     }
-    assert envelope_state == {
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE raylight_runtime_state SET descriptor = ? WHERE singleton = 1",
+            (json.dumps(legacy_envelope),),
+        )
+
+    assert database.get_raylight_runtime_state() == {
         "version": 2,
         "epoch": 7,
         "current": None,
@@ -573,7 +561,7 @@ async def test_model_and_gpu_proxy_shapes(client) -> None:
     assert capabilities.json()["connection"] == "online"
     assert capabilities.json()["missing_nodes"] == []
 
-    tested = await client.post("/api/capabilities", json={"comfy_url": "http://comfy.test:8188"})
+    tested = await client.post("/api/capabilities")
     assert tested.status_code == 200
     assert tested.json()["ok"] is True
 
@@ -722,7 +710,6 @@ async def test_raylight_recovery_maps_malformed_exact_history_to_structured_502(
     client, fake_comfy, monkeypatch, history: object
 ) -> None:
     database = client.director_app.state.database
-    origin = database.canonical_comfy_origin(database.get_settings().comfy_url)
     state = {
         "version": 2,
         "epoch": 4,
@@ -740,7 +727,7 @@ async def test_raylight_recovery_maps_malformed_exact_history_to_structured_502(
         "tail_action": "shutdown",
         "tainted": True,
     }
-    database.put_raylight_runtime_state(origin, state)
+    database.put_raylight_runtime_state(state)
     status = (
         await client.get(
             "/api/raylight/runtime",
@@ -760,7 +747,6 @@ async def test_raylight_recovery_maps_malformed_exact_history_to_structured_502(
         "/api/raylight/runtime/recovery/confirm-comfy-restart",
         json={
             "confirmation": "comfyui_process_restarted",
-            "expected_comfy_origin": origin,
             "expected_epoch": 4,
             "expected_recovery_token": status["recovery_token"],
         },
@@ -768,4 +754,4 @@ async def test_raylight_recovery_maps_malformed_exact_history_to_structured_502(
 
     assert response.status_code == 502, response.text
     assert response.json()["detail"]["code"] == "comfy_history_invalid"
-    assert database.get_raylight_runtime_state(origin) == state
+    assert database.get_raylight_runtime_state() == state

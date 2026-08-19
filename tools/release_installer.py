@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, dependency-free helpers used by install.sh."""
+"""Dependency-free release helpers: payload verification and tree digests."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-IGNORED_PARTS = {".git", "__pycache__", ".pytest_cache", ".ruff_cache", ".director-keep"}
+IGNORED_PARTS = {".git", "__pycache__", ".pytest_cache", ".ruff_cache"}
 
 
 def _tree_entries(root: Path) -> list[dict[str, Any]]:
@@ -70,13 +70,6 @@ def _nodes() -> list[dict[str, Any]]:
     return [node for node in nodes if isinstance(node, dict)]
 
 
-def expected_node(name: str) -> dict[str, Any]:
-    for node in _nodes():
-        if node.get("name") == name:
-            return node
-    raise ValueError(f"unknown bundled custom node: {name}")
-
-
 def payload_check() -> int:
     failures: list[str] = []
     for node in _nodes():
@@ -103,60 +96,12 @@ def payload_check() -> int:
     return 0
 
 
-def node_status(name: str, target: Path) -> int:
-    expected = str(expected_node(name).get("tree_sha256") or "")
-    if target.is_symlink():
-        print("symlink")
-        return 0
-    if not target.exists():
-        print("absent")
-        return 0
-    if not target.is_dir():
-        print("conflict")
-        return 0
-    try:
-        actual = tree_digest(target)
-    except (OSError, ValueError):
-        print("conflict")
-        return 0
-    if actual == expected:
-        print("same")
-        return 0
-    # A .director-keep marker records an explicit user decision to reuse
-    # existing content. Any later content change returns to "conflict".
-    try:
-        recorded = (target / ".director-keep").read_text(encoding="utf-8").split()[0]
-    except (OSError, IndexError):
-        recorded = ""
-    if recorded and recorded == actual:
-        print("kept")
-        return 0
-    print("conflict")
-    return 0
-
-
-def mark_keep(name: str, target: Path) -> int:
-    expected_node(name)  # only bundled node names may be kept
-    if target.is_symlink() or not target.is_dir():
-        raise ValueError(f"cannot mark keep on non-directory: {target}")
-    digest = tree_digest(target)
-    (target / ".director-keep").write_text(f"{digest}\n", encoding="utf-8")
-    print(f"[PASS] 已记录复用决定：{name}（{digest[:12]}；删除 {target}/.director-keep 可重新选择）")
-    return 0
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("payload-check")
     digest_parser = subparsers.add_parser("tree-digest")
     digest_parser.add_argument("path", type=Path)
-    status_parser = subparsers.add_parser("node-status")
-    status_parser.add_argument("name")
-    status_parser.add_argument("path", type=Path)
-    keep_parser = subparsers.add_parser("mark-keep")
-    keep_parser.add_argument("name")
-    keep_parser.add_argument("path", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "payload-check":
@@ -164,10 +109,6 @@ def main() -> int:
         if args.command == "tree-digest":
             print(tree_digest(args.path.resolve()))
             return 0
-        if args.command == "node-status":
-            return node_status(args.name, args.path)
-        if args.command == "mark-keep":
-            return mark_keep(args.name, args.path)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 2
