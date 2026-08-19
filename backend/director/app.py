@@ -5826,6 +5826,7 @@ def create_app(
     legacy_database_path: str | Path | None = None,
     public_api_prefix: str = "",
     raylight_requirements_path: str | Path | None = None,
+    pinned_comfy_url: str | None = None,
 ) -> FastAPI:
     set_public_api_prefix(public_api_prefix)
     storage = StorageController.resolve(
@@ -5833,7 +5834,9 @@ def create_app(
         storage_config_path=storage_config_path,
         legacy_database_path=legacy_database_path,
     )
-    database = Database(storage.active_database_path)
+    database = Database(
+        storage.active_database_path, pinned_comfy_url=pinned_comfy_url
+    )
     instance_lock = DirectorInstanceLock(storage.active_database_path)
     live_preview_cache = LivePreviewCache()
     reconcile_wake_event = asyncio.Event()

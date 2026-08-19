@@ -298,8 +298,14 @@ class Database:
     )
     _CONFIRMED_COMFY_RESTART_STAGE = "cancelled_after_confirmed_comfy_restart"
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self, path: str | Path, pinned_comfy_url: str | None = None
+    ) -> None:
         self.path = Path(path)
+        # Plugin-embedded mode pins the live ComfyUI address to the host
+        # instance's loopback origin.  ``None`` (standalone) leaves every
+        # read/write path byte-for-byte identical to an unpinned database.
+        self.pinned_comfy_url = pinned_comfy_url
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -1034,6 +1040,21 @@ class Database:
             ).fetchone()
         return row is not None
 
+    def _apply_pinned_comfy_url(self, settings: RuntimeSettings) -> RuntimeSettings:
+        """Force the live ComfyUI address to the pinned host loopback value.
+
+        The pinned value is well-formed by construction (the plugin derives it
+        from the host ComfyUI listen settings), so it is applied verbatim
+        without revalidation.  The pinned value is part of the returned live
+        document on both the read and write paths: the browser compares its
+        PUT draft with the authoritative GET byte-for-byte, and any silent
+        server-side rewrite becomes an infinite latest-wins retry loop.
+        Historical job ``settings_snapshot`` payloads never pass through here.
+        """
+        if self.pinned_comfy_url is None:
+            return settings
+        return settings.model_copy(update={"comfy_url": self.pinned_comfy_url})
+
     def get_settings_authority(self) -> tuple[RuntimeSettings, str]:
         with self.connect() as db:
             row = db.execute(
@@ -1041,8 +1062,10 @@ class Database:
             ).fetchone()
         if row is None:
             raise RuntimeError("settings row is missing")
-        settings = canonicalize_live_runtime_settings(
-            RuntimeSettings.model_validate_json(row["document"])
+        settings = self._apply_pinned_comfy_url(
+            canonicalize_live_runtime_settings(
+                RuntimeSettings.model_validate_json(row["document"])
+            )
         )
         authority = hashlib.sha256(
             (
@@ -1057,7 +1080,9 @@ class Database:
         return self.get_settings_authority()[0]
 
     def put_settings(self, settings: RuntimeSettings) -> RuntimeSettings:
-        settings = canonicalize_live_runtime_settings(settings)
+        settings = self._apply_pinned_comfy_url(
+            canonicalize_live_runtime_settings(settings)
+        )
         with self.connect() as db:
             db.execute(
                 "UPDATE settings SET document = ?, updated_at = ?, "

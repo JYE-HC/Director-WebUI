@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Assemble the ComfyUI-Director plugin package into build/ComfyUI-Director/.
+"""Assemble the DirectorDeck plugin package into build/DirectorDeck/.
 
 The package layout produced here is what gets linked into
 ``ComfyUI/custom_nodes/`` for local testing and (later) published to the
 plugin repository:
 
-    ComfyUI-Director/
+    DirectorDeck/
     ├── __init__.py        # plugin entry (from plugin/)
     ├── pyproject.toml     # registry manifest (from plugin/)
     ├── web/               # WEB_DIRECTORY sidebar extension (from plugin/)
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-BUILD_DIR = PROJECT_ROOT / "build" / "ComfyUI-Director"
+BUILD_DIR = PROJECT_ROOT / "build" / "DirectorDeck"
 
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", ".git")
 
@@ -67,7 +67,7 @@ def link(comfyui_root: Path) -> None:
     custom_nodes = comfyui_root / "custom_nodes"
     if not custom_nodes.is_dir():
         raise SystemExit(f"custom_nodes not found under {comfyui_root}")
-    target = custom_nodes / "ComfyUI-Director"
+    target = custom_nodes / "DirectorDeck"
     if target.is_symlink() or target.exists():
         if target.is_symlink() and target.resolve() == BUILD_DIR.resolve():
             print(f"link already in place: {target}")

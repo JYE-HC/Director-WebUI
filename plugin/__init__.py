@@ -1,4 +1,4 @@
-"""ComfyUI-Director plugin entry.
+"""DirectorDeck plugin entry.
 
 Embeds the Director Web backend (FastAPI) into the ComfyUI process:
 
@@ -9,8 +9,10 @@ Embeds the Director Web backend (FastAPI) into the ComfyUI process:
   streamed request/response bodies (SSE, Range media, large uploads);
 - exposes ``/director/status`` for the menu extension and the SPA to learn
   backend state without touching the proxy;
-- seeds ``comfy_url`` once (only when unset) to point at this ComfyUI
-  instance, mirroring bootstrap's ``seed_comfyui_url_if_unset`` semantics;
+- pins ``comfy_url`` to this ComfyUI instance's loopback address: the backend
+  settings layer forces every read/write to that value, and a startup seeder
+  additionally converges the stored row (reseeds stale loopback values after
+  ``--port`` changes);
 - registers the bundled MiniMax-H3-Turbo nodes unconditionally and the
   bundled Director-fork RayLight nodes behind a platform/dependency/conflict
   gate (multi-GPU is opt-in, see docs).
@@ -34,7 +36,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-LOGGER = logging.getLogger("ComfyUI-Director")
+LOGGER = logging.getLogger("DirectorDeck")
 
 WEB_DIRECTORY = "./web"
 
@@ -129,7 +131,7 @@ def _load_bundled_nodes() -> None:
         )
     elif turbo_dir.is_dir():
         try:
-            count = _load_node_pack(turbo_dir, "comfyui_director_minimax_h3_turbo")
+            count = _load_node_pack(turbo_dir, "director_deck_minimax_h3_turbo")
             LOGGER.info("Director: registered %d MiniMax-H3-Turbo nodes", count)
         except Exception as exc:  # noqa: BLE001 - recorded for /director/status
             _state.nodes_error = f"MiniMax-H3-Turbo: {type(exc).__name__}: {exc}"
@@ -156,7 +158,7 @@ def _load_bundled_nodes() -> None:
         _state.raylight = "pack_missing"
         return
     try:
-        count = _load_node_pack(raylight_dir, "comfyui_director_raylight")
+        count = _load_node_pack(raylight_dir, "director_deck_raylight")
         _state.raylight = "registered"
         LOGGER.info("Director: registered %d RayLight nodes", count)
     except Exception as exc:  # noqa: BLE001 - recorded for /director/status
@@ -178,7 +180,7 @@ def _internal_port() -> int:
                 candidate += 1
                 continue
         return candidate
-    raise RuntimeError("ComfyUI-Director: no free loopback port for the backend")
+    raise RuntimeError("DirectorDeck: no free loopback port for the backend")
 
 
 def _database_locations() -> tuple[Path, Path]:
@@ -260,6 +262,10 @@ def _run_backend(database_path: Path, storage_config_path: Path) -> None:
             storage_config_path=storage_config_path,
             public_api_prefix="/director",
             raylight_requirements_path=_PLUGIN_ROOT / "requirements-raylight.txt",
+            # Embedded mode hard-pins comfy_url to this ComfyUI instance's
+            # loopback address: the settings layer overrides every read and
+            # normalizes every write, so the address is not user-configurable.
+            pinned_comfy_url=_comfyui_loopback_url(),
         )
         _state.version = app.version
         port = _internal_port()
@@ -290,8 +296,23 @@ def _run_backend(database_path: Path, storage_config_path: Path) -> None:
         _state.status = "failed" if _state.error else "stopped"
 
 
+_LOOPBACK_ORIGIN_PREFIXES = (
+    "http://127.0.0.1",
+    "https://127.0.0.1",
+    "http://localhost",
+    "https://localhost",
+    "http://[::1]",
+    "https://[::1]",
+)
+
+
 def _seed_comfy_url() -> None:
-    """Write this ComfyUI instance's loopback URL once, only when unset."""
+    """Point ``comfy_url`` at this ComfyUI instance's loopback address.
+
+    Seeds when unset and reseeds a stale loopback value (e.g. after the
+    user restarts ComfyUI with a different ``--port``).  Non-loopback
+    values are user-authored and stay authoritative.
+    """
     import json
     import time
     import urllib.error
@@ -314,9 +335,13 @@ def _seed_comfy_url() -> None:
     except (OSError, urllib.error.URLError, ValueError) as exc:
         LOGGER.warning("Director: could not read settings for comfy_url seeding: %s", exc)
         return
-    if str(settings.get("comfy_url") or "").strip():
+    desired = _comfyui_loopback_url()
+    current = str(settings.get("comfy_url") or "").strip()
+    if current == desired:
         return
-    settings["comfy_url"] = _comfyui_loopback_url()
+    if current and not current.startswith(_LOOPBACK_ORIGIN_PREFIXES):
+        return
+    settings["comfy_url"] = desired
     request = urllib.request.Request(
         f"{base}/api/settings",
         data=json.dumps(settings).encode("utf-8"),
@@ -326,7 +351,10 @@ def _seed_comfy_url() -> None:
     try:
         with urllib.request.urlopen(request, timeout=10):
             pass
-        LOGGER.info("Director: comfy_url seeded to %s", settings["comfy_url"])
+        if current:
+            LOGGER.info("Director: comfy_url reseeded %s -> %s", current, desired)
+        else:
+            LOGGER.info("Director: comfy_url seeded to %s", desired)
     except (OSError, urllib.error.URLError) as exc:
         LOGGER.warning("Director: comfy_url seeding failed: %s", exc)
 
@@ -514,4 +542,4 @@ except BaseException:  # noqa: BLE001 - a plugin must not break ComfyUI startup
     import traceback
 
     _state.error = traceback.format_exc(limit=5)
-    LOGGER.exception("ComfyUI-Director plugin initialization failed")
+    LOGGER.exception("DirectorDeck plugin initialization failed")

@@ -65,6 +65,21 @@ const API_BASE = (
 export const DATABASE_IDENTITY_STALE_EVENT = "director:stale-database-identity";
 let latchedDatabaseIdentity: string | null = null;
 
+// The ComfyUI host aiohttp app registers /director/status only when the
+// plugin embeds the backend. Standalone servers (vite dev/preview or a bare
+// deployment) answer 404, an HTML fallback, or nothing at all, so only a
+// valid JSON payload with the plugin's `backend` field proves embedded mode.
+export async function detectEmbeddedComfyUi(): Promise<boolean> {
+  try {
+    const response = await fetch("/director/status", { cache: "no-store" });
+    if (!response.ok) return false;
+    const payload: unknown = await response.json();
+    return typeof payload === "object" && payload !== null && "backend" in payload;
+  } catch {
+    return false;
+  }
+}
+
 export function taskEventsUrl(): string {
   return `${API_BASE}/tasks/events`;
 }

@@ -147,6 +147,46 @@ describe("共享设置表单", () => {
     expect(within(modePanel).getByText("Ref2VA")).toBeInTheDocument();
   });
 
+  it("插件内嵌模式下 ComfyUI 地址只读且保留测试连接", () => {
+    render(
+      <SettingsPage
+        settings={CONFIGURED_SETTINGS}
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[]}
+        models={MODEL_INVENTORY}
+        loadingModels={false}
+        embeddedComfyUi
+        onSaved={confirmConfiguredSettings}
+      />,
+    );
+
+    const input = screen.getByLabelText("ComfyUI 地址");
+    expect(input).toHaveAttribute("readonly");
+    expect(input).not.toBeDisabled();
+    expect(input).toHaveValue(CONFIGURED_SETTINGS.comfy_url);
+    expect(input).toHaveAccessibleDescription("插件模式：自动指向当前 ComfyUI 实例，无需设置。");
+    expect(screen.getByRole("button", { name: "测试连接" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "ComfyUI 地址显示状态" })).toBeEnabled();
+  });
+
+  it("独立部署下 ComfyUI 地址可编辑且无插件提示", () => {
+    render(
+      <SettingsPage
+        settings={CONFIGURED_SETTINGS}
+        capabilities={ONLINE_CAPABILITIES}
+        gpus={[]}
+        models={MODEL_INVENTORY}
+        loadingModels={false}
+        onSaved={confirmConfiguredSettings}
+      />,
+    );
+
+    const input = screen.getByLabelText("ComfyUI 地址");
+    expect(input).not.toHaveAttribute("readonly");
+    expect(input).not.toHaveAttribute("aria-describedby");
+    expect(screen.queryByText(/插件模式/)).not.toBeInTheDocument();
+  });
+
   it("三个敏感设置默认隐藏，并可独立显示且不改动字段值", async () => {
     const user = userEvent.setup();
     vi.mocked(directorApi.getStorage).mockResolvedValue(STORAGE_CONFIGURATION);

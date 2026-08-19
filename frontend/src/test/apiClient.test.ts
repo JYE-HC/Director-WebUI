@@ -1,4 +1,4 @@
-import { ApiError, DATABASE_IDENTITY_STALE_EVENT, directorApi } from "../api/client";
+import { ApiError, DATABASE_IDENTITY_STALE_EVENT, detectEmbeddedComfyUi, directorApi } from "../api/client";
 import { DEFAULT_SETTINGS, type GenerationTask } from "../api/types";
 import { createInitialDrafts, MODE_ORDER } from "../domain/modes";
 import { createTimelineProject } from "../domain/timelineProject";
@@ -2003,5 +2003,33 @@ describe("Director REST 契约", () => {
       title: "历史来源",
       document: project,
     });
+  });
+});
+
+describe("插件内嵌模式探测", () => {
+  it("仅 /director/status 返回含 backend 字段的 JSON 时判定为插件模式", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ backend: "ready" }));
+
+    await expect(detectEmbeddedComfyUi()).resolves.toBe(true);
+    expect(fetchMock.mock.calls[0][0]).toBe("/director/status");
+    expect(fetchMock.mock.calls[0][1]?.cache).toBe("no-store");
+  });
+
+  it("404、HTML 回退和网络失败都按独立部署处理", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ error: "not found" }, 404))
+      .mockResolvedValueOnce(
+        new Response("<!doctype html><title>Director</title>", {
+          status: 200,
+          headers: { "Content-Type": "text/html" },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }))
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    await expect(detectEmbeddedComfyUi()).resolves.toBe(false);
+    await expect(detectEmbeddedComfyUi()).resolves.toBe(false);
+    await expect(detectEmbeddedComfyUi()).resolves.toBe(false);
+    await expect(detectEmbeddedComfyUi()).resolves.toBe(false);
   });
 });
