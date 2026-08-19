@@ -244,7 +244,10 @@ def _write_bootstrap(config_path: Path, database_path: Path) -> None:
             dir=config_path.parent,
         )
         temporary_path = Path(temporary_name)
-        os.fchmod(descriptor, 0o600)
+        # mkstemp already creates the file 0o600 on POSIX; os.fchmod does not
+        # exist on Windows, where the user profile temp dir is ACL-scoped.
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
         payload = json.dumps(
             {
                 "version": _BOOTSTRAP_VERSION,
