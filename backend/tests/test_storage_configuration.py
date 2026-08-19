@@ -270,6 +270,9 @@ def test_database_context_manager_closes_connection_and_repeated_reads_do_not_le
         assert after <= before + 2
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows st_mode does not carry Unix permission bits"
+)
 def test_new_database_and_parent_are_private_without_changing_existing_mode(
     tmp_path,
 ) -> None:
@@ -721,7 +724,9 @@ async def test_migrate_copies_consistent_database_updates_bootstrap_and_freezes_
     assert json.loads(config.read_text(encoding="utf-8"))["database_path"] == str(
         target.resolve()
     )
-    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+    if os.name != "nt":
+        # Windows st_mode does not carry Unix permission bits.
+        assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
 
 
 @pytest.mark.asyncio

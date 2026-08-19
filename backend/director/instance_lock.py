@@ -20,17 +20,27 @@ else:
 _LOCK_CONFLICT_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EDEADLK})
 
 
+# The owner diagnostic JSON is written at the start of the lock file.  On
+# Windows the byte-range lock must sit past that payload: a locked range
+# denies reads from every other handle (even in the same process), so locking
+# offset 0 would hide the owner diagnostic from the conflicting process —
+# exactly the process that needs to read it.  msvcrt explicitly permits
+# locking a range beyond EOF, so one byte at this offset is enough because
+# every Director process locks the same range.
+_WINDOWS_LOCK_OFFSET = 4096
+
+
 def _lock_exclusive_nb(descriptor: int) -> None:
     """Take the non-blocking exclusive kernel lock on the lock file.
 
-    POSIX locks the whole file with flock; Windows locks just the first byte,
-    which is enough because every Director process locks the same range.  The
-    OS drops either lock when the owning process exits, so the kernel lock —
-    never the leftover file — represents ownership.
+    POSIX locks the whole file with flock; Windows locks one byte at
+    ``_WINDOWS_LOCK_OFFSET``, past the diagnostic payload.  The OS drops
+    either lock when the owning process exits, so the kernel lock — never
+    the leftover file — represents ownership.
     """
     if _IS_WINDOWS:
         # msvcrt locks a byte range starting at the current file offset.
-        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.lseek(descriptor, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
         msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
     else:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -39,7 +49,7 @@ def _lock_exclusive_nb(descriptor: int) -> None:
 def _unlock(descriptor: int) -> None:
     if _IS_WINDOWS:
         # LK_UNLCK must start at the same offset the lock was taken at.
-        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.lseek(descriptor, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
         msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
     else:
         fcntl.flock(descriptor, fcntl.LOCK_UN)

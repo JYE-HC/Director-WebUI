@@ -144,6 +144,11 @@ async def test_setup_install_rejects_missing_requirements(
 async def test_setup_install_and_cancel_flow(
     client, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The endpoint consults the name imported into the app namespace; lift the
+    # Linux-only release gate so the install/cancel flow runs on Windows CI.
+    monkeypatch.setattr(
+        "director.app.raylight_platform_supported", lambda: True
+    )
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("# fake\n")
     client.director_app.state.raylight_requirements_path = requirements

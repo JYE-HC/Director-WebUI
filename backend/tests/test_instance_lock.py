@@ -199,13 +199,14 @@ def test_windows_branch_excludes_second_owner_and_recovers(
     finally:
         first.release()
 
-    # LK_UNLCK ran after seeking back to the locked first byte even though
-    # the diagnostic write had moved the descriptor offset.
-    assert fake_windows_locking.unlock_offsets == [0]
+    # LK_UNLCK ran after seeking back to the locked byte past the diagnostic
+    # payload even though the diagnostic write had moved the descriptor offset.
+    lock_offset = instance_lock_module._WINDOWS_LOCK_OFFSET
+    assert fake_windows_locking.unlock_offsets == [lock_offset]
 
     second.acquire()
     second.release()
-    assert fake_windows_locking.unlock_offsets == [0, 0]
+    assert fake_windows_locking.unlock_offsets == [lock_offset, lock_offset]
 
 
 @pytest.mark.parametrize("conflict_errno", [errno.EACCES, errno.EDEADLK])
