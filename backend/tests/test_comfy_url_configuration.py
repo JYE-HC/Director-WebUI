@@ -177,6 +177,116 @@ def test_standalone_database_initialize_preserves_the_stored_comfy_url(
     assert revision_after == revision_before
 
 
+def _insert_asset(database: Database, asset_id: str, origin: str) -> None:
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO assets(id, document, created_at, comfy_origin) "
+            "VALUES(?, ?, ?, ?)",
+            (asset_id, json.dumps({"name": f"{asset_id}.png"}), "now", origin),
+        )
+
+
+def _insert_segment_take(database: Database, take_id: str, origin: str) -> None:
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO segment_takes(id, segment_id, content_fingerprint, "
+            "comfy_origin, output_descriptor, has_audio, source_job_id, "
+            "source_child_id, completed_at, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                take_id,
+                f"segment-{take_id}",
+                "fingerprint",
+                origin,
+                "{}",
+                0,
+                "job-1",
+                f"child-{take_id}",
+                "now",
+                "now",
+            ),
+        )
+
+
+def _comfy_origins(database: Database, table: str) -> dict[str, str]:
+    with database.connect() as db:
+        rows = db.execute(f'SELECT id, comfy_origin FROM "{table}"').fetchall()
+    return {str(row["id"]): str(row["comfy_origin"]) for row in rows}
+
+
+def test_pinned_initialize_migrates_loopback_origins_without_touching_settings(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "director.sqlite3"
+    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
+    database.initialize()
+    _, revision_before = _stored_settings_row(database)
+
+    # The settings row already converged, but origin-scoped rows from an
+    # earlier listen address (or the 0.1.1 pinning era) are still stale.
+    stale_origin = "http://127.0.0.1:8188"
+    remote_origin = "http://remote-comfy.test:9000"
+    _insert_asset(database, "asset-stale", stale_origin)
+    _insert_asset(database, "asset-remote", remote_origin)
+    _insert_segment_take(database, "take-stale", stale_origin)
+    _insert_segment_take(database, "take-remote", remote_origin)
+
+    database.initialize()
+
+    # Embedded databases belong to one ComfyUI installation, so every
+    # loopback origin is an old address of this same host and follows the
+    # pinned value; a genuinely remote origin stays untouched. Migration
+    # alone must not write the settings row.
+    assert _comfy_origins(database, "assets") == {
+        "asset-stale": PINNED_LOOPBACK_URL,
+        "asset-remote": remote_origin,
+    }
+    assert _comfy_origins(database, "segment_takes") == {
+        "take-stale": PINNED_LOOPBACK_URL,
+        "take-remote": remote_origin,
+    }
+    document, revision_after = _stored_settings_row(database)
+    assert document["comfy_url"] == PINNED_LOOPBACK_URL
+    assert revision_after == revision_before
+
+
+def test_pinned_initialize_migrates_origins_and_converges_settings(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "director.sqlite3"
+    unpinned = Database(path)
+    unpinned.initialize()
+    unpinned.put_settings(default_settings("http://127.0.0.1:8188"))
+    _insert_asset(unpinned, "asset-stale", "http://127.0.0.1:8188")
+    _insert_segment_take(unpinned, "take-stale", "http://127.0.0.1:8188")
+
+    database = Database(path, pinned_comfy_url=PINNED_LOOPBACK_URL)
+    database.initialize()
+
+    assert _comfy_origins(database, "assets")["asset-stale"] == PINNED_LOOPBACK_URL
+    assert _comfy_origins(database, "segment_takes")["take-stale"] == PINNED_LOOPBACK_URL
+    document, _revision = _stored_settings_row(database)
+    assert document["comfy_url"] == PINNED_LOOPBACK_URL
+
+
+def test_standalone_initialize_preserves_origin_rows(tmp_path: Path) -> None:
+    path = tmp_path / "director.sqlite3"
+    database = Database(path)
+    database.initialize()
+    database.put_settings(default_settings("http://127.0.0.1:8188"))
+    _insert_asset(database, "asset-stale", "http://127.0.0.1:8188")
+    _insert_segment_take(database, "take-stale", "http://127.0.0.1:8188")
+    _, revision_before = _stored_settings_row(database)
+
+    database.initialize()
+
+    assert _comfy_origins(database, "assets")["asset-stale"] == "http://127.0.0.1:8188"
+    assert _comfy_origins(database, "segment_takes")["take-stale"] == "http://127.0.0.1:8188"
+    document, revision_after = _stored_settings_row(database)
+    assert document["comfy_url"] == "http://127.0.0.1:8188"
+    assert revision_after == revision_before
+
+
 async def test_standalone_put_comfy_url_persists_the_user_value(
     tmp_path: Path,
 ) -> None:
