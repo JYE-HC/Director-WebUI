@@ -1,6 +1,6 @@
-"""Embedded-mode contract: the ComfyUI address is injected, never a setting.
+"""Embedded-mode contract: the ComfyUI callback is injected, never a setting.
 
-The plugin passes the host instance's loopback URL to ``create_app``. The
+The plugin derives a directly reachable host-instance URL for ``create_app``. The
 persisted settings document has no URL field, the connection test probes the
 injected address, and there is no standalone/unconfigured state.
 """
@@ -13,8 +13,10 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+import directordeck.app as app_module
+import directordeck.comfy as comfy_module
 from directordeck.app import create_app
-from directordeck.comfy import ComfyError
+from directordeck.comfy import ComfyClient, ComfyError
 from directordeck.schemas import RuntimeSettings, default_settings
 
 from .conftest import TEST_COMFY_URL, runtime_authority_headers
@@ -33,6 +35,99 @@ def test_runtime_settings_have_no_comfy_url_field() -> None:
                 "comfy_url": "http://127.0.0.1:8188",
             }
         )
+
+
+def test_embedded_tls_certificate_is_shared_by_http_and_websocket_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    certificate = tmp_path / "comfy-cert.pem"
+    certificate.write_text("test certificate", encoding="utf-8")
+
+    class FakeTLSContext:
+        def __init__(self) -> None:
+            self.loaded: list[str] = []
+            self.verify_flags = 0
+
+        def load_verify_locations(self, *, cafile: str) -> None:
+            self.loaded.append(cafile)
+
+    context = FakeTLSContext()
+    monkeypatch.setattr(
+        app_module.ssl,
+        "create_default_context",
+        lambda: context,
+    )
+
+    app = create_app(
+        database_path=tmp_path / "directordeck.sqlite3",
+        comfy_url="https://127.0.0.1:8188",
+        comfy_tls_certfile=certificate,
+    )
+    comfy_client = app.state.comfy_factory(app.state.comfy_url)
+
+    assert isinstance(comfy_client, ComfyClient)
+    assert comfy_client.verify is context
+    assert app.state.comfy_tls_context is context
+    assert app.state.progress_manager._ssl_context is context
+    assert context.loaded == [str(certificate)]
+    assert context.verify_flags & app_module.ssl.VERIFY_X509_PARTIAL_CHAIN
+
+
+def test_embedded_tls_certificate_requires_an_https_callback(tmp_path: Path) -> None:
+    certificate = tmp_path / "comfy-cert.pem"
+    certificate.write_text("test certificate", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires an https"):
+        create_app(
+            database_path=tmp_path / "directordeck.sqlite3",
+            comfy_url="http://127.0.0.1:8188",
+            comfy_tls_certfile=certificate,
+        )
+
+
+async def test_embedded_comfy_http_clients_ignore_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status_code = 200
+        is_error = False
+        is_redirect = False
+
+        async def aclose(self) -> None:
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def build_request(self, *_args: object, **_kwargs: object) -> object:
+            return object()
+
+        async def send(self, *_args: object, **_kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(comfy_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = ComfyClient("http://192.0.2.25:8188")
+
+    async with client._http():
+        pass
+    stream = await client.view_stream({"filename": "preview.mp4"})
+    await stream.aclose()
+
+    assert len(created) == 2
+    assert [kwargs["trust_env"] for kwargs in created] == [False, False]
 
 
 async def test_injected_comfy_url_reaches_the_client_factory(

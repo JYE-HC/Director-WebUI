@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ssl
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -213,10 +214,17 @@ class ComfyClient:
         *,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        verify: ssl.SSLContext | bool = True,
+        trust_env: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.transport = transport
+        self.verify = verify
+        # The embedded backend calls the ComfyUI server in this same process.
+        # Explicit non-loopback listen addresses must not escape through an
+        # HTTP(S)_PROXY entry merely because they aren't listed in NO_PROXY.
+        self.trust_env = trust_env
 
     @asynccontextmanager
     async def _http(self, *, timeout: float | None = None) -> AsyncIterator[httpx.AsyncClient]:
@@ -224,6 +232,8 @@ class ComfyClient:
             base_url=self.base_url,
             timeout=timeout if timeout is not None else self.timeout,
             transport=self.transport,
+            verify=self.verify,
+            trust_env=self.trust_env,
         ) as client:
             yield client
 
@@ -644,6 +654,8 @@ class ComfyClient:
             base_url=self.base_url,
             timeout=300,
             transport=self.transport,
+            verify=self.verify,
+            trust_env=self.trust_env,
         )
         headers = {"Accept-Encoding": "identity"}
         if byte_range is not None:

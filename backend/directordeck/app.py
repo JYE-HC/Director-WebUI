@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import ssl
 import tempfile
 import time
 import uuid
@@ -14,7 +15,7 @@ from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 import anyio
@@ -1109,11 +1110,38 @@ def _live_preview_for_job(request: Request, job: dict[str, Any]):
     return preview
 
 
+class _UnsetCurrentTimeline:
+    """Distinguish the legacy default scope from an explicitly missing scope."""
+
+
+_UNSET_CURRENT_TIMELINE = _UnsetCurrentTimeline()
+
+
+def _job_read_context_for_project(
+    request: Request,
+    project_id: str | None,
+) -> tuple[UnifiedTimelineDraft | None, RuntimeSettings]:
+    """Resolve one request's active-project comparison authority exactly once."""
+
+    database = _db(request)
+    active_project_id = project_id or database.LEGACY_DEFAULT_PROJECT_ID
+    try:
+        current_timeline = database.get_project_timeline(active_project_id)
+    except KeyError:
+        # A stale browser tab may cancel a still-owned task after its active
+        # project was deleted. The mutation remains valid, but currentness must
+        # fail closed rather than silently comparing against the default.
+        current_timeline = None
+    return current_timeline, database.get_settings()
+
+
 def _job_read_for_request(
     request: Request,
     job: dict[str, Any],
     *,
-    current_timeline: UnifiedTimelineDraft | None = None,
+    current_timeline: (
+        UnifiedTimelineDraft | None | _UnsetCurrentTimeline
+    ) = _UNSET_CURRENT_TIMELINE,
     current_settings: RuntimeSettings | None = None,
 ) -> JobRead:
     """Annotate one job with strict currentness flags.
@@ -1128,12 +1156,13 @@ def _job_read_for_request(
     current_project = False
     snapshot_timeline = _job_timeline_snapshot(job)
     if snapshot_timeline is not None:
-        if current_timeline is None:
+        if isinstance(current_timeline, _UnsetCurrentTimeline):
             current_timeline = _db(request).get_timeline()
-        current_project = (
-            snapshot_timeline.model_dump(mode="json")
-            == current_timeline.model_dump(mode="json")
-        )
+        if current_timeline is not None:
+            current_project = (
+                snapshot_timeline.model_dump(mode="json")
+                == current_timeline.model_dump(mode="json")
+            )
     if job.get("mode") == "timeline" and snapshot_timeline is not None:
         try:
             snapshot_settings = RuntimeSettings.model_validate(
@@ -1156,6 +1185,26 @@ def _job_read_for_request(
         live_preview_available=_live_preview_for_job(request, job) is not None,
         current_snapshot=current_snapshot,
         current_project=current_project,
+    )
+
+
+def _job_read_for_project_scope(
+    request: Request,
+    job: dict[str, Any],
+    *,
+    project_id: str | None,
+) -> JobRead:
+    """Project one job against the caller's explicit active-project scope."""
+
+    current_timeline, current_settings = _job_read_context_for_project(
+        request,
+        project_id,
+    )
+    return _job_read_for_request(
+        request,
+        job,
+        current_timeline=current_timeline,
+        current_settings=current_settings,
     )
 
 
@@ -4312,6 +4361,16 @@ async def _create_timeline_job_impl(
     settings = database.get_settings()
     client = _comfy(request)
     owner_project_id = project_id or database.LEGACY_DEFAULT_PROJECT_ID
+
+    def project_job_read(snapshot: dict[str, Any]) -> JobRead:
+        # Resolve at the response boundary so a timeline edit made while a
+        # long submission is running is reflected in currentness immediately.
+        return _job_read_for_project_scope(
+            request,
+            snapshot,
+            project_id=owner_project_id,
+        )
+
     draft = body.config or database.get_project_timeline(owner_project_id)
     try:
         database.validate_timeline_assets(
@@ -4438,7 +4497,7 @@ async def _create_timeline_job_impl(
             if latest is None:
                 raise HTTPException(status_code=404, detail="job disappeared during submission")
             latest["children"] = database.list_job_children(job_id)
-            return _job_read_for_request(request, latest)
+            return project_job_read(latest)
         endpoint_key = _EMBEDDED_ENDPOINT_KEY
         loop = asyncio.get_running_loop()
         submission_ticket = loop.create_future()
@@ -4848,8 +4907,8 @@ async def _create_timeline_job_impl(
                 # marks every not-yet-submitted child terminal.
                 submission_lock.release()
                 lock_acquired = False
-                return _job_read_for_request(
-                    request, await _cancel_timeline_job(request, current)
+                return project_job_read(
+                    await _cancel_timeline_job(request, current)
                 )
             child_id = child_ids[unit.id]
             planned_ray_state = ray_state_before_submit.get(unit.id)
@@ -4888,8 +4947,8 @@ async def _create_timeline_job_impl(
                     # to cancellation—not to preflight failure.
                     submission_lock.release()
                     lock_acquired = False
-                    return _job_read_for_request(
-                        request, await _cancel_timeline_job(request, latest_parent)
+                    return project_job_read(
+                        await _cancel_timeline_job(request, latest_parent)
                     )
                 raise HTTPException(
                     status_code=409,
@@ -5018,9 +5077,8 @@ async def _create_timeline_job_impl(
                         # to reopen either lifecycle row.
                         submission_lock.release()
                         lock_acquired = False
-                        return _job_read_for_request(
-                            request,
-                            await _sync_timeline_job(request, latest_parent),
+                        return project_job_read(
+                            await _sync_timeline_job(request, latest_parent)
                         )
                     database.update_job_child_if_snapshot(
                         child_id,
@@ -5050,7 +5108,7 @@ async def _create_timeline_job_impl(
                     if reconciled["status"] in {"succeeded", "failed"}:
                         submission_lock.release()
                         lock_acquired = False
-                        return _job_read_for_request(request, reconciled)
+                        return project_job_read(reconciled)
                 else:
                     latest_child = database.get_job_child(child_id)
                     if (
@@ -5074,9 +5132,8 @@ async def _create_timeline_job_impl(
                     )
                 submission_lock.release()
                 lock_acquired = False
-                return _job_read_for_request(
-                    request,
-                    await _sync_timeline_job(request, cancelled_parent),
+                return project_job_read(
+                    await _sync_timeline_job(request, cancelled_parent)
                 )
             if unit.id in transition_unit_ids:
                 # Queue order alone is insufficient: ComfyUI continues with
@@ -5101,8 +5158,8 @@ async def _create_timeline_job_impl(
                         )
                     submission_lock.release()
                     lock_acquired = False
-                    return _job_read_for_request(
-                        request, await _cancel_timeline_job(request, latest_parent)
+                    return project_job_read(
+                        await _cancel_timeline_job(request, latest_parent)
                     )
                 for expected_status in ("queued", "running"):
                     if database.update_job_child_if_status(
@@ -5153,8 +5210,8 @@ async def _create_timeline_job_impl(
                 if latest_parent["status"] in {"cancelling", "cancelled"}:
                     submission_lock.release()
                     lock_acquired = False
-                    return _job_read_for_request(
-                        request, await _cancel_timeline_job(request, latest_parent)
+                    return project_job_read(
+                        await _cancel_timeline_job(request, latest_parent)
                     )
             if segment_id is not None and segment_id in continuity_dependents:
                 terminal_child = database.get_job_child(child_id)
@@ -5183,9 +5240,8 @@ async def _create_timeline_job_impl(
                 if latest_parent["status"] in {"cancelling", "cancelled"}:
                     submission_lock.release()
                     lock_acquired = False
-                    return _job_read_for_request(
-                        request,
-                        await _cancel_timeline_job(request, latest_parent),
+                    return project_job_read(
+                        await _cancel_timeline_job(request, latest_parent)
                     )
                 if terminal_child["status"] == "succeeded":
                     try:
@@ -5277,7 +5333,7 @@ async def _create_timeline_job_impl(
         current = database.get_job(job_id)
         if current is not None and current["status"] in {"cancelling", "cancelled"}:
             current["children"] = database.list_job_children(job_id)
-            return _job_read_for_request(request, current)
+            return project_job_read(current)
         raise
     except BaseException:
         # A graceful server shutdown can cancel the shielded submission task.
@@ -5405,7 +5461,7 @@ async def _create_timeline_job_impl(
             # that claim; the reconciler remains the lifecycle owner.
             job = latest
     job["children"] = database.list_job_children(job_id)
-    return _job_read_for_request(request, job)
+    return project_job_read(job)
 
 
 async def _create_timeline_job(
@@ -5467,7 +5523,11 @@ async def _create_timeline_job(
         if job is None:
             return await asyncio.shield(task)
         job["children"] = _db(request).list_job_children(job_id)
-        return _job_read_for_request(request, job)
+        return _job_read_for_project_scope(
+            request,
+            job,
+            project_id=project_id,
+        )
     finally:
         accepted_release.set()
         accepted_wait.cancel()
@@ -5713,13 +5773,28 @@ def create_app(
     database_path: str | Path,
     comfy_url: str,
     comfy_factory: ComfyFactory | None = None,
+    comfy_tls_certfile: str | Path | None = None,
     public_api_prefix: str = "",
     raylight_requirements_path: str | Path | None = None,
 ) -> FastAPI:
     set_public_api_prefix(public_api_prefix)
     comfy_url = comfy_url.rstrip("/")
     if not comfy_url:
-        raise ValueError("create_app requires the host ComfyUI loopback URL")
+        raise ValueError("create_app requires the host ComfyUI callback URL")
+    comfy_tls_context: ssl.SSLContext | None = None
+    if comfy_tls_certfile is not None:
+        if urlsplit(comfy_url).scheme.lower() != "https":
+            raise ValueError("comfy_tls_certfile requires an https ComfyUI callback URL")
+        comfy_tls_context = ssl.create_default_context()
+        comfy_tls_context.load_verify_locations(cafile=str(comfy_tls_certfile))
+        # ComfyUI commonly receives a leaf/full-chain PEM instead of a
+        # separately installed root CA. Trust that explicit local chain while
+        # retaining normal hostname/SAN validation.
+        comfy_tls_context.verify_flags |= getattr(
+            ssl,
+            "VERIFY_X509_PARTIAL_CHAIN",
+            0,
+        )
     storage = StorageController.resolve(database_path)
     database = Database(storage.active_database_path)
     instance_lock = DirectorInstanceLock(storage.active_database_path)
@@ -5817,7 +5892,10 @@ def create_app(
             prompt_terminal_events.notify(event.prompt_id)
 
     progress_manager = NativeProgressManager(
-        persist_native_progress, persist_native_preview, wake_native_reconcile
+        persist_native_progress,
+        persist_native_preview,
+        wake_native_reconcile,
+        ssl_context=comfy_tls_context,
     )
 
     @asynccontextmanager
@@ -5915,7 +5993,12 @@ def create_app(
     app.state.instance_lock = instance_lock
     app.state.storage = storage
     app.state.comfy_url = comfy_url
-    app.state.comfy_factory = comfy_factory or default_comfy_factory
+    app.state.comfy_factory = comfy_factory or (
+        partial(ComfyClient, verify=comfy_tls_context)
+        if comfy_tls_context is not None
+        else default_comfy_factory
+    )
+    app.state.comfy_tls_context = comfy_tls_context
     app.state.progress_manager = progress_manager
     app.state.live_preview_cache = live_preview_cache
     app.state.raylight_install_manager = RayLightInstallManager()
@@ -7096,12 +7179,10 @@ def create_app(
             # queue/history I/O and persists the next observable snapshot.
             snapshot["children"] = children_by_job[str(snapshot["id"])]
             jobs.append(snapshot)
-        active_project_id = project_id or database.LEGACY_DEFAULT_PROJECT_ID
-        try:
-            current_timeline = database.get_project_timeline(active_project_id)
-        except KeyError:
-            current_timeline = None
-        current_settings = database.get_settings()
+        current_timeline, current_settings = _job_read_context_for_project(
+            request,
+            project_id,
+        )
         return JobListRead(
             jobs=[
                 _job_read_for_request(
@@ -7120,13 +7201,21 @@ def create_app(
         )
 
     @app.get("/api/jobs/{job_id}", response_model=JobRead)
-    async def get_job(request: Request, job_id: str) -> JobRead:
+    async def get_job(
+        request: Request,
+        job_id: str,
+        project_id: Annotated[str | None, Query(max_length=128)] = None,
+    ) -> JobRead:
         database = _db(request)
         job = database.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         job["children"] = database.list_job_children(job_id)
-        return _job_read_for_request(request, job)
+        return _job_read_for_project_scope(
+            request,
+            job,
+            project_id=project_id,
+        )
 
     @app.get("/api/jobs/{job_id}/diagnostic", response_model=JobDiagnosticRead)
     async def get_job_diagnostic(
@@ -7343,6 +7432,7 @@ def create_app(
         request: Request,
         job_id: str,
         body: JobRecoveryConfirmComfyRestartRequest,
+        project_id: Annotated[str | None, Query(max_length=128)] = None,
     ) -> JobRead:
         """End only an ambiguous restart-owned submission after operator proof.
 
@@ -7373,10 +7463,27 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         request.app.state.live_preview_cache.discard(job_id)
         settled["children"] = _db(request).list_job_children(job_id)
-        return _job_read_for_request(request, settled)
+        return _job_read_for_project_scope(
+            request,
+            settled,
+            project_id=project_id,
+        )
 
-    @app.post("/api/jobs/{job_id}/cancel", response_model=JobRead)
-    async def cancel_job(request: Request, job_id: str) -> JobRead:
+    async def _cancel_job_with_read_context(
+        request: Request,
+        job_id: str,
+        *,
+        current_timeline: UnifiedTimelineDraft | None,
+        current_settings: RuntimeSettings,
+    ) -> JobRead:
+        def read_job(snapshot: dict[str, Any]) -> JobRead:
+            return _job_read_for_request(
+                request,
+                snapshot,
+                current_timeline=current_timeline,
+                current_settings=current_settings,
+            )
+
         database = _db(request)
         job = database.get_job(job_id)
         if job is None:
@@ -7394,8 +7501,7 @@ def create_app(
                     if latest is None:
                         raise HTTPException(status_code=404, detail="job not found")
                     job = latest
-            return _job_read_for_request(
-                request,
+            return read_job(
                 await _cancel_timeline_job(
                     request,
                     job,
@@ -7403,10 +7509,10 @@ def create_app(
                 ),
             )
         if job["status"] in _TERMINAL_STATUSES:
-            return _job_read_for_request(request, job)
+            return read_job(job)
         job = await _sync_existing_job(request, job)
         if job["status"] in _TERMINAL_STATUSES:
-            return _job_read_for_request(request, job)
+            return read_job(job)
         if job["status"] == "preparing" and not job.get("prompt_id"):
             job = database.update_job_if_status(
                 job_id,
@@ -7417,16 +7523,16 @@ def create_app(
                 completed_at=utc_now(),
             )
             if job is not None:
-                return _job_read_for_request(request, job)
+                return read_job(job)
             latest = database.get_job(job_id)
             if latest is None:
                 raise HTTPException(status_code=404, detail="job not found")
             job = latest
             if job["status"] in _TERMINAL_STATUSES:
-                return _job_read_for_request(request, job)
+                return read_job(job)
         while job["status"] != "cancelling":
             if job["status"] in _TERMINAL_STATUSES:
-                return _job_read_for_request(request, job)
+                return read_job(job)
             transitioned = database.update_job_if_status(
                 job_id,
                 job["status"],
@@ -7458,13 +7564,13 @@ def create_app(
                     if latest is not None:
                         job = await _sync_existing_job(request, latest)
                         if job["status"] in _TERMINAL_STATUSES:
-                            return _job_read_for_request(request, job)
+                            return read_job(job)
                     job = database.update_job_if_status(
                         job_id,
                         "cancelling",
                         stage="cancel_unconfirmed",
                     ) or job
-                    return _job_read_for_request(request, job)
+                    return read_job(job)
             except (ComfyError, httpx.HTTPError) as exc:
                 job = database.update_job_if_status(
                     job_id,
@@ -7476,7 +7582,7 @@ def create_app(
                     job = database.get_job(job_id)
                     if job is None:
                         raise HTTPException(status_code=404, detail="job not found")
-                return _job_read_for_request(request, job)
+                return read_job(job)
         job = database.update_job_if_status(
             job_id,
             "cancelling",
@@ -7490,11 +7596,30 @@ def create_app(
             job = database.get_job(job_id)
             if job is None:
                 raise HTTPException(status_code=404, detail="job not found")
-        return _job_read_for_request(request, job)
+        return read_job(job)
+
+    @app.post("/api/jobs/{job_id}/cancel", response_model=JobRead)
+    async def cancel_job(
+        request: Request,
+        job_id: str,
+        project_id: Annotated[str | None, Query(max_length=128)] = None,
+    ) -> JobRead:
+        current_timeline, current_settings = _job_read_context_for_project(
+            request,
+            project_id,
+        )
+        return await _cancel_job_with_read_context(
+            request,
+            job_id,
+            current_timeline=current_timeline,
+            current_settings=current_settings,
+        )
 
     @app.post("/api/jobs/cancel", response_model=JobBulkCancelRead)
     async def cancel_jobs(
-        request: Request, body: JobBulkCancelRequest
+        request: Request,
+        body: JobBulkCancelRequest,
+        project_id: Annotated[str | None, Query(max_length=128)] = None,
     ) -> JobBulkCancelRead:
         """Cancel an explicit set of locally-owned parent tasks.
 
@@ -7510,9 +7635,20 @@ def create_app(
                 status_code=404,
                 detail="job not found: " + ", ".join(missing),
             )
+        current_timeline, current_settings = _job_read_context_for_project(
+            request,
+            project_id,
+        )
         results: list[JobRead] = []
         for job_id in body.job_ids:
-            results.append(await cancel_job(request, job_id))
+            results.append(
+                await _cancel_job_with_read_context(
+                    request,
+                    job_id,
+                    current_timeline=current_timeline,
+                    current_settings=current_settings,
+                )
+            )
         return JobBulkCancelRead(
             jobs=results,
             requested_count=len(body.job_ids),

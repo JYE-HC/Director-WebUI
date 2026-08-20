@@ -351,6 +351,34 @@ function mockCommonRequests(settings = CONFIGURED_SETTINGS) {
   });
 }
 
+function mockNonDefaultActiveProject(projectId: string) {
+  const project = createTimelineProject();
+  project.title = "非默认活动项目";
+  localStorage.setItem("directordeck:v1:active-project-id", projectId);
+  vi.mocked(directorApi.listProjects).mockResolvedValue({
+    projects: [
+      {
+        id: DEFAULT_PROJECT_ID,
+        title: "默认项目",
+        created_at: "2026-08-12T00:00:00Z",
+        updated_at: "2026-08-12T00:00:00Z",
+        segment_count: 1,
+      },
+      {
+        id: projectId,
+        title: project.title,
+        created_at: "2026-08-12T00:01:00Z",
+        updated_at: "2026-08-12T00:01:00Z",
+        segment_count: project.segments.length,
+      },
+    ],
+  });
+  vi.mocked(directorApi.getProjectTimelineAuthority).mockResolvedValue({
+    document: project,
+    revision: 3,
+  });
+}
+
 async function waitUntilReady() {
   expect(await screen.findByText("ComfyUI 已连接")).toBeInTheDocument();
   await waitFor(() => expect(screen.queryByText(/正在从服务器恢复时间线|暂时无法确认数据库或读取服务器时间线/)).not.toBeInTheDocument());
@@ -4644,9 +4672,12 @@ describe("统一长视频时间线应用", () => {
 
   it("确认 ComfyUI 已重启后立即更新任务、刷新列表并提示成功", async () => {
     const user = userEvent.setup();
+    const activeProjectId = "project-recovery";
     const recoveryTask: GenerationTask = {
       ...queuedTimelineTask,
       id: "job-restart-recovery",
+      project_id: activeProjectId,
+      current_project: true,
       status: "cancelling",
       stage: "restart_cancel_unconfirmed",
     };
@@ -4658,6 +4689,7 @@ describe("统一长视频时间线应用", () => {
       completed_at: "2026-08-12T00:03:00Z",
     };
     mockCommonRequests();
+    mockNonDefaultActiveProject(activeProjectId);
     vi.mocked(directorApi.listTasks)
       .mockResolvedValueOnce({ jobs: [recoveryTask] })
       .mockResolvedValue({ jobs: [recoveredTask] });
@@ -4675,7 +4707,10 @@ describe("统一长视频时间线应用", () => {
       name: "确认 ComfyUI 已重启并结束任务",
     }));
 
-    await waitFor(() => expect(confirmRecovery).toHaveBeenCalledWith(recoveryTask.id));
+    await waitFor(() => expect(confirmRecovery).toHaveBeenCalledWith(
+      recoveryTask.id,
+      activeProjectId,
+    ));
     expect(await screen.findByText(
       "已确认 ComfyUI 重启，导演台任务已结束",
     )).toHaveAttribute("role", "status");
@@ -4709,7 +4744,10 @@ describe("统一长视频时间线应用", () => {
       name: "确认 ComfyUI 已重启并结束任务",
     }));
 
-    await waitFor(() => expect(confirmRecovery).toHaveBeenCalledWith(recoveryTask.id));
+    await waitFor(() => expect(confirmRecovery).toHaveBeenCalledWith(
+      recoveryTask.id,
+      DEFAULT_PROJECT_ID,
+    ));
     expect(await screen.findByText(
       "恢复确认失败：服务器拒绝该确认",
     )).toHaveAttribute("role", "status");
@@ -4728,6 +4766,47 @@ describe("统一长视频时间线应用", () => {
 
     expect(await screen.findByRole("button", { name: "任务，1 个进行中" })).toBeInTheDocument();
     expect(directorApi.listTasks).toHaveBeenCalledTimes(2);
+  });
+
+  it("非默认活动项目的单任务取消携带同步项目作用域", async () => {
+    const user = userEvent.setup();
+    const activeProjectId = "project-cancel";
+    const runningTask: GenerationTask = {
+      ...queuedTimelineTask,
+      id: "job-scoped-cancel",
+      project_id: activeProjectId,
+      current_project: true,
+      status: "running",
+      progress: 0.4,
+      stage: "sampling",
+    };
+    const cancelledTask: GenerationTask = {
+      ...runningTask,
+      status: "cancelled",
+      progress: 1,
+      completed_at: "2026-08-12T00:03:00Z",
+    };
+    mockCommonRequests();
+    mockNonDefaultActiveProject(activeProjectId);
+    vi.mocked(directorApi.getCapabilities).mockResolvedValue({
+      ...ONLINE_CAPABILITIES,
+      supports_cancel: true,
+    });
+    vi.mocked(directorApi.listTasks)
+      .mockResolvedValueOnce({ jobs: [runningTask] })
+      .mockResolvedValue({ jobs: [cancelledTask] });
+    const cancelTask = vi.spyOn(directorApi, "cancelTask")
+      .mockResolvedValue(cancelledTask);
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(await screen.findByRole("button", { name: "任务，1 个进行中" }));
+    await user.click(screen.getByRole("button", { name: "取消" }));
+
+    await waitFor(() => expect(cancelTask).toHaveBeenCalledWith(
+      runningTask.id,
+      activeProjectId,
+    ));
   });
 
   it("任务刷新和活跃状态变化不会重建 SSE 连接", async () => {
@@ -4858,7 +4937,9 @@ describe("统一长视频时间线应用", () => {
 
   it("批量取消超过服务端单批上限时按 100 个父任务安全分批", async () => {
     const user = userEvent.setup();
+    const activeProjectId = "project-bulk-cancel";
     mockCommonRequests();
+    mockNonDefaultActiveProject(activeProjectId);
     vi.mocked(directorApi.getCapabilities).mockResolvedValue({
       ...ONLINE_CAPABILITIES,
       supports_cancel: true,
@@ -4892,6 +4973,8 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(cancelTasks).toHaveBeenCalledTimes(2));
     expect(cancelTasks.mock.calls[0][0]).toHaveLength(100);
     expect(cancelTasks.mock.calls[1][0]).toHaveLength(1);
+    expect(cancelTasks.mock.calls[0][1]).toBe(activeProjectId);
+    expect(cancelTasks.mock.calls[1][1]).toBe(activeProjectId);
     expect(new Set(cancelTasks.mock.calls.flatMap(([ids]) => ids))).toHaveProperty("size", 101);
   }, 10_000);
 

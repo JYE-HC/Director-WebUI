@@ -1481,6 +1481,10 @@ function parseJobClearResponse(value: unknown): JobClearResponse {
   };
 }
 
+function activeProjectQuery(projectId?: string): string {
+  return projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+}
+
 export const directorApi = {
   getCapabilities: (signal: AbortSignal | undefined, authorityToken: string) =>
     request<unknown>("/capabilities", {
@@ -1749,20 +1753,26 @@ export const directorApi = {
       summary,
     };
   },
-  getTask: (taskId: string, signal?: AbortSignal) =>
-    request<unknown>(`/jobs/${encodeURIComponent(taskId)}`, { signal }).then(parseGenerationTask),
-  cancelTask: (taskId: string) =>
-    request<unknown>(`/jobs/${encodeURIComponent(taskId)}/cancel`, { method: "POST" }).then(parseGenerationTask),
-  confirmComfyRestartRecovery: (taskId: string) =>
+  getTask: (taskId: string, signal?: AbortSignal, activeProjectId?: string) =>
     request<unknown>(
-      `/jobs/${encodeURIComponent(taskId)}/recovery/confirm-comfy-restart`,
+      `/jobs/${encodeURIComponent(taskId)}${activeProjectQuery(activeProjectId)}`,
+      { signal },
+    ).then(parseGenerationTask),
+  cancelTask: (taskId: string, activeProjectId?: string) =>
+    request<unknown>(
+      `/jobs/${encodeURIComponent(taskId)}/cancel${activeProjectQuery(activeProjectId)}`,
+      { method: "POST" },
+    ).then(parseGenerationTask),
+  confirmComfyRestartRecovery: (taskId: string, activeProjectId?: string) =>
+    request<unknown>(
+      `/jobs/${encodeURIComponent(taskId)}/recovery/confirm-comfy-restart${activeProjectQuery(activeProjectId)}`,
       {
         method: "POST",
         body: JSON.stringify({ confirmation: "comfyui_process_restarted" }),
       },
     ).then(parseGenerationTask),
-  cancelTasks: (taskIds: string[]) =>
-    request<unknown>("/jobs/cancel", {
+  cancelTasks: (taskIds: string[], activeProjectId?: string) =>
+    request<unknown>(`/jobs/cancel${activeProjectQuery(activeProjectId)}`, {
       method: "POST",
       body: JSON.stringify({ job_ids: taskIds }),
     }).then(parseTaskBulkCancel),

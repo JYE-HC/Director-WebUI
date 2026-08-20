@@ -8,7 +8,8 @@ Embeds the Director Web backend (FastAPI) into the ComfyUI process:
 - reverse-proxies ``/directordeck/api/*`` to the internal backend with fully
   streamed request/response bodies (SSE, Range media, large uploads);
 - exposes ``/directordeck/status`` for the menu extension and the SPA to learn
-  backend state without touching the proxy;
+  the explicit ``starting``/``ready``/``stopped``/``failed`` backend state
+  without touching the proxy;
 - injects this ComfyUI instance's loopback address into the backend at
   construction; the ComfyUI address is not a setting and is never persisted;
 - registers the bundled MiniMax-H3-Turbo nodes unconditionally and the
@@ -25,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import importlib.util
+import ipaddress
 import logging
 import os
 import socket
@@ -49,6 +51,8 @@ _NODES_DIR = _PLUGIN_ROOT / "nodes"
 
 _DEFAULT_INTERNAL_PORT = 18788
 _PORT_SCAN_LIMIT = 20
+_ATEXIT_JOIN_TIMEOUT_SECONDS = 10.0
+_COMFY_SHUTDOWN_JOIN_TIMEOUT_SECONDS = 8.0
 
 _HOP_BY_HOP_HEADERS = frozenset(
     {
@@ -83,6 +87,25 @@ class _BackendState:
 _state = _BackendState()
 _proxy_session = None
 _proxy_session_lock = threading.Lock()
+
+
+def _set_backend_failure(error: str, *, preserve_existing: bool = False) -> None:
+    """Record a terminal failure without losing an earlier diagnostic."""
+    if preserve_existing and _state.error:
+        if error not in _state.error:
+            _state.error = f"{_state.error}\n{error}"
+    else:
+        _state.error = error
+    _state.status = "failed"
+
+
+def _record_shutdown_timeout(thread: threading.Thread, timeout: float) -> None:
+    if thread.is_alive():
+        _set_backend_failure(
+            "TimeoutError: Director backend did not stop within "
+            f"{timeout:g} seconds",
+            preserve_existing=True,
+        )
 
 
 def _load_node_pack(pack_dir: Path, unique_name: str) -> int:
@@ -191,11 +214,37 @@ def _database_location() -> Path:
     return db_dir / "directordeck.sqlite3"
 
 
-def _comfyui_loopback_url() -> str:
+def _comfyui_callback_host(listen: object) -> str:
+    """Choose an address that this process can reach from ComfyUI's binds."""
+
+    addresses = [
+        address.strip()
+        for address in str(listen or "").split(",")
+        if address.strip()
+    ]
+    if not addresses:
+        addresses = ["0.0.0.0"]
+    address = addresses[0].removeprefix("[").removesuffix("]")
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    if parsed.is_unspecified:
+        parsed = ipaddress.ip_address("::1" if parsed.version == 6 else "127.0.0.1")
+    rendered = str(parsed)
+    return f"[{rendered}]" if parsed.version == 6 else rendered
+
+
+def _comfyui_callback_url() -> str:
     from comfy.cli_args import args as comfy_args
 
-    scheme = "https" if getattr(comfy_args, "tls_certfile", None) else "http"
-    return f"{scheme}://127.0.0.1:{getattr(comfy_args, 'port', 8188)}"
+    tls_enabled = bool(
+        getattr(comfy_args, "tls_certfile", None)
+        and getattr(comfy_args, "tls_keyfile", None)
+    )
+    scheme = "https" if tls_enabled else "http"
+    host = _comfyui_callback_host(getattr(comfy_args, "listen", "127.0.0.1"))
+    return f"{scheme}://{host}:{getattr(comfy_args, 'port', 8188)}"
 
 
 _MIN_COMFYUI_VERSION = (0, 33, 0)
@@ -250,6 +299,7 @@ def _run_backend(database_path: Path) -> None:
             DirectorInstanceLock,
             DirectorInstanceLockError,
         )
+        from comfy.cli_args import args as comfy_args
 
         # Probe the single-instance lock ourselves: uvicorn converts a
         # lifespan startup failure into SystemExit, which would hide the
@@ -258,8 +308,7 @@ def _run_backend(database_path: Path) -> None:
         try:
             probe.acquire()
         except DirectorInstanceLockError as exc:
-            _state.status = "failed"
-            _state.error = str(exc)
+            _set_backend_failure(str(exc))
             LOGGER.error("Director backend cannot start: %s", exc)
             return
         else:
@@ -267,7 +316,12 @@ def _run_backend(database_path: Path) -> None:
 
         app = create_app(
             database_path=database_path,
-            comfy_url=_comfyui_loopback_url(),
+            comfy_url=_comfyui_callback_url(),
+            comfy_tls_certfile=(
+                getattr(comfy_args, "tls_certfile", None)
+                if getattr(comfy_args, "tls_keyfile", None)
+                else None
+            ),
             public_api_prefix="/directordeck",
             raylight_requirements_path=_PLUGIN_ROOT / "requirements-raylight.txt",
         )
@@ -290,14 +344,13 @@ def _run_backend(database_path: Path) -> None:
         finally:
             loop.close()
     except BaseException as exc:  # noqa: BLE001 - surfaced via /directordeck/status
-        _state.status = "failed"
-        _state.error = f"{type(exc).__name__}: {exc}"
-        LOGGER.exception("Director backend failed to start")
+        _set_backend_failure(f"{type(exc).__name__}: {exc}")
+        LOGGER.exception("Director backend exited with an error")
         return
-    if _state.status == "starting":
-        # serve() returned without an exception but the ready flag may never
-        # have been set (e.g. early shutdown).
-        _state.status = "failed" if _state.error else "stopped"
+    # ``uvicorn.Server.started`` remains true after ``serve()`` returns.  Do
+    # not leave a backend that was observed as ready stuck in that stale state.
+    _state.status = "stopped"
+    LOGGER.info("Director backend stopped")
 
 
 def _shutdown_backend() -> None:
@@ -306,14 +359,18 @@ def _shutdown_backend() -> None:
     if server is not None:
         server.should_exit = True
     if thread is not None:
-        thread.join(timeout=10.0)
+        thread.join(timeout=_ATEXIT_JOIN_TIMEOUT_SECONDS)
+        _record_shutdown_timeout(thread, _ATEXIT_JOIN_TIMEOUT_SECONDS)
 
 
 def _start_backend() -> None:
+    _state.status = "starting"
+    _state.error = None
+    _state.server = None
+    _state.port = None
     version_error = _comfyui_version_check()
     if version_error is not None:
-        _state.status = "failed"
-        _state.error = version_error
+        _set_backend_failure(version_error)
         LOGGER.error("Director backend cannot start: %s", version_error)
         return
     database_path = _database_location()
@@ -343,7 +400,10 @@ async def _on_comfy_shutdown(_app: web.Application) -> None:
         server.should_exit = True
     thread = _state.thread
     if thread is not None:
-        await asyncio.get_running_loop().run_in_executor(None, thread.join, 8.0)
+        await asyncio.get_running_loop().run_in_executor(
+            None, thread.join, _COMFY_SHUTDOWN_JOIN_TIMEOUT_SECONDS
+        )
+        _record_shutdown_timeout(thread, _COMFY_SHUTDOWN_JOIN_TIMEOUT_SECONDS)
     if _proxy_session is not None and not _proxy_session.closed:
         await _proxy_session.close()
     _proxy_session = None
@@ -358,7 +418,11 @@ def _register_routes() -> None:
 
     @routes.get("/directordeck/status")
     async def _director_status(_request: web.Request) -> web.Response:
-        if _state.status == "starting" and _state.server is not None and _state.server.started:
+        if (
+            _state.status == "starting"
+            and _state.server is not None
+            and getattr(_state.server, "started", False)
+        ):
             _state.status = "ready"
         return web.json_response(
             {
@@ -366,7 +430,7 @@ def _register_routes() -> None:
                 "error": _state.error,
                 "version": _state.version,
                 "database_path": _state.database_path,
-                "comfy_url": _comfyui_loopback_url(),
+                "comfy_url": _comfyui_callback_url(),
                 "raylight": {
                     "status": _state.raylight,
                     "detail": _state.raylight_detail,
@@ -381,9 +445,14 @@ def _register_routes() -> None:
 
     @routes.route("*", "/directordeck/api/{tail:.*}")
     async def _director_api_proxy(request: web.Request) -> web.StreamResponse:
-        if _state.status == "failed":
+        if _state.status in {"failed", "stopped"}:
+            error = (
+                "directordeck_backend_failed"
+                if _state.status == "failed"
+                else "directordeck_backend_stopped"
+            )
             return web.json_response(
-                {"error": "directordeck_backend_failed", "detail": _state.error}, status=503
+                {"error": error, "detail": _state.error}, status=503
             )
         server = _state.server
         if server is None or not server.started or _state.port is None:
@@ -417,7 +486,7 @@ def _register_routes() -> None:
             name: value
             for name, value in upstream.headers.items()
             if name.lower() not in _HOP_BY_HOP_HEADERS
-            and name.lower() not in {"content-length", "content-encoding"}
+            and name.lower() != "content-length"
         }
         downstream = web.StreamResponse(
             status=upstream.status, reason=upstream.reason, headers=response_headers

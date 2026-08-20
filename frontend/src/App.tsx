@@ -4078,7 +4078,7 @@ export default function App() {
 
   const cancel = async (id: string) => {
     try {
-      const task = await directorApi.cancelTask(id);
+      const task = await directorApi.cancelTask(id, activeProjectIdRef.current);
       taskListRequest.current += 1;
       dispatch({ type: "tasks/upsert", task });
       void loadTasks(undefined, true);
@@ -4088,7 +4088,10 @@ export default function App() {
   };
   const confirmComfyRestartRecovery = async (id: string) => {
     try {
-      const task = await directorApi.confirmComfyRestartRecovery(id);
+      const task = await directorApi.confirmComfyRestartRecovery(
+        id,
+        activeProjectIdRef.current,
+      );
       dispatch({ type: "tasks/upsert", task });
       setToast("已确认 ComfyUI 重启，导演台任务已结束");
     } catch (reason) {
@@ -4213,7 +4216,10 @@ export default function App() {
     let cancelledCount = 0;
     try {
       for (let index = 0; index < ids.length; index += 100) {
-        const result = await directorApi.cancelTasks(ids.slice(index, index + 100));
+        const result = await directorApi.cancelTasks(
+          ids.slice(index, index + 100),
+          activeProjectIdRef.current,
+        );
         cancelledCount += result.requested_count;
         result.jobs.forEach((task) => dispatch({ type: "tasks/upsert", task }));
       }
