@@ -58,6 +58,7 @@ import {
   timelineProjectDocumentHash,
   TIMELINE_WAL_FORMAT,
   TIMELINE_WAL_VERSION,
+  type TimelineAction,
   type TimelineProject,
   UNBOUND_TIMELINE_WAL_STORAGE_KEY,
   updateRef2VASourceRange,
@@ -239,6 +240,7 @@ describe("统一 timeline domain", () => {
       asset: video,
       anchorId: state.project.segments[0].id,
       position: "after",
+      newId: "test-inserted-video-segment",
     });
     expect(state.project.segments[1]).toMatchObject({
       mode: "ref2va",
@@ -298,6 +300,11 @@ describe("统一 timeline domain", () => {
       assets: videos,
       anchorId: first.id,
       position: "after",
+      newIds: [
+        "test-batch-video-segment-1",
+        "test-batch-video-segment-2",
+        "test-batch-video-segment-3",
+      ],
     });
     const inserted = next.project.segments.slice(1, 4);
 
@@ -332,6 +339,7 @@ describe("统一 timeline domain", () => {
       assets: [image, firstVideo, overflowVideo],
       anchorId: anchor.id,
       position: "after",
+      newIds: ["test-capacity-video-segment"],
     });
 
     expect(next.project.segments).toHaveLength(128);
@@ -346,7 +354,263 @@ describe("统一 timeline domain", () => {
       type: "segment/insert-videos",
       assets: [overflowVideo],
       anchorId: next.project.segments.at(-1)!.id,
+      newIds: [],
     })).toBe(next);
+  });
+
+  it("所有会创建片段 ID 的结构 action 都可确定性重放，reducer 内不再取随机数", () => {
+    const insertState = createTimelineEditorState();
+    const splitState = {
+      ...createTimelineEditorState(),
+      playhead_seconds: 2,
+    };
+    const sourceState = createTimelineEditorState();
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      id: sourceState.project.segments[0].id,
+      duration_seconds: 10,
+      source_video: video,
+      source_start_seconds: 2,
+      source_duration_seconds: 12,
+    };
+    sourceState.project = { ...sourceState.project, segments: [source] };
+    const expectedSource = {
+      asset_id: video.id,
+      source_start_seconds: 2,
+      source_duration_seconds: 12,
+      project_fps: sourceState.project.render.fps,
+    };
+    const modeState = createTimelineEditorState();
+    const cases: Array<{
+      name: string;
+      state: ReturnType<typeof createTimelineEditorState>;
+      action: TimelineAction;
+      expectedNewIds: string[];
+    }> = [
+      {
+        name: "insert",
+        state: insertState,
+        action: { type: "segment/insert", position: "after", newId: "deterministic-insert" },
+        expectedNewIds: ["deterministic-insert"],
+      },
+      {
+        name: "insert-video",
+        state: insertState,
+        action: {
+          type: "segment/insert-video",
+          asset: video,
+          newId: "deterministic-video",
+        },
+        expectedNewIds: ["deterministic-video"],
+      },
+      {
+        name: "insert-videos",
+        state: insertState,
+        action: {
+          type: "segment/insert-videos",
+          assets: [
+            { ...video, id: "deterministic-asset-1" },
+            { ...video, id: "deterministic-asset-2" },
+          ],
+          newIds: ["deterministic-videos-1", "deterministic-videos-2"],
+        },
+        expectedNewIds: ["deterministic-videos-1", "deterministic-videos-2"],
+      },
+      {
+        name: "delete-selected fallback",
+        state: insertState,
+        action: {
+          type: "segment/delete-selected",
+          fallbackId: "deterministic-delete-fallback",
+        },
+        expectedNewIds: ["deterministic-delete-fallback"],
+      },
+      {
+        name: "split-selected",
+        state: splitState,
+        action: { type: "segment/split-selected", newId: "deterministic-split-right" },
+        expectedNewIds: ["deterministic-split-right"],
+      },
+      {
+        name: "apply-source-cuts",
+        state: sourceState,
+        action: {
+          type: "segment/apply-source-cuts",
+          id: source.id,
+          cutFrames: [5 * 24, 9 * 24],
+          frameRate: 24,
+          expected: expectedSource,
+          newIds: ["deterministic-cut-2", "deterministic-cut-3"],
+        },
+        expectedNewIds: ["deterministic-cut-2", "deterministic-cut-3"],
+      },
+      {
+        name: "split-evenly",
+        state: sourceState,
+        action: {
+          type: "segment/split-evenly",
+          id: source.id,
+          pieces: 3,
+          newIds: ["deterministic-even-2", "deterministic-even-3"],
+        },
+        expectedNewIds: ["deterministic-even-2", "deterministic-even-3"],
+      },
+      {
+        name: "duplicate-selected",
+        state: insertState,
+        action: {
+          type: "segment/duplicate-selected",
+          newIds: ["deterministic-duplicate"],
+        },
+        expectedNewIds: ["deterministic-duplicate"],
+      },
+      {
+        name: "set-mode keeps identity without throwaway ID",
+        state: modeState,
+        action: {
+          type: "segment/set-mode",
+          ids: [modeState.project.segments[0].id],
+          mode: "ref2va",
+        },
+        expectedNewIds: [],
+      },
+    ];
+    const randomUUID = vi.spyOn(globalThis.crypto, "randomUUID");
+
+    try {
+      for (const testCase of cases) {
+        const first = timelineEditorReducer(testCase.state, testCase.action);
+        const replay = timelineEditorReducer(testCase.state, testCase.action);
+        expect(first, testCase.name).toEqual(replay);
+        expect(first, testCase.name).not.toBe(testCase.state);
+        const outputIds = first.project.segments.map((segment) => segment.id);
+        for (const expectedId of testCase.expectedNewIds) {
+          expect(outputIds, testCase.name).toContain(expectedId);
+        }
+      }
+      expect(randomUUID).not.toHaveBeenCalled();
+    } finally {
+      randomUUID.mockRestore();
+    }
+  });
+
+  it("结构 action 对缺失、非法、重复和冲突的预生成 ID 原子失败封闭", () => {
+    const state = createTimelineEditorState();
+    const existingId = state.project.segments[0].id;
+    const invalidScalarActions = [
+      { type: "segment/insert", position: "after" },
+      { type: "segment/insert", position: "after", newId: "" },
+      { type: "segment/insert", position: "after", newId: "x".repeat(129) },
+      { type: "segment/insert", position: "after", newId: existingId },
+    ] as unknown as TimelineAction[];
+    for (const action of invalidScalarActions) {
+      expect(timelineEditorReducer(state, action)).toBe(state);
+    }
+
+    const twoVideos = [
+      { ...video, id: "invalid-id-asset-1" },
+      { ...video, id: "invalid-id-asset-2" },
+    ];
+    const invalidBatchActions = [
+      { type: "segment/insert-videos", assets: twoVideos },
+      { type: "segment/insert-videos", assets: twoVideos, newIds: "ab" },
+      { type: "segment/insert-videos", assets: twoVideos, newIds: { 0: "one", 1: "two", length: 2 } },
+      { type: "segment/insert-videos", assets: twoVideos, newIds: [] },
+      { type: "segment/insert-videos", assets: twoVideos, newIds: ["only-one"] },
+      { type: "segment/insert-videos", assets: twoVideos, newIds: ["one", "two", "extra"] },
+      { type: "segment/insert-videos", assets: twoVideos, newIds: ["duplicate", "duplicate"] },
+      { type: "segment/insert-videos", assets: twoVideos, newIds: [existingId, "new-id"] },
+      { type: "segment/insert-videos", assets: twoVideos, newIds: ["x".repeat(129), "new-id"] },
+    ] as unknown as TimelineAction[];
+    for (const action of invalidBatchActions) {
+      expect(timelineEditorReducer(state, action)).toBe(state);
+    }
+
+    const splitState = { ...createTimelineEditorState(), playhead_seconds: 2 };
+    const sourceState = createTimelineEditorState();
+    const source = {
+      ...createTimelineSegment("ref2va", 1),
+      id: sourceState.project.segments[0].id,
+      duration_seconds: 10,
+      source_video: video,
+      source_start_seconds: 2,
+      source_duration_seconds: 12,
+    };
+    sourceState.project = { ...sourceState.project, segments: [source] };
+    const collisionCases: Array<{
+      state: ReturnType<typeof createTimelineEditorState>;
+      action: TimelineAction;
+    }> = [
+      {
+        state,
+        action: { type: "segment/insert-video", asset: video, newId: existingId },
+      },
+      {
+        state,
+        action: { type: "segment/delete-selected", fallbackId: existingId },
+      },
+      {
+        state: splitState,
+        action: {
+          type: "segment/split-selected",
+          newId: splitState.project.segments[0].id,
+        },
+      },
+      {
+        state: sourceState,
+        action: {
+          type: "segment/apply-source-cuts",
+          id: source.id,
+          cutFrames: [5 * 24],
+          frameRate: 24,
+          expected: {
+            asset_id: video.id,
+            source_start_seconds: 2,
+            source_duration_seconds: 12,
+            project_fps: sourceState.project.render.fps,
+          },
+          newIds: [source.id],
+        },
+      },
+      {
+        state: sourceState,
+        action: {
+          type: "segment/split-evenly",
+          id: source.id,
+          pieces: 2,
+          newIds: [source.id],
+        },
+      },
+      {
+        state,
+        action: { type: "segment/duplicate-selected", newIds: [existingId] },
+      },
+    ];
+    for (const testCase of collisionCases) {
+      expect(timelineEditorReducer(testCase.state, testCase.action)).toBe(testCase.state);
+    }
+  });
+
+  it("复制片段按剩余容量精确消费预生成 ID", () => {
+    const state = createTimelineEditorState();
+    state.project.segments = Array.from({ length: 127 }, (_, index) => ({
+      ...createTimelineSegment("fl2va", index + 1),
+      id: `capacity-duplicate-source-${index}`,
+    }));
+    state.selected_segment_ids = state.project.segments.slice(0, 2).map((segment) => segment.id);
+    state.active_segment_id = state.selected_segment_ids[0];
+    state.selection_anchor_id = state.selected_segment_ids[0];
+
+    const exact = timelineEditorReducer(state, {
+      type: "segment/duplicate-selected",
+      newIds: ["capacity-duplicate-copy"],
+    });
+    expect(exact.project.segments).toHaveLength(128);
+    expect(exact.project.segments[2]?.id).toBe("capacity-duplicate-copy");
+    expect(timelineEditorReducer(state, {
+      type: "segment/duplicate-selected",
+      newIds: ["capacity-duplicate-copy-1", "capacity-duplicate-copy-2"],
+    })).toBe(state);
   });
 
   it("源范围编辑与更短替换视频保持既有源到输出时长比例", () => {
@@ -643,9 +907,17 @@ describe("统一 timeline domain", () => {
   it("Ctrl/Shift 选择使用稳定 ID，重排不改 ID", () => {
     let state = createTimelineEditorState();
     const first = state.project.segments[0].id;
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    state = timelineEditorReducer(state, {
+      type: "segment/insert",
+      position: "after",
+      newId: "test-selection-segment-2",
+    });
     const second = state.project.segments[1].id;
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    state = timelineEditorReducer(state, {
+      type: "segment/insert",
+      position: "after",
+      newId: "test-selection-segment-3",
+    });
     const third = state.project.segments[2].id;
     state = timelineEditorReducer(state, { type: "segment/select", id: first });
     expect(runnableTimelineSegmentIds(state)).toEqual([first]);
@@ -729,10 +1001,18 @@ describe("统一 timeline domain", () => {
 
   it("在片段 02 前插空段时分配新的默认编号且保留已有名称", () => {
     let state = createTimelineEditorState();
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    state = timelineEditorReducer(state, {
+      type: "segment/insert",
+      position: "after",
+      newId: "test-title-segment-after",
+    });
     expect(state.project.segments.map((segment) => segment.title)).toEqual(["片段 01", "片段 02"]);
 
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "before" });
+    state = timelineEditorReducer(state, {
+      type: "segment/insert",
+      position: "before",
+      newId: "test-title-segment-before",
+    });
 
     expect(state.project.segments.map((segment) => segment.title)).toEqual([
       "片段 01",
@@ -752,8 +1032,16 @@ describe("统一 timeline domain", () => {
       selection_anchor_id: segments[3].id,
     };
 
-    const before = timelineEditorReducer(initial, { type: "segment/insert", position: "before" });
-    const after = timelineEditorReducer(initial, { type: "segment/insert", position: "after" });
+    const before = timelineEditorReducer(initial, {
+      type: "segment/insert",
+      position: "before",
+      newId: "test-default-number-before",
+    });
+    const after = timelineEditorReducer(initial, {
+      type: "segment/insert",
+      position: "after",
+      newId: "test-default-number-after",
+    });
 
     expect(before.project.segments.map((segment) => segment.title)).toEqual([
       "片段 01",
@@ -981,7 +1269,10 @@ describe("统一 timeline domain", () => {
       prompt: "重绘",
     };
     state = { ...state, project: { ...state.project, segments: [source] }, playhead_seconds: 2 };
-    state = timelineEditorReducer(state, { type: "segment/split-selected" });
+    state = timelineEditorReducer(state, {
+      type: "segment/split-selected",
+      newId: "test-playhead-split-right",
+    });
     const [left, right] = state.project.segments;
     expect(left).toMatchObject({ mode: "ref2va", duration_seconds: 2, source_start_seconds: 2, source_duration_seconds: 3 });
     expect(right).toMatchObject({ mode: "ref2va", duration_seconds: 6, source_start_seconds: 5, source_duration_seconds: 9 });
@@ -1003,7 +1294,14 @@ describe("统一 timeline domain", () => {
     };
     state = { ...state, project: { ...state.project, segments: [source] } };
     const expected = { asset_id: video.id, source_start_seconds: 2, source_duration_seconds: 12, project_fps: 24 };
-    const split = splitTimelineSourceSegmentAtCuts(state, source.id, [0, 5 * 24, 9 * 24, 20 * 24], 24, expected);
+    const split = splitTimelineSourceSegmentAtCuts(
+      state,
+      source.id,
+      [0, 5 * 24, 9 * 24, 20 * 24],
+      24,
+      ["test-shot-cut-2", "test-shot-cut-3"],
+      expected,
+    );
     expect(split.project.segments).toHaveLength(3);
     expect(split.project.segments).toEqual([
       expect.objectContaining({ id: source.id, mode: "ref2va", source_start_seconds: 2, source_duration_seconds: 3, duration_seconds: 2.5, reference_images: source.reference_images }),
@@ -1014,10 +1312,17 @@ describe("统一 timeline domain", () => {
     expect(split.selected_segment_ids).toEqual(split.project.segments.map((segment) => segment.id));
     expect(split.active_segment_id).toBe(split.project.segments[0].id);
 
-    const stale = splitTimelineSourceSegmentAtCuts(state, source.id, [5 * 24], 24, {
-      ...expected,
-      source_duration_seconds: 11,
-    });
+    const stale = splitTimelineSourceSegmentAtCuts(
+      state,
+      source.id,
+      [5 * 24],
+      24,
+      ["test-stale-shot-cut"],
+      {
+        ...expected,
+        source_duration_seconds: 11,
+      },
+    );
     expect(stale).toBe(state);
   });
 
@@ -1034,7 +1339,11 @@ describe("统一 timeline domain", () => {
     };
     state = { ...state, project: { ...state.project, segments: [source] } };
 
-    const split = splitTimelineSourceSegmentEvenly(state, source.id, 4);
+    const split = splitTimelineSourceSegmentEvenly(state, source.id, 4, [
+      "test-even-split-2",
+      "test-even-split-3",
+      "test-even-split-4",
+    ]);
     expect(split.project.segments).toHaveLength(4);
     expect(split.project.segments.map((segment) => segment.mode === "ref2va" ? [
       segment.source_start_seconds,
@@ -1054,13 +1363,22 @@ describe("统一 timeline domain", () => {
       ...state,
       project: { ...state.project, segments: [oddFrameSource] },
     };
-    const oddFrameSplit = splitTimelineSourceSegmentEvenly(oddFrameState, source.id, 4);
+    const oddFrameSplit = splitTimelineSourceSegmentEvenly(oddFrameState, source.id, 4, [
+      "test-odd-even-split-2",
+      "test-odd-even-split-3",
+      "test-odd-even-split-4",
+    ]);
     expect(oddFrameSplit.project.segments.map((segment) =>
       segment.mode === "ref2va" ? Math.round(segment.source_duration_seconds * 24) : 0,
     )).toEqual([61, 60, 60, 60]);
 
-    expect(splitTimelineSourceSegmentEvenly(state, source.id, 49)).toBe(state);
-    expect(splitTimelineSourceSegmentEvenly(state, source.id, 1)).toBe(state);
+    expect(splitTimelineSourceSegmentEvenly(
+      state,
+      source.id,
+      49,
+      Array.from({ length: 48 }, (_, index) => `test-overflow-even-split-${index}`),
+    )).toBe(state);
+    expect(splitTimelineSourceSegmentEvenly(state, source.id, 1, [])).toBe(state);
   });
 
   it("允许显式全选或清空片段复选状态", () => {
@@ -1154,7 +1472,12 @@ describe("统一 timeline domain", () => {
   it("用单一选择派生启用运行集合，禁用和重新启用不丢失选择", () => {
     let state = createTimelineEditorState();
     const first = state.project.segments[0].id;
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "after", mode: "ref2va" });
+    state = timelineEditorReducer(state, {
+      type: "segment/insert",
+      position: "after",
+      mode: "ref2va",
+      newId: "test-runnable-ref2va-segment",
+    });
     const second = state.project.segments[1].id;
     expect(state.selected_segment_ids).toEqual([first, second]);
     expect(runnableTimelineSegmentIds(state)).toEqual([first, second]);
@@ -1191,7 +1514,10 @@ describe("统一 timeline domain", () => {
     expect(state.active_segment_id).toBeNull();
 
     let fallback = createTimelineEditorState();
-    fallback = timelineEditorReducer(fallback, { type: "segment/delete-selected" });
+    fallback = timelineEditorReducer(fallback, {
+      type: "segment/delete-selected",
+      fallbackId: "test-runnable-fallback-segment",
+    });
     expect(runnableTimelineSegmentIds(fallback)).toEqual([fallback.project.segments[0].id]);
   });
 
@@ -1212,8 +1538,15 @@ describe("统一 timeline domain", () => {
 
   it("复制片段后只选择副本并把第一个副本设为活动片段", () => {
     let state = createTimelineEditorState();
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
-    state = timelineEditorReducer(state, { type: "segment/duplicate-selected" });
+    state = timelineEditorReducer(state, {
+      type: "segment/insert",
+      position: "after",
+      newId: "test-duplicate-source-2",
+    });
+    state = timelineEditorReducer(state, {
+      type: "segment/duplicate-selected",
+      newIds: ["test-duplicate-copy-1", "test-duplicate-copy-2"],
+    });
 
     const copiedIds = state.selected_segment_ids;
     expect(copiedIds).toHaveLength(2);

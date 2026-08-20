@@ -298,7 +298,7 @@ export function deriveSegmentRecipe(
  * server-side generated takes. Prefer a collision-resistant UUID while
  * retaining the legacy generator for older browsers and test environments.
  */
-function createSegmentId(): string {
+export function createSegmentId(): string {
   try {
     const uuid = globalThis.crypto?.randomUUID?.();
     if (uuid) return `segment-${uuid}`;
@@ -397,9 +397,10 @@ export function promptSkeleton(segment: TimelineSegment): string {
 function segmentBase<M extends TimelineGenerationMode>(
   mode: M,
   index: number,
+  id?: string,
 ): TimelineSegmentBase<M> {
   return {
-    id: createSegmentId(),
+    id: id ?? createSegmentId(),
     mode,
     title: defaultTimelineSegmentTitle(index),
     prompt: "",
@@ -436,20 +437,24 @@ function nextDefaultTimelineSegmentNumber(project: TimelineProject): number {
 export function createTimelineSegment(
   mode: "fl2va",
   index: number,
+  id?: string,
 ): FL2VASegment;
 export function createTimelineSegment(
   mode: "ref2va",
   index: number,
+  id?: string,
 ): Ref2VASegment;
 export function createTimelineSegment(
   mode: TimelineGenerationMode,
   index: number,
+  id?: string,
 ): TimelineSegment;
 export function createTimelineSegment(
   mode: TimelineGenerationMode,
   index: number,
+  id?: string,
 ): TimelineSegment {
-  const base = segmentBase(mode, index);
+  const base = segmentBase(mode, index, id);
   switch (mode) {
     case "fl2va":
       return { ...base, mode: "fl2va", first_image: null, last_image: null };
@@ -584,7 +589,9 @@ export function changeSegmentMode(
   mode: TimelineGenerationMode,
 ): TimelineSegment {
   if (segment.mode === mode) return segment;
-  const fresh = createTimelineSegment(mode, 1);
+  // Keep reducer-reachable mode changes free of random side effects. The
+  // segment keeps its durable identity across the discriminated-union rebuild.
+  const fresh = createTimelineSegment(mode, 1, segment.id);
   const base = copyBase(segment, fresh);
   switch (mode) {
     case "fl2va":
@@ -707,12 +714,43 @@ function touchProject(project: TimelineProject, segments: TimelineSegment[]): Ti
   return { ...project, segments };
 }
 
+const MAX_TIMELINE_SEGMENT_ID_LENGTH = 128;
+
+/**
+ * Reducer actions are also a runtime boundary (tests, devtools and stale
+ * bundles can bypass TypeScript). Reject the whole structural edit unless its
+ * preallocated IDs exactly match this transition and preserve project-wide
+ * identity uniqueness.
+ */
+function validNewTimelineSegmentIds(
+  project: TimelineProject,
+  ids: unknown,
+  expectedCount: number,
+): ids is readonly string[] {
+  if (!Array.isArray(ids) || ids.length !== expectedCount) return false;
+  const existing = new Set(project.segments.map((segment) => segment.id));
+  const incoming = new Set<string>();
+  for (const id of ids) {
+    if (
+      typeof id !== "string" ||
+      id.length < 1 ||
+      id.length > MAX_TIMELINE_SEGMENT_ID_LENGTH ||
+      existing.has(id) ||
+      incoming.has(id)
+    ) return false;
+    incoming.add(id);
+  }
+  return true;
+}
+
 export function insertTimelineSegment(
   state: TimelineEditorState,
   position: "before" | "after",
+  newId: string,
   mode: TimelineGenerationMode = "fl2va",
 ): TimelineEditorState {
   if (state.project.segments.length >= 128) return state;
+  if (!validNewTimelineSegmentIds(state.project, [newId], 1)) return state;
   const selectedId = state.active_segment_id ?? state.selected_segment_ids.at(-1);
   const selectedIndex = selectedId
     ? timelineIndexById(state.project, selectedId)
@@ -720,7 +758,11 @@ export function insertTimelineSegment(
   const insertionIndex = selectedIndex < 0
     ? state.project.segments.length
     : selectedIndex + (position === "after" ? 1 : 0);
-  const segment = createTimelineSegment(mode, nextDefaultTimelineSegmentNumber(state.project));
+  const segment = createTimelineSegment(
+    mode,
+    nextDefaultTimelineSegmentNumber(state.project),
+    newId,
+  );
   const segments = [...state.project.segments];
   segments.splice(insertionIndex, 0, segment);
   const selected = new Set([...state.selected_segment_ids, segment.id]);
@@ -736,12 +778,14 @@ export function insertTimelineSegment(
 export function insertTimelineVideoAsset(
   state: TimelineEditorState,
   asset: AssetReference,
+  newId: string,
   position: "before" | "after" = "after",
 ): TimelineEditorState {
   return insertTimelineVideoAssetAtAnchor(
     state,
     asset,
     state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null,
+    newId,
     position,
   );
 }
@@ -751,9 +795,16 @@ export function insertTimelineVideoAssetAtAnchor(
   state: TimelineEditorState,
   asset: AssetReference,
   anchorId: string | null,
+  newId: string,
   position: "before" | "after" = "after",
 ): TimelineEditorState {
-  return insertTimelineVideoAssetsAtAnchor(state, [asset], anchorId, position);
+  return insertTimelineVideoAssetsAtAnchor(
+    state,
+    [asset],
+    anchorId,
+    [newId],
+    position,
+  );
 }
 
 /** Inserts multiple source-backed Ref2VA segments in one reducer transition. */
@@ -761,6 +812,7 @@ export function insertTimelineVideoAssetsAtAnchor(
   state: TimelineEditorState,
   assets: readonly AssetReference[],
   anchorId: string | null,
+  newIds: readonly string[],
   position: "before" | "after" = "after",
 ): TimelineEditorState {
   const capacity = Math.max(0, 128 - state.project.segments.length);
@@ -768,6 +820,7 @@ export function insertTimelineVideoAssetsAtAnchor(
     .filter((asset) => asset.kind === "video")
     .slice(0, capacity);
   if (!videos.length) return state;
+  if (!validNewTimelineSegmentIds(state.project, newIds, videos.length)) return state;
   const anchorIndex = anchorId ? timelineIndexById(state.project, anchorId) : -1;
   const fallbackIndex = state.selected_segment_ids.at(-1)
     ? timelineIndexById(state.project, state.selected_segment_ids.at(-1) as string)
@@ -777,7 +830,7 @@ export function insertTimelineVideoAssetsAtAnchor(
     ? state.project.segments.length
     : resolvedAnchor + (position === "after" ? 1 : 0);
   let allocationProject = state.project;
-  const inserted = videos.map((asset) => {
+  const inserted = videos.map((asset, videoIndex) => {
     // A source video is editing material, not a five-second reference sample.
     // Materialize its complete server-probed range on the timeline first;
     // compile validation remains the boundary that requires the user to split a
@@ -785,7 +838,7 @@ export function insertTimelineVideoAssetsAtAnchor(
     const duration = Math.max(0.01, asset.metadata?.duration ?? 5);
     const nextDefaultIndex = nextDefaultTimelineSegmentNumber(allocationProject);
     const segment: Ref2VASegment = {
-      ...createTimelineSegment("ref2va", nextDefaultIndex),
+      ...createTimelineSegment("ref2va", nextDefaultIndex, newIds[videoIndex]),
       title: asset.name.replace(/\.[^.]+$/, "") || defaultTimelineSegmentTitle(
         nextDefaultIndex,
       ),
@@ -832,12 +885,19 @@ export function moveTimelineSegment(
   return { ...state, project: touchProject(state.project, segments) };
 }
 
-export function deleteSelectedSegments(state: TimelineEditorState): TimelineEditorState {
+export function deleteSelectedSegments(
+  state: TimelineEditorState,
+  fallbackId: string,
+): TimelineEditorState {
   const selected = new Set(state.selected_segment_ids);
   if (!selected.size) return state;
   let segments = state.project.segments.filter((segment) => !selected.has(segment.id));
   const createdFallback = segments.length === 0;
-  if (createdFallback) segments = [createTimelineSegment("fl2va", 1)];
+  if (
+    createdFallback &&
+    !validNewTimelineSegmentIds(state.project, [fallbackId], 1)
+  ) return state;
+  if (createdFallback) segments = [createTimelineSegment("fl2va", 1, fallbackId)];
   const first = segments[Math.min(
     Math.max(0, timelineIndexById(state.project, state.selected_segment_ids[0])),
     segments.length - 1,
@@ -979,8 +1039,12 @@ export function canSplitSelectedSegment(state: TimelineEditorState): boolean {
   return leftRequest >= minimumRequest && rightRequest >= minimumRequest;
 }
 
-export function splitSelectedSegment(state: TimelineEditorState): TimelineEditorState {
+export function splitSelectedSegment(
+  state: TimelineEditorState,
+  newId: string,
+): TimelineEditorState {
   if (!canSplitSelectedSegment(state)) return state;
+  if (!validNewTimelineSegmentIds(state.project, [newId], 1)) return state;
   const id = state.active_segment_id as string;
   const index = timelineIndexById(state.project, id);
   const source = state.project.segments[index];
@@ -992,7 +1056,7 @@ export function splitSelectedSegment(state: TimelineEditorState): TimelineEditor
     : 0;
   const requestOffset = source.duration_seconds * ratio;
   const right = structuredClone(source) as TimelineSegment;
-  right.id = createSegmentId();
+  right.id = newId;
   right.title = `${source.title} · 后段`;
   right.duration_seconds = source.duration_seconds - requestOffset;
   const left = { ...source, duration_seconds: requestOffset } as TimelineSegment;
@@ -1030,6 +1094,7 @@ export function splitTimelineSourceSegmentAtCuts(
   segmentId: string,
   cutFrames: readonly number[],
   frameRate: number,
+  newIds: readonly string[],
   expected?: SourceCutExpectation,
 ): TimelineEditorState {
   const index = timelineIndexById(state.project, segmentId);
@@ -1058,12 +1123,13 @@ export function splitTimelineSourceSegmentAtCuts(
     .sort((left, right) => left - right)
     .slice(0, Math.max(0, 128 - state.project.segments.length));
   if (!cuts.length) return state;
+  if (!validNewTimelineSegmentIds(state.project, newIds, cuts.length)) return state;
   const boundaries = [sourceStart, ...cuts, sourceEnd];
   const replacements = boundaries.slice(0, -1).map((start, pieceIndex) => {
     const end = boundaries[pieceIndex + 1];
     const sourceDuration = end - start;
     const piece = structuredClone(source) as SourceVideoSegment;
-    piece.id = pieceIndex === 0 ? source.id : createSegmentId();
+    piece.id = pieceIndex === 0 ? source.id : newIds[pieceIndex - 1];
     piece.title = pieceIndex === 0 ? source.title : `${source.title} · 分镜 ${pieceIndex + 1}`;
     piece.source_start_seconds = start;
     piece.source_duration_seconds = sourceDuration;
@@ -1090,6 +1156,7 @@ export function splitTimelineSourceSegmentEvenly(
   state: TimelineEditorState,
   segmentId: string,
   pieces: number,
+  newIds: readonly string[],
 ): TimelineEditorState {
   const source = state.project.segments.find((segment) => segment.id === segmentId);
   const count = Math.trunc(pieces);
@@ -1121,7 +1188,7 @@ export function splitTimelineSourceSegmentEvenly(
     cursorFrame += baseFrames + (index < remainderFrames ? 1 : 0);
     return cursorFrame;
   });
-  return splitTimelineSourceSegmentAtCuts(state, segmentId, cuts, fps, {
+  return splitTimelineSourceSegmentAtCuts(state, segmentId, cuts, fps, newIds, {
     asset_id: source.source_video.id,
     source_start_seconds: source.source_start_seconds,
     source_duration_seconds: source.source_duration_seconds,
@@ -1129,16 +1196,20 @@ export function splitTimelineSourceSegmentEvenly(
   });
 }
 
-export function duplicateSelectedSegments(state: TimelineEditorState): TimelineEditorState {
+export function duplicateSelectedSegments(
+  state: TimelineEditorState,
+  newIds: readonly string[],
+): TimelineEditorState {
   if (!state.selected_segment_ids.length || state.project.segments.length >= 128) return state;
   const selected = new Set(state.selected_segment_ids);
   const capacity = 128 - state.project.segments.length;
   const sources = state.project.segments
     .filter((segment) => selected.has(segment.id))
     .slice(0, capacity);
-  const copies = sources.map((segment) => ({
+  if (!validNewTimelineSegmentIds(state.project, newIds, sources.length)) return state;
+  const copies = sources.map((segment, copyIndex) => ({
     ...structuredClone(segment),
-    id: createSegmentId(),
+    id: newIds[copyIndex],
     title: `${segment.title} · 副本`,
   } as TimelineSegment));
   if (!copies.length) return state;
@@ -1363,16 +1434,16 @@ export type TimelineAction =
   | { type: "segment/toggle-selection"; id: string }
   | { type: "segment/set-selection"; ids: string[] }
   | { type: "segment/set-enabled"; ids: string[]; enabled: boolean }
-  | { type: "segment/insert"; position: "before" | "after"; mode?: TimelineGenerationMode }
-  | { type: "segment/insert-video"; position?: "before" | "after"; anchorId?: string | null; asset: AssetReference }
-  | { type: "segment/insert-videos"; position?: "before" | "after"; anchorId?: string | null; assets: AssetReference[] }
+  | { type: "segment/insert"; position: "before" | "after"; mode?: TimelineGenerationMode; newId: string }
+  | { type: "segment/insert-video"; position?: "before" | "after"; anchorId?: string | null; asset: AssetReference; newId: string }
+  | { type: "segment/insert-videos"; position?: "before" | "after"; anchorId?: string | null; assets: AssetReference[]; newIds: string[] }
   | { type: "segment/move"; draggedId: string; targetId: string }
-  | { type: "segment/delete-selected" }
+  | { type: "segment/delete-selected"; fallbackId: string }
   | { type: "segment/merge-selected" }
-  | { type: "segment/split-selected" }
-  | { type: "segment/apply-source-cuts"; id: string; cutFrames: number[]; frameRate: number; expected: SourceCutExpectation }
-  | { type: "segment/split-evenly"; id: string; pieces: number }
-  | { type: "segment/duplicate-selected" }
+  | { type: "segment/split-selected"; newId: string }
+  | { type: "segment/apply-source-cuts"; id: string; cutFrames: number[]; frameRate: number; expected: SourceCutExpectation; newIds: string[] }
+  | { type: "segment/split-evenly"; id: string; pieces: number; newIds: string[] }
+  | { type: "segment/duplicate-selected"; newIds: string[] }
   | {
       type: "segment/patch-base";
       id: string;
@@ -1523,12 +1594,13 @@ export function timelineEditorReducer(
       });
     }
     case "segment/insert":
-      return insertTimelineSegment(state, action.position, action.mode);
+      return insertTimelineSegment(state, action.position, action.newId, action.mode);
     case "segment/insert-video":
       return insertTimelineVideoAssetAtAnchor(
         state,
         action.asset,
         action.anchorId ?? state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null,
+        action.newId,
         action.position,
       );
     case "segment/insert-videos":
@@ -1536,28 +1608,35 @@ export function timelineEditorReducer(
         state,
         action.assets,
         action.anchorId ?? state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null,
+        action.newIds,
         action.position,
       );
     case "segment/move":
       return moveTimelineSegment(state, action.draggedId, action.targetId);
     case "segment/delete-selected":
-      return deleteSelectedSegments(state);
+      return deleteSelectedSegments(state, action.fallbackId);
     case "segment/merge-selected":
       return mergeSelectedSegments(state);
     case "segment/split-selected":
-      return splitSelectedSegment(state);
+      return splitSelectedSegment(state, action.newId);
     case "segment/apply-source-cuts":
       return splitTimelineSourceSegmentAtCuts(
         state,
         action.id,
         action.cutFrames,
         action.frameRate,
+        action.newIds,
         action.expected,
       );
     case "segment/split-evenly":
-      return splitTimelineSourceSegmentEvenly(state, action.id, action.pieces);
+      return splitTimelineSourceSegmentEvenly(
+        state,
+        action.id,
+        action.pieces,
+        action.newIds,
+      );
     case "segment/duplicate-selected":
-      return duplicateSelectedSegments(state);
+      return duplicateSelectedSegments(state, action.newIds);
     case "segment/patch-base":
       return updateTimelineSegment(state, action.id, (segment) => ({
         ...segment,
