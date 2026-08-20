@@ -611,12 +611,15 @@ describe("统一时间线关键交互", () => {
       type: "assets/add",
       assets: [video, image, secondVideo],
     });
-    expect(onDispatch).toHaveBeenNthCalledWith(2, {
+    expect(onDispatch).toHaveBeenNthCalledWith(2, expect.objectContaining({
       type: "segment/insert-videos",
       assets: [video, secondVideo],
       anchorId: state.project.segments[0].id,
       position: "after",
-    });
+    }));
+    const insertVideosAction = onDispatch.mock.calls[1][0] as { ids?: string[] };
+    expect(insertVideosAction.ids).toHaveLength(2);
+    expect(new Set(insertVideosAction.ids).size).toBe(2);
     expect(screen.getByText("已按顺序追加 2 个视频片段；1 个非视频素材仅加入素材库")).toBeInTheDocument();
   });
 
@@ -985,12 +988,14 @@ describe("统一时间线关键交互", () => {
     fireEvent(dropClip!, drop);
     expect(dataTransfer.getData).toHaveBeenCalledWith("application/x-director-asset");
     expect(onDispatch).toHaveBeenCalledTimes(1);
-    expect(onDispatch).toHaveBeenCalledWith({
+    expect(onDispatch).toHaveBeenCalledWith(expect.objectContaining({
       type: "segment/insert-video",
       asset: video,
       anchorId: state.project.segments[0].id,
       position: "before",
-    });
+    }));
+    const insertBeforeAction = onDispatch.mock.calls[0][0] as { id?: string };
+    expect(insertBeforeAction.id).toMatch(/^segment-/);
   });
 
   it("视频落在轨道空白处时以当前检查器焦点作为插入锚点", () => {
@@ -1018,12 +1023,14 @@ describe("统一时间线关键交互", () => {
 
     fireEvent.drop(track!, { dataTransfer });
 
-    expect(onDispatch).toHaveBeenCalledWith({
+    expect(onDispatch).toHaveBeenCalledWith(expect.objectContaining({
       type: "segment/insert-video",
       asset: video,
       anchorId: second.id,
       position: "after",
-    });
+    }));
+    const insertAfterAction = onDispatch.mock.calls[0][0] as { id?: string };
+    expect(insertAfterAction.id).toMatch(/^segment-/);
   });
 
   it("操作系统 Files 落在时间线片段时不会继承素材插片或重排语义", () => {
@@ -2081,7 +2088,7 @@ describe("统一时间线关键交互", () => {
   it("全选覆盖停用片段，禁用所选后仍保持单一选择", async () => {
     const user = userEvent.setup();
     let state = createTimelineEditorState();
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    state = timelineEditorReducer(state, { type: "segment/insert", position: "after", id: "test-select-all-second" });
     const [first, second] = state.project.segments;
     state = timelineEditorReducer(state, {
       type: "segment/set-enabled",
@@ -2285,7 +2292,7 @@ describe("统一时间线关键交互", () => {
 
   it("停用轨可选择和多选，重新启用后仍保持选择", () => {
     let state = createTimelineEditorState();
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    state = timelineEditorReducer(state, { type: "segment/insert", position: "after", id: "test-disabled-track-second" });
     const second = state.project.segments[1];
     state = timelineEditorReducer(state, {
       type: "segment/set-enabled",
@@ -2315,7 +2322,7 @@ describe("统一时间线关键交互", () => {
   it("按钮和键盘删除多个片段时共用带数量的确认", async () => {
     const user = userEvent.setup();
     let state = createTimelineEditorState();
-    state = timelineEditorReducer(state, { type: "segment/insert", position: "after" });
+    state = timelineEditorReducer(state, { type: "segment/insert", position: "after", id: "test-delete-second" });
     const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
     render(<Harness initial={state} />);
 

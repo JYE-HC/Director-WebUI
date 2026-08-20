@@ -31,6 +31,7 @@ import {
   alignedTimelineSegmentDuration,
   canMergeSelectedSegments,
   canSplitSelectedSegment,
+  createSegmentId,
   deriveSegmentRecipe,
   promptSubjectReferences,
   promptSkeleton,
@@ -1716,6 +1717,7 @@ export function LongFormTimelineWorkspace({
         assets: inserted,
         anchorId,
         position: "after",
+        ids: inserted.map(() => createSegmentId()),
       });
       const parts = inserted.length ? [`已按顺序追加 ${inserted.length} 个视频片段`] : [];
       if (videos.length > inserted.length) parts.push(`${videos.length - inserted.length} 个视频仅入库（已达 128 段上限）`);
@@ -1784,6 +1786,7 @@ export function LongFormTimelineWorkspace({
         cutFrames: appliedCuts,
         frameRate: expected.project_fps,
         expected,
+        pieceIds: appliedCuts.map(() => createSegmentId()),
       });
       const truncated = appliedCuts.length < inRangeCuts.length ? "；超出 128 段上限的切点已忽略" : "";
       const warnings = result.warnings.length ? `；${result.warnings.join("；")}` : "";
@@ -1915,7 +1918,7 @@ export function LongFormTimelineWorkspace({
       count > 1 &&
       !window.confirm(`确定删除所选的 ${count} 个片段吗？此操作会同时移除它们的时间线配置。`)
     ) return;
-    onDispatch({ type: "segment/delete-selected" });
+    onDispatch({ type: "segment/delete-selected", fallbackId: createSegmentId() });
   };
 
   const handleTimelineKey = (event: ReactKeyboardEvent) => {
@@ -1928,7 +1931,10 @@ export function LongFormTimelineWorkspace({
     }
     if (command && event.key.toLocaleLowerCase() === "d") {
       event.preventDefault();
-      onDispatch({ type: "segment/duplicate-selected" });
+      onDispatch({
+        type: "segment/duplicate-selected",
+        ids: state.selected_segment_ids.map(() => createSegmentId()),
+      });
       return;
     }
     if (command || event.altKey) return;
@@ -1944,7 +1950,7 @@ export function LongFormTimelineWorkspace({
     }
     if (event.key.toLocaleLowerCase() === "s") {
       event.preventDefault();
-      onDispatch({ type: "segment/split-selected" });
+      onDispatch({ type: "segment/split-selected", newId: createSegmentId() });
       return;
     }
     if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
@@ -2006,7 +2012,7 @@ export function LongFormTimelineWorkspace({
       const target = state.project.segments.find((segment) => segment.id === targetId);
       if (!target) return;
       if (assets.length === 1 && assets[0].kind === "video" && zone !== "bind") {
-        onDispatch({ type: "segment/insert-video", asset: assets[0], anchorId: target.id, position: zone });
+        onDispatch({ type: "segment/insert-video", asset: assets[0], anchorId: target.id, position: zone, id: createSegmentId() });
       } else {
         bindAssetsById(target.id, ids);
       }
@@ -2015,7 +2021,7 @@ export function LongFormTimelineWorkspace({
       return;
     }
     const firstVideo = assets.find((asset) => asset.kind === "video");
-    if (firstVideo) onDispatch({ type: "segment/insert-video", asset: firstVideo, anchorId: state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null, position: "after" });
+    if (firstVideo) onDispatch({ type: "segment/insert-video", asset: firstVideo, anchorId: state.active_segment_id ?? state.selected_segment_ids.at(-1) ?? null, position: "after", id: createSegmentId() });
     assetDropTargetRef.current = null;
     setAssetDropTarget(null);
   };
@@ -2253,16 +2259,16 @@ export function LongFormTimelineWorkspace({
         />
         <div className="timeline-commandbar__group timeline-commandbar__group--edit">
           <button type="button" disabled={!onUploadFiles || uploadingFiles || capabilities.connection !== "online" || state.project.segments.length >= 128} onClick={() => appendVideoInputRef.current?.click()}>{uploadingFiles ? "导入中…" : "导入并追加视频"}</button>
-          <button type="button" disabled={state.project.segments.length >= 128} onClick={() => onDispatch({ type: "segment/insert", position: "before", mode: activeSegment?.mode ?? "fl2va" })}>＋ 前插空段</button>
-          <button type="button" disabled={state.project.segments.length >= 128} onClick={() => onDispatch({ type: "segment/insert", position: "after", mode: activeSegment?.mode ?? "fl2va" })}>＋ 后插空段</button>
-          <button type="button" disabled={!canSplitSelectedSegment(state)} onClick={() => onDispatch({ type: "segment/split-selected" })}>播放头拆分</button>
+          <button type="button" disabled={state.project.segments.length >= 128} onClick={() => onDispatch({ type: "segment/insert", position: "before", mode: activeSegment?.mode ?? "fl2va", id: createSegmentId() })}>＋ 前插空段</button>
+          <button type="button" disabled={state.project.segments.length >= 128} onClick={() => onDispatch({ type: "segment/insert", position: "after", mode: activeSegment?.mode ?? "fl2va", id: createSegmentId() })}>＋ 后插空段</button>
+          <button type="button" disabled={!canSplitSelectedSegment(state)} onClick={() => onDispatch({ type: "segment/split-selected", newId: createSegmentId() })}>播放头拆分</button>
           <label className="timeline-commandbar__inline-field"><span>均分</span><DeferredNumberInput aria-label="均分片段数量" min="2" max={Math.max(2, maxEvenSplitPieces)} step="1" value={evenSplitPieces} normalizeValue={Math.trunc} onValueCommit={setEvenSplitPieces} /></label>
-          <button type="button" disabled={activeSegment?.mode !== "ref2va" || !activeSegment.source_video || evenSplitPieces > maxEvenSplitPieces || state.project.segments.length >= 128} onClick={() => activeSegment && onDispatch({ type: "segment/split-evenly", id: activeSegment.id, pieces: evenSplitPieces })}>均分当前段</button>
+          <button type="button" disabled={activeSegment?.mode !== "ref2va" || !activeSegment.source_video || evenSplitPieces > maxEvenSplitPieces || state.project.segments.length >= 128} onClick={() => activeSegment && onDispatch({ type: "segment/split-evenly", id: activeSegment.id, pieces: evenSplitPieces, pieceIds: Array.from({ length: Math.max(0, evenSplitPieces - 1) }, () => createSegmentId()) })}>均分当前段</button>
           <label className="timeline-commandbar__inline-field"><span>灵敏度</span><select aria-label="智能分割灵敏度" value={detectionSensitivity} disabled={detectingShots} onChange={(event) => setDetectionSensitivity(event.target.value as RV2VShotDetectionRequest["sensitivity"])}><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></label>
           <label className="timeline-commandbar__inline-field"><span>最短帧</span><DeferredNumberInput aria-label="智能分割最短镜头帧数" min="4" max="100000" step="1" value={minimumShotFrames} disabled={detectingShots} normalizeValue={Math.trunc} onValueCommit={setMinimumShotFrames} /></label>
           <button type="button" disabled={capabilities.connection !== "online" || detectingShots || activeSegment?.mode !== "ref2va" || !activeSegment.source_video || state.project.segments.length >= 128} onClick={() => void detectActiveSegmentShots()}>{detectingShots ? "检测中…" : "智能分割"}</button>
           <button type="button" disabled={!canMergeSelectedSegments(state)} onClick={() => onDispatch({ type: "segment/merge-selected" })}>合并所选</button>
-          <button type="button" disabled={!state.selected_segment_ids.length || state.project.segments.length >= 128} onClick={() => onDispatch({ type: "segment/duplicate-selected" })}>复制片段</button>
+          <button type="button" disabled={!state.selected_segment_ids.length || state.project.segments.length >= 128} onClick={() => onDispatch({ type: "segment/duplicate-selected", ids: state.selected_segment_ids.map(() => createSegmentId()) })}>复制片段</button>
           <button type="button" className="is-danger" disabled={!state.selected_segment_ids.length} onClick={deleteSelectedSegments}>删除所选</button>
         </div>
       </section>
