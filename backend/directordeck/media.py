@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import subprocess
@@ -14,6 +15,15 @@ from .schemas import DetectShotsResponse, VideoMetadata
 
 class MediaToolError(RuntimeError):
     """Raised when a bounded ffmpeg/ffprobe operation cannot be completed."""
+
+
+class MediaToolTimeout(MediaToolError):
+    """Raised when a named media stage exceeds its bounded subprocess budget."""
+
+    def __init__(self, operation: str, timeout: float) -> None:
+        self.operation = operation
+        self.timeout = timeout
+        super().__init__(f"{operation} exceeded its {timeout:g}s timeout")
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +44,11 @@ class VideoProxyResult:
 _SCENE_THRESHOLDS = {"low": 0.55, "medium": 0.35, "high": 0.18}
 _PTS_TIME = re.compile(r"\bpts_time:([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
 _SAFE_SUFFIX = re.compile(r"^\.[a-zA-Z0-9]{1,10}$")
+_LOGGER = logging.getLogger(__name__)
+_METADATA_PROBE_TIMEOUT_SECONDS = 60
+_REMUX_ELIGIBILITY_SCAN_TIMEOUT_SECONDS = 60
+_FRAME_COUNT_SCAN_TIMEOUT_SECONDS = 60
+_MEDIA_PROCESS_TIMEOUT_SECONDS = 1800
 
 
 def _suffix(value: str) -> str:
@@ -41,7 +56,13 @@ def _suffix(value: str) -> str:
     return candidate.lower() if _SAFE_SUFFIX.fullmatch(candidate) else ".bin"
 
 
-def _run_command(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[bytes]:
+def _run_command(
+    args: list[str],
+    *,
+    timeout: float,
+    operation: str | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    label = operation or args[0]
     try:
         result = subprocess.run(
             args,
@@ -54,10 +75,10 @@ def _run_command(args: list[str], *, timeout: float) -> subprocess.CompletedProc
     except FileNotFoundError as exc:
         raise MediaToolError(f"required media tool is unavailable: {args[0]}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise MediaToolError(f"{args[0]} exceeded its {timeout:g}s timeout") from exc
+        raise MediaToolTimeout(label, timeout) from exc
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace")[-4000:].strip()
-        raise MediaToolError(f"{args[0]} failed with exit code {result.returncode}: {detail}")
+        raise MediaToolError(f"{label} failed with exit code {result.returncode}: {detail}")
     return result
 
 
@@ -85,7 +106,12 @@ def _frame_rate(value: object) -> float | None:
     return parsed if math.isfinite(parsed) and parsed > 0 else None
 
 
-def probe_video_path(path: str | Path, *, probe_method: str = "backend_ffprobe") -> VideoMetadata:
+def probe_video_path(
+    path: str | Path,
+    *,
+    probe_method: str = "backend_ffprobe",
+    allow_frame_count_estimate_on_timeout: bool = False,
+) -> VideoMetadata:
     source = Path(path)
     result = _run_command(
         [
@@ -98,7 +124,8 @@ def probe_video_path(path: str | Path, *, probe_method: str = "backend_ffprobe")
             "json",
             str(source),
         ],
-        timeout=60,
+        timeout=_METADATA_PROBE_TIMEOUT_SECONDS,
+        operation="video metadata probe",
     )
     try:
         payload = json.loads(result.stdout)
@@ -121,41 +148,64 @@ def probe_video_path(path: str | Path, *, probe_method: str = "backend_ffprobe")
     format_duration = format_value.get("duration") if isinstance(format_value, dict) else None
     duration = _positive_float(stream.get("duration")) or _positive_float(format_duration)
     frame_count = _positive_int(stream.get("nb_frames"))
+    frame_count_estimated = False
     if frame_count is None:
-        counted = _run_command(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-count_frames",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=nb_read_frames",
-                "-of",
-                "json",
-                str(source),
-            ],
-            timeout=60,
-        )
         try:
-            counted_stream = json.loads(counted.stdout)["streams"][0]
-            frame_count = _positive_int(counted_stream.get("nb_read_frames"))
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError):
-            frame_count = None
+            counted = _run_command(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=nb_read_frames",
+                    "-of",
+                    "json",
+                    str(source),
+                ],
+                timeout=_FRAME_COUNT_SCAN_TIMEOUT_SECONDS,
+                operation="video frame-count scan",
+            )
+        except MediaToolTimeout as exc:
+            if (
+                not allow_frame_count_estimate_on_timeout
+                or duration is None
+                or fps is None
+            ):
+                raise
+            # Frame counting scans the complete stream. If the container already
+            # supplies duration and frame rate, keep the scan bounded and use
+            # the same estimate accepted when ffprobe returns no readable count.
+            _LOGGER.warning(
+                "%s; estimating frame count from duration and frame rate",
+                exc,
+            )
+        else:
+            try:
+                counted_stream = json.loads(counted.stdout)["streams"][0]
+                frame_count = _positive_int(counted_stream.get("nb_read_frames"))
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError):
+                frame_count = None
     if duration is None and frame_count is not None and fps is not None:
         duration = frame_count / fps
     if frame_count is None and duration is not None and fps is not None:
         frame_count = max(1, int(round(duration * fps)))
+        frame_count_estimated = True
     if None in (width, height, fps, duration, frame_count):
         raise MediaToolError("ffprobe returned incomplete video metadata")
+    resolved_probe_method = probe_method
+    if frame_count_estimated:
+        candidate = f"{probe_method}_estimated_frames"
+        resolved_probe_method = candidate if len(candidate) <= 128 else "estimated_frames"
     return VideoMetadata(
         duration=duration,
         native_fps=fps,
         frame_count=frame_count,
         width=width,
         height=height,
-        probe_method=probe_method,
+        probe_method=resolved_probe_method,
         has_audio=any(
             isinstance(item, dict) and item.get("codec_type") == "audio"
             for item in streams
@@ -190,7 +240,8 @@ def _can_remux_24fps_proxy(source: str | Path) -> bool:
             "json",
             str(source),
         ],
-        timeout=60,
+        timeout=_METADATA_PROBE_TIMEOUT_SECONDS,
+        operation="proxy compatibility probe",
     )
     try:
         streams = json.loads(result.stdout)["streams"]
@@ -232,21 +283,29 @@ def _can_remux_24fps_proxy(source: str | Path) -> bool:
         return False
     # Container rate fields can claim 24 fps for VFR media. Packet durations
     # are cheap to scan compared with decoding/re-encoding and close that gap.
-    packet_result = _run_command(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "packet=duration_time",
-            "-of",
-            "csv=p=0",
-            str(source),
-        ],
-        timeout=60,
-    )
+    try:
+        packet_result = _run_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=duration_time",
+                "-of",
+                "csv=p=0",
+                str(source),
+            ],
+            timeout=_REMUX_ELIGIBILITY_SCAN_TIMEOUT_SECONDS,
+            operation="proxy packet-duration scan",
+        )
+    except MediaToolTimeout as exc:
+        # This scan only proves eligibility for the remux optimization. A
+        # timeout must conservatively choose canonical transcoding, not reject
+        # an otherwise valid upload.
+        _LOGGER.warning("%s; falling back to canonical transcode", exc)
+        return False
     durations = [
         _positive_float(line.strip())
         for line in packet_result.stdout.decode("utf-8", errors="replace").splitlines()
@@ -289,10 +348,15 @@ def create_24fps_proxy_file(source: str | Path, destination: str | Path) -> Vide
                 "-1",
                 str(destination),
             ],
-            timeout=1800,
+            timeout=_MEDIA_PROCESS_TIMEOUT_SECONDS,
+            operation="video proxy remux",
         )
         return VideoProxyResult(
-            metadata=probe_video_path(destination, probe_method="backend_ffmpeg_proxy_24fps"),
+            metadata=probe_video_path(
+                destination,
+                probe_method="backend_ffmpeg_proxy_24fps",
+                allow_frame_count_estimate_on_timeout=True,
+            ),
             strategy="remux",
         )
 
@@ -337,10 +401,15 @@ def create_24fps_proxy_file(source: str | Path, destination: str | Path) -> Vide
             "-1",
             str(destination),
         ],
-        timeout=1800,
+        timeout=_MEDIA_PROCESS_TIMEOUT_SECONDS,
+        operation="video proxy transcode",
     )
     return VideoProxyResult(
-        metadata=probe_video_path(destination, probe_method="backend_ffmpeg_proxy_24fps"),
+        metadata=probe_video_path(
+            destination,
+            probe_method="backend_ffmpeg_proxy_24fps",
+            allow_frame_count_estimate_on_timeout=True,
+        ),
         strategy="transcode",
     )
 
@@ -465,7 +534,12 @@ def assemble_video_paths(
             )
             _run_command(command, timeout=1800)
             normalized.append(normalized_path)
-            normalized_durations.append(probe_video_path(normalized_path).duration)
+            normalized_durations.append(
+                probe_video_path(
+                    normalized_path,
+                    allow_frame_count_estimate_on_timeout=True,
+                ).duration
+            )
 
         concat_file = workspace / "segments.txt"
         concat_file.write_text(
@@ -498,7 +572,9 @@ def assemble_video_paths(
             timeout=1800,
         )
     return probe_video_path(
-        destination_path, probe_method="backend_ffmpeg_timeline_assembly"
+        destination_path,
+        probe_method="backend_ffmpeg_timeline_assembly",
+        allow_frame_count_estimate_on_timeout=True,
     )
 
 
