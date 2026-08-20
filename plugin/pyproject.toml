@@ -1,16 +1,18 @@
 [project]
 name = "director-deck"
 description = "长视频导演台，面向 MiniMax H3。一键启动 WebUI 在 timeline 上创作！"
-version = "0.2.5"
+version = "0.2.6"
+readme = "README.md"
+license = "GPL-3.0-only"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi==0.116.*",
-    "uvicorn[standard]",
-    "httpx",
-    "pydantic>=2",
-    "python-multipart",
-    "websockets>=16,<19",
-    "anyio<4.10",
+    "anyio>=4.6,<4.10",
+    "fastapi>=0.116,<0.117",
+    "httpx>=0.28,<1",
+    "pydantic>=2.11,<3",
+    "python-multipart>=0.0.20,<1",
+    "uvicorn[standard]>=0.35,<1",
+    "websockets>=16,<18",
 ]
 
 [project.urls]

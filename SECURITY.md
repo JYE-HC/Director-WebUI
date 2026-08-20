@@ -9,9 +9,9 @@ loopback; before remote access, place ComfyUI behind an authenticated TLS
 reverse proxy with source restrictions. Do not expose ComfyUI or Director
 directly to the public Internet.
 
-After the GitHub repository is created, report vulnerabilities privately with
-GitHub's **Security → Report a vulnerability** flow. Do not include prompts,
-media, database contents, access tokens, private addresses, GPU UUIDs or full
-diagnostic logs in a public issue. Until private reporting is configured, do
-not publish exploit details; contact the repository owner through their chosen
-private channel.
+Report vulnerabilities privately with the repository's GitHub **Security →
+Report a vulnerability** flow. If that private form is unavailable, do not
+open a public issue with exploit details; contact the repository owner through
+their GitHub profile first. Never include prompts, media, database contents,
+access tokens, private addresses, GPU UUIDs or full diagnostic logs in a public
+issue.

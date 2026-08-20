@@ -4,6 +4,8 @@ import asyncio
 import json
 import struct
 
+import pytest
+
 from directordeck.progress import (
     MAX_PREVIEW_MESSAGE_BYTES,
     ComfyExecutionEvent,
@@ -52,11 +54,17 @@ def test_websocket_url_preserves_reverse_proxy_prefix() -> None:
     )
 
 
-async def test_progress_manager_can_bounded_wait_for_websocket_handshake(
+@pytest.mark.parametrize(
+    "base_url",
+    ("http://comfy.test:8188", "https://comfy.test:8188"),
+)
+async def test_progress_manager_can_bounded_wait_for_direct_websocket_handshake(
     monkeypatch,
+    base_url: str,
 ) -> None:
     release = asyncio.Event()
     sent: list[str] = []
+    connect_calls: list[tuple[str, dict[str, object]]] = []
 
     class FakeSocket:
         async def __aenter__(self):
@@ -75,9 +83,11 @@ async def test_progress_manager_can_bounded_wait_for_websocket_handshake(
             await release.wait()
             raise StopAsyncIteration
 
-    monkeypatch.setattr(
-        "directordeck.progress.websockets.connect", lambda *_args, **_kwargs: FakeSocket()
-    )
+    def connect(url: str, **kwargs: object) -> FakeSocket:
+        connect_calls.append((url, kwargs))
+        return FakeSocket()
+
+    monkeypatch.setattr("directordeck.progress.websockets.connect", connect)
 
     async def sink(_origin, _event) -> None:
         return None
@@ -85,9 +95,57 @@ async def test_progress_manager_can_bounded_wait_for_websocket_handshake(
     manager = NativeProgressManager(sink)
     try:
         assert await manager.ensure_ready(
-            "http://comfy.test:8188", "director", timeout_seconds=0.5
+            base_url, "director", timeout_seconds=0.5
         )
         assert sent and '"supports_preview_metadata": true' in sent[0]
+        assert len(connect_calls) == 1
+        assert connect_calls[0][1]["proxy"] is None
+        assert "ssl" not in connect_calls[0][1]
+    finally:
+        release.set()
+        await manager.close()
+
+
+async def test_progress_manager_passes_explicit_tls_context_without_proxy(
+    monkeypatch,
+) -> None:
+    release = asyncio.Event()
+    connect_kwargs: dict[str, object] = {}
+    tls_context = object()
+
+    class FakeSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send(self, _message: str) -> None:
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await release.wait()
+            raise StopAsyncIteration
+
+    def connect(_url: str, **kwargs: object) -> FakeSocket:
+        connect_kwargs.update(kwargs)
+        return FakeSocket()
+
+    monkeypatch.setattr("directordeck.progress.websockets.connect", connect)
+
+    async def sink(_origin, _event) -> None:
+        return None
+
+    manager = NativeProgressManager(sink, ssl_context=tls_context)  # type: ignore[arg-type]
+    try:
+        assert await manager.ensure_ready(
+            "https://comfy.test:8188", "director", timeout_seconds=0.5
+        )
+        assert connect_kwargs["proxy"] is None
+        assert connect_kwargs["ssl"] is tls_context
     finally:
         release.set()
         await manager.close()

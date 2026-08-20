@@ -1153,6 +1153,39 @@ describe("Director REST 契约", () => {
     expect(fetchMock.mock.calls[3][1]?.method).toBe("POST");
   });
 
+  it("任务详情和 mutation 对非默认活动项目使用 URL 编码的 project_id", async () => {
+    const activeProjectId = "project /?&当前";
+    const encodedProjectId = encodeURIComponent(activeProjectId);
+    const cancelled = { ...job, status: "cancelled" as const, progress: 1 };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(job))
+      .mockResolvedValueOnce(jsonResponse(cancelled))
+      .mockResolvedValueOnce(jsonResponse(cancelled))
+      .mockResolvedValueOnce(jsonResponse({
+        jobs: [cancelled], requested_count: 1, terminal_count: 1,
+      }));
+    const controller = new AbortController();
+
+    await directorApi.getTask(job.id, controller.signal, activeProjectId);
+    await directorApi.cancelTask(job.id, activeProjectId);
+    await directorApi.confirmComfyRestartRecovery(job.id, activeProjectId);
+    await directorApi.cancelTasks([job.id], activeProjectId);
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      `/directordeck/api/jobs/job-1?project_id=${encodedProjectId}`,
+      `/directordeck/api/jobs/job-1/cancel?project_id=${encodedProjectId}`,
+      `/directordeck/api/jobs/job-1/recovery/confirm-comfy-restart?project_id=${encodedProjectId}`,
+      `/directordeck/api/jobs/cancel?project_id=${encodedProjectId}`,
+    ]);
+    expect(fetchMock.mock.calls[0][1]?.signal).toBe(controller.signal);
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+      confirmation: "comfyui_process_restarted",
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[3][1]?.body))).toEqual({
+      job_ids: [job.id],
+    });
+  });
+
   it("任务响应按公开字段精确重建，拒绝 workflow/prompt 图泄漏", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ ...job, workflow: { nodes: [] } }))

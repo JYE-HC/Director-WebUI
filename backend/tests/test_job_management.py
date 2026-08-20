@@ -23,6 +23,31 @@ async def _create_timeline_job(client, *, title: str | None = None) -> dict:
     return refreshed.json()
 
 
+async def _create_project_timeline_job(
+    client,
+    project_id: str,
+    *,
+    wait_for_dispatch: bool = True,
+) -> tuple[dict, dict]:
+    project = copy.deepcopy(
+        (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    )
+    project["segments"][0]["prompt"] = "A scoped cinematic camera move"
+    saved = await client.put(
+        f"/api/projects/{project_id}/timeline",
+        json=project,
+    )
+    assert saved.status_code == 200, saved.text
+    response = await client.post(
+        f"/api/projects/{project_id}/jobs",
+        json={"config": project},
+    )
+    assert response.status_code == 200, response.text
+    if wait_for_dispatch:
+        await wait_for_submission_tasks(client)
+    return response.json(), project
+
+
 async def test_job_list_filters_sorts_summarizes_and_never_contacts_comfy(
     client, fake_comfy
 ) -> None:
@@ -112,6 +137,186 @@ async def test_job_list_filters_sorts_summarizes_and_never_contacts_comfy(
     ).json()["jobs"][0]
     assert current_task["id"] == current["id"]
     assert current_task["current_project"] is True
+
+
+async def test_job_currentness_uses_the_callers_active_project_scope(
+    client,
+    monkeypatch,
+) -> None:
+    project_summary = (
+        await client.post("/api/projects", json={"title": "作用域项目 A"})
+    ).json()
+    project_id = project_summary["id"]
+    created, project = await _create_project_timeline_job(
+        client,
+        project_id,
+        wait_for_dispatch=False,
+    )
+
+    # The project path is already the active-context authority for the direct
+    # create response; clients must not wait for a later list refresh to repair
+    # the flag.
+    assert created["project_id"] == project_id
+    assert created["current_project"] is True
+    await wait_for_submission_tasks(client)
+
+    unscoped = await client.get(f"/api/jobs/{created['id']}")
+    scoped = await client.get(
+        f"/api/jobs/{created['id']}",
+        params={"project_id": project_id},
+    )
+    assert unscoped.status_code == 200, unscoped.text
+    assert scoped.status_code == 200, scoped.text
+    assert unscoped.json()["current_project"] is False
+    assert scoped.json()["current_project"] is True
+
+    database = client.director_app.state.database
+    original_get_project_timeline = database.get_project_timeline
+    timeline_reads: list[str] = []
+
+    def tracked_get_project_timeline(active_project_id: str):
+        timeline_reads.append(active_project_id)
+        return original_get_project_timeline(active_project_id)
+
+    monkeypatch.setattr(
+        database,
+        "get_project_timeline",
+        tracked_get_project_timeline,
+    )
+    listed = await client.get("/api/jobs", params={"project_id": project_id})
+    assert listed.status_code == 200, listed.text
+    listed_job = next(
+        job for job in listed.json()["jobs"] if job["id"] == created["id"]
+    )
+    assert listed_job["current_project"] is True
+    assert timeline_reads == [project_id]
+
+    # Runtime-only changes affect the stricter monitor snapshot, not project
+    # timeline currentness.
+    settings = (await client.get("/api/settings")).json()
+    settings["client_id"] = "scoped-currentness-test"
+    saved_settings = await client.put("/api/settings", json=settings)
+    assert saved_settings.status_code == 200, saved_settings.text
+    runtime_changed = await client.get(
+        f"/api/jobs/{created['id']}",
+        params={"project_id": project_id},
+    )
+    assert runtime_changed.json()["current_project"] is True
+
+    # Currentness is strict document equality, not loose project membership.
+    project_b = (
+        await client.post("/api/projects", json={"title": "作用域项目 B"})
+    ).json()
+    mirrored = await client.put(
+        f"/api/projects/{project_b['id']}/timeline",
+        json=project,
+    )
+    assert mirrored.status_code == 200, mirrored.text
+    same_document = await client.get(
+        f"/api/jobs/{created['id']}",
+        params={"project_id": project_b["id"]},
+    )
+    assert same_document.json()["project_id"] == project_id
+    assert same_document.json()["current_project"] is True
+
+    edited = copy.deepcopy(project)
+    edited["segments"][0]["prompt"] += " after an edit"
+    saved_edit = await client.put(
+        f"/api/projects/{project_id}/timeline",
+        json=edited,
+    )
+    assert saved_edit.status_code == 200, saved_edit.text
+    stale = await client.get(
+        f"/api/jobs/{created['id']}",
+        params={"project_id": project_id},
+    )
+    missing_scope = await client.get(
+        f"/api/jobs/{created['id']}",
+        params={"project_id": "deleted-or-unknown-project"},
+    )
+    assert stale.json()["current_project"] is False
+    assert missing_scope.status_code == 200, missing_scope.text
+    assert missing_scope.json()["current_project"] is False
+
+
+async def test_job_mutations_preserve_one_explicit_project_context(
+    client,
+    fake_comfy,
+    monkeypatch,
+) -> None:
+    project = (
+        await client.post("/api/projects", json={"title": "任务操作作用域"})
+    ).json()
+    project_id = project["id"]
+    first, _ = await _create_project_timeline_job(client, project_id)
+    second, _ = await _create_project_timeline_job(client, project_id)
+    third, _ = await _create_project_timeline_job(client, project_id)
+
+    single = await client.post(
+        f"/api/jobs/{first['id']}/cancel",
+        params={"project_id": project_id},
+    )
+    assert single.status_code == 200, single.text
+    assert single.json()["status"] == "cancelled"
+    assert single.json()["current_project"] is True
+
+    database = client.director_app.state.database
+    original_get_project_timeline = database.get_project_timeline
+    timeline_reads: list[str] = []
+
+    def tracked_get_project_timeline(active_project_id: str):
+        timeline_reads.append(active_project_id)
+        return original_get_project_timeline(active_project_id)
+
+    monkeypatch.setattr(
+        database,
+        "get_project_timeline",
+        tracked_get_project_timeline,
+    )
+    bulk = await client.post(
+        "/api/jobs/cancel",
+        params={"project_id": project_id},
+        json={"job_ids": [second["id"], third["id"]]},
+    )
+    assert bulk.status_code == 200, bulk.text
+    assert [job["current_project"] for job in bulk.json()["jobs"]] == [True, True]
+    assert timeline_reads == [project_id]
+
+    # A stale explicit context fails closed without blocking the owned side
+    # effect or silently falling back to the default project.
+    fourth, _ = await _create_project_timeline_job(client, project_id)
+    cancelled_before = list(fake_comfy.cancelled)
+    missing_scope = await client.post(
+        f"/api/jobs/{fourth['id']}/cancel",
+        params={"project_id": "deleted-or-unknown-project"},
+    )
+    assert missing_scope.status_code == 200, missing_scope.text
+    assert missing_scope.json()["status"] == "cancelled"
+    assert missing_scope.json()["current_project"] is False
+    assert len(fake_comfy.cancelled) > len(cancelled_before)
+
+    recovery, _ = await _create_project_timeline_job(client, project_id)
+    marked, first_claim = database.mark_job_cancel_requested(recovery["id"])
+    assert marked is not None and first_claim
+    database.update_job(
+        recovery["id"],
+        status="cancelling",
+        stage="restart_cancel_pending",
+    )
+    for child in database.list_job_children(recovery["id"]):
+        database.update_job_child(
+            child["id"],
+            status="cancelling",
+            stage="restart_cancel_pending",
+        )
+    confirmed = await client.post(
+        f"/api/jobs/{recovery['id']}/recovery/confirm-comfy-restart",
+        params={"project_id": project_id},
+        json={"confirmation": "comfyui_process_restarted"},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "cancelled"
+    assert confirmed.json()["current_project"] is True
 
 
 async def test_bulk_cancel_prevalidates_all_local_parent_ids(client, fake_comfy) -> None:

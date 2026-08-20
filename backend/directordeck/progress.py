@@ -15,6 +15,7 @@ queued/running/terminal state of a job.
 
 import asyncio
 import json
+import ssl
 import struct
 import time
 from collections import OrderedDict
@@ -685,6 +686,7 @@ class NativeProgressMonitor:
         preview_sink: PreviewSink | None = None,
         reconcile_sink: ReconcileSink | None = None,
         ready_event: asyncio.Event | None = None,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.client_id = client_id
@@ -692,18 +694,28 @@ class NativeProgressMonitor:
         self.preview_sink = preview_sink
         self.reconcile_sink = reconcile_sink
         self.ready_event = ready_event
+        self.ssl_context = ssl_context
 
     async def run(self) -> None:
         delay = 0.5
         url = websocket_url(self.base_url, self.client_id)
         while True:
             try:
+                connect_kwargs: dict[str, Any] = {
+                    "proxy": None,
+                    "open_timeout": 10,
+                    "ping_interval": 20,
+                    "ping_timeout": 20,
+                    "max_size": 2 * 1024 * 1024,
+                }
+                # Omitting ``ssl`` lets websockets construct its normal client
+                # context for public-CA wss:// URLs. Explicit ssl=None is
+                # rejected for wss://, while a context is invalid for ws://.
+                if self.ssl_context is not None:
+                    connect_kwargs["ssl"] = self.ssl_context
                 async with websockets.connect(
                     url,
-                    open_timeout=10,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    max_size=2 * 1024 * 1024,
+                    **connect_kwargs,
                 ) as socket:
                     # Ask ComfyUI for metadata-bearing previews. Only bounded
                     # event-4 PNG/JPEG frames from registered sampler nodes are
@@ -763,10 +775,12 @@ class NativeProgressManager:
         sink: ProgressSink,
         preview_sink: PreviewSink | None = None,
         reconcile_sink: ReconcileSink | None = None,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self._sink = sink
         self._preview_sink = preview_sink
         self._reconcile_sink = reconcile_sink
+        self._ssl_context = ssl_context
         self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._ready: dict[tuple[str, str], asyncio.Event] = {}
         self._closed = False
@@ -786,6 +800,7 @@ class NativeProgressManager:
             self._preview_sink,
             self._reconcile_sink,
             ready_event,
+            self._ssl_context,
         )
         self._tasks[key] = asyncio.create_task(
             monitor.run(), name=f"comfy-progress:{key[0]}"
