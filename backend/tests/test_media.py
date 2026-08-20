@@ -120,6 +120,33 @@ def test_noncompliant_proxy_uses_veryfast_transcode(tmp_path: Path, monkeypatch)
     assert ffmpeg[ffmpeg.index("-preset") + 1] == "veryfast"
 
 
+def test_fps_sync_args_match_detected_ffmpeg_capability(monkeypatch) -> None:
+    import directordeck.media as media_module
+
+    try:
+        monkeypatch.setattr(
+            media_module,
+            "_ffmpeg_full_help",
+            lambda: "Per-stream options:\n-fps_mode ...\n-vsync ...\n",
+        )
+        media_module._fps_sync_args.cache_clear()
+        assert media_module._fps_sync_args() == ("-fps_mode", "cfr")
+
+        monkeypatch.setattr(
+            media_module,
+            "_ffmpeg_full_help",
+            lambda: "AVOptions:\n-vsync ...\n",
+        )
+        media_module._fps_sync_args.cache_clear()
+        assert media_module._fps_sync_args() == ("-vsync", "cfr")
+
+        monkeypatch.setattr(media_module, "_ffmpeg_full_help", lambda: "")
+        media_module._fps_sync_args.cache_clear()
+        assert media_module._fps_sync_args() == ("-vsync", "cfr")
+    finally:
+        media_module._fps_sync_args.cache_clear()
+
+
 def test_real_matroska_count_scan_is_separate_from_proxy_normalization(
     tmp_path: Path, monkeypatch
 ) -> None:

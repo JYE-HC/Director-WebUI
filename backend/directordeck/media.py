@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 from .schemas import DetectShotsResponse, VideoMetadata
@@ -80,6 +81,35 @@ def _run_command(
         detail = result.stderr.decode("utf-8", errors="replace")[-4000:].strip()
         raise MediaToolError(f"{label} failed with exit code {result.returncode}: {detail}")
     return result
+
+
+def _ffmpeg_full_help() -> str:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-h", "full"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+@lru_cache(maxsize=1)
+def _fps_sync_args() -> tuple[str, str]:
+    """Return the CFR frame-sync option spelling this ffmpeg build accepts.
+
+    ``-fps_mode`` only exists since ffmpeg 5.1 while ``-vsync`` is deprecated
+    and marked for future removal, so no single spelling runs everywhere.
+    Probe the binary once and cache the answer; an unprobed or unreadable
+    binary keeps the historical ``-vsync cfr``.
+    """
+    if "-fps_mode" in _ffmpeg_full_help():
+        return ("-fps_mode", "cfr")
+    return ("-vsync", "cfr")
 
 
 def _positive_float(value: object) -> float | None:
@@ -376,11 +406,9 @@ def create_24fps_proxy_file(source: str | Path, destination: str | Path) -> Vide
             "0:a:0?",
             "-vf",
             "fps=24,scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            # The server image may ship an older ffmpeg without ``-fps_mode``.
-            # ``-vsync cfr`` is the compatible spelling and remains safe here
-            # because the output contains exactly one video stream.
-            "-vsync",
-            "cfr",
+            # A single video output stream keeps both frame-sync spellings
+            # unambiguous here.
+            *_fps_sync_args(),
             "-c:v",
             "libx264",
             "-preset",
@@ -506,8 +534,7 @@ def assemble_video_paths(
                     f"fps={fps:g},scale={width}:{height}:flags=lanczos,setsar=1",
                     "-af",
                     "aresample=48000:async=1:first_pts=0,apad",
-                    "-vsync",
-                    "cfr",
+                    *_fps_sync_args(),
                     "-shortest",
                     "-c:v",
                     "libx264",
