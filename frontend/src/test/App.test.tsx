@@ -1519,36 +1519,6 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull());
   });
 
-  it("插入片段后再编辑提示词，连续撤销两步完整回滚而不塌缩历史", async () => {
-    const user = userEvent.setup();
-    mockCommonRequests();
-    render(<App />);
-    await waitUntilReady();
-
-    const undoButton = screen.getByRole("button", { name: "撤销" });
-    expect(undoButton).toBeDisabled();
-
-    // Structural edit: insert one empty segment after the only segment.
-    await user.click(screen.getByRole("button", { name: "＋ 后插空段" }));
-    expect(screen.getByRole("button", { name: "聚焦并选择片段 2：片段 02" }))
-      .toBeInTheDocument();
-
-    // Text edit on the freshly inserted segment.
-    const prompt = screen.getByLabelText("片段提示词");
-    fireEvent.change(prompt, { target: { value: "插入片段后的提示词" } });
-    expect(prompt).toHaveValue("插入片段后的提示词");
-
-    // Both edits must stay undoable. Pre-fix, the shadow reducer run minted
-    // different segment ids than the React run, so the text edit no longer
-    // matched the recorded history head and collapsed the whole past.
-    await user.click(undoButton);
-    expect(prompt).toHaveValue("");
-    await user.click(undoButton);
-    expect(screen.queryByRole("button", { name: "聚焦并选择片段 2：片段 02" }))
-      .not.toBeInTheDocument();
-    expect(undoButton).toBeDisabled();
-  });
-
   it("顶栏项目名可用键盘进入编辑，并实时同步且不显示任何保存控件", async () => {
     const user = userEvent.setup();
     mockCommonRequests();

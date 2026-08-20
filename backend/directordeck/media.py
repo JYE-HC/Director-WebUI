@@ -122,8 +122,6 @@ def probe_video_path(path: str | Path, *, probe_method: str = "backend_ffprobe")
     duration = _positive_float(stream.get("duration")) or _positive_float(format_duration)
     frame_count = _positive_int(stream.get("nb_frames"))
     if frame_count is None:
-        # Full-frame counting decodes every frame like a transcode, so it gets
-        # the same 1800s budget; 60s falsely rejected long uploads with 422.
         counted = _run_command(
             [
                 "ffprobe",
@@ -138,7 +136,7 @@ def probe_video_path(path: str | Path, *, probe_method: str = "backend_ffprobe")
                 "json",
                 str(source),
             ],
-            timeout=1800,
+            timeout=60,
         )
         try:
             counted_stream = json.loads(counted.stdout)["streams"][0]

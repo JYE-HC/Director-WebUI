@@ -1,7 +1,7 @@
 [project]
 name = "director-deck"
 description = "长视频导演台，面向 MiniMax H3。一键启动 WebUI 在 timeline 上创作！"
-version = "0.2.4"
+version = "0.2.3"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.116.*",

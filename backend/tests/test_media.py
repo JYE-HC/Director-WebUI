@@ -112,44 +112,6 @@ def test_noncompliant_proxy_uses_veryfast_transcode(tmp_path: Path, monkeypatch)
     assert ffmpeg[ffmpeg.index("-preset") + 1] == "veryfast"
 
 
-def test_frame_count_fallback_probe_uses_transcode_aligned_timeout(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Containers without ``nb_frames`` fall back to full-frame counting, which
-    decodes every frame like a transcode; its timeout must match the 1800s
-    transcode budget or long videos are falsely rejected with 422."""
-    import json
-
-    import directordeck.media as media_module
-
-    metadata_payload = json.dumps({
-        "streams": [{
-            "codec_type": "video",
-            "width": 64,
-            "height": 48,
-            "avg_frame_rate": "24/1",
-            "duration": "120.0",
-        }],
-        "format": {"duration": "120.0"},
-    })
-    counted_payload = json.dumps({"streams": [{"nb_read_frames": "2880"}]})
-    responses = [metadata_payload, counted_payload]
-    calls: list[tuple[list[str], float]] = []
-
-    def fake_run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[bytes]:
-        calls.append((args, timeout))
-        return subprocess.CompletedProcess(
-            args, 0, responses[len(calls) - 1].encode(), b""
-        )
-
-    monkeypatch.setattr(media_module, "_run_command", fake_run)
-    metadata = media_module.probe_video_path(tmp_path / "long-no-nb-frames.mp4")
-
-    assert metadata.frame_count == 2880
-    fallback = next(call for call in calls if "-count_frames" in call[0])
-    assert fallback[1] == 1800
-
-
 def test_historical_video_metadata_defaults_to_silent() -> None:
     historical = VideoMetadata.model_validate({
         "duration": 1,

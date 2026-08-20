@@ -47,7 +47,6 @@ describe("timeline transaction policy", () => {
     });
     expect(timelineTransactionPolicy(state, {
       type: "segment/delete-selected",
-      fallbackId: "test-delete-fallback",
     })).toMatchObject({ scope: "document", context: "structural" });
     expect(timelineTransactionPolicy(state, {
       type: "playhead/set",
