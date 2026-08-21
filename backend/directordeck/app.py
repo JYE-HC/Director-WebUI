@@ -5814,8 +5814,8 @@ def create_app(
         _comfy_origin: str, event: ComfyProgressEvent | ComfyExecutionEvent
     ) -> None:
         for child in database.find_job_children_by_prompt_id(event.prompt_id):
-            parent = database.get_job(child["job_id"])
-            if parent is None or parent["status"] in _TERMINAL_STATUSES:
+            parent_status = database.get_job_status(child["job_id"])
+            if parent_status is None or parent_status in _TERMINAL_STATUSES:
                 continue
             snapshot = (
                 child_progress_snapshot(child, event)
@@ -5845,8 +5845,9 @@ def create_app(
         _comfy_origin: str, event: ComfyPreviewEvent
     ) -> None:
         for child in database.find_job_children_by_prompt_id(event.prompt_id):
-            parent = database.get_job(child["job_id"])
-            if parent is None or parent["status"] in _TERMINAL_STATUSES:
+            parent_job_id = str(child["job_id"])
+            parent_status = database.get_job_status(parent_job_id)
+            if parent_status is None or parent_status in _TERMINAL_STATUSES:
                 continue
             segment_id = sampler_segment_for_node(child, event.node_id)
             if segment_id is None:
@@ -5854,11 +5855,11 @@ def create_app(
             # Re-read both rows at the final cache boundary. DELETE cascades
             # child rows; the cache tombstone closes the inverse ordering where
             # deletion wins immediately before this put.
-            latest_parent = database.get_job(parent["id"])
+            latest_parent_status = database.get_job_status(parent_job_id)
             latest_child = database.get_job_child(child["id"])
             if (
-                latest_parent is None
-                or latest_parent["status"] in _TERMINAL_STATUSES
+                latest_parent_status is None
+                or latest_parent_status in _TERMINAL_STATUSES
                 or latest_child is None
                 or latest_child["status"] not in {"queued", "running"}
                 or latest_child.get("prompt_id") != event.prompt_id
@@ -5867,7 +5868,7 @@ def create_app(
             ):
                 continue
             live_preview_cache.put(
-                job_id=parent["id"],
+                job_id=parent_job_id,
                 child_id=child["id"],
                 segment_id=segment_id,
                 event=event,
@@ -6117,7 +6118,7 @@ def create_app(
     async def test_capabilities(request: Request) -> dict[str, Any]:
         """Re-probe the embedded host ComfyUI instance (the only endpoint)."""
 
-        started = __import__("time").monotonic()
+        started = time.monotonic()
         try:
             report = await _comfy(request).capabilities()
             missing = report.get("missing_nodes") or []
@@ -6126,7 +6127,8 @@ def create_app(
                 # test. Missing execution nodes affect readiness, not network
                 # connectivity, and are reported separately in the message.
                 "ok": True,
-                "latency_ms": report.get("latency_ms") or round((__import__("time").monotonic() - started) * 1000, 1),
+                "latency_ms": report.get("latency_ms")
+                or round((time.monotonic() - started) * 1000, 1),
                 "message": "连接成功" if not missing else f"连接成功，但缺少节点: {', '.join(missing)}",
             }
         except (ComfyError, httpx.HTTPError) as exc:

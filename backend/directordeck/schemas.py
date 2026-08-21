@@ -1103,7 +1103,7 @@ def default_timeline_draft() -> UnifiedTimelineDraft:
             "segments": [
                 {
                     "id": "timeline-segment-1",
-                    "title": "分段 01",
+                    "title": "片段 01",
                     "mode": "fl2va",
                     "prompt": "",
                     "duration_seconds": 5.0,

@@ -88,6 +88,10 @@ async def _submitted_job(client, accepted: dict) -> dict:
     return response.json()
 
 
+def test_default_timeline_uses_the_segment_title_contract() -> None:
+    assert default_timeline_draft().segments[0].title == "片段 01"
+
+
 def test_h3_prompt_limit_counts_unicode_characters_not_utf8_bytes() -> None:
     value = default_timeline_draft().model_dump(mode="json")
     value["segments"][0]["prompt"] = "中" * MINIMAX_H3_PROMPT_MAX_CHARACTERS

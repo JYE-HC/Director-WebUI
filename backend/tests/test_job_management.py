@@ -139,6 +139,46 @@ async def test_job_list_filters_sorts_summarizes_and_never_contacts_comfy(
     assert current_task["current_project"] is True
 
 
+async def test_job_list_projection_does_not_decode_internal_prompt_snapshots(
+    client,
+) -> None:
+    created = await _create_timeline_job(client, title="Prompt projection")
+    database = client.director_app.state.database
+    children = database.list_job_children(created["id"])
+    assert children
+
+    # A list response never exposes an executable prompt graph. Corrupting only
+    # those internal columns makes an accidental SELECT * / JSON decode fail
+    # deterministically while the public list projection must remain readable.
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE jobs SET prompt_snapshot = ? WHERE id = ?",
+            ("{malformed-parent-prompt", created["id"]),
+        )
+        connection.execute(
+            "UPDATE job_children SET prompt_snapshot = ? WHERE job_id = ?",
+            ("{malformed-child-prompt", created["id"]),
+        )
+
+    page, total = database.list_jobs_page(limit=100)
+    listed = next(job for job in page if job["id"] == created["id"])
+    assert total == 1
+    assert "prompt_snapshot" not in listed
+    children_by_job = database.list_job_children_for_jobs([created["id"]])
+    assert children_by_job[created["id"]]
+    assert all(
+        "prompt_snapshot" not in child
+        for child in children_by_job[created["id"]]
+    )
+    assert database.get_job_status(created["id"]) == created["status"]
+    assert database.get_job_status("missing-job") is None
+
+    response = await client.get("/api/jobs")
+    assert response.status_code == 200, response.text
+    public = next(job for job in response.json()["jobs"] if job["id"] == created["id"])
+    assert public["display_name"] == "Prompt projection"
+
+
 async def test_job_currentness_uses_the_callers_active_project_scope(
     client,
     monkeypatch,
