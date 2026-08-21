@@ -6,7 +6,11 @@ import pytest
 from starlette.requests import Request
 
 from directordeck.app import _sync_job
-from directordeck.progress import ComfyExecutionEvent, ComfyProgressEvent
+from directordeck.progress import (
+    ComfyExecutionEvent,
+    ComfyPreviewEvent,
+    ComfyProgressEvent,
+)
 from directordeck.schemas import RuntimeSettings, default_settings
 
 from .conftest import runnable_draft
@@ -14,6 +18,7 @@ from .conftest import runnable_draft
 
 async def test_raylight_native_events_persist_all_visible_execution_stages(
     client,
+    monkeypatch,
 ) -> None:
     raw_settings = default_settings().model_dump(mode="json")
     raw_settings["multi_gpu_enabled"] = True
@@ -69,6 +74,11 @@ async def test_raylight_native_events_persist_all_visible_execution_stages(
     origin = "http://comfy.test:8188"
     prompt_id = child["prompt_id"]
 
+    def full_parent_snapshot_is_forbidden(_job_id: str):
+        raise AssertionError("native websocket events must use the status projection")
+
+    monkeypatch.setattr(database, "get_job", full_parent_snapshot_is_forbidden)
+
     stages = [
         (None, 0.01, "开始执行"),
         (
@@ -118,6 +128,19 @@ async def test_raylight_native_events_persist_all_visible_execution_stages(
     assert sampling is not None
     assert sampling["progress"] == pytest.approx(0.29)
     assert sampling["stage"] == "片段 1/1 · 采样 5/25"
+
+    preview_sink = client.director_app.state.progress_manager._preview_sink
+    assert preview_sink is not None
+    await preview_sink(
+        origin,
+        ComfyPreviewEvent(
+            prompt_id=prompt_id,
+            node_id=sampler_id,
+            mime_type="image/png",
+            content=b"\x89PNG\r\n\x1a\nstatus-projection-preview",
+        ),
+    )
+    assert client.director_app.state.live_preview_cache.get(parent["id"]) is not None
 
     for class_type, expected_progress, expected_stage in (
         ("VAEDecode", 0.90, "片段 1/1 · 解码视频画面"),

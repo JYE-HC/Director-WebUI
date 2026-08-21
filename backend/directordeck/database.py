@@ -40,6 +40,47 @@ from .schemas import (
 )
 
 
+# The task list deliberately excludes internal prompt/workflow snapshots. The
+# public projection still needs the immutable timeline/runtime snapshots for
+# display identity and currentness, plus child output-node mappings for stable
+# segment results, but never exposes or interprets the executable prompt graph.
+_JOB_LIST_COLUMNS = ", ".join(
+    (
+        "id",
+        "mode",
+        "status",
+        "progress",
+        "stage",
+        "prompt_id",
+        "project_id",
+        "outputs",
+        "error",
+        "config_snapshot",
+        "settings_snapshot",
+        "created_at",
+        "updated_at",
+        "started_at",
+        "completed_at",
+    )
+)
+_JOB_CHILD_LIST_COLUMNS = ", ".join(
+    (
+        "id",
+        "job_id",
+        "family",
+        "backend",
+        "segment_ids",
+        "output_nodes",
+        "status",
+        "progress",
+        "stage",
+        "prompt_id",
+        "outputs",
+        "error",
+    )
+)
+
+
 class TimelineRevisionConflict(RuntimeError):
     """A conditional timeline write was based on an obsolete server revision."""
 
@@ -2902,7 +2943,7 @@ class Database:
     def list_job_children_for_jobs(
         self, job_ids: list[str]
     ) -> dict[str, list[dict[str, Any]]]:
-        """Load a page of task children without one query per parent row."""
+        """Load only public-list child fields without one query per parent row."""
 
         children = {job_id: [] for job_id in job_ids}
         if not job_ids:
@@ -2910,12 +2951,12 @@ class Database:
         placeholders = ",".join("?" for _ in job_ids)
         with self.connect() as db:
             rows = db.execute(
-                "SELECT * FROM job_children "
+                f"SELECT {_JOB_CHILD_LIST_COLUMNS} FROM job_children "
                 f"WHERE job_id IN ({placeholders}) ORDER BY job_id, group_index",
                 tuple(job_ids),
             ).fetchall()
         for row in rows:
-            child = self._job_child_row(row)
+            child = self._job_child_list_row(row)
             children[str(child["job_id"])].append(child)
         return children
 
@@ -3279,6 +3320,15 @@ class Database:
             row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._job_row(row) if row else None
 
+    def get_job_status(self, job_id: str) -> str | None:
+        """Read lifecycle state without decoding immutable job snapshots."""
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return str(row["status"]) if row is not None else None
+
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
@@ -3369,7 +3419,10 @@ class Database:
                 ).fetchone()[0]
             )
             rows = db.execute(
-                "SELECT * FROM jobs" + where + order + " LIMIT ? OFFSET ?",
+                f"SELECT {_JOB_LIST_COLUMNS} FROM jobs"
+                + where
+                + order
+                + " LIMIT ? OFFSET ?",
                 (*parameters, limit, offset),
             ).fetchall()
         return [self._job_row(row) for row in rows], total
@@ -3848,5 +3901,12 @@ class Database:
     def _job_child_row(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
         for field in ("segment_ids", "output_nodes", "outputs", "prompt_snapshot"):
+            value[field] = json.loads(value[field])
+        return value
+
+    @staticmethod
+    def _job_child_list_row(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        for field in ("segment_ids", "output_nodes", "outputs"):
             value[field] = json.loads(value[field])
         return value

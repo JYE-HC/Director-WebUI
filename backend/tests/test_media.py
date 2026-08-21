@@ -10,6 +10,8 @@ import pytest
 from directordeck.media import (
     MediaToolError,
     MediaToolTimeout,
+    _packet_durations_are_24fps,
+    _run_command_to_file,
     _scene_frames,
     assemble_video_bytes,
     create_24fps_proxy_file,
@@ -382,21 +384,21 @@ def test_packet_scan_timeout_falls_back_from_remux_eligibility(
     source.write_bytes(_sample_video(tmp_path, fps=24))
     destination = tmp_path / "packet-timeout-proxy.mp4"
     calls: list[tuple[list[str], float, str | None]] = []
-    original = media_module._run_command
 
     def fake_run(
         args: list[str],
+        output,
         *,
         timeout: float,
         operation: str | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
+    ) -> None:
         calls.append((args, timeout, operation))
-        if operation == "proxy packet-duration scan":
-            assert "packet=duration_time" in args
-            raise MediaToolTimeout(operation, timeout)
-        return original(args, timeout=timeout, operation=operation)
+        assert output is not subprocess.PIPE
+        assert output.fileno() >= 0
+        assert "packet=duration_time" in args
+        raise MediaToolTimeout(operation or args[0], timeout)
 
-    monkeypatch.setattr(media_module, "_run_command", fake_run)
+    monkeypatch.setattr(media_module, "_run_command_to_file", fake_run)
     proxy = create_24fps_proxy_file(source, destination)
 
     packet_call = next(call for call in calls if call[2] == "proxy packet-duration scan")
@@ -415,22 +417,79 @@ def test_packet_scan_non_timeout_error_is_not_downgraded(
     source = tmp_path / "packet-error-source.mp4"
     source.write_bytes(_sample_video(tmp_path, fps=24))
     destination = tmp_path / "packet-error-proxy.mp4"
-    original = media_module._run_command
 
     def fake_run(
         args: list[str],
+        output,
         *,
         timeout: float,
         operation: str | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
-        if operation == "proxy packet-duration scan":
-            raise MediaToolError("packet scan command failed")
-        return original(args, timeout=timeout, operation=operation)
+    ) -> None:
+        assert output is not subprocess.PIPE
+        assert output.fileno() >= 0
+        assert operation == "proxy packet-duration scan"
+        raise MediaToolError("packet scan command failed")
 
-    monkeypatch.setattr(media_module, "_run_command", fake_run)
+    monkeypatch.setattr(media_module, "_run_command_to_file", fake_run)
     with pytest.raises(MediaToolError, match="packet scan command failed"):
         create_24fps_proxy_file(source, destination)
     assert not destination.exists()
+
+
+def test_packet_scan_writes_stdout_to_a_file(monkeypatch, tmp_path: Path) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        output = kwargs["stdout"]
+        observed["stdout"] = output
+        assert output is not subprocess.PIPE
+        output.write(b"0.041667\n")
+        return subprocess.CompletedProcess(args, 0, None, b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    output_path = tmp_path / "packet-durations.txt"
+    with output_path.open("w+b") as output:
+        _run_command_to_file(
+            ["ffprobe", "input.mp4"],
+            output,
+            timeout=60,
+            operation="proxy packet-duration scan",
+        )
+        output.seek(0)
+        assert output.read() == b"0.041667\n"
+    assert observed["stdout"] is output
+
+
+def test_packet_duration_parser_consumes_a_stream_incrementally() -> None:
+    class StreamingOnly:
+        def read(self, *args, **kwargs):
+            raise AssertionError("packet duration output must not be read into memory")
+
+        def readlines(self, *args, **kwargs):
+            raise AssertionError("packet duration output must not be collected")
+
+        def __iter__(self):
+            for _ in range(100_000):
+                yield b"0.041667\n"
+
+    assert _packet_durations_are_24fps(StreamingOnly()) is True
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        ([], False),
+        ([b"\n", b" \r\n"], False),
+        ([b"N/A\n"], False),
+        ([b"0.041667\n", b"not-a-duration\n"], False),
+        ([b"0.041667\n", b"0.040000\n"], False),
+        ([b"\n", b"0.041667\r\n", b"0.041667\n"], True),
+    ],
+)
+def test_packet_duration_parser_fails_closed(
+    lines: list[bytes], expected: bool
+) -> None:
+    assert _packet_durations_are_24fps(iter(lines)) is expected
 
 
 def test_historical_video_metadata_defaults_to_silent() -> None:

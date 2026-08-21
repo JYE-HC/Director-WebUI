@@ -219,7 +219,8 @@ def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
         if has_first_cond_uuid and easycache.first_cond_uuid in easycache.uuid_cache_diffs:
             diff_slice = easycache.uuid_cache_diffs[easycache.first_cond_uuid]
 
-            xs = list(x_slice.shape); ds = list(diff_slice.shape)
+            xs = list(x_slice.shape)
+            ds = list(diff_slice.shape)
             if xs[1:] != ds[1:]:
                 min_shape = tuple(min(a, b) for a, b in zip(xs[1:], ds[1:]))
                 crop = (slice(None),) + tuple(slice(0, s) for s in min_shape)
@@ -266,7 +267,8 @@ def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
                 easycache.x_prev_subsampled = x_slice.clone()
                 if has_first_cond_uuid and easycache.first_cond_uuid in easycache.uuid_cache_diffs:
                     diff_slice = easycache.uuid_cache_diffs[easycache.first_cond_uuid]
-                    xs = list(x_slice.shape); ds = list(diff_slice.shape)
+                    xs = list(x_slice.shape)
+                    ds = list(diff_slice.shape)
                     if xs[1:] != ds[1:]:
                         min_shape = tuple(min(a, b) for a, b in zip(xs[1:], ds[1:]))
                         crop = (slice(None),) + tuple(slice(0, s) for s in min_shape)

@@ -6,10 +6,12 @@ import math
 import re
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
+from typing import BinaryIO
 
 from .schemas import DetectShotsResponse, VideoMetadata
 
@@ -57,9 +59,10 @@ def _suffix(value: str) -> str:
     return candidate.lower() if _SAFE_SUFFIX.fullmatch(candidate) else ".bin"
 
 
-def _run_command(
+def _run_command_with_stdout(
     args: list[str],
     *,
+    stdout: int | BinaryIO,
     timeout: float,
     operation: str | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -68,7 +71,7 @@ def _run_command(
         result = subprocess.run(
             args,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
+            stdout=stdout,
             stderr=subprocess.PIPE,
             check=False,
             timeout=timeout,
@@ -81,6 +84,35 @@ def _run_command(
         detail = result.stderr.decode("utf-8", errors="replace")[-4000:].strip()
         raise MediaToolError(f"{label} failed with exit code {result.returncode}: {detail}")
     return result
+
+
+def _run_command(
+    args: list[str],
+    *,
+    timeout: float,
+    operation: str | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    return _run_command_with_stdout(
+        args,
+        stdout=subprocess.PIPE,
+        timeout=timeout,
+        operation=operation,
+    )
+
+
+def _run_command_to_file(
+    args: list[str],
+    output: BinaryIO,
+    *,
+    timeout: float,
+    operation: str | None = None,
+) -> None:
+    _run_command_with_stdout(
+        args,
+        stdout=output,
+        timeout=timeout,
+        operation=operation,
+    )
 
 
 def _ffmpeg_full_help() -> str:
@@ -118,6 +150,19 @@ def _positive_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _packet_durations_are_24fps(lines: Iterable[bytes]) -> bool:
+    found_duration = False
+    for raw_line in lines:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        found_duration = True
+        duration = _positive_float(line)
+        if duration is None or not math.isclose(duration, 1 / 24, abs_tol=1e-6):
+            return False
+    return found_duration
 
 
 def _positive_int(value: object) -> int | None:
@@ -313,41 +358,33 @@ def _can_remux_24fps_proxy(source: str | Path) -> bool:
         return False
     # Container rate fields can claim 24 fps for VFR media. Packet durations
     # are cheap to scan compared with decoding/re-encoding and close that gap.
-    try:
-        packet_result = _run_command(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "packet=duration_time",
-                "-of",
-                "csv=p=0",
-                str(source),
-            ],
-            timeout=_REMUX_ELIGIBILITY_SCAN_TIMEOUT_SECONDS,
-            operation="proxy packet-duration scan",
-        )
-    except MediaToolTimeout as exc:
-        # This scan only proves eligibility for the remux optimization. A
-        # timeout must conservatively choose canonical transcoding, not reject
-        # an otherwise valid upload.
-        _LOGGER.warning("%s; falling back to canonical transcode", exc)
-        return False
-    durations = [
-        _positive_float(line.strip())
-        for line in packet_result.stdout.decode("utf-8", errors="replace").splitlines()
-        if line.strip()
-    ]
-    return bool(
-        durations
-        and all(
-            duration is not None and math.isclose(duration, 1 / 24, abs_tol=1e-6)
-            for duration in durations
-        )
-    )
+    with tempfile.TemporaryFile(mode="w+b") as packet_output:
+        try:
+            _run_command_to_file(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "packet=duration_time",
+                    "-of",
+                    "csv=p=0",
+                    str(source),
+                ],
+                packet_output,
+                timeout=_REMUX_ELIGIBILITY_SCAN_TIMEOUT_SECONDS,
+                operation="proxy packet-duration scan",
+            )
+        except MediaToolTimeout as exc:
+            # This scan only proves eligibility for the remux optimization. A
+            # timeout must conservatively choose canonical transcoding, not reject
+            # an otherwise valid upload.
+            _LOGGER.warning("%s; falling back to canonical transcode", exc)
+            return False
+        packet_output.seek(0)
+        return _packet_durations_are_24fps(packet_output)
 
 
 def create_24fps_proxy_file(source: str | Path, destination: str | Path) -> VideoProxyResult:
