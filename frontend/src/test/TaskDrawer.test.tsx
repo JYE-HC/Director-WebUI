@@ -541,6 +541,7 @@ describe("ComfyUI 风格的任务历史抽屉", () => {
     "restart_cancel_pending",
     "restart_cancel_failed",
     "restart_cancel_unconfirmed",
+    "restart_certificate_required",
   ])("取消恢复阶段 %s 同时保留重试取消和人工重启确认", async (stage) => {
     const user = userEvent.setup();
     const onConfirmComfyRestart = vi.fn();
@@ -618,6 +619,57 @@ describe("ComfyUI 风格的任务历史抽屉", () => {
     const initialSource = first!.src;
     act(() => vi.advanceTimersByTime(500));
     expect(first!.src).not.toBe(initialSource);
+  });
+
+  it("旧的重启确认任务不会遮住真正运行任务的阶段、进度和实时缩略图", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-12T16:00:00Z"));
+    const staleCancellation: GenerationTask = {
+      ...baseTask,
+      id: "old-restart-certificate",
+      status: "cancelling",
+      stage: "restart_certificate_required",
+      progress: 0.01,
+      created_at: "2026-08-12T14:00:00Z",
+      started_at: "2026-08-12T14:00:10Z",
+      live_preview_url: "/api/jobs/old-restart-certificate/live-preview",
+    };
+    const currentRun: GenerationTask = {
+      ...baseTask,
+      id: "current-running-task",
+      status: "running",
+      stage: "构建多模态条件",
+      progress: 0.45,
+      created_at: "2026-08-12T15:00:00Z",
+      started_at: "2026-08-12T15:00:10Z",
+      live_preview_url: "/api/jobs/current-running-task/live-preview",
+      children: [{
+        id: "current-running-child",
+        family: "fl2va",
+        backend: "standard",
+        segment_ids: ["segment-1"],
+        status: "running",
+        progress: 0.7,
+        stage: "采样 3/4",
+        prompt_id: "current-prompt",
+        outputs: [],
+        error: null,
+      }],
+    };
+
+    const { container } = renderDrawer({
+      tasks: [staleCancellation, currentRun],
+    });
+
+    expect(screen.getByText("采样 3/4")).toBeInTheDocument();
+    expect(screen.queryByText("构建多模态条件")).not.toBeInTheDocument();
+    expect(screen.getByText("取消中")).toBeInTheDocument();
+    expect(screen.getByLabelText("完成 70%")).toBeInTheDocument();
+    expect(screen.queryByLabelText("完成 1%")).not.toBeInTheDocument();
+    const preview = container.querySelector<HTMLImageElement>(".task-row__thumb img");
+    expect(preview).not.toBeNull();
+    expect(preview!.src).toContain("current-running-task/live-preview?frame=");
+    expect(preview!.src).not.toContain("old-restart-certificate");
   });
 
   it("清空历史先说明仅删记录，关闭抽屉时完全卸载", async () => {

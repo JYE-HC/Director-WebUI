@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import socket
 import sys
@@ -546,6 +547,43 @@ def start_fake_backend(plugin: Any, database_path: Path) -> threading.Thread:
     return thread
 
 
+def test_backend_httpx_filter_is_narrowly_scoped(loaded_plugin: Any) -> None:
+    plugin = loaded_plugin.module
+    backend_thread = 12345
+    request_filter = plugin._DirectorHttpxRequestFilter(backend_thread)
+
+    def record(*, level: int, message: str, thread: int = backend_thread):
+        item = logging.LogRecord(
+            "httpx",
+            level,
+            __file__,
+            1,
+            message,
+            (),
+            None,
+        )
+        item.thread = thread
+        return item
+
+    assert request_filter.filter(record(
+        level=logging.INFO,
+        message='HTTP Request: GET http://127.0.0.1/models "HTTP/1.1 200 OK"',
+    )) is False
+    assert request_filter.filter(record(
+        level=logging.WARNING,
+        message="HTTP Request: GET failed",
+    )) is True
+    assert request_filter.filter(record(
+        level=logging.INFO,
+        message="Director transport initialized",
+    )) is True
+    assert request_filter.filter(record(
+        level=logging.INFO,
+        message="HTTP Request: GET from another plugin",
+        thread=backend_thread + 1,
+    )) is True
+
+
 async def read_status(loaded_plugin: Any) -> dict[str, Any]:
     handler = loaded_plugin.routes.handlers[("GET", "/directordeck/status")]
     response = await handler(None)
@@ -787,6 +825,10 @@ async def test_fake_comfy_lifecycle_reports_ready_then_stopped(
     control = install_fake_backend(monkeypatch, plugin)
     thread = start_fake_backend(plugin, tmp_path / "director.sqlite3")
     assert control.started.wait(timeout=1)
+    assert any(
+        isinstance(item, plugin._DirectorHttpxRequestFilter)
+        for item in logging.getLogger("httpx").filters
+    )
 
     ready = await read_status(loaded_plugin)
     assert ready["backend"] == "ready"
@@ -806,6 +848,10 @@ async def test_fake_comfy_lifecycle_reports_ready_then_stopped(
     control.release.set()
     thread.join(timeout=1)
     assert not thread.is_alive()
+    assert not any(
+        isinstance(item, plugin._DirectorHttpxRequestFilter)
+        for item in logging.getLogger("httpx").filters
+    )
 
     stopped = await read_status(loaded_plugin)
     assert stopped["backend"] == "stopped"

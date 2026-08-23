@@ -15,6 +15,7 @@ import type {
 } from "../api/types";
 import { downloadHistoricalProjectConfig } from "../domain/historicalProjectExport";
 import { MODE_META } from "../domain/modes";
+import { taskLivePresentation } from "../domain/taskProgress";
 import {
   loadTimelineWorkspacePreferences,
   updateTimelineWorkspacePreferences,
@@ -61,7 +62,13 @@ const COMFY_RESTART_CONFIRMATION_STAGES = new Set([
   "restart_cancel_pending",
   "restart_cancel_failed",
   "restart_cancel_unconfirmed",
+  "restart_certificate_required",
 ]);
+const CURRENT_ACTIVE_STATUS_RANK: Record<"running" | "preparing" | "cancelling", number> = {
+  running: 0,
+  preparing: 1,
+  cancelling: 2,
+};
 
 type TaskTab = "all" | "completed" | "failed";
 type TaskSort = "recent" | "duration";
@@ -845,7 +852,7 @@ export function TaskDrawer(props: TaskDrawerProps) {
     onLoadGenerationDetails,
     onImportOutput,
   } = props;
-  const tasks = rawTasks as TaskDrawerTask[];
+  const tasks = rawTasks.map(taskLivePresentation) as TaskDrawerTask[];
   const [initialPreferences] = useState(loadTimelineWorkspacePreferences);
   const [tab, setTab] = useState<TaskTab>(initialPreferences.taskTab);
   const [search, setSearch] = useState("");
@@ -988,9 +995,13 @@ export function TaskDrawer(props: TaskDrawerProps) {
   );
   const currentActiveTaskId = useMemo(
     () => [...runningTasks].sort(
-      (left, right) =>
-        (timestamp(left.started_at ?? left.created_at) ?? 0) -
-        (timestamp(right.started_at ?? right.created_at) ?? 0),
+      (left, right) => {
+        const statusOrder = CURRENT_ACTIVE_STATUS_RANK[left.status as keyof typeof CURRENT_ACTIVE_STATUS_RANK] -
+          CURRENT_ACTIVE_STATUS_RANK[right.status as keyof typeof CURRENT_ACTIVE_STATUS_RANK];
+        if (statusOrder !== 0) return statusOrder;
+        return (timestamp(left.started_at ?? left.created_at) ?? 0) -
+          (timestamp(right.started_at ?? right.created_at) ?? 0);
+      },
     )[0]?.id ?? null,
     [runningTasks],
   );

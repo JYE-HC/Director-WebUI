@@ -1268,7 +1268,36 @@ def _plugin_version() -> str | None:
         return None
 
 
+class _DirectorHttpxRequestFilter(logging.Filter):
+    """Silence routine HTTPX request summaries from Director's backend only."""
+
+    def __init__(self, thread_ident: int) -> None:
+        super().__init__()
+        self._thread_ident = thread_ident
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.thread == self._thread_ident
+            and record.name == "httpx"
+            and record.levelno == logging.INFO
+            and record.getMessage().startswith("HTTP Request:")
+        )
+
+
 def _run_backend(database_path: Path) -> None:
+    # ComfyUI's process-wide logging configuration exposes HTTPX INFO records.
+    # Filter only the routine summaries emitted by this dedicated thread; do
+    # not change the httpx logger level or hide another plugin's diagnostics.
+    httpx_logger = logging.getLogger("httpx")
+    request_filter = _DirectorHttpxRequestFilter(threading.get_ident())
+    httpx_logger.addFilter(request_filter)
+    try:
+        _serve_backend(database_path)
+    finally:
+        httpx_logger.removeFilter(request_filter)
+
+
+def _serve_backend(database_path: Path) -> None:
     try:
         if str(_BACKEND_PATH) not in sys.path:
             sys.path.insert(0, str(_BACKEND_PATH))
