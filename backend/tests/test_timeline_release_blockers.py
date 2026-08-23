@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -22,8 +23,24 @@ from directordeck.schemas import (
     default_timeline_draft,
     utc_now,
 )
+from directordeck.workflow.execution import (
+    ExactCancelConfirmedEvidence,
+    OutputDescriptor,
+)
 
-from .conftest import VIDEO_METADATA, asset, wait_for_submission_tasks
+from .conftest import (
+    VIDEO_METADATA,
+    adapt_legacy_workflow_requests,
+    asset,
+    save_database_legacy_settings,
+    save_timeline_document,
+    wait_for_submission_tasks,
+)
+
+
+@pytest.fixture(autouse=True)
+def _stage6_v5_request_adapter(client, monkeypatch) -> None:
+    adapt_legacy_workflow_requests(client, monkeypatch)
 
 
 def _background_request(app) -> Request:
@@ -206,7 +223,7 @@ async def test_segment_candidate_currentness_requires_exact_authority_snapshots(
     client, fake_comfy
 ) -> None:
     draft = _timeline("current")
-    assert (await client.put("/api/timeline", json=draft)).status_code == 200
+    assert (await save_timeline_document(client, draft)).status_code == 200
     parent, children = await _create_timeline_job(client, "current")
     child = children[0]
     fake_comfy.pending = []
@@ -219,16 +236,25 @@ async def test_segment_candidate_currentness_requires_exact_authority_snapshots(
 
     edited = _timeline("current")
     edited["segments"][0]["prompt"] = "A changed prompt"
-    assert (await client.put("/api/timeline", json=edited)).status_code == 200
+    assert (await save_timeline_document(client, edited)).status_code == 200
     historical = await client.get(f"/api/jobs/{parent['id']}")
     assert historical.json()["segment_results"][0]["current_snapshot"] is False
 
-    # Restoring the creative document is insufficient if any runtime setting
-    # changed; exact model/endpoint/device selection is part of take identity.
-    assert (await client.put("/api/timeline", json=draft)).status_code == 200
-    settings = (await client.get("/api/settings")).json()
-    settings["client_id"] = "candidate-settings-changed"
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
+    # Restoring the creative document is insufficient if this task's runtime
+    # placement changed. Unrelated runtime fields deliberately do not make all
+    # v5 jobs stale.
+    assert (await save_timeline_document(client, draft)).status_code == 200
+    authority = (await client.get("/api/settings/authority")).json()
+    authority["settings"]["placement"]["fl2va"]["device"] = "gpu:1"
+    runtime_saved = await client.put(
+        "/api/settings/authority",
+        json={
+                "document": authority["settings"],
+                "expected_authority_token": authority["authority_token"],
+                "schema_version": 3,
+            },
+        )
+    assert runtime_saved.status_code == 200, runtime_saved.text
     stale_runtime = await client.get(f"/api/jobs/{parent['id']}")
     assert stale_runtime.json()["segment_results"][0]["current_snapshot"] is False
 
@@ -237,7 +263,7 @@ async def test_invalid_historical_snapshot_keeps_take_but_never_marks_current(
     client, fake_comfy
 ) -> None:
     draft = _timeline("legacy")
-    assert (await client.put("/api/timeline", json=draft)).status_code == 200
+    assert (await save_timeline_document(client, draft)).status_code == 200
     parent, children = await _create_timeline_job(client, "legacy")
     child = children[0]
     fake_comfy.pending = []
@@ -545,8 +571,15 @@ async def test_multisegment_missing_output_fails_before_assembly(
     assert response.status_code == 200, response.text
     job = response.json()
     assert job["status"] == "failed"
-    assert job["stage"] == "output_missing"
-    assert "missing=['second']" in job["error"]
+    assert job["stage"] == "segments_failed"
+    persisted_children = client.director_app.state.database.list_job_children(
+        parent["id"]
+    )
+    assert any(
+        child["stage"] == "artifact_verification_failed"
+        for child in persisted_children
+    )
+    assert "missing the expected output node" in job["error"]
     assert job["outputs"] == []
     assert [item["segment_id"] for item in job["segment_results"]] == ["first"]
     assert assemble.call_count == 0
@@ -570,8 +603,15 @@ async def test_multisegment_duplicate_output_fails_before_assembly(
     assert response.status_code == 200, response.text
     job = response.json()
     assert job["status"] == "failed"
-    assert job["stage"] == "output_missing"
-    assert "duplicate output for segment 'first'" in job["error"]
+    assert job["stage"] == "segments_failed"
+    persisted_children = client.director_app.state.database.list_job_children(
+        parent["id"]
+    )
+    assert any(
+        child["stage"] == "artifact_verification_failed"
+        for child in persisted_children
+    )
+    assert "exactly one expected take descriptor" in job["error"]
     assert job["outputs"] == []
     assert [item["segment_id"] for item in job["segment_results"]] == ["second"]
     assert assemble.call_count == 0
@@ -590,12 +630,14 @@ async def test_http_reads_do_not_wait_for_background_timeline_assembly(
     async def blocked_assembly(_request, _job, _outputs):
         assembly_started.set()
         await assembly_release.wait()
-        return {
-            "node_id": "assembly",
-            "filename": "assembled.mp4",
-            "subfolder": "directordeck/timelines",
-            "type": "output",
-        }
+        return (
+            OutputDescriptor(
+                filename="assembled.mp4",
+                subfolder="directordeck/timelines",
+            ),
+            VideoMetadata.model_validate(VIDEO_METADATA),
+            "sha256:" + "a" * 64,
+        )
 
     monkeypatch.setattr("directordeck.app._assemble_timeline_output", blocked_assembly)
     database = client.director_app.state.database
@@ -639,14 +681,21 @@ async def test_unexpected_assembly_exception_releases_claim_for_one_later_retry(
     for child in children:
         fake_comfy.histories[child["prompt_id"]] = _success_history(child)
     fake_comfy.pending = []
+    assembled_descriptor = OutputDescriptor(
+        filename="retried.mp4",
+        subfolder="directordeck/timelines",
+    )
     assembled_output = {
         "node_id": "assembly",
-        "filename": "retried.mp4",
-        "subfolder": "directordeck/timelines",
-        "type": "output",
+        **assembled_descriptor.model_dump(mode="json"),
     }
+    assembled_result = (
+        assembled_descriptor,
+        VideoMetadata.model_validate(VIDEO_METADATA),
+        "sha256:" + "b" * 64,
+    )
     assemble = AsyncMock(
-        side_effect=[RuntimeError("unexpected assembler bug"), assembled_output]
+        side_effect=[RuntimeError("unexpected assembler bug"), assembled_result]
     )
     monkeypatch.setattr("directordeck.app._assemble_timeline_output", assemble)
 
@@ -781,7 +830,7 @@ async def test_progress_sink_tolerates_job_deletion_between_lookup_and_write(
     sampler_id = next(
         str(node_id)
         for node_id, node in child["prompt_snapshot"].items()
-        if node["class_type"] in {"SamplerCustomAdvanced", "XFuserSamplerCustomAdvanced"}
+        if node["class_type"] in {"SamplerCustomAdvanced", "DirectorDeckRayXFuserSamplerCustomAdvanced"}
     )
     database = client.director_app.state.database
     original = database.update_job_child_progress_monotonic
@@ -790,6 +839,23 @@ async def test_progress_sink_tolerates_job_deletion_between_lookup_and_write(
     def delete_immediately_before_progress_write(child_id: str, **kwargs):
         nonlocal deletion_won
         assert child_id == child["id"]
+        ownership = database.get_prompt_ownership(child_id)
+        assert ownership is not None
+        confirmed_at = datetime.now(timezone.utc)
+        released = database.confirm_prompt_cleanup(
+            child_id,
+            expected_revision=ownership.ownership_revision,
+            evidence=ExactCancelConfirmedEvidence(
+                prompt_id=ownership.effective_prompt_id,
+                confirmation_id=(
+                    f"test-progress-race-cancel:{ownership.effective_prompt_id}"
+                ),
+                confirmed_at=confirmed_at,
+            ),
+            stage="cancelled",
+            updated_at=confirmed_at,
+        )
+        assert released is not None
         terminal = database.update_job_if_status(
             parent["id"],
             "queued",
@@ -836,7 +902,7 @@ async def test_live_preview_accepts_only_registered_child_sampler_and_is_no_stor
     sampler_ids = [
         str(node_id)
         for node_id, node in child["prompt_snapshot"].items()
-        if node["class_type"] in {"SamplerCustomAdvanced", "XFuserSamplerCustomAdvanced"}
+        if node["class_type"] in {"SamplerCustomAdvanced", "DirectorDeckRayXFuserSamplerCustomAdvanced"}
     ]
     assert len(sampler_ids) == 1
     cache = client.director_app.state.live_preview_cache
@@ -898,7 +964,7 @@ async def test_live_preview_is_removed_on_job_delete_and_late_frame_cannot_resto
     sampler_id = next(
         str(node_id)
         for node_id, node in child["prompt_snapshot"].items()
-        if node["class_type"] in {"SamplerCustomAdvanced", "XFuserSamplerCustomAdvanced"}
+        if node["class_type"] in {"SamplerCustomAdvanced", "DirectorDeckRayXFuserSamplerCustomAdvanced"}
     )
     event = ComfyPreviewEvent(
         prompt_id=child["prompt_id"],
@@ -913,13 +979,21 @@ async def test_live_preview_is_removed_on_job_delete_and_late_frame_cannot_resto
     assert cache.get(parent["id"]) is not None
 
     database = client.director_app.state.database
-    database.update_job_child(
+    ownership = database.get_prompt_ownership(child["id"])
+    assert ownership is not None
+    confirmed_at = datetime.now(timezone.utc)
+    released = database.confirm_prompt_cleanup(
         child["id"],
-        status="cancelled",
-        progress=1.0,
+        expected_revision=ownership.ownership_revision,
+        evidence=ExactCancelConfirmedEvidence(
+            prompt_id=ownership.effective_prompt_id,
+            confirmation_id=f"test-preview-cancel:{ownership.effective_prompt_id}",
+            confirmed_at=confirmed_at,
+        ),
         stage="cancelled",
-        completed_at=utc_now(),
+        updated_at=confirmed_at,
     )
+    assert released is not None
     database.update_job(
         parent["id"],
         status="cancelled",
@@ -959,7 +1033,7 @@ async def test_job_read_hides_preview_from_terminal_child_while_parent_is_active
         str(node_id)
         for node_id, node in terminal_child["prompt_snapshot"].items()
         if node["class_type"]
-        in {"SamplerCustomAdvanced", "XFuserSamplerCustomAdvanced"}
+        in {"SamplerCustomAdvanced", "DirectorDeckRayXFuserSamplerCustomAdvanced"}
     )
     sink = client.director_app.state.progress_manager._preview_sink
     assert sink is not None
@@ -995,7 +1069,7 @@ async def test_job_read_hides_preview_from_terminal_child_while_parent_is_active
         str(node_id)
         for node_id, node in active_child["prompt_snapshot"].items()
         if node["class_type"]
-        in {"SamplerCustomAdvanced", "XFuserSamplerCustomAdvanced"}
+        in {"SamplerCustomAdvanced", "DirectorDeckRayXFuserSamplerCustomAdvanced"}
     )
     await sink(
         "http://comfy.test:8188",
@@ -1048,7 +1122,7 @@ async def test_lifespan_restores_progress_monitors_for_historical_active_endpoin
     historical_a = _settings_for("client-a")
     historical_b = _settings_for("client-b")
     terminal = _settings_for("terminal-client")
-    database.put_settings(current)
+    save_database_legacy_settings(database, current)
     _insert_lifecycle_job(database, "active-a", "queued", historical_a)
     _insert_lifecycle_job(database, "active-b", "running", historical_b)
     _insert_lifecycle_job(database, "finished", "succeeded", terminal)

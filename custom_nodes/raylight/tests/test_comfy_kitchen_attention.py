@@ -6,8 +6,8 @@ import pytest
 import torch
 from yunchang.kernels import AttnType
 
-import raylight.distributed_modules.attention as attention
-from raylight.distributed_modules.attention_backends import (
+import directordeck_raylight.distributed_modules.attention as attention
+from directordeck_raylight.distributed_modules.attention_backends import (
     COMFY_KITCHEN_INT8,
     attention_backend_choices,
     validate_attention_backend_config,
@@ -15,10 +15,10 @@ from raylight.distributed_modules.attention_backends import (
 
 
 ROOT = Path(__file__).parents[1]
-ATTENTION = ROOT / "src/raylight/distributed_modules/attention.py"
-NODES = ROOT / "src/raylight/nodes.py"
-NODES_DEBUG = ROOT / "src/raylight/nodes_debug.py"
-PARALLEL_GROUP_MANAGER = ROOT / "src/raylight/distributed_worker/parallel_group_manager.py"
+ATTENTION = ROOT / "src/directordeck_raylight/distributed_modules/attention.py"
+NODES = ROOT / "src/directordeck_raylight/nodes.py"
+NODES_DEBUG = ROOT / "src/directordeck_raylight/nodes_debug.py"
+PARALLEL_GROUP_MANAGER = ROOT / "src/directordeck_raylight/distributed_worker/parallel_group_manager.py"
 
 
 def _xfuser_dropdown_entries(path):

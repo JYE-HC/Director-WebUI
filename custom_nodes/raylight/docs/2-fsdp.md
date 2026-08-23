@@ -147,10 +147,10 @@ def load_unet(self, unet_path, model_options):
         import comfy.model_patcher as model_patcher
         import comfy.model_management as model_management
 
-        from raylight.comfy_dist.model_management import cleanup_models_gc
-        from raylight.comfy_dist.model_patcher import LowVramPatch
+        from directordeck_raylight.comfy_dist.model_management import cleanup_models_gc
+        from directordeck_raylight.comfy_dist.model_patcher import LowVramPatch
 
-        from raylight.comfy_dist.sd import fsdp_load_diffusion_model
+        from directordeck_raylight.comfy_dist.sd import fsdp_load_diffusion_model
 
         fsdp_model_options = dict(model_options)
         fsdp_model_options["use_mmap"] = self.parallel_dict.get("use_mmap", True)

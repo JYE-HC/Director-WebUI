@@ -8,7 +8,7 @@ import torch
 
 
 ROOT = Path(__file__).parents[3]
-RAYLIGHT = ROOT / "custom_nodes/raylight/src/raylight"
+RAYLIGHT = ROOT / "custom_nodes/raylight/src/directordeck_raylight"
 
 
 def _function(path, function_name, class_name=None):

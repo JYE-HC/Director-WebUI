@@ -792,7 +792,6 @@ function segmentCopyOptionCount(options: TimelineSegmentCopyOptions): number {
 function SegmentInspector({
   state,
   segment,
-  capabilities,
   runtimeEnabled,
   onDispatch,
   onBindAssets,
@@ -802,7 +801,6 @@ function SegmentInspector({
 }: {
   state: TimelineEditorState;
   segment: TimelineSegment;
-  capabilities: CapabilityReport;
   runtimeEnabled: boolean;
   onDispatch: (action: TimelineUserAction) => void;
   onBindAssets: (segmentId: string, assetIds: string[], target?: SegmentAssetTarget) => void;
@@ -899,25 +897,34 @@ function SegmentInspector({
   ).length;
   const copyOptionCount = segmentCopyOptionCount(copyOptions);
   const referenceCount = segmentAssetReferences(segment).length;
+  const segmentFeatureIds = Object.keys(
+    state.project.features.by_segment[segment.id] ?? {},
+  );
+  const changeMode = (mode: TimelineGenerationMode) => {
+    if (mode === segment.mode) return;
+    onDispatch({
+      type: "segment/set-mode",
+      ids: [segment.id],
+      mode,
+      // The generic feature editor is intentionally not a workflow surface.
+      // Preserve opaque selections until a dedicated editor or resolver owns them.
+      compatibleFeatureIds: segmentFeatureIds,
+    });
+  };
   const applyConfiguration = (scope: "following" | "selected", targetCount: number) => {
     if (!targetCount || !copyOptionCount) return;
     onDispatch({
       type: "segment/apply-config",
       sourceId: segment.id,
       scope,
-      options: copyOptions,
+      // Hidden extension selections must never be copied by a stale browser preference.
+      options: { ...copyOptions, features: false },
     });
     setCopyFeedback(`已向 ${targetCount} 个片段应用 ${copyOptionCount} 项设置`);
   };
   const continuityBoundary = timelineContinuityBoundaries(state.project)
     .find((boundary) => boundary.segment.id === segment.id) ?? null;
-  const nativeTimeline = capabilities.native_timeline;
-  const nativeContinuitySupported = capabilities.connection === "online" &&
-    nativeTimeline?.supported === true &&
-    nativeTimeline.continuity === true &&
-    nativeTimeline.modes.includes(segment.mode);
   const continuityCanEnable = segment.enabled &&
-    nativeContinuitySupported &&
     continuityBoundary?.kind === "eligible";
   const continuityParameterIssue = timelineContinuityRunIssues(state.project)
     .find((issue) => issue.boundary.segment.id === segment.id &&
@@ -931,9 +938,7 @@ function SegmentInspector({
   const sourceCropSummary = segment.mode === "ref2va" && segment.source_video?.metadata && sourceCropFrames !== null
     ? `素材总长${segment.source_video.metadata.duration.toFixed(2)}秒，共${segment.source_video.metadata.frame_count}帧，为满足H3约束，Director自动裁剪到${segment.source_duration_seconds.toFixed(4)}秒，${sourceCropFrames}帧`
     : null;
-  const continuityHelp = !nativeContinuitySupported
-    ? "当前原生分段子图不支持这个片段的连续性"
-    : !segment.enabled
+  const continuityHelp = !segment.enabled
       ? "片段重新启用后才可读取前段尾帧"
       : !continuityBoundary
         ? "当前是第一个启用片段，没有可读取的前段"
@@ -1098,7 +1103,7 @@ function SegmentInspector({
           <label className="segment-inspector__continuity-frames"><span>接续帧</span><select aria-label="当前片段接续尾帧数" aria-invalid={Boolean(continuityParameterIssue) || undefined} disabled={!segment.continuity.enabled} value={segment.continuity.overlap_frames} onChange={(event) => onDispatch({ type: "segment/set-continuity", id: segment.id, patch: { overlap_frames: Number(event.target.value) as TimelineSegment["continuity"]["overlap_frames"] } })}>{[5, 22, 39, 56].map((frames) => <option key={frames} value={frames}>{frames}</option>)}</select></label>
           <span id={continuityHelpId} className="sr-only">{continuityHelp}</span>
         </div>
-        <Field label="生成模式" className="field--inline segment-inspector__mode"><select aria-label="片段生成模式" value={segment.mode} onChange={(event) => onDispatch({ type: "segment/set-mode", ids: [segment.id], mode: event.target.value as TimelineGenerationMode })}>{TIMELINE_MODE_ORDER.map((mode) => <option key={mode} value={mode}>{segmentModeLabel(mode)}</option>)}</select></Field>
+        <Field label="生成模式" className="field--inline segment-inspector__mode"><select aria-label="片段生成模式" value={segment.mode} onChange={(event) => changeMode(event.target.value as TimelineGenerationMode)}>{TIMELINE_MODE_ORDER.map((mode) => <option key={mode} value={mode}>{segmentModeLabel(mode)}</option>)}</select></Field>
         <Field label="生成时长（秒）" className="field--inline segment-inspector__duration"><DeferredNumberInput aria-label="生成时长（秒）" min={recipe === "fl2v" ? 0.1 : 0.01} max={durationLockedBySource ? 86_400 : 120} step="0.01" value={segment.duration_seconds} disabled={durationLockedBySource} aria-describedby={durationLockedBySource ? durationHelpId : undefined} title={durationLockedBySource ? "已绑定源视频；生成时长由源视频片段确定" : undefined} onValueCommit={(value) => updateBase({ duration_seconds: value })} />{durationLockedBySource && <small id={durationHelpId} className="sr-only">已绑定源视频；请通过下方源视频裁剪范围调整片段时长。</small>}</Field>
         <Field label="音频策略" className="field--inline segment-inspector__audio-mode"><select aria-label="音频策略" value={segment.audio_mode} onChange={(event) => updateBase({ audio_mode: event.target.value as TimelineSegment["audio_mode"] })}><option value="generate">生成音频</option><option value="source">保留源音频</option><option value="mute">静音</option></select></Field>
         <Field label="参考图采样尺寸" className="field--inline segment-inspector__ref-image-size"><select aria-label="参考图采样尺寸" value={segment.ref_image_size} onChange={(event) => updateBase({ ref_image_size: event.target.value as TimelineSegment["ref_image_size"] })}><option value="match">match（匹配画布）</option><option value="max">max（最高保真）</option></select></Field>
@@ -2604,7 +2609,6 @@ export function LongFormTimelineWorkspace({
       {activeSegment ? <SegmentInspector
         state={state}
         segment={activeSegment}
-        capabilities={capabilities}
         runtimeEnabled={capabilities.connection === "online" && !uploadingFiles}
         onDispatch={onDispatch}
         onBindAssets={bindAssetsById}

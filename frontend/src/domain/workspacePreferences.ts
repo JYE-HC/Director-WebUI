@@ -146,6 +146,9 @@ export function normalizeTimelineSegmentCopyOptions(
     audioMode: copyOption(value.audioMode, fallback.audioMode),
     refImageSize: copyOption(value.refImageSize, fallback.refImageSize),
     prompt,
+    // Generic extension configuration has no generic workflow UI. Discard the
+    // old opt-in preference so a hidden selection cannot be copied silently.
+    features: false,
     // Referenced material has no independent meaning in this workflow: its
     // slots are copied only alongside Prompt and the source generation mode.
     promptReferences: prompt && mode && copyOption(

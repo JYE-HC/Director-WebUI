@@ -75,6 +75,11 @@ function normalizeVideoMetadata(value: unknown): VideoMetadata | null {
 export function normalizeAssetReference(
   value: unknown,
   expectedKind: AssetKind,
+  options: {
+    includeContentHash?: boolean;
+    requireContentHash?: boolean;
+    completeWireShape?: boolean;
+  } = {},
 ): AssetReference | null {
   if (!isRecord(value)) return null;
   if (typeof value.id !== "string" || !value.id.trim()) return null;
@@ -94,12 +99,35 @@ export function normalizeAssetReference(
   };
   for (const key of ["filename", "path", "preview_url"] as const) {
     const optional = value[key];
-    if (typeof optional === "string" || optional === null) asset[key] = optional;
+    if (options.completeWireShape) {
+      if (optional !== undefined && typeof optional !== "string" && optional !== null) return null;
+      asset[key] = typeof optional === "string" ? optional : null;
+    } else if (typeof optional === "string" || optional === null) {
+      asset[key] = optional;
+    }
+  }
+  if (
+    options.includeContentHash !== false &&
+    options.requireContentHash === true &&
+    !Object.prototype.hasOwnProperty.call(value, "content_hash")
+  ) return null;
+  if (options.includeContentHash !== false && value.content_hash !== undefined) {
+    if (
+      value.content_hash !== null &&
+      (typeof value.content_hash !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(value.content_hash))
+    ) return null;
+    asset.content_hash = value.content_hash;
+  } else if (options.includeContentHash !== false && options.completeWireShape) {
+    asset.content_hash = null;
   }
   if (expectedKind === "video") {
     const metadata = normalizeVideoMetadata(value.metadata);
     if (!metadata) return null;
     asset.metadata = metadata;
+  } else if (options.completeWireShape) {
+    if (value.metadata !== undefined && value.metadata !== null) return null;
+    asset.metadata = null;
   }
   // Non-video metadata and slot fields are deliberately omitted. The backend
   // accepts metadata only for videos, while plain first/last/source assets are
@@ -126,11 +154,16 @@ export function normalizeSlottedAssetReference(
   value: unknown,
   kind: AssetKind,
   maxSlot: number,
+  options: {
+    includeContentHash?: boolean;
+    requireContentHash?: boolean;
+    completeWireShape?: boolean;
+  } = {},
 ): SlottedAssetReference | null {
   if (!isRecord(value) || !Number.isInteger(value.slot)) return null;
   const slot = value.slot as number;
   if (slot < 0 || slot > maxSlot) return null;
-  const asset = normalizeAssetReference(value, kind);
+  const asset = normalizeAssetReference(value, kind, options);
   return asset ? { ...asset, slot } : null;
 }
 
@@ -138,12 +171,17 @@ export function normalizeSlottedAssetList(
   values: unknown,
   kind: AssetKind,
   maxSlot: number,
+  options: {
+    includeContentHash?: boolean;
+    requireContentHash?: boolean;
+    completeWireShape?: boolean;
+  } = {},
 ): SlottedAssetReference[] {
   if (!Array.isArray(values)) return [];
   const acceptedExplicit = new Map<number, SlottedAssetReference>();
   const used = new Set<number>();
   values.forEach((value, index) => {
-    const asset = normalizeSlottedAssetReference(value, kind, maxSlot);
+    const asset = normalizeSlottedAssetReference(value, kind, maxSlot, options);
     if (!asset || used.has(asset.slot)) return;
     used.add(asset.slot);
     acceptedExplicit.set(index, asset);
@@ -158,7 +196,7 @@ export function normalizeSlottedAssetList(
     }
     // Migrate pre-slot local drafts while preserving all explicit server slots.
     if (!isRecord(value) || value.slot !== undefined) return;
-    const asset = normalizeAssetReference(value, kind);
+    const asset = normalizeAssetReference(value, kind, options);
     if (!asset) return;
     let slot = 0;
     while (slot <= maxSlot && used.has(slot)) slot += 1;

@@ -13,6 +13,7 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 import check_plugin_package as gate
+import build_plugin
 from plugin_package import (
     PROVENANCE_NAME,
     PackageError,
@@ -30,6 +31,115 @@ DEPENDENCIES = [
     "uvicorn[standard]>=0.35,<1",
     "websockets>=16,<18",
 ]
+
+
+@pytest.mark.parametrize(
+    "package_name",
+    (
+        "DirectorDeck-Strict-Attention",
+        "DirectorDeck-Strict-H3",
+    ),
+)
+def test_director_strict_packs_are_built_and_required(package_name: str) -> None:
+    assert package_name in build_plugin.BUNDLED_NODE_PACKS
+    assert f"nodes/{package_name}" in gate.REQUIRED_DIRECTORIES
+
+
+def test_bundled_raylight_uses_directordeck_package_identity() -> None:
+    assert "raylight" in build_plugin.BUNDLED_NODE_PACKS
+    assert (
+        build_plugin.BUNDLED_NODE_PACK_DESTINATIONS["raylight"]
+        == "DirectorDeck-RayLight"
+    )
+    assert "nodes/DirectorDeck-RayLight" in gate.REQUIRED_DIRECTORIES
+    assert (
+        "nodes/DirectorDeck-RayLight/src/directordeck_raylight"
+        in gate.REQUIRED_DIRECTORIES
+    )
+    assert "nodes/raylight" in gate.FORBIDDEN_BUNDLED_NODE_DIRECTORIES
+    assert (
+        "nodes/DirectorDeck-RayLight/src/raylight"
+        in gate.FORBIDDEN_BUNDLED_NODE_DIRECTORIES
+    )
+    assert (
+        "nodes/DirectorDeck-RayLight/src/_ray_runtime_env"
+        in gate.FORBIDDEN_BUNDLED_NODE_DIRECTORIES
+    )
+    assert build_plugin.BUNDLED_RAYLIGHT_PYTHON_PACKAGE == (
+        "directordeck_raylight"
+    )
+    assert set(build_plugin.BUNDLED_RAYLIGHT_EXCLUDED_DIRECTORIES) == {
+        "docs",
+        "example_workflows",
+        "tests",
+    }
+    for directory in build_plugin.BUNDLED_RAYLIGHT_EXCLUDED_DIRECTORIES:
+        assert (
+            f"nodes/DirectorDeck-RayLight/{directory}"
+            in gate.FORBIDDEN_BUNDLED_NODE_DIRECTORIES
+        )
+
+
+def test_bundled_raylight_uses_private_python_import_namespace() -> None:
+    source_root = Path(__file__).resolve().parents[2] / "custom_nodes" / "raylight"
+    private_package = source_root / "src" / "directordeck_raylight"
+    assert private_package.is_dir()
+    assert not (source_root / "src" / "raylight").exists()
+
+    entrypoint = (source_root / "__init__.py").read_text(encoding="utf-8")
+    assert "from directordeck_raylight.nodes import" in entrypoint
+    metadata = (source_root / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'name = "directordeck-raylight"' in metadata
+    assert 'version = "1.8.0+director.1"' in metadata
+    assert "[tool.comfy]" not in metadata
+
+    legacy_import = re.compile(r"(?m)^\s*(?:from|import)\s+raylight(?:\b|\.)")
+    legacy_module_lookup = re.compile(
+        r"(?:sys\.modules\[|ModuleType\(|import_module\(|__import__\()"
+        r"\s*[\"']raylight(?:[\"']|\.)"
+    )
+    for path in (source_root / "__init__.py", *private_package.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        assert legacy_import.search(source) is None, path
+        assert legacy_module_lookup.search(source) is None, path
+
+
+@pytest.mark.parametrize(
+    "package_name",
+    (
+        "ComfyUI-MiniMax-H3-Turbo",
+        "DirectorDeck-Strict-LoRA",
+    ),
+)
+def test_externally_owned_lora_packs_are_not_bundled(package_name: str) -> None:
+    relative = f"nodes/{package_name}"
+    assert package_name not in build_plugin.BUNDLED_NODE_PACKS
+    assert relative not in gate.REQUIRED_DIRECTORIES
+    assert relative in gate.FORBIDDEN_BUNDLED_NODE_DIRECTORIES
+    assert not any(path.startswith(f"{relative}/") for path in gate.REQUIRED_PATHS)
+
+
+def test_release_manifest_uses_advisory_comfyui_floor_and_only_owned_node_fork() -> None:
+    manifest = json.loads(
+        (Path(__file__).resolve().parents[2] / "release-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert manifest["comfyui"] == {
+        "recommended_minimum_version": "0.33.0",
+        "enforcement": "warning_only",
+    }
+    assert [node["name"] for node in manifest["custom_nodes"]] == ["raylight"]
+    assert manifest["custom_nodes"][0]["packaged_path"] == (
+        "nodes/DirectorDeck-RayLight"
+    )
+    assert manifest["custom_nodes"][0]["python_package"] == (
+        "directordeck_raylight"
+    )
+    assert manifest["custom_nodes"][0]["version"] == (
+        "1.8.0+director.1"
+    )
 
 
 def _manifest(dependencies: list[str]) -> str:
@@ -86,7 +196,7 @@ def test_docs_reject_legacy_route_and_accept_release_policy(tmp_path: Path) -> N
     )
     (tmp_path / "LICENSE").write_text("GNU GENERAL PUBLIC LICENSE\nVersion 3\n", encoding="utf-8")
     (tmp_path / "THIRD_PARTY_NOTICES.md").write_text(
-        "RayLight\nComfyUI-MiniMax-H3-Turbo\n", encoding="utf-8"
+        "RayLight\n", encoding="utf-8"
     )
     gate._validate_docs(tmp_path)
 
@@ -95,7 +205,6 @@ def test_docs_reject_legacy_route_and_accept_release_policy(tmp_path: Path) -> N
     )
     with pytest.raises(PackageError, match="legacy|canonical"):
         gate._validate_docs(tmp_path)
-
 
 def test_privacy_gate_rejects_private_paths_and_notes(
     tmp_path: Path,

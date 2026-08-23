@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=70.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "directordeck-strict-attention"
+version = "1.0.0"
+description = "Director-owned fail-closed MiniMax H3 attention backend selection."
+license = { text = "GPL-3.0-only" }
+dependencies = []
+requires-python = ">=3.10"

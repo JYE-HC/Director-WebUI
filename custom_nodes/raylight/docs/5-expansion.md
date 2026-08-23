@@ -267,8 +267,8 @@ expansion/comfyui_lazytensors/
 
 ```python
 # In sd.py
-from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
-from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
+from directordeck_raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
+from directordeck_raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
 
 def lazy_load_diffusion_model(unet_path, model_options={}):
     sd = load_safetensors_mmap(unet_path)
@@ -336,7 +336,7 @@ def load_unet(self, unet_path, model_options):
     # ... existing code ...
 
     if unet_path.lower().endswith(".myext"):
-        from raylight.expansion.my_custom_module.loader import my_loader
+        from directordeck_raylight.expansion.my_custom_module.loader import my_loader
         loaded_model = my_loader(unet_path, model_options=model_options)
     else:
         # ... existing code ...

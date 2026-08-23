@@ -5,12 +5,12 @@ import re
 import httpx
 import pytest
 
-from directordeck.comfy import ComfyClient, ComfyError
+from directordeck.comfy import ComfyClient
 
 
 def _director_raylight_initializer_info() -> dict[str, object]:
     return {
-        "python_module": "custom_nodes.raylight",
+        "python_module": "custom_nodes.DirectorDeck-RayLight",
         "input": {
             "required": {
                 "XFuser_attention": [
@@ -128,7 +128,7 @@ async def test_capabilities_keep_legacy_recipes_separate_from_timeline_families(
     }
 
 
-async def test_continuity_capability_requires_optional_nodes_and_exact_provenance() -> None:
+async def test_continuity_capability_requires_optional_nodes_but_not_provenance() -> None:
     available = {
         node: {"python_module": "test"}
         for node in ComfyClient.STANDARD_REQUIRED_NODES
@@ -137,7 +137,8 @@ async def test_continuity_capability_requires_optional_nodes_and_exact_provenanc
         {
             node: {"python_module": module}
             for node, module in (
-                ComfyClient.CONTINUITY_REQUIRED_NODE_MODULES.items()
+                (node, "custom_nodes.user-managed")
+                for node in ComfyClient.CONTINUITY_REQUIRED_NODES
             )
         }
     )
@@ -161,7 +162,7 @@ async def test_continuity_capability_requires_optional_nodes_and_exact_provenanc
         "http://comfy.test", transport=httpx.MockTransport(handler)
     ).capabilities()
     assert spoofed["native_timeline"]["supported"] is True
-    assert spoofed["native_timeline"]["continuity"] is False
+    assert spoofed["native_timeline"]["continuity"] is True
     assert spoofed["missing_nodes"] == []
 
 
@@ -172,10 +173,8 @@ async def test_missing_continuity_node_does_not_disable_non_continuity_timeline(
     }
     available.update(
         {
-            node: {"python_module": module}
-            for node, module in (
-                ComfyClient.CONTINUITY_REQUIRED_NODE_MODULES.items()
-            )
+            node: {"python_module": "custom_nodes.user-managed"}
+            for node in ComfyClient.CONTINUITY_REQUIRED_NODES
             if node != "TrimAudioDuration"
         }
     )
@@ -203,8 +202,8 @@ async def test_raylight_without_lora_does_not_require_ray_lora_loader() -> None:
             *ComfyClient.RAYLIGHT_REQUIRED_NODES,
         )
     }
-    available["RayInitializerAdvanced"] = _director_raylight_initializer_info()
-    assert "RayLoraLoader" not in available
+    available["DirectorDeckRayInitializerAdvanced"] = _director_raylight_initializer_info()
+    assert "DirectorDeckRayLoraLoader" not in available
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/object_info":
@@ -224,11 +223,11 @@ async def test_raylight_without_lora_does_not_require_ray_lora_loader() -> None:
         "conditional_requirements": {
             "lora": {
                 "available": False,
-                "missing_nodes": ["RayLoraLoader"],
+                "missing_nodes": ["DirectorDeckRayLoraLoader"],
             }
         },
     }
-    assert "RayLoraLoader" not in report["missing_nodes"]
+    assert "DirectorDeckRayLoraLoader" not in report["missing_nodes"]
 
 
 async def test_raylight_capability_reports_present_conditional_lora_loader() -> None:
@@ -240,7 +239,7 @@ async def test_raylight_capability_reports_present_conditional_lora_loader() -> 
             *ComfyClient.RAYLIGHT_LORA_REQUIRED_NODES,
         )
     }
-    available["RayInitializerAdvanced"] = _director_raylight_initializer_info()
+    available["DirectorDeckRayInitializerAdvanced"] = _director_raylight_initializer_info()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/object_info":
@@ -259,13 +258,13 @@ async def test_raylight_capability_reports_present_conditional_lora_loader() -> 
     }
 
 
-async def test_raylight_capability_rejects_stock_initializer_schema() -> None:
+async def test_raylight_capability_reports_initializer_schema_as_advisory() -> None:
     available = {
         node: {"python_module": "test"}
         for node in ComfyClient.RAYLIGHT_REQUIRED_NODES
     }
-    available["RayInitializerAdvanced"] = {
-        "python_module": "custom_nodes.raylight",
+    available["DirectorDeckRayInitializerAdvanced"] = {
+        "python_module": "custom_nodes.DirectorDeck-RayLight",
         "input": {
             "required": {
                 "XFuser_attention": [
@@ -289,7 +288,7 @@ async def test_raylight_capability_rejects_stock_initializer_schema() -> None:
     ).capabilities()
 
     raylight = report["execution_backends"]["raylight"]
-    assert raylight["available"] is False
+    assert raylight["available"] is True
     assert raylight["missing_nodes"] == []
     assert raylight["contract_issues"] == [
         "XFuser_attention must offer COMFY_KITCHEN_INT8 and TORCH_FLASH",
@@ -299,8 +298,8 @@ async def test_raylight_capability_rejects_stock_initializer_schema() -> None:
 
 
 def test_raylight_base_and_conditional_lora_node_sets_are_disjoint() -> None:
-    assert "RayLoraLoader" not in ComfyClient.RAYLIGHT_REQUIRED_NODES
-    assert ComfyClient.RAYLIGHT_LORA_REQUIRED_NODES == ("RayLoraLoader",)
+    assert "DirectorDeckRayLoraLoader" not in ComfyClient.RAYLIGHT_REQUIRED_NODES
+    assert ComfyClient.RAYLIGHT_LORA_REQUIRED_NODES == ("DirectorDeckRayLoraLoader",)
 
 
 async def test_both_diffusion_slots_receive_the_complete_comfy_inventory() -> None:
@@ -340,46 +339,3 @@ async def test_both_diffusion_slots_receive_the_complete_comfy_inventory() -> No
         ("GET", "/models/vae"),
         ("GET", "/models/loras"),
     ]
-
-
-async def test_lora_metadata_uses_the_remote_fixed_lora_folder() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            json={
-                "target_format": "ComfyUI generic LoRA",
-                "source_format": "Diffusers PEFT LoRA",
-            },
-        )
-
-    metadata = await ComfyClient(
-        "http://comfy.test", transport=httpx.MockTransport(handler)
-    ).lora_metadata("nested/ref style.safetensors")
-
-    assert metadata == {
-        "target_format": "ComfyUI generic LoRA",
-        "source_format": "Diffusers PEFT LoRA",
-    }
-    assert len(requests) == 1
-    assert requests[0].url.path == "/view_metadata/loras"
-    assert requests[0].url.params["filename"] == "nested/ref style.safetensors"
-
-
-async def test_lora_metadata_distinguishes_missing_and_malformed_headers() -> None:
-    missing = await ComfyClient(
-        "http://comfy.test",
-        transport=httpx.MockTransport(lambda _request: httpx.Response(404)),
-    ).lora_metadata("missing.safetensors")
-    assert missing is None
-
-    malformed = ComfyClient(
-        "http://comfy.test",
-        transport=httpx.MockTransport(
-            lambda _request: httpx.Response(200, json={"target_format": 7})
-        ),
-    )
-    with pytest.raises(ComfyError, match="invalid metadata"):
-        await malformed.lora_metadata("bad.safetensors")

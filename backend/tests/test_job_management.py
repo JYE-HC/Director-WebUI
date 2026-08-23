@@ -3,7 +3,12 @@ from __future__ import annotations
 import copy
 import json
 
-from .conftest import wait_for_submission_tasks
+from .conftest import (
+    legacy_settings_document,
+    save_legacy_settings_document,
+    save_timeline_document,
+    wait_for_submission_tasks,
+)
 
 
 async def _create_timeline_job(client, *, title: str | None = None) -> dict:
@@ -12,7 +17,7 @@ async def _create_timeline_job(client, *, title: str | None = None) -> dict:
     if title is not None:
         project["title"] = title
     else:
-        saved = await client.put("/api/timeline", json=project)
+        saved = await save_timeline_document(client, project)
         assert saved.status_code == 200, saved.text
     response = await client.post("/api/timeline/jobs", json={"config": project})
     assert response.status_code == 200, response.text
@@ -32,10 +37,18 @@ async def _create_project_timeline_job(
     project = copy.deepcopy(
         (await client.get(f"/api/projects/{project_id}/timeline")).json()
     )
+    if any(
+        binding["filename"] is None
+        for binding in project["model_stack"].values()
+    ):
+        project["model_stack"] = copy.deepcopy(
+            (await client.get("/api/timeline")).json()["model_stack"]
+        )
     project["segments"][0]["prompt"] = "A scoped cinematic camera move"
-    saved = await client.put(
-        f"/api/projects/{project_id}/timeline",
-        json=project,
+    saved = await save_timeline_document(
+        client,
+        project,
+        project_id=project_id,
     )
     assert saved.status_code == 200, saved.text
     response = await client.post(
@@ -131,7 +144,9 @@ async def test_job_list_filters_sorts_summarizes_and_never_contacts_comfy(
     completed = (
         await client.get("/api/jobs", params={"status": "succeeded"})
     ).json()["jobs"][0]
-    assert completed["output_count"] == 1
+    # Typed jobs project outputs only from Expected+Observed evidence; the
+    # hand-written mutable jobs.outputs compatibility value above is ignored.
+    assert completed["output_count"] == 0
     current_task = (
         await client.get("/api/jobs", params={"status": "running"})
     ).json()["jobs"][0]
@@ -233,9 +248,9 @@ async def test_job_currentness_uses_the_callers_active_project_scope(
 
     # Runtime-only changes affect the stricter monitor snapshot, not project
     # timeline currentness.
-    settings = (await client.get("/api/settings")).json()
+    settings = await legacy_settings_document(client)
     settings["client_id"] = "scoped-currentness-test"
-    saved_settings = await client.put("/api/settings", json=settings)
+    saved_settings = await save_legacy_settings_document(client, settings)
     assert saved_settings.status_code == 200, saved_settings.text
     runtime_changed = await client.get(
         f"/api/jobs/{created['id']}",
@@ -247,9 +262,10 @@ async def test_job_currentness_uses_the_callers_active_project_scope(
     project_b = (
         await client.post("/api/projects", json={"title": "作用域项目 B"})
     ).json()
-    mirrored = await client.put(
-        f"/api/projects/{project_b['id']}/timeline",
-        json=project,
+    mirrored = await save_timeline_document(
+        client,
+        project,
+        project_id=project_b["id"],
     )
     assert mirrored.status_code == 200, mirrored.text
     same_document = await client.get(
@@ -261,9 +277,10 @@ async def test_job_currentness_uses_the_callers_active_project_scope(
 
     edited = copy.deepcopy(project)
     edited["segments"][0]["prompt"] += " after an edit"
-    saved_edit = await client.put(
-        f"/api/projects/{project_id}/timeline",
-        json=edited,
+    saved_edit = await save_timeline_document(
+        client,
+        edited,
+        project_id=project_id,
     )
     assert saved_edit.status_code == 200, saved_edit.text
     stale = await client.get(
@@ -349,6 +366,10 @@ async def test_job_mutations_preserve_one_explicit_project_context(
             status="cancelling",
             stage="restart_cancel_pending",
         )
+    old_endpoint = client.director_app.state.endpoint_identity
+    client.director_app.state.endpoint_identity = old_endpoint.model_copy(
+        update={"runtime_instance_id": "project-scope-replacement-boot"}
+    )
     confirmed = await client.post(
         f"/api/jobs/{recovery['id']}/recovery/confirm-comfy-restart",
         params={"project_id": project_id},
@@ -437,7 +458,7 @@ async def test_diagnostic_is_redacted_and_project_snapshot_is_typed(
     project = project_response.json()
     assert project["job_id"] == created["id"]
     assert project["project"]["title"] == "可恢复项目"
-    assert project["project"]["version"] == 4
+    assert project["project"]["version"] == 5
     assert "settings_snapshot" not in project
     assert "prompt_snapshot" not in project
 
@@ -445,7 +466,7 @@ async def test_diagnostic_is_redacted_and_project_snapshot_is_typed(
 async def test_generation_details_are_typed_lazy_and_exclude_runtime_secrets(
     client, fake_comfy
 ) -> None:
-    settings = (await client.get("/api/settings")).json()
+    settings = await legacy_settings_document(client)
     settings["client_id"] = "private-client-id"
     settings["multi_gpu_enabled"] = True
     settings["models"]["fl2va"].update(
@@ -464,7 +485,7 @@ async def test_generation_details_are_typed_lazy_and_exclude_runtime_secrets(
             "cpu_offload": False,
         },
     )
-    saved_settings = await client.put("/api/settings", json=settings)
+    saved_settings = await save_legacy_settings_document(client, settings)
     assert saved_settings.status_code == 200, saved_settings.text
 
     project = copy.deepcopy((await client.get("/api/timeline")).json())

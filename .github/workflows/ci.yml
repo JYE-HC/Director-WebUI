@@ -35,6 +35,8 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - run: uv sync --frozen --all-groups
       - run: uv run pytest backend/tests -q
+      - name: Exercise bundled Turbo/Ray strict runtime contracts on CPU
+        run: uv run python tools/run_strict_runtime_contract_tests.py
       # The release privacy scan validates platform-independent release
       # artifacts; run it once on Linux.
       - if: matrix.os == 'ubuntu-latest'

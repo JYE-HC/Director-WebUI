@@ -105,6 +105,7 @@ describe("时间线工作区浏览器偏好", () => {
       refImageSize: true,
       prompt: false,
       promptReferences: false,
+      features: false,
     });
 
     saveTimelineSegmentCopyOptions({
@@ -115,6 +116,7 @@ describe("时间线工作区浏览器偏好", () => {
       refImageSize: false,
       prompt: true,
       promptReferences: true,
+      features: false,
     });
     expect(loadTimelineSegmentCopyOptions()).toEqual({
       mode: true,
@@ -124,6 +126,7 @@ describe("时间线工作区浏览器偏好", () => {
       refImageSize: false,
       prompt: true,
       promptReferences: true,
+      features: false,
     });
 
     localStorage.setItem(TIMELINE_SEGMENT_COPY_OPTIONS_KEY, JSON.stringify({
@@ -131,6 +134,7 @@ describe("时间线工作区浏览器偏好", () => {
       mode: false,
       prompt: true,
       promptReferences: true,
+      features: true,
       duration: "损坏",
     }));
     expect(loadTimelineSegmentCopyOptions()).toMatchObject({
@@ -138,6 +142,7 @@ describe("时间线工作区浏览器偏好", () => {
       duration: true,
       prompt: true,
       promptReferences: false,
+      features: false,
     });
 
     localStorage.setItem(TIMELINE_SEGMENT_COPY_OPTIONS_KEY, JSON.stringify({ version: 2 }));

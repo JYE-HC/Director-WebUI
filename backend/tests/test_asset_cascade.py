@@ -7,9 +7,19 @@ import pytest
 
 import directordeck.database as database_module
 from directordeck.compiler import DraftNotRunnable, validate_unified_runnable
-from directordeck.schemas import UnifiedTimelineDraft, default_timeline_draft
+from directordeck.migrations.timeline_v4_v5 import migrate_timeline_v4_to_v5
+from directordeck.schemas import (
+    UnifiedTimelineDraft,
+    default_settings,
+    default_timeline_draft,
+)
 
-from .conftest import asset, runnable_draft
+from .conftest import (
+    asset,
+    compile_timeline_document,
+    runnable_draft,
+    save_timeline_document,
+)
 
 
 def timeline(*segments: dict[str, Any]) -> dict[str, Any]:
@@ -108,7 +118,7 @@ async def test_cascade_delete_preserves_family_while_recipe_follows_remaining_me
             reference_videos=[],
         ),
     )
-    saved = await client.put("/api/timeline", json=document)
+    saved = await save_timeline_document(client, document)
     assert saved.status_code == 200, saved.text
 
     deleted = await client.delete(
@@ -160,7 +170,7 @@ async def test_cascade_delete_rewrites_fl_picture_ordinals_without_touching_whit
             last_image=last,
         )
     )
-    saved = await client.put("/api/timeline", json=document)
+    saved = await save_timeline_document(client, document)
     assert saved.status_code == 200, saved.text
 
     deleted_first = await client.delete(
@@ -220,7 +230,7 @@ async def test_cascade_delete_source_preserves_ref2va_and_rewrites_reference_lab
             reference_audios=[],
         ),
     )
-    saved = await client.put("/api/timeline", json=document)
+    saved = await save_timeline_document(client, document)
     assert saved.status_code == 200, saved.text
 
     deleted = await client.delete(
@@ -277,7 +287,7 @@ async def test_v2_source_cascade_shifts_independent_video_and_audio_labels(
             reference_audios=[asset("voice.wav", "audio", slot=0)],
         )
     )
-    saved = await client.put("/api/timeline", json=document)
+    saved = await save_timeline_document(client, document)
     assert saved.status_code == 200, saved.text
 
     deleted = await client.delete(
@@ -295,7 +305,13 @@ async def test_v2_source_cascade_shifts_independent_video_and_audio_labels(
     assert current_segment["prompt"] == (
         "source ; motion <Video 1>; source sound ; voice <Audio 1>"
     )
-    validate_unified_runnable(UnifiedTimelineDraft.model_validate(current))
+    legacy_current = {
+        key: value
+        for key, value in current.items()
+        if key not in {"model_stack", "features"}
+    }
+    legacy_current["version"] = 4
+    validate_unified_runnable(UnifiedTimelineDraft.model_validate(legacy_current))
 
 
 async def test_cascade_compacts_reference_slots_and_rewrites_effective_prompt(
@@ -316,7 +332,7 @@ async def test_cascade_compacts_reference_slots_and_rewrites_effective_prompt(
         )
     )
     document["prompt"] = top_level_prompt
-    saved = await client.put("/api/timeline", json=document)
+    saved = await save_timeline_document(client, document)
     assert saved.status_code == 200, saved.text
 
     removed = asset("reference.png", "image")
@@ -344,14 +360,21 @@ async def test_cascade_compacts_reference_slots_and_rewrites_effective_prompt(
     assert current_segment["prompt"].count("<Picture 1>") == 1
     assert "<Picture 2>" not in current_segment["prompt"]
 
-    validated = UnifiedTimelineDraft.model_validate(current)
+    legacy_current = {
+        key: value
+        for key, value in current.items()
+        if key not in {"model_stack", "features"}
+    }
+    legacy_current["version"] = 4
+    validated = UnifiedTimelineDraft.model_validate(legacy_current)
     execution = validate_unified_runnable(
         validated, segment_ids=["dense-after-delete"]
     )
     assert [item.id for item in execution] == ["dense-after-delete"]
-    compiled = await client.post(
-        "/api/timeline/compile",
-        json={"segment_ids": ["dense-after-delete"]},
+    compiled = await compile_timeline_document(
+        client,
+        current,
+        segment_ids=["dense-after-delete"],
     )
     assert compiled.status_code == 200, compiled.text
 
@@ -377,7 +400,7 @@ async def test_cascade_reference_rewrite_preserves_multiline_prompt_formatting(
         reference_audios=[],
         reference_videos=[],
     ))
-    saved = await client.put("/api/timeline", json=document)
+    saved = await save_timeline_document(client, document)
     assert saved.status_code == 200, saved.text
 
     deleted = await client.delete(
@@ -410,7 +433,7 @@ async def test_cascade_normalizes_source_audio_when_enabled_source_is_removed(
         )
     )
     document["audio_mode"] = "source"
-    saved = await client.put("/api/timeline", json=document)
+    saved = await save_timeline_document(client, document)
     assert saved.status_code == 200, saved.text
 
     deleted = await client.delete(
@@ -422,9 +445,17 @@ async def test_cascade_normalizes_source_audio_when_enabled_source_is_removed(
     assert "audio_mode" not in current
     assert current["segments"][0]["audio_mode"] == "generate"
     assert_empty_ref2va_shape(current["segments"][0], "source-audio-segment")
+    legacy_current = {
+        key: value
+        for key, value in current.items()
+        if key not in {"model_stack", "features"}
+    }
+    legacy_current["version"] = 4
     with pytest.raises(DraftNotRunnable, match="Ref2VA segments need"):
-        validate_unified_runnable(UnifiedTimelineDraft.model_validate(current))
-    compiled = await client.post("/api/timeline/compile", json={})
+        validate_unified_runnable(
+            UnifiedTimelineDraft.model_validate(legacy_current)
+        )
+    compiled = await compile_timeline_document(client, current)
     assert compiled.status_code == 422, compiled.text
 
 
@@ -447,8 +478,12 @@ async def test_cascade_unbinds_every_typed_reference_across_six_legacy_drafts(
         asset("first.png", "image", slot=0)
     ]
     for mode, draft in drafts.items():
-        saved = await client.put(f"/api/drafts/{mode}", json=draft)
-        assert saved.status_code == 200, saved.text
+        retired = await client.put(f"/api/drafts/{mode}", json=draft)
+        assert retired.status_code == 410, retired.text
+        client.director_app.state.database.validate_and_put_draft(
+            mode,
+            database_module.validate_mode_draft(mode, draft),
+        )
 
     first = asset("first.png", "image")
     deleted_image = await client.delete(
@@ -531,10 +566,12 @@ async def test_delete_without_cascade_still_returns_409_and_changes_nothing(
         segment("i2v", "timeline-i2v", first_image=first)
     )
     draft_before = runnable_draft("i2v")
-    saved_timeline = await client.put("/api/timeline", json=timeline_before)
-    saved_draft = await client.put("/api/drafts/i2v", json=draft_before)
+    saved_timeline = await save_timeline_document(client, timeline_before)
+    saved_draft = client.director_app.state.database.validate_and_put_draft(
+        "i2v",
+        database_module.validate_mode_draft("i2v", draft_before),
+    )
     assert saved_timeline.status_code == 200
-    assert saved_draft.status_code == 200
 
     refused = await client.delete(f"/api/assets/{first['id']}")
 
@@ -549,7 +586,9 @@ async def test_delete_without_cascade_still_returns_409_and_changes_nothing(
     }
     assert client.director_app.state.database.get_asset(first["id"]) is not None
     assert (await client.get("/api/timeline")).json() == saved_timeline.json()
-    assert (await client.get("/api/drafts/i2v")).json() == saved_draft.json()
+    assert (await client.get("/api/drafts/i2v")).json() == saved_draft.model_dump(
+        mode="json"
+    )
 
 
 @pytest.mark.parametrize("document_kind", ["timeline", "draft"])
@@ -579,7 +618,11 @@ def test_atomic_validate_and_put_cannot_resurrect_asset_after_cascade_delete(
                 value = UnifiedTimelineDraft.model_validate(
                     timeline(segment("i2v", "atomic", first_image=first))
                 )
-                database.validate_and_put_timeline(value)
+                current_revision = database.get_timeline_authority()[1]
+                database.validate_and_put_timeline_authority(
+                    migrate_timeline_v4_to_v5(value, default_settings()),
+                    expected_revision=current_revision,
+                )
             else:
                 value = database_module.validate_mode_draft(
                     "i2v", runnable_draft("i2v")
@@ -650,10 +693,12 @@ async def test_cascade_validation_failure_rolls_back_asset_and_all_documents(
         segment("i2v", "rollback-i2v", first_image=first)
     )
     draft_before = runnable_draft("i2v")
-    saved_timeline = await client.put("/api/timeline", json=timeline_before)
-    saved_draft = await client.put("/api/drafts/i2v", json=draft_before)
+    saved_timeline = await save_timeline_document(client, timeline_before)
+    saved_draft = client.director_app.state.database.validate_and_put_draft(
+        "i2v",
+        database_module.validate_mode_draft("i2v", draft_before),
+    )
     assert saved_timeline.status_code == 200
-    assert saved_draft.status_code == 200
     database = client.director_app.state.database
     before = persisted_rows(database)
     original_validate_mode_draft = database_module.validate_mode_draft
@@ -679,4 +724,6 @@ async def test_cascade_validation_failure_rolls_back_asset_and_all_documents(
     assert persisted_rows(database) == before
     assert database.get_asset(first["id"]) is not None
     assert database.get_timeline().model_dump(mode="json") == saved_timeline.json()
-    assert database.get_draft("i2v").model_dump(mode="json") == saved_draft.json()
+    assert database.get_draft("i2v").model_dump(mode="json") == saved_draft.model_dump(
+        mode="json"
+    )

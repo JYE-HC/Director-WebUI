@@ -2,7 +2,7 @@
 import ast
 from pathlib import Path
 
-from raylight.gpu_visibility import resolve_cuda_visible_devices
+from directordeck_raylight.gpu_visibility import resolve_cuda_visible_devices
 
 
 def _assert_raises(exception_type, message, function):
@@ -91,7 +91,7 @@ def test_rejects_parent_mask_count_that_disagrees_with_torch():
 
 
 def test_ray_actors_do_not_override_ray_assigned_cuda_visibility():
-    worker_path = Path(__file__).parents[1] / "src/raylight/distributed_worker/ray_worker.py"
+    worker_path = Path(__file__).parents[1] / "src/directordeck_raylight/distributed_worker/ray_worker.py"
     tree = ast.parse(worker_path.read_text())
     assignments = []
     for node in ast.walk(tree):

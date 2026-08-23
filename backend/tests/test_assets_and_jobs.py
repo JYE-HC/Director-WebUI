@@ -11,9 +11,23 @@ from starlette.requests import Request
 from directordeck.app import _sync_job
 from directordeck.comfy import ComfyError
 from directordeck.media import MediaToolError, VideoProxy, VideoProxyResult
-from directordeck.schemas import VideoMetadata
+from directordeck.schemas import (
+    VideoMetadata,
+    default_timeline_draft,
+    mode_draft_to_timeline,
+    validate_mode_draft,
+)
 
-from .conftest import runnable_draft, wait_for_submission_tasks
+from .conftest import (
+    compile_timeline_document,
+    legacy_settings_document,
+    runnable_draft,
+    save_legacy_settings_document,
+    submit_legacy_mode_job,
+    submit_timeline_document,
+    v5_timeline_document,
+    wait_for_submission_tasks,
+)
 
 
 async def _reconcile(client, job_id: str) -> dict:
@@ -66,7 +80,7 @@ async def test_asset_upload_returns_stable_identity_and_preview(client, fake_com
 
 
 async def test_create_job_submits_api_prompt_and_syncs_history(client, fake_comfy) -> None:
-    response = await client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})
+    response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     assert response.status_code == 200, response.text
     job = await _submitted_job(client, response.json())
     assert job["status"] == "queued"
@@ -117,9 +131,7 @@ async def test_create_job_submits_api_prompt_and_syncs_history(client, fake_comf
 async def test_completed_job_output_can_be_safely_imported_as_input_asset(
     client, fake_comfy, monkeypatch
 ) -> None:
-    response = await client.post(
-        "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-    )
+    response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     job = await _submitted_job(client, response.json())
     submitted = fake_comfy.prompts[0]
     save_id = next(
@@ -183,9 +195,7 @@ async def test_completed_job_output_can_be_safely_imported_as_input_asset(
 
 async def test_running_job_uses_native_child_progress(client, fake_comfy) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     fake_comfy.pending = []
@@ -207,9 +217,7 @@ async def test_running_progress_is_monotonic_and_falls_back_for_old_nodes(
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     fake_comfy.pending = []
@@ -232,9 +240,7 @@ async def test_first_running_poll_without_progress_endpoint_does_not_leave_queue
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     fake_comfy.pending = []
@@ -252,9 +258,7 @@ async def test_same_status_concurrent_progress_updates_cannot_rewind_job(
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     database = client.director_app.state.database
@@ -293,9 +297,7 @@ async def test_equal_progress_stale_phase_cannot_overwrite_newer_phase(
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     database = client.director_app.state.database
@@ -332,9 +334,7 @@ async def test_delete_terminal_job_forgets_only_the_director_record(
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     save_id = next(
@@ -381,9 +381,7 @@ async def test_delete_job_rejects_active_work_without_comfy_io(
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
 
@@ -402,15 +400,15 @@ async def test_delete_job_rejects_active_work_without_comfy_io(
 async def test_clear_jobs_removes_terminal_rows_and_keeps_active_work(client) -> None:
     jobs = []
     for mode in ("t2v", "i2v", "fl2v"):
-        response = await client.post(
-            "/api/jobs", json={"mode": mode, "config": runnable_draft(mode)}
-        )
+        response = await submit_legacy_mode_job(client, mode, runnable_draft(mode))
         assert response.status_code == 200, response.text
         jobs.append(response.json())
     await wait_for_submission_tasks(client)
     database = client.director_app.state.database  # type: ignore[attr-defined]
-    database.update_job(jobs[0]["id"], status="succeeded", progress=1.0)
-    database.update_job(jobs[1]["id"], status="failed", progress=1.0)
+    for terminal in jobs[:2]:
+        cancelled = await client.post(f"/api/jobs/{terminal['id']}/cancel")
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelled"
 
     cleared = await client.delete("/api/jobs")
 
@@ -466,13 +464,11 @@ async def test_database_job_delete_is_compare_and_set(client) -> None:
 async def test_each_diffusion_slot_accepts_any_model_from_the_shared_inventory(
     client, fake_comfy, mode: str, settings_slot: str, selected_model: str
 ) -> None:
-    settings = (await client.get("/api/settings")).json()
+    settings = await legacy_settings_document(client)
     settings["models"][settings_slot]["filename"] = selected_model
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
 
-    response = await client.post(
-        "/api/jobs", json={"mode": mode, "config": runnable_draft(mode)}
-    )
+    response = await submit_legacy_mode_job(client, mode, runnable_draft(mode))
 
     assert response.status_code == 200, response.text
     await wait_for_submission_tasks(client)
@@ -484,24 +480,36 @@ async def test_each_diffusion_slot_accepts_any_model_from_the_shared_inventory(
     assert loader["inputs"]["unet_name"] == selected_model
 
 
-async def test_job_automatically_uses_model_only_lora(client, fake_comfy) -> None:
-    settings = (await client.get("/api/settings")).json()
-    settings["models"]["fl2va"].update(
+async def test_job_submits_user_mapped_model_only_lora_through_host_adapter(
+    client, fake_comfy
+) -> None:
+    settings = await legacy_settings_document(client)
+    binding = settings["models"]["fl2va"]
+    binding.update(
         lora_name="minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
         lora_strength=0.5,
         lora_loader="dedicated",
     )
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
+    binding["standard_lora_loader_override"] = {
+        "loader": "model_only",
+        "lora_name": binding["lora_name"],
+        "model_filename": binding["filename"],
+    }
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
 
-    response = await client.post(
-        "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-    )
+    draft = default_timeline_draft().model_dump(mode="json")
+    draft["segments"][0]["prompt"] = "A cinematic camera move"
+    compile_response = await compile_timeline_document(client, draft)
+    assert compile_response.status_code == 200, compile_response.text
+    assert (await client.get("/api/jobs")).json()["jobs"] == []
 
+    response = await submit_timeline_document(client, draft)
     assert response.status_code == 200, response.text
     await wait_for_submission_tasks(client)
     lora = next(
         node
-        for node in fake_comfy.prompts[-1]["prompt"].values()
+        for submission in fake_comfy.prompts
+        for node in submission["prompt"].values()
         if node["class_type"] == "LoraLoaderModelOnly"
     )
     assert lora["inputs"]["lora_name"] == (
@@ -510,59 +518,99 @@ async def test_job_automatically_uses_model_only_lora(client, fake_comfy) -> Non
     assert lora["inputs"]["strength_model"] == 0.5
 
 
-async def test_standard_ref2va_official_lora_compiles_without_raylight(
+async def test_job_submits_user_managed_dedicated_lora(
     client, fake_comfy
 ) -> None:
-    settings = (await client.get("/api/settings")).json()
-    settings["models"]["ref2va"].update(
+    settings = await legacy_settings_document(client)
+    binding = settings["models"]["fl2va"]
+    binding.update(
+        lora_name="minimax_h3_turbo_v4_step600_ema.safetensors",
+        lora_strength=0.5,
+    )
+    binding["standard_lora_loader_override"] = {
+        "loader": "dedicated",
+        "lora_name": binding["lora_name"],
+        "model_filename": binding["filename"],
+    }
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
+
+    response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
+
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    lora = next(
+        node
+        for node in fake_comfy.prompts[-1]["prompt"].values()
+        if node["class_type"] == "MiniMaxH3TurboLoRA"
+    )
+    assert lora["inputs"]["lora_name"] == (
+        "minimax_h3_turbo_v4_step600_ema.safetensors"
+    )
+    assert lora["inputs"]["strength"] == 0.5
+
+
+async def test_standard_ref2va_user_mapping_submits_host_adapter(
+    client, fake_comfy
+) -> None:
+    settings = await legacy_settings_document(client)
+    binding = settings["models"]["ref2va"]
+    binding.update(
         lora_name="minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
         lora_strength=0.8,
     )
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
+    binding["standard_lora_loader_override"] = {
+        "loader": "model_only",
+        "lora_name": binding["lora_name"],
+        "model_filename": binding["filename"],
+    }
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
 
-    response = await client.post(
-        "/api/jobs", json={"mode": "r2v", "config": runnable_draft("r2v")}
-    )
+    response = await submit_legacy_mode_job(client, "r2v", runnable_draft("r2v"))
 
     assert response.status_code == 200, response.text
-    assert response.json()["children"][0]["backend"] == "standard"
-    await wait_for_submission_tasks(client)
-    prompt = fake_comfy.prompts[-1]["prompt"]
-    assert "LoraLoaderModelOnly" in {
-        node["class_type"] for node in prompt.values()
-    }
-    assert "RayLoraLoader" not in {
-        node["class_type"] for node in prompt.values()
-    }
+    job = await _submitted_job(client, response.json())
+    assert job["status"] == "queued", job
+    assert job["children"][0]["family"] == "ref2va"
+    lora = next(
+        node
+        for submission in fake_comfy.prompts
+        for node in submission["prompt"].values()
+        if node["class_type"] == "LoraLoaderModelOnly"
+    )
+    assert lora["inputs"]["lora_name"] == (
+        "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+    )
+    assert lora["inputs"]["strength_model"] == 0.8
 
 
-async def test_unknown_named_generic_lora_is_resolved_from_remote_metadata(
+async def test_unmapped_generic_lora_uses_configured_model_only_fallback(
     client, fake_comfy
 ) -> None:
-    settings = (await client.get("/api/settings")).json()
+    settings = await legacy_settings_document(client)
     settings["models"]["fl2va"].update(
         lora_name="renamed_generic.safetensors",
         lora_strength=0.6,
     )
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
 
-    response = await client.post(
-        "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-    )
+    response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
 
     assert response.status_code == 200, response.text
     await wait_for_submission_tasks(client)
-    assert fake_comfy.lora_metadata_requests == ["renamed_generic.safetensors"]
-    prompt = fake_comfy.prompts[-1]["prompt"]
-    assert "LoraLoaderModelOnly" in {
-        node["class_type"] for node in prompt.values()
-    }
+    lora = next(
+        node
+        for submission in fake_comfy.prompts
+        for node in submission["prompt"].values()
+        if node["class_type"] == "LoraLoaderModelOnly"
+    )
+    assert lora["inputs"]["lora_name"] == "renamed_generic.safetensors"
+    assert lora["inputs"]["strength_model"] == 0.6
 
 
-async def test_scoped_standard_lora_override_handles_missing_metadata(
+async def test_scoped_standard_lora_override_submits_mapped_host_adapter(
     client, fake_comfy
 ) -> None:
-    settings = (await client.get("/api/settings")).json()
+    settings = await legacy_settings_document(client)
     binding = settings["models"]["fl2va"]
     binding["lora_name"] = "style.safetensors"
     binding["standard_lora_loader_override"] = {
@@ -570,86 +618,92 @@ async def test_scoped_standard_lora_override_handles_missing_metadata(
         "lora_name": "style.safetensors",
         "model_filename": binding["filename"],
     }
-    saved = await client.put("/api/settings", json=settings)
+    saved = await save_legacy_settings_document(client, settings)
     assert saved.status_code == 200, saved.text
 
-    response = await client.post(
-        "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-    )
+    response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
 
     assert response.status_code == 200, response.text
     await wait_for_submission_tasks(client)
-    assert fake_comfy.lora_metadata_requests == []
-    prompt = fake_comfy.prompts[-1]["prompt"]
     assert "LoraLoaderModelOnly" in {
-        node["class_type"] for node in prompt.values()
+        node["class_type"]
+        for submission in fake_comfy.prompts
+        for node in submission["prompt"].values()
     }
 
 
-async def test_job_rejects_unavailable_lora_before_submission(client, fake_comfy) -> None:
-    settings = (await client.get("/api/settings")).json()
+async def test_retired_lora_loader_field_does_not_override_configured_fallback(
+    client, fake_comfy
+) -> None:
+    settings = await legacy_settings_document(client)
     settings["models"]["fl2va"].update(
-        lora_name="minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+        lora_name="style.safetensors",
         lora_loader="model_only",
     )
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
 
-    response = await client.post(
-        "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-    )
+    response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
 
-    assert response.status_code == 409
-    assert (
-        "loras:fl2va:minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
-        in response.text
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    lora = next(
+        node
+        for submission in fake_comfy.prompts
+        for node in submission["prompt"].values()
+        if node["class_type"] == "LoraLoaderModelOnly"
     )
+    assert lora["inputs"]["lora_name"] == "style.safetensors"
+
+
+async def test_job_requires_the_configured_dedicated_lora_adapter_node(
+    client, fake_comfy
+) -> None:
+    settings = await legacy_settings_document(client)
+    binding = settings["models"]["fl2va"]
+    binding.update(
+        lora_name="minimax_h3_turbo_v4_step600_ema.safetensors",
+    )
+    binding["standard_lora_loader_override"] = {
+        "loader": "dedicated",
+        "lora_name": binding["lora_name"],
+        "model_filename": binding["filename"],
+    }
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
+    fake_comfy.available_nodes.remove("MiniMaxH3TurboLoRA")
+
+    response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "node_unavailable"
     assert fake_comfy.prompts == []
 
 
-async def test_job_requires_the_automatically_derived_lora_loader_node(client, fake_comfy) -> None:
-    settings = (await client.get("/api/settings")).json()
-    settings["models"]["fl2va"].update(
-        lora_name="minimax_h3_fl2v_turbo_4step_v1.0_768p_10ErosMax_beta1_pruned_compat_v001_T8.safetensors",
-        lora_loader="model_only",
-    )
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
-    fake_comfy.available_nodes.remove("LoraLoaderBypassModelOnly")
-
-    response = await client.post(
-        "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-    )
-
-    # The typed graph is valid, but the configured ComfyUI runtime cannot
-    # satisfy it. Treat this as a runtime capability conflict, consistently
-    # with unavailable model inventory and logical devices.
-    assert response.status_code == 409
-    assert "LoraLoaderBypassModelOnly" in response.text
-    assert fake_comfy.prompts == []
-
-
-async def test_job_refuses_unknown_auto_lora_dialect(client, fake_comfy) -> None:
-    settings = (await client.get("/api/settings")).json()
+async def test_auto_lora_uses_configured_model_only_fallback(client, fake_comfy) -> None:
+    settings = await legacy_settings_document(client)
     settings["models"]["fl2va"].update(
         lora_name="style.safetensors",
         lora_loader="auto",
     )
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
 
-    response = await client.post(
-        "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
+    response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
+
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    lora = next(
+        node
+        for submission in fake_comfy.prompts
+        for node in submission["prompt"].values()
+        if node["class_type"] == "LoraLoaderModelOnly"
     )
-
-    # Auto could not derive a safe typed graph from this LoRA dialect, so this
-    # is an invalid job configuration rather than a runtime inventory conflict.
-    assert response.status_code == 422
-    assert "cannot be inferred safely" in response.text
-    assert fake_comfy.prompts == []
+    assert lora["inputs"]["lora_name"] == "style.safetensors"
 
 
 async def test_create_job_can_use_saved_mode_draft(client, fake_comfy) -> None:
     draft = runnable_draft("i2v")
-    assert (await client.put("/api/drafts/i2v", json=draft)).status_code == 200
-    response = await client.post("/api/jobs", json={"mode": "i2v"})
+    retired = await client.put("/api/drafts/i2v", json=draft)
+    assert retired.status_code == 410
+    response = await submit_legacy_mode_job(client, "i2v", draft)
     assert response.status_code == 200, response.text
     await wait_for_submission_tasks(client)
     load_image = next(
@@ -661,7 +715,7 @@ async def test_create_job_can_use_saved_mode_draft(client, fake_comfy) -> None:
 
 
 async def test_cancel_job_targets_comfy_prompt(client, fake_comfy) -> None:
-    created = (await client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})).json()
+    created = (await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))).json()
     created = await _submitted_job(client, created)
     cancelled = await client.post(f"/api/jobs/{created['id']}/cancel")
     assert cancelled.status_code == 200
@@ -672,7 +726,7 @@ async def test_cancel_job_targets_comfy_prompt(client, fake_comfy) -> None:
 
 
 async def test_cancel_running_job_uses_targeted_interrupt(client, fake_comfy) -> None:
-    created = (await client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})).json()
+    created = (await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))).json()
     created = await _submitted_job(client, created)
     fake_comfy.pending = []
     fake_comfy.running = [[0, created["prompt_id"]]]
@@ -683,7 +737,7 @@ async def test_cancel_running_job_uses_targeted_interrupt(client, fake_comfy) ->
 
 
 async def test_cancel_syncs_a_just_completed_job_before_mutating_comfy(client, fake_comfy) -> None:
-    created = (await client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})).json()
+    created = (await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))).json()
     created = await _submitted_job(client, created)
     save_id = next(
         node_id
@@ -712,7 +766,7 @@ async def test_cancel_syncs_a_just_completed_job_before_mutating_comfy(client, f
 async def test_explicit_cancel_wins_when_completion_arrives_during_cancel_dispatch(
     client, fake_comfy
 ) -> None:
-    created = (await client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})).json()
+    created = (await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))).json()
     created = await _submitted_job(client, created)
     save_id = next(
         node_id
@@ -741,7 +795,7 @@ async def test_cancel_during_preflight_prevents_upstream_submission(client, fake
     fake_comfy.preflight_started = asyncio.Event()
     fake_comfy.preflight_release = asyncio.Event()
     create_request = asyncio.create_task(
-        client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})
+        submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     )
     await asyncio.wait_for(fake_comfy.preflight_started.wait(), timeout=1)
     jobs = (await client.get("/api/jobs")).json()["jobs"]
@@ -764,7 +818,7 @@ async def test_cancel_during_submit_cancels_minted_prompt_without_reviving_job(
     fake_comfy.submit_started = asyncio.Event()
     fake_comfy.submit_release = asyncio.Event()
     create_request = asyncio.create_task(
-        client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})
+        submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     )
     await asyncio.wait_for(fake_comfy.submit_started.wait(), timeout=1)
     jobs = (await client.get("/api/jobs")).json()["jobs"]
@@ -797,7 +851,7 @@ async def test_completion_during_post_submit_cancel_is_not_overwritten(
     fake_comfy.submit_started = asyncio.Event()
     fake_comfy.submit_release = asyncio.Event()
     create_request = asyncio.create_task(
-        client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})
+        submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     )
     await asyncio.wait_for(fake_comfy.submit_started.wait(), timeout=1)
     job = (await client.get("/api/jobs")).json()["jobs"][0]
@@ -845,7 +899,7 @@ async def test_cancel_failure_after_inflight_submit_stays_reconcilable(
     fake_comfy.submit_started = asyncio.Event()
     fake_comfy.submit_release = asyncio.Event()
     create_request = asyncio.create_task(
-        client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})
+        submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     )
     await asyncio.wait_for(fake_comfy.submit_started.wait(), timeout=1)
     job = (await client.get("/api/jobs")).json()["jobs"][0]
@@ -869,9 +923,7 @@ async def test_cancel_failure_after_inflight_submit_stays_reconcilable(
 
 async def test_cancel_transport_failure_stays_reconcilable(client, fake_comfy) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     fake_comfy.cancel_error = ComfyError("cancel endpoint unavailable")
@@ -906,9 +958,7 @@ async def test_explicit_cancel_retries_a_transient_timeline_dispatch_failure(
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     prompt_id = created["children"][0]["prompt_id"]
@@ -930,9 +980,7 @@ async def test_explicit_cancel_retries_a_transient_timeline_dispatch_failure(
 
 async def test_interrupted_cancelling_job_recovers_as_cancelled(client, fake_comfy) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     fake_comfy.cancel_error = ComfyError("local write crashed after dispatch")
@@ -955,11 +1003,11 @@ async def test_interrupted_cancelling_job_recovers_as_cancelled(client, fake_com
     assert reconciled.json()["error"] is None
 
 
-async def test_cancelled_pending_prompt_recovers_when_absent_everywhere(client, fake_comfy) -> None:
+async def test_cancelled_pending_prompt_stays_owned_when_absent_everywhere(
+    client, fake_comfy
+) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     fake_comfy.cancel_error = ComfyError("simulated local crash")
@@ -970,15 +1018,18 @@ async def test_cancelled_pending_prompt_recovers_when_absent_everywhere(client, 
     fake_comfy.pending = []
     await _reconcile(client, created["id"])
     recovered = await client.get(f"/api/jobs/{created['id']}")
+    database = client.director_app.state.database
+    child = database.list_job_children(created["id"])[0]
+    ownership = database.get_prompt_ownership(child["id"])
 
-    assert recovered.json()["status"] == "cancelled"
+    assert recovered.json()["status"] == "cancelling"
+    assert ownership is not None
+    assert ownership.state == "unconfirmed"
 
 
 async def test_stale_sync_cannot_overwrite_a_terminal_job(client, fake_comfy) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     fake_comfy.history_started = asyncio.Event()
@@ -1012,24 +1063,16 @@ async def test_sqlite_only_list_omits_a_deleted_job(
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     database = client.director_app.state.database
-    database.update_job(
-        created["id"],
-        status="succeeded",
-        progress=1.0,
-        stage="completed",
-        completed_at="2026-01-01T00:00:00+00:00",
-    )
+    cancelled = await client.post(f"/api/jobs/{created['id']}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
 
     active = (
-        await client.post(
-            "/api/jobs", json={"mode": "i2v", "config": runnable_draft("i2v")}
-        )
+        await submit_legacy_mode_job(client, "i2v", runnable_draft("i2v"))
     ).json()
     active = await _submitted_job(client, active)
     deleted = await client.delete(f"/api/jobs/{created['id']}")
@@ -1042,20 +1085,13 @@ async def test_sqlite_only_list_omits_a_deleted_job(
 
 async def test_sqlite_only_list_handles_a_directly_deleted_row(client, fake_comfy) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     database = client.director_app.state.database
-    database.update_job(
-        created["id"],
-        status="succeeded",
-        progress=1.0,
-        stage="completed",
-        completed_at="2026-01-01T00:00:00+00:00",
-    )
-    assert database.delete_job_if_status(created["id"], "succeeded") is True
+    cancelled = await client.post(f"/api/jobs/{created['id']}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    assert database.delete_job_if_status(created["id"], "cancelled") is True
     response = await client.get("/api/jobs")
 
     assert response.status_code == 200
@@ -1066,20 +1102,13 @@ async def test_single_job_get_returns_404_for_a_deleted_row(
     client, fake_comfy
 ) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     database = client.director_app.state.database
-    database.update_job(
-        created["id"],
-        status="succeeded",
-        progress=1.0,
-        stage="completed",
-        completed_at="2026-01-01T00:00:00+00:00",
-    )
-    assert database.delete_job_if_status(created["id"], "succeeded") is True
+    cancelled = await client.post(f"/api/jobs/{created['id']}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    assert database.delete_job_if_status(created["id"], "cancelled") is True
     response = await client.get(f"/api/jobs/{created['id']}")
 
     assert response.status_code == 404
@@ -1088,9 +1117,7 @@ async def test_single_job_get_returns_404_for_a_deleted_row(
 
 async def test_history_for_another_prompt_is_not_misattributed(client, fake_comfy) -> None:
     created = (
-        await client.post(
-            "/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")}
-        )
+        await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     ).json()
     created = await _submitted_job(client, created)
     fake_comfy.pending = []
@@ -1106,16 +1133,17 @@ async def test_history_for_another_prompt_is_not_misattributed(client, fake_comf
     assert refreshed.json()["status"] == "queued"
 
 
-async def test_invalid_or_incomplete_job_does_not_submit(client, fake_comfy) -> None:
-    draft = runnable_draft("i2v")
-    draft["shots"][0]["first_image"] = None
-    response = await client.post("/api/jobs", json={"mode": "i2v", "config": draft})
+async def test_incomplete_v5_model_stack_does_not_submit(client, fake_comfy) -> None:
+    draft = (await client.get("/api/timeline")).json()
+    draft["segments"][0]["prompt"] = "A cinematic camera move"
+    draft["model_stack"]["fl2va"]["filename"] = None
+    response = await client.post("/api/jobs", json={"config": draft})
     assert response.status_code == 422
     assert not fake_comfy.prompts
 
 
 async def test_success_history_with_progress_messages_is_not_failed(client, fake_comfy) -> None:
-    created = (await client.post("/api/jobs", json={"mode": "t2v", "config": runnable_draft("t2v")})).json()
+    created = (await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))).json()
     created = await _submitted_job(client, created)
     child = client.director_app.state.database.list_job_children(created["id"])[0]
     save_id = next(iter(child["output_nodes"].values()))
@@ -1278,9 +1306,22 @@ async def test_source_trim_cannot_exceed_probed_duration(
     draft["shots"][0]["source_duration_seconds"] = 4.01
     if endpoint == "draft":
         response = await client.put(f"/api/drafts/{mode}", json=draft)
+        assert response.status_code == 410
+        assert response.json()["detail"]["code"] == "legacy_generation_api_retired"
     else:
-        response = await client.post("/api/jobs", json={"mode": mode, "config": draft})
+        valid_draft = runnable_draft(mode)
+        timeline = mode_draft_to_timeline(
+            validate_mode_draft(mode, valid_draft)
+        )
+        document = await v5_timeline_document(
+            client,
+            timeline.model_dump(mode="json"),
+        )
+        document["segments"][0]["source_start_seconds"] = 8.0
+        document["segments"][0]["source_duration_seconds"] = 4.01
+        response = await client.post("/api/jobs", json={"config": document})
 
-    assert response.status_code == 422
-    assert "metadata.duration" in response.text
+    if endpoint == "job":
+        assert response.status_code == 422
+        assert "metadata.duration" in response.text
     assert fake_comfy.prompts == []

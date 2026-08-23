@@ -25,9 +25,19 @@ COMFY_ROOT = (
 )
 RAYLIGHT_ROOT = Path(
     os.environ.get(
-        "RAYLIGHT_NODE_ROOT", str(COMFY_ROOT / "custom_nodes" / "raylight")
+        "RAYLIGHT_NODE_ROOT", str(PROJECT_ROOT / "custom_nodes" / "raylight")
     )
 ).resolve()
+DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES = {
+    "RayInitializerAdvanced": "DirectorDeckRayInitializerAdvanced",
+    "RayLoraLoader": "DirectorDeckRayLoraLoader",
+    "RayUNETLoader": "DirectorDeckRayUNETLoader",
+    "RayMiniMaxH3SigmaShift": "DirectorDeckRayMiniMaxH3SigmaShift",
+    "RayBasicGuider": "DirectorDeckRayBasicGuider",
+    "RayBasicScheduler": "DirectorDeckRayBasicScheduler",
+    "XFuserSamplerCustomAdvanced": "DirectorDeckRayXFuserSamplerCustomAdvanced",
+    "RayKill": "DirectorDeckRayKill",
+}
 TURBO_LORA_ROOT = Path(
     os.environ.get(
         "MINIMAX_H3_TURBO_NODE_ROOT",
@@ -50,7 +60,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 sys.path.insert(0, str(COMFY_ROOT))
 
 from directordeck.native_templates import (  # noqa: E402
-    EXPECTED_NATIVE_NODE_MODULES,
     bind_native_workflow_predecessor_output,
     build_raylight_shutdown_unit,
     compile_native_timeline,
@@ -240,6 +249,11 @@ def _maximum_reference_draft(*, with_source_video: bool) -> UnifiedTimelineDraft
 
 def _raylight_settings() -> RuntimeSettings:
     value = default_settings().model_dump(mode="json")
+    # The production compiler intentionally fails closed when a multi-GPU
+    # pool is configured before the operator enables the optional RayLight
+    # runtime.  This validator is explicitly exercising the installed
+    # RayLight registry, so its fixture must opt in just like the live UI.
+    value["multi_gpu_enabled"] = True
     for family in ("fl2va", "ref2va"):
         value["models"][family].update(
             backend="raylight",
@@ -278,11 +292,17 @@ def _dedicated_lora_settings() -> RuntimeSettings:
 
 def _standard_lora_settings(loader: str) -> RuntimeSettings:
     value = _standard_settings().model_dump(mode="json")
-    value["models"]["fl2va"].update(
-        lora_name=TURBO_LORA,
-        lora_loader=loader,
-        lora_low_vram=False,
-    )
+    binding = value["models"]["fl2va"]
+    binding.update(lora_name=TURBO_LORA, lora_low_vram=False)
+    # ``lora_loader`` is an obsolete compatibility field and production
+    # correctly ignores it.  The validator needs the visible, exact binding
+    # override in order to exercise the two non-default Standard adapters
+    # against the live registry.
+    binding["standard_lora_loader_override"] = {
+        "loader": loader,
+        "lora_name": TURBO_LORA,
+        "model_filename": binding["filename"],
+    }
     return RuntimeSettings.model_validate(value)
 
 
@@ -358,8 +378,46 @@ async def _validate(
     return False
 
 
-def _validate_registry_provenance(nodes: Any, results: list[Any]) -> list[str]:
-    """Check the same registry metadata served by ComfyUI ``/object_info``."""
+def _install_director_raylight_aliases(nodes: Any, base_nodes: set[str]) -> list[str]:
+    """Mirror the plugin's filtered, namespaced bundled-RayLight export."""
+
+    registry = nodes.NODE_CLASS_MAPPINGS
+    displays = nodes.NODE_DISPLAY_NAME_MAPPINGS
+    loaded_names = set(registry) - base_nodes
+    missing = set(DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES) - loaded_names
+    conflicts = set(DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES.values()).intersection(
+        base_nodes
+    )
+    if missing or conflicts:
+        failures = [
+            f"bundled RayLight alias source missing: {name}"
+            for name in sorted(missing)
+        ]
+        failures.extend(
+            f"DirectorDeck RayLight alias conflicts with host node: {name}"
+            for name in sorted(conflicts)
+        )
+        return failures
+
+    selected = {
+        target: registry[source]
+        for source, target in DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES.items()
+    }
+    selected_displays = {
+        target: f"DirectorDeck · {displays[source]}"
+        for source, target in DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES.items()
+        if source in displays
+    }
+    for name in loaded_names:
+        registry.pop(name, None)
+        displays.pop(name, None)
+    registry.update(selected)
+    displays.update(selected_displays)
+    return []
+
+
+def _validate_registry_ownership(nodes: Any, results: list[Any]) -> list[str]:
+    """Validate only that emitted class_types exist in ComfyUI's registry."""
 
     failures: list[str] = []
     expected: dict[str, str] = {}
@@ -371,27 +429,17 @@ def _validate_registry_provenance(nodes: Any, results: list[Any]) -> list[str]:
                 for node in unit.prompt.values()
             ):
                 failures.append(f"{unit.id}: emitted forbidden MiniMaxH3Director")
-    for node_name, provenance in sorted(expected.items()):
+    for node_name in sorted(expected):
         node_class = nodes.NODE_CLASS_MAPPINGS.get(node_name)
         if node_class is None:
             failures.append(f"{node_name}: missing from registry")
-            continue
-        module = str(getattr(node_class, "__module__", ""))
-        relative = str(getattr(node_class, "RELATIVE_PYTHON_MODULE", ""))
-        source = relative or module
-        matches = source == EXPECTED_NATIVE_NODE_MODULES[node_name]
-        if not matches:
-            failures.append(
-                f"{node_name}: policy={provenance}, registry module={module!r}, "
-                f"python_module={relative!r}"
-            )
     if failures:
         for failure in failures:
             print(f"FAIL provenance: {failure}")
     else:
         print(
-            f"PASS object_info provenance: {len(expected)} emitted node classes; "
-            "no Director node"
+            "PASS registry presence: "
+            f"{len(expected)} emitted node classes present"
         )
     return failures
 
@@ -407,22 +455,22 @@ def _validate_raylight_initializer_contract(nodes: Any) -> list[str]:
     Director selects COMFY_KITCHEN_INT8 explicitly in every generated prompt.
     """
 
-    node_class = nodes.NODE_CLASS_MAPPINGS.get("RayInitializerAdvanced")
+    node_class = nodes.NODE_CLASS_MAPPINGS.get("DirectorDeckRayInitializerAdvanced")
     if node_class is None:
-        return ["RayInitializerAdvanced: missing from registry"]
+        return ["DirectorDeckRayInitializerAdvanced: missing from registry"]
     try:
         input_types = node_class.INPUT_TYPES()
     except Exception as exc:
-        return [f"RayInitializerAdvanced: INPUT_TYPES failed: {exc}"]
+        return [f"DirectorDeckRayInitializerAdvanced: INPUT_TYPES failed: {exc}"]
     if not isinstance(input_types, dict):
-        return ["RayInitializerAdvanced: INPUT_TYPES is not an object"]
+        return ["DirectorDeckRayInitializerAdvanced: INPUT_TYPES is not an object"]
     required = input_types.get("required")
     if not isinstance(required, dict):
-        return ["RayInitializerAdvanced: required inputs are missing"]
+        return ["DirectorDeckRayInitializerAdvanced: required inputs are missing"]
     attention = required.get("XFuser_attention")
     if not isinstance(attention, tuple) or not attention:
         return [
-            "RayInitializerAdvanced.XFuser_attention must be a required combo"
+            "DirectorDeckRayInitializerAdvanced.XFuser_attention must be a required combo"
         ]
     attention_options = attention[0]
     attention_metadata = (
@@ -439,17 +487,17 @@ def _validate_raylight_initializer_contract(nodes: Any) -> list[str]:
         or "TORCH_FLASH" not in attention_options
     ):
         return [
-            "RayInitializerAdvanced.XFuser_attention must offer "
+            "DirectorDeckRayInitializerAdvanced.XFuser_attention must offer "
             "COMFY_KITCHEN_INT8 and TORCH_FLASH"
         ]
     if attention_metadata.get("default") != "TORCH_FLASH":
         return [
-            "RayInitializerAdvanced.XFuser_attention must retain "
+            "DirectorDeckRayInitializerAdvanced.XFuser_attention must retain "
             "TORCH_FLASH as the third-party workflow default"
         ]
     optional = input_types.get("optional")
     if not isinstance(optional, dict):
-        return ["RayInitializerAdvanced: optional inputs are missing"]
+        return ["DirectorDeckRayInitializerAdvanced: optional inputs are missing"]
     policy = optional.get("driver_cleanup_policy")
     if (
         not isinstance(policy, tuple)
@@ -459,7 +507,7 @@ def _validate_raylight_initializer_contract(nodes: Any) -> list[str]:
         or "ray_devices" not in policy[0]
     ):
         return [
-            "RayInitializerAdvanced.driver_cleanup_policy must offer "
+            "DirectorDeckRayInitializerAdvanced.driver_cleanup_policy must offer "
             "legacy_all and ray_devices"
         ]
     # The RAM-cache fork contract: Director explicitly sends this input, and
@@ -476,11 +524,11 @@ def _validate_raylight_initializer_contract(nodes: Any) -> list[str]:
         or ram_cache[1].get("min") != 0
     ):
         return [
-            "RayInitializerAdvanced.ram_cache_max_models must be an optional "
+            "DirectorDeckRayInitializerAdvanced.ram_cache_max_models must be an optional "
             "INT input with default 2 and min 0 (worker RAM-cache fork)"
         ]
     print(
-        "PASS RayInitializerAdvanced contract: attention offers "
+        "PASS DirectorDeckRayInitializerAdvanced contract: attention offers "
         "COMFY_KITCHEN_INT8/TORCH_FLASH with legacy default TORCH_FLASH; "
         "driver cleanup and RAM-cache inputs present"
     )
@@ -499,11 +547,11 @@ def _validate_compiled_raylight_attention(results: list[Any]) -> list[str]:
             initializers = [
                 node
                 for node in unit.prompt.values()
-                if node.get("class_type") == "RayInitializerAdvanced"
+                if node.get("class_type") == "DirectorDeckRayInitializerAdvanced"
             ]
             if len(initializers) != 1:
                 failures.append(
-                    f"{unit.id}: expected exactly one RayInitializerAdvanced"
+                    f"{unit.id}: expected exactly one DirectorDeckRayInitializerAdvanced"
                 )
                 continue
             checked += 1
@@ -530,7 +578,7 @@ def _validate_beta_scheduler_contract(nodes: Any) -> list[str]:
     """
 
     failures: list[str] = []
-    for node_name in ("BasicScheduler", "RayBasicScheduler"):
+    for node_name in ("BasicScheduler", "DirectorDeckRayBasicScheduler"):
         node_class = nodes.NODE_CLASS_MAPPINGS.get(node_name)
         if node_class is None:
             failures.append(f"{node_name}: missing from registry")
@@ -555,7 +603,7 @@ def _validate_beta_scheduler_contract(nodes: Any) -> list[str]:
         if not isinstance(options, (list, tuple)) or "beta" not in options:
             failures.append(f"{node_name}.scheduler does not offer beta")
     if not failures:
-        print("PASS beta scheduler contract: BasicScheduler, RayBasicScheduler")
+        print("PASS beta scheduler contract: BasicScheduler, DirectorDeckRayBasicScheduler")
     return failures
 
 
@@ -673,6 +721,11 @@ async def validate_all() -> int:
         print("FAIL raylight-u2: RayLight failed to register")
         failures.append("raylight-u2")
     else:
+        alias_failures = _install_director_raylight_aliases(nodes, base_nodes)
+        if alias_failures:
+            for failure in alias_failures:
+                print(f"FAIL raylight-alias: {failure}")
+            failures.extend(alias_failures)
         raylight_settings = _raylight_settings()
         raylight_without_lora = None
         for mode in MODES:
@@ -738,9 +791,9 @@ async def validate_all() -> int:
             failures.append("raylight-lora")
 
         # The runtime switch graph is server-generated after ordinary compile,
-        # so validate its exact RAY_ACTORS wiring and RayKill input contract
+        # so validate its exact RAY_ACTORS wiring and DirectorDeckRayKill input contract
         # explicitly against the installed registry. Cover both forms of the
-        # persisted loader chain: without and with the optional RayLoraLoader.
+        # persisted loader chain: without and with the optional DirectorDeckRayLoraLoader.
         barrier_sources = (
             ("raylight-kill", raylight_without_lora),
             ("raylight-lora-kill", ray_lora.workflows[0]),
@@ -792,8 +845,8 @@ async def validate_all() -> int:
         ):
             failures.append(f"standard-{label}-lora")
 
-    provenance_failures = _validate_registry_provenance(nodes, compiled_results)
-    failures.extend(f"provenance:{item}" for item in provenance_failures)
+    ownership_failures = _validate_registry_ownership(nodes, compiled_results)
+    failures.extend(f"ownership:{item}" for item in ownership_failures)
     initializer_contract_failures = _validate_raylight_initializer_contract(nodes)
     failures.extend(
         f"raylight-initializer:{item}" for item in initializer_contract_failures

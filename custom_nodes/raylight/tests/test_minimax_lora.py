@@ -1,18 +1,46 @@
 # Added for Director Web; see DIRECTOR_MODIFICATIONS.md.
 from types import SimpleNamespace
 
-from raylight.diffusion_models.minimax.lora import (
+from directordeck_raylight.diffusion_models.minimax.lora import (
     is_minimax_h3_fused_int8_fc2,
+    minimax_h3_lora_targets,
     normalize_minimax_h3_lora_keys,
 )
 
 
+class _FakeReduction:
+    def __init__(self, value):
+        self.value = value
+
+    def all(self):
+        return self
+
+    def any(self):
+        return self
+
+    def item(self):
+        return self.value
+
+
 class FakeTensor:
-    def __init__(self, shape, layout=None, transposed=False):
+    def __init__(self, shape, layout=None, transposed=False, *, finite=True, nonzero=True, scalar=1.0):
         self.shape = shape
+        self.finite = finite
+        self.nonzero = nonzero
+        self.scalar = scalar
         if layout is not None:
             self._layout_cls = layout
             self._params = SimpleNamespace(transposed=transposed)
+
+    def item(self):
+        return self.scalar
+
+    def isfinite(self):
+        return _FakeReduction(self.finite)
+
+    def ne(self, value):
+        assert value == 0
+        return _FakeReduction(self.nonzero)
 
 
 class MiniMaxH3Model:
@@ -54,27 +82,23 @@ def test_normalizes_all_official_h3_turbo_lora_roots_without_mutating_input():
         "blocks.0.attn.qkv_proj.lora_A.weight": FakeTensor((2, 8)),
         "blocks.0.attn.qkv_proj.lora_B.weight": FakeTensor((12, 2)),
         "blocks.0.attn.qkv_proj.alpha": FakeTensor(()),
-        "blocks.0.attn.qkv_proj.dora_scale": FakeTensor((12,)),
         "final_layer.adaln_proj.linear.lora_A.weight": FakeTensor((2, 8)),
         "final_layer.adaln_proj.linear.lora_B.weight": FakeTensor((24, 2)),
         "token_refiner.blocks.0.mlp.fc1.lora_A.weight": FakeTensor((2, 8)),
         "token_refiner.blocks.0.mlp.fc1.lora_B.weight": FakeTensor((16, 2)),
-        "metadata": object(),
     }
 
     normalized, count = normalize_minimax_h3_lora_keys(_patcher(MiniMaxH3Model()), state_dict)
 
-    assert count == 8
+    assert count == 7
     assert set(normalized) == {
         "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight",
         "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight",
         "diffusion_model.blocks.0.attn.qkv_proj.alpha",
-        "diffusion_model.blocks.0.attn.qkv_proj.dora_scale",
         "diffusion_model.final_layer.adaln_proj.linear.lora_A.weight",
         "diffusion_model.final_layer.adaln_proj.linear.lora_B.weight",
         "diffusion_model.token_refiner.blocks.0.mlp.fc1.lora_A.weight",
         "diffusion_model.token_refiner.blocks.0.mlp.fc1.lora_B.weight",
-        "metadata",
     }
     assert all(not key.startswith("diffusion_model.") for key in state_dict)
 
@@ -98,8 +122,18 @@ def test_duplicate_bare_and_prefixed_key_is_rejected():
     )
 
 
-def test_leaves_non_h3_models_unchanged():
+def test_rejects_h3_keys_for_non_h3_model():
     state_dict = {"blocks.0.attn.qkv_proj.lora_A.weight": object()}
+
+    _assert_raises(
+        TypeError,
+        "require a MiniMaxH3Model",
+        lambda: normalize_minimax_h3_lora_keys(_patcher(OtherModel()), state_dict),
+    )
+
+
+def test_leaves_non_h3_model_and_non_h3_keys_unchanged():
+    state_dict = {"other_model.layer.lora_A.weight": object()}
 
     normalized, count = normalize_minimax_h3_lora_keys(_patcher(OtherModel()), state_dict)
 
@@ -117,6 +151,44 @@ def test_validates_already_normalized_h3_state_dict():
 
     assert normalized is state_dict
     assert count == 0
+
+    assert minimax_h3_lora_targets(_patcher(MiniMaxH3Model()), normalized) == (
+        "diffusion_model.blocks.0.attn.qkv_proj.weight",
+    )
+
+
+def test_rejects_h3_lora_without_adapter_pairs():
+    _assert_raises(
+        ValueError,
+        "no adapter A/B pairs",
+        lambda: normalize_minimax_h3_lora_keys(
+            _patcher(MiniMaxH3Model()),
+            {"blocks.0.attn.qkv_proj.alpha": FakeTensor(())},
+        ),
+    )
+
+
+def test_rejects_every_unsupported_pending_key():
+    base = {
+        "blocks.0.attn.qkv_proj.lora_A.weight": FakeTensor((2, 8)),
+        "blocks.0.attn.qkv_proj.lora_B.weight": FakeTensor((12, 2)),
+    }
+
+    _assert_raises(
+        ValueError,
+        "Unsupported MiniMax H3 LoRA adapter key",
+        lambda: normalize_minimax_h3_lora_keys(
+            _patcher(MiniMaxH3Model()),
+            {**base, "blocks.0.attn.qkv_proj.dora_scale": FakeTensor((12,))},
+        ),
+    )
+    _assert_raises(
+        ValueError,
+        "Unsupported key in MiniMax H3 LoRA state dict",
+        lambda: normalize_minimax_h3_lora_keys(
+            _patcher(MiniMaxH3Model()), {**base, "metadata": FakeTensor(())}
+        ),
+    )
 
 
 def test_rejects_incomplete_pair():
@@ -140,6 +212,46 @@ def test_rejects_rank_mismatch():
         "Invalid MiniMax H3 LoRA rank",
         lambda: normalize_minimax_h3_lora_keys(_patcher(MiniMaxH3Model()), state_dict),
     )
+
+
+def test_rejects_non_finite_or_zero_alpha():
+    base = {
+        "blocks.0.attn.qkv_proj.lora_A.weight": FakeTensor((2, 8)),
+        "blocks.0.attn.qkv_proj.lora_B.weight": FakeTensor((12, 2)),
+    }
+
+    for alpha in (0.0, -0.0, float("nan"), float("inf"), float("-inf")):
+        _assert_raises(
+            ValueError,
+            "alpha must be a finite non-zero scalar",
+            lambda alpha=alpha: normalize_minimax_h3_lora_keys(
+                _patcher(MiniMaxH3Model()),
+                {**base, "blocks.0.attn.qkv_proj.alpha": FakeTensor((), scalar=alpha)},
+            ),
+        )
+
+
+def test_rejects_non_finite_or_all_zero_adapter_tensors():
+    for suffix, tensor in (
+        ("lora_A.weight", FakeTensor((2, 8), finite=False)),
+        ("lora_B.weight", FakeTensor((12, 2), finite=False)),
+        ("lora_A.weight", FakeTensor((2, 8), nonzero=False)),
+        ("lora_B.weight", FakeTensor((12, 2), nonzero=False)),
+    ):
+        a = tensor if suffix.startswith("lora_A") else FakeTensor((2, 8))
+        b = tensor if suffix.startswith("lora_B") else FakeTensor((12, 2))
+        message = "only finite values" if not tensor.finite else "must not be all zero"
+        _assert_raises(
+            ValueError,
+            message,
+            lambda a=a, b=b: normalize_minimax_h3_lora_keys(
+                _patcher(MiniMaxH3Model()),
+                {
+                    "blocks.0.attn.qkv_proj.lora_A.weight": a,
+                    "blocks.0.attn.qkv_proj.lora_B.weight": b,
+                },
+            ),
+        )
 
 
 def test_rejects_target_shape_mismatch():

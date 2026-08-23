@@ -30,6 +30,8 @@ import {
   loadLocalTimeline,
   loadLocalTimelineWal,
   localTimelineWalStorageKey,
+  migrateTimelineFeatureBundle4To5,
+  normalizeLegacyTimelineProject,
   normalizeTimelineProject,
   orderAssetsByPreference,
   promptSubjectReferences,
@@ -864,7 +866,7 @@ describe("统一 timeline domain", () => {
       ],
     };
 
-    const normalized = normalizeTimelineProject(legacy);
+    const normalized = normalizeLegacyTimelineProject(legacy);
     expect(normalized?.version).toBe(4);
     expect(normalized?.segments.map((segment) => segment.mode)).toEqual([
       "fl2va", "fl2va", "fl2va", "ref2va", "ref2va", "ref2va",
@@ -1121,19 +1123,28 @@ describe("统一 timeline domain", () => {
     const historical = structuredClone(video);
     if (!historical.metadata) throw new Error("fixture requires metadata");
     delete (historical.metadata as Partial<typeof historical.metadata>).has_audio;
-    const normalized = normalizeTimelineProject({
+    const staleCurrent = {
       ...createTimelineProject(),
       segments: [{
         ...createTimelineSegment("ref2va", 1),
         source_video: historical,
         source_audio_as_reference: true,
       }],
+    };
+    expect(normalizeTimelineProject(staleCurrent)).toBeNull();
+    const { model_stack: _modelStack, features: _features, ...legacyDocument } = staleCurrent;
+    const normalized = normalizeLegacyTimelineProject({
+      ...legacyDocument,
+      version: 4,
     })!;
     const source = normalized.segments[0];
     expect(source.mode).toBe("ref2va");
     if (source.mode !== "ref2va") throw new Error("fixture must remain v2v");
     expect(source.source_video?.metadata?.has_audio).toBe(false);
-    expect(validateTimelineProject(normalized).join(" ")).toContain("没有可用音轨");
+    expect(validateTimelineProject({
+      ...createTimelineProject(),
+      segments: [source],
+    }).join(" ")).toContain("没有可用音轨");
     expect(setSourceAudioAsReference({ ...source, source_audio_as_reference: false }, true).source_audio_as_reference).toBe(false);
   });
 
@@ -1910,18 +1921,14 @@ describe("统一 timeline domain", () => {
     expect(canMergeSelectedSegments(mixedEnabledState)).toBe(false);
   });
 
-  it("normalizer 按模式白名单剥离 UI 和其他模式字段", () => {
+  it("current v5 strict parser rejects UI and cross-mode fields instead of silently stripping them", () => {
     const project = createTimelineProject() as unknown as Record<string, unknown>;
     project.playhead_seconds = 12;
     const segments = project.segments as Record<string, unknown>[];
     segments[0].source_video = video;
     segments[0].reference_images = [{ ...image, slot: 0 }];
     segments[0].candidate_take = "/output.mp4";
-    const normalized = normalizeTimelineProject(project)!;
-    expect(normalized).not.toHaveProperty("playhead_seconds");
-    expect(normalized.segments[0]).not.toHaveProperty("source_video");
-    expect(normalized.segments[0]).not.toHaveProperty("reference_images");
-    expect(normalized.segments[0]).not.toHaveProperty("candidate_take");
+    expect(normalizeTimelineProject(project)).toBeNull();
   });
 
   it("normalizer 将旧 FPS/单套采样迁移为 24fps 与两套无 CFG 配置", () => {
@@ -1945,7 +1952,7 @@ describe("统一 timeline domain", () => {
       audio_shift: 4,
       cfg: 7.5,
     };
-    const normalized = normalizeTimelineProject(legacy)!;
+    const normalized = normalizeLegacyTimelineProject(legacy)!;
     expect(normalized.render.fps).toBe(24);
     expect(normalized.sampling.fl2va).toEqual({
       steps: 31,
@@ -1974,7 +1981,7 @@ describe("统一 timeline domain", () => {
       delete migrated.audio_mode;
       return migrated;
     });
-    const normalized = normalizeTimelineProject(legacy)!;
+    const normalized = normalizeLegacyTimelineProject(legacy)!;
     expect(normalized.version).toBe(4);
     expect(normalized).not.toHaveProperty("continuity");
     expect(normalized.segments.every((segment) =>
@@ -1985,7 +1992,7 @@ describe("统一 timeline domain", () => {
       enabled: false,
       overlap_frames: 5,
     };
-    expect(normalizeTimelineProject(smuggled)).toBeNull();
+    expect(normalizeLegacyTimelineProject(smuggled)).toBeNull();
   });
 
   it("把 v3 的全片音频与参考图策略复制到每个 v4 片段", () => {
@@ -2000,7 +2007,7 @@ describe("统一 timeline domain", () => {
       return migrated;
     });
 
-    const normalized = normalizeTimelineProject(legacy)!;
+    const normalized = normalizeLegacyTimelineProject(legacy)!;
 
     expect(normalized.version).toBe(4);
     expect(normalized).not.toHaveProperty("ref_image_size");
@@ -2033,7 +2040,7 @@ describe("统一 timeline domain", () => {
       enabled: true,
     }];
     legacy.sampling = { ...current.sampling.fl2va, scheduler: "beta" };
-    expect(normalizeTimelineProject(legacy)?.sampling).toMatchObject({
+    expect(normalizeLegacyTimelineProject(legacy)?.sampling).toMatchObject({
       fl2va: { scheduler: "beta" },
       ref2va: { scheduler: "beta" },
     });
@@ -2074,7 +2081,7 @@ describe("统一 timeline domain", () => {
       duration_seconds: 5,
       enabled: true,
     }];
-    const normalized = normalizeTimelineProject(legacy)!;
+    const normalized = normalizeLegacyTimelineProject(legacy)!;
     expect(normalized.render).toEqual({ width: 1024, height: 576, fps: 24 });
     expect(inferTimelineOutputAspect(normalized.render.width, normalized.render.height)).toBe("16:9");
     expect(isTimelineOutputResolution(normalized.render.width, normalized.render.height)).toBe(false);
@@ -2097,7 +2104,7 @@ describe("统一 timeline domain", () => {
       cfg: 1,
     };
 
-    const normalized = normalizeTimelineProject(legacy)!;
+    const normalized = normalizeLegacyTimelineProject(legacy)!;
     expect(normalized).not.toHaveProperty("prompt");
     expect(normalized.segments.map((segment) => segment.prompt)).toEqual([
       "旧全片默认提示词",
@@ -2591,8 +2598,10 @@ describe("统一 timeline domain", () => {
       export_mode: base.export_mode,
       sampling: structuredClone(base.sampling),
       render: structuredClone(base.render),
+      model_stack: structuredClone(base.model_stack),
+      features: structuredClone(base.features),
       title: base.title,
-      version: 4,
+      version: 5,
     };
     expect(timelineProjectDocumentHash(reordered)).toBe(timelineProjectDocumentHash(base));
     expect(loadLocalTimelineWal(ACTIVE_DATABASE)).toEqual(wal);
@@ -2661,6 +2670,50 @@ describe("统一 timeline domain", () => {
     expect(readTimelineWalRaw()).not.toBeNull();
     clearLocalTimelineWal(wal);
     expect(readTimelineWalRaw()).toBeNull();
+  });
+
+  it("schema 5 bundle 4 WAL 只跨确定性的 marker revision 重放或确认 lost ACK", () => {
+    localStorage.clear();
+    const base = createTimelineProject();
+    base.features.template_bundle_version = 4;
+    const pending = { ...structuredClone(base), title: "bundle 4 本地待同步" };
+    const wal = writeTimelineWal(base, pending, 7)!;
+    const raw = readTimelineWalRaw();
+    const upgradedBase = migrateTimelineFeatureBundle4To5(base)!;
+    const upgradedPending = migrateTimelineFeatureBundle4To5(pending)!;
+
+    expect(resolveLocalTimelineWal(wal, {
+      revision: 8,
+      document: upgradedBase,
+    })).toEqual({
+      status: "replay",
+      project: upgradedPending,
+      expected_server_revision: 8,
+    });
+    expect(resolveLocalTimelineWal(wal, {
+      revision: 9,
+      document: upgradedPending,
+    })).toEqual({
+      status: "acknowledged",
+      project: upgradedPending,
+      server_revision: 9,
+    });
+
+    const unrelated = { ...structuredClone(upgradedBase), title: "服务器另一个编辑" };
+    expect(resolveLocalTimelineWal(wal, {
+      revision: 8,
+      document: unrelated,
+    })).toMatchObject({
+      status: "conflict",
+      reason: "revision-mismatch",
+      local_project: pending,
+      server_project: unrelated,
+    });
+    expect(resolveLocalTimelineWal(wal, {
+      revision: 9,
+      document: upgradedBase,
+    })).toMatchObject({ status: "conflict", reason: "revision-mismatch" });
+    expect(readTimelineWalRaw()).toBe(raw);
   });
 
   it("lost ACK 只匹配被核对的具体 branch head", () => {

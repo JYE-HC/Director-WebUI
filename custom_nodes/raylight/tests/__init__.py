@@ -1,1 +1,1 @@
-"""Unit test package for raylight."""
+"""Unit tests for the DirectorDeck-maintained RayLight fork."""

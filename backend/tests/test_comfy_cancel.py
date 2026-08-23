@@ -10,23 +10,30 @@ from directordeck.comfy import ComfyClient, ComfyError
 
 async def test_comfy_submit_requests_only_server_owned_metadata_previews() -> None:
     submitted: dict = {}
+    events: list[object] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        events.append(("request", request.url.path))
         submitted.update(json.loads(request.content))
         return httpx.Response(
             200,
             json={"prompt_id": "fixed-id", "number": 1, "node_errors": {}},
         )
 
+    def on_receipt(requested_prompt_id: str | None, actual_prompt_id: str) -> None:
+        events.append(("receipt", requested_prompt_id, actual_prompt_id))
+
     client = ComfyClient(
         "http://comfy.test", transport=httpx.MockTransport(handler)
     )
 
-    await client.submit(
+    response = await client.submit(
         {"1": {"class_type": "UNETLoader", "inputs": {}}},
         "director-client",
         "fixed-id",
+        on_receipt=on_receipt,
     )
+    events.append(("returned", response["prompt_id"]))
 
     assert submitted == {
         "prompt": {"1": {"class_type": "UNETLoader", "inputs": {}}},
@@ -34,19 +41,29 @@ async def test_comfy_submit_requests_only_server_owned_metadata_previews() -> No
         "extra_data": {"preview_method": "latent2rgb"},
         "prompt_id": "fixed-id",
     }
+    assert events == [
+        ("request", "/prompt"),
+        ("receipt", "fixed-id", "fixed-id"),
+        ("returned", "fixed-id"),
+    ]
 
 
 async def test_comfy_submit_prompt_id_mismatch_atomically_cancels_actual_id() -> None:
     requests: list[httpx.Request] = []
+    events: list[object] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        events.append(("request", request.url.path))
         if request.url.path == "/prompt":
             return httpx.Response(
                 200,
                 json={"prompt_id": "actual", "number": 1, "node_errors": {}},
             )
         return httpx.Response(200, json={"cancelled": True})
+
+    def on_receipt(requested_prompt_id: str | None, actual_prompt_id: str) -> None:
+        events.append(("receipt", requested_prompt_id, actual_prompt_id))
 
     client = ComfyClient(
         "http://comfy.test", transport=httpx.MockTransport(handler)
@@ -55,7 +72,12 @@ async def test_comfy_submit_prompt_id_mismatch_atomically_cancels_actual_id() ->
     with pytest.raises(
         ComfyError, match="different prompt id.*atomically cancelled"
     ) as caught:
-        await client.submit({}, "director-client", "requested")
+        await client.submit(
+            {},
+            "director-client",
+            "requested",
+            on_receipt=on_receipt,
+        )
 
     assert caught.value.detail["requested_prompt_id"] == "requested"
     assert caught.value.detail["actual_prompt_id"] == "actual"
@@ -63,6 +85,95 @@ async def test_comfy_submit_prompt_id_mismatch_atomically_cancels_actual_id() ->
     assert [(request.method, request.url.path) for request in requests] == [
         ("POST", "/prompt"),
         ("POST", "/api/jobs/actual/cancel"),
+    ]
+    assert events == [
+        ("request", "/prompt"),
+        ("receipt", "requested", "actual"),
+        ("request", "/api/jobs/actual/cancel"),
+    ]
+
+
+async def test_comfy_submit_receipt_hook_failure_cancels_actual_id() -> None:
+    events: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events.append(("request", request.url.path))
+        if request.url.path == "/prompt":
+            return httpx.Response(
+                200,
+                json={"prompt_id": "fixed-id", "number": 1, "node_errors": {}},
+            )
+        return httpx.Response(200, json={"cancelled": True})
+
+    def on_receipt(requested_prompt_id: str | None, actual_prompt_id: str) -> None:
+        events.append(("receipt", requested_prompt_id, actual_prompt_id))
+        raise RuntimeError("durable receipt write failed")
+
+    client = ComfyClient(
+        "http://comfy.test", transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(
+        ComfyError, match="receipt hook failed.*atomically cancelled"
+    ) as caught:
+        await client.submit(
+            {},
+            "director-client",
+            "fixed-id",
+            on_receipt=on_receipt,
+        )
+
+    assert caught.value.detail["requested_prompt_id"] == "fixed-id"
+    assert caught.value.detail["actual_prompt_id"] == "fixed-id"
+    assert caught.value.detail["receipt_hook_error"] == "RuntimeError"
+    assert caught.value.detail["cleanup_response"] == {"cancelled": True}
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert events == [
+        ("request", "/prompt"),
+        ("receipt", "fixed-id", "fixed-id"),
+        ("request", "/api/jobs/fixed-id/cancel"),
+    ]
+
+
+async def test_comfy_submit_receipt_hook_and_cancel_failure_stays_fail_closed() -> None:
+    events: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events.append(("request", request.url.path))
+        if request.url.path == "/prompt":
+            return httpx.Response(
+                200,
+                json={"prompt_id": "actual", "number": 1, "node_errors": {}},
+            )
+        return httpx.Response(200, json={"cancelled": False})
+
+    def on_receipt(requested_prompt_id: str | None, actual_prompt_id: str) -> None:
+        events.append(("receipt", requested_prompt_id, actual_prompt_id))
+        raise RuntimeError("durable receipt write failed")
+
+    client = ComfyClient(
+        "http://comfy.test", transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(
+        ComfyError, match="receipt hook failed.*cleanup was not confirmed"
+    ) as caught:
+        await client.submit(
+            {},
+            "director-client",
+            "requested",
+            on_receipt=on_receipt,
+        )
+
+    assert "may still be queued or running" in str(caught.value)
+    assert caught.value.detail["requested_prompt_id"] == "requested"
+    assert caught.value.detail["actual_prompt_id"] == "actual"
+    assert caught.value.detail["receipt_hook_error"] == "RuntimeError"
+    assert caught.value.detail["cleanup_response"] == {"cancelled": False}
+    assert events == [
+        ("request", "/prompt"),
+        ("receipt", "requested", "actual"),
+        ("request", "/api/jobs/actual/cancel"),
     ]
 
 

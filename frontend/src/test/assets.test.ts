@@ -34,7 +34,10 @@ function asset(id: string, kind: "image" | "audio" | "video"): AssetReference {
 
 describe("媒体素材运行时契约", () => {
   it("完整保留合法视频 metadata，并拒绝任一非法探测字段", () => {
-    const video = asset("video-1", "video");
+    const video = {
+      ...asset("video-1", "video"),
+      content_hash: `sha256:${"a".repeat(64)}`,
+    };
     expect(normalizeAssetReference(video, "video")).toEqual(video);
 
     const invalidValues = [
@@ -54,6 +57,18 @@ describe("媒体素材运行时契约", () => {
       ).toBeNull();
     }
     expect(normalizeAssetReference({ ...video, metadata: undefined }, "video")).toBeNull();
+  });
+
+  it("保留 null 或小写 sha256 内容摘要，并拒绝非规范摘要", () => {
+    const image = asset("image-hash", "image");
+    expect(normalizeAssetReference({ ...image, content_hash: null }, "image"))
+      .toEqual({ ...image, content_hash: null });
+    expect(normalizeAssetReference({ ...image, content_hash: `sha256:${"b".repeat(64)}` }, "image"))
+      .toEqual({ ...image, content_hash: `sha256:${"b".repeat(64)}` });
+    expect(normalizeAssetReference({ ...image, content_hash: `sha256:${"B".repeat(64)}` }, "image"))
+      .toBeNull();
+    expect(normalizeAssetReference({ ...image, content_hash: "sha256:short" }, "image"))
+      .toBeNull();
   });
 
   it("图片和音频会丢弃 metadata，普通素材也不会保留 slot", () => {

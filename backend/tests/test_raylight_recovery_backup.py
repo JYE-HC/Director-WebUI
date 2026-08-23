@@ -10,6 +10,8 @@ import directordeck.database as database_module
 from directordeck.database import Database
 from directordeck.schemas import default_settings
 
+from .conftest import save_database_legacy_settings
+
 
 def _stale_runtime_state() -> dict:
     return {
@@ -49,7 +51,7 @@ def _stale_runtime_state() -> dict:
 def _database_with_stale_runtime(tmp_path: Path) -> tuple[Database, dict]:
     database = Database(tmp_path / "directordeck.sqlite3")
     database.initialize()
-    database.put_settings(default_settings())
+    save_database_legacy_settings(database, default_settings())
     database.put_raylight_runtime_state(_stale_runtime_state())
     state = database.get_raylight_runtime_state()
     assert state is not None

@@ -1,0 +1,1151 @@
+{
+  "fixture_schema": 1,
+  "pragma_user_version": 0,
+  "schema": [
+    {
+      "type": "index",
+      "name": "asset_trash_batches_created_idx",
+      "tbl_name": "asset_trash_batches",
+      "sql": "CREATE INDEX asset_trash_batches_created_idx ON asset_trash_batches(created_at DESC, id DESC)"
+    },
+    {
+      "type": "index",
+      "name": "assets_live_idx",
+      "tbl_name": "assets",
+      "sql": "CREATE INDEX assets_live_idx ON assets(trashed_at, created_at DESC, id DESC)"
+    },
+    {
+      "type": "index",
+      "name": "assets_trash_batch_idx",
+      "tbl_name": "assets",
+      "sql": "CREATE INDEX assets_trash_batch_idx ON assets(trash_batch_id) WHERE trash_batch_id IS NOT NULL"
+    },
+    {
+      "type": "index",
+      "name": "job_children_job_idx",
+      "tbl_name": "job_children",
+      "sql": "CREATE INDEX job_children_job_idx\n                    ON job_children(job_id, group_index)"
+    },
+    {
+      "type": "index",
+      "name": "job_children_prompt_idx",
+      "tbl_name": "job_children",
+      "sql": "CREATE UNIQUE INDEX job_children_prompt_idx\n                    ON job_children(prompt_id) WHERE prompt_id IS NOT NULL"
+    },
+    {
+      "type": "index",
+      "name": "jobs_created_at_idx",
+      "tbl_name": "jobs",
+      "sql": "CREATE INDEX jobs_created_at_idx ON jobs(created_at DESC)"
+    },
+    {
+      "type": "index",
+      "name": "jobs_prompt_id_idx",
+      "tbl_name": "jobs",
+      "sql": "CREATE INDEX jobs_prompt_id_idx ON jobs(prompt_id)"
+    },
+    {
+      "type": "index",
+      "name": "segment_takes_lookup_idx",
+      "tbl_name": "segment_takes",
+      "sql": "CREATE INDEX segment_takes_lookup_idx\n                    ON segment_takes(\n                        segment_id,\n                        content_fingerprint,\n                        has_audio,\n                        completed_at DESC,\n                        id DESC\n                    )"
+    },
+    {
+      "type": "table",
+      "name": "asset_trash_batches",
+      "tbl_name": "asset_trash_batches",
+      "sql": "CREATE TABLE asset_trash_batches (\n                    id TEXT PRIMARY KEY,\n                    asset_ids TEXT NOT NULL,\n                    cascade INTEGER NOT NULL CHECK (cascade IN (0, 1)),\n                    unbound_usages TEXT NOT NULL,\n                    created_at TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "asset_trash_document_changes",
+      "tbl_name": "asset_trash_document_changes",
+      "sql": "CREATE TABLE asset_trash_document_changes (\n                    batch_id TEXT NOT NULL REFERENCES asset_trash_batches(id)\n                        ON DELETE CASCADE,\n                    owner_kind TEXT NOT NULL\n                        CHECK (owner_kind IN ('timeline', 'project', 'draft')),\n                    owner_id TEXT NOT NULL,\n                    before_document TEXT NOT NULL,\n                    after_digest TEXT NOT NULL,\n                    after_revision INTEGER,\n                    PRIMARY KEY(batch_id, owner_kind, owner_id)\n                )"
+    },
+    {
+      "type": "table",
+      "name": "assets",
+      "tbl_name": "assets",
+      "sql": "CREATE TABLE assets (\n                    id TEXT PRIMARY KEY,\n                    document TEXT NOT NULL,\n                    created_at TEXT NOT NULL,\n                    trashed_at TEXT,\n                    trash_batch_id TEXT\n                )"
+    },
+    {
+      "type": "table",
+      "name": "job_children",
+      "tbl_name": "job_children",
+      "sql": "CREATE TABLE job_children (\n                    id TEXT PRIMARY KEY,\n                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,\n                    group_index INTEGER NOT NULL,\n                    family TEXT NOT NULL CHECK (family IN ('fl2va','ref2va')),\n                    backend TEXT NOT NULL CHECK (backend IN ('standard','raylight')),\n                    segment_ids TEXT NOT NULL,\n                    output_nodes TEXT NOT NULL,\n                    status TEXT NOT NULL,\n                    progress REAL NOT NULL,\n                    stage TEXT,\n                    prompt_id TEXT,\n                    outputs TEXT NOT NULL DEFAULT '[]',\n                    error TEXT,\n                    prompt_snapshot TEXT NOT NULL,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL,\n                    started_at TEXT,\n                    completed_at TEXT,\n                    UNIQUE(job_id, group_index)\n                )"
+    },
+    {
+      "type": "table",
+      "name": "jobs",
+      "tbl_name": "jobs",
+      "sql": "CREATE TABLE jobs (\n                    id TEXT PRIMARY KEY,\n                    mode TEXT NOT NULL,\n                    status TEXT NOT NULL,\n                    cancel_requested INTEGER NOT NULL DEFAULT 0\n                        CHECK (cancel_requested IN (0, 1)),\n                    progress REAL NOT NULL,\n                    stage TEXT,\n                    prompt_id TEXT,\n                    project_id TEXT,\n                    outputs TEXT NOT NULL DEFAULT '[]',\n                    error TEXT,\n                    config_snapshot TEXT NOT NULL,\n                    settings_snapshot TEXT NOT NULL,\n                    prompt_snapshot TEXT,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL,\n                    started_at TEXT,\n                    completed_at TEXT\n                )"
+    },
+    {
+      "type": "table",
+      "name": "migration_notices",
+      "tbl_name": "migration_notices",
+      "sql": "CREATE TABLE migration_notices (\n                    id TEXT PRIMARY KEY,\n                    message TEXT NOT NULL,\n                    created_at TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "mode_drafts",
+      "tbl_name": "mode_drafts",
+      "sql": "CREATE TABLE mode_drafts (\n                    mode TEXT PRIMARY KEY CHECK (mode IN ('t2v','i2v','fl2v','r2v','v2v','rv2v')),\n                    document TEXT NOT NULL,\n                    updated_at TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "projects",
+      "tbl_name": "projects",
+      "sql": "CREATE TABLE projects (\n                    id TEXT PRIMARY KEY,\n                    title TEXT NOT NULL,\n                    document TEXT NOT NULL,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL,\n                    revision INTEGER NOT NULL DEFAULT 0\n                        CHECK (revision >= 0 AND revision <= 9007199254740991)\n                )"
+    },
+    {
+      "type": "table",
+      "name": "raylight_runtime_state",
+      "tbl_name": "raylight_runtime_state",
+      "sql": "CREATE TABLE raylight_runtime_state (\n                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\n                    descriptor TEXT NOT NULL,\n                    updated_at TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "segment_takes",
+      "tbl_name": "segment_takes",
+      "sql": "CREATE TABLE segment_takes (\n                    id TEXT PRIMARY KEY,\n                    segment_id TEXT NOT NULL,\n                    content_fingerprint TEXT NOT NULL,\n                    project_id TEXT,\n                    output_descriptor TEXT NOT NULL,\n                    has_audio INTEGER NOT NULL CHECK (has_audio IN (0, 1)),\n                    source_job_id TEXT NOT NULL,\n                    source_child_id TEXT NOT NULL UNIQUE,\n                    completed_at TEXT NOT NULL,\n                    created_at TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "settings",
+      "tbl_name": "settings",
+      "sql": "CREATE TABLE settings (\n                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\n                    document TEXT NOT NULL,\n                    updated_at TEXT NOT NULL,\n                    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)\n                )"
+    },
+    {
+      "type": "table",
+      "name": "unified_timeline",
+      "tbl_name": "unified_timeline",
+      "sql": "CREATE TABLE unified_timeline (\n                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\n                    document TEXT NOT NULL,\n                    updated_at TEXT NOT NULL,\n                    revision INTEGER NOT NULL DEFAULT 0\n                        CHECK (revision >= 0 AND revision <= 9007199254740991)\n                )"
+    }
+  ],
+  "settings": [
+    {
+      "singleton": 1,
+      "document": {
+        "client_id": "directordeck",
+        "memory_policy": "keep_resident",
+        "raylight_residency_policy": "keep_until_switch",
+        "multi_gpu_enabled": true,
+        "models": {
+          "fl2va": {
+            "filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "device": "default",
+            "lora_name": null,
+            "lora_strength": 1.0,
+            "lora_loader": "auto",
+            "standard_lora_loader_override": null,
+            "lora_low_vram": false,
+            "backend": "auto",
+            "raylight": {
+              "gpu_select": [
+                0
+              ],
+              "ulysses_degree": 1,
+              "ring_degree": 1,
+              "cfg_degree": 1,
+              "dp_degree": 1,
+              "fsdp": false,
+              "cpu_offload": false
+            }
+          },
+          "ref2va": {
+            "filename": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "device": "default",
+            "lora_name": null,
+            "lora_strength": 1.0,
+            "lora_loader": "auto",
+            "standard_lora_loader_override": null,
+            "lora_low_vram": false,
+            "backend": "auto",
+            "raylight": {
+              "gpu_select": [
+                0,
+                1
+              ],
+              "ulysses_degree": 2,
+              "ring_degree": 1,
+              "cfg_degree": 1,
+              "dp_degree": 1,
+              "fsdp": false,
+              "cpu_offload": false
+            }
+          },
+          "clip": {
+            "filename": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+            "device": "default"
+          },
+          "video_vae": {
+            "filename": "minimax_h3_video_vae_fp16.safetensors",
+            "device": "default"
+          },
+          "audio_vae": {
+            "filename": "minimax_h3_audio_vae_fp32.safetensors",
+            "device": "default"
+          }
+        }
+      },
+      "revision": 1,
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    }
+  ],
+  "unified_timeline": [
+    {
+      "singleton": 1,
+      "document": {
+        "version": 4,
+        "title": "Extensible workflow v0 database",
+        "render": {
+          "width": 864,
+          "height": 480,
+          "fps": 24.0
+        },
+        "sampling": {
+          "fl2va": {
+            "steps": 20,
+            "seed": 424242,
+            "random_seed": false,
+            "sampler": "res_multistep",
+            "scheduler": "simple",
+            "shift": 12.0,
+            "audio_shift": 3.0
+          },
+          "ref2va": {
+            "steps": 20,
+            "seed": 424242,
+            "random_seed": false,
+            "sampler": "res_multistep",
+            "scheduler": "simple",
+            "shift": 12.0,
+            "audio_shift": 3.0
+          }
+        },
+        "export_mode": "segments",
+        "segments": [
+          {
+            "id": "baseline-db-segment",
+            "title": "Baseline t2v",
+            "prompt": "Generate the frozen t2v baseline.",
+            "duration_seconds": 5.0,
+            "enabled": true,
+            "mode": "fl2va",
+            "continuity": {
+              "enabled": false,
+              "overlap_frames": 22
+            },
+            "ref_image_size": "match",
+            "audio_mode": "generate",
+            "first_image": null,
+            "last_image": null
+          }
+        ]
+      },
+      "revision": 1,
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    }
+  ],
+  "mode_drafts": [
+    {
+      "mode": "fl2v",
+      "document": {
+        "prompt": "",
+        "ref_image_size": "match",
+        "render": {
+          "width": 864,
+          "height": 480,
+          "fps": 24.0
+        },
+        "sampling": {
+          "steps": 25,
+          "seed": 0,
+          "random_seed": true,
+          "sampler": "res_multistep",
+          "scheduler": "simple",
+          "shift": 12.0,
+          "audio_shift": 3.0
+        },
+        "mode": "fl2v",
+        "shots": [
+          {
+            "id": "fl2v-shot-1",
+            "title": "镜头 01",
+            "prompt": "",
+            "duration_seconds": 5.0,
+            "enabled": true,
+            "first_image": null,
+            "last_image": null
+          }
+        ]
+      },
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    },
+    {
+      "mode": "i2v",
+      "document": {
+        "prompt": "",
+        "ref_image_size": "match",
+        "render": {
+          "width": 864,
+          "height": 480,
+          "fps": 24.0
+        },
+        "sampling": {
+          "steps": 25,
+          "seed": 0,
+          "random_seed": true,
+          "sampler": "res_multistep",
+          "scheduler": "simple",
+          "shift": 12.0,
+          "audio_shift": 3.0
+        },
+        "mode": "i2v",
+        "shots": [
+          {
+            "id": "i2v-shot-1",
+            "title": "镜头 01",
+            "prompt": "",
+            "duration_seconds": 5.0,
+            "enabled": true,
+            "first_image": null
+          }
+        ]
+      },
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    },
+    {
+      "mode": "r2v",
+      "document": {
+        "prompt": "",
+        "ref_image_size": "match",
+        "render": {
+          "width": 864,
+          "height": 480,
+          "fps": 24.0
+        },
+        "sampling": {
+          "steps": 25,
+          "seed": 0,
+          "random_seed": true,
+          "sampler": "res_multistep",
+          "scheduler": "simple",
+          "shift": 12.0,
+          "audio_shift": 3.0
+        },
+        "mode": "r2v",
+        "shots": [
+          {
+            "id": "r2v-shot-1",
+            "title": "镜头 01",
+            "prompt": "",
+            "duration_seconds": 5.0,
+            "enabled": true,
+            "reference_images": [],
+            "reference_audios": [],
+            "reference_videos": []
+          }
+        ]
+      },
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    },
+    {
+      "mode": "rv2v",
+      "document": {
+        "prompt": "",
+        "ref_image_size": "match",
+        "render": {
+          "width": 864,
+          "height": 480,
+          "fps": 24.0
+        },
+        "sampling": {
+          "steps": 25,
+          "seed": 0,
+          "random_seed": true,
+          "sampler": "res_multistep",
+          "scheduler": "simple",
+          "shift": 12.0,
+          "audio_shift": 3.0
+        },
+        "mode": "rv2v",
+        "shots": [
+          {
+            "id": "rv2v-shot-1",
+            "title": "镜头 01",
+            "prompt": "",
+            "duration_seconds": 5.0,
+            "enabled": true,
+            "source_video": null,
+            "source_start_seconds": 0.0,
+            "source_duration_seconds": 5.0,
+            "reference_images": [],
+            "reference_audios": []
+          }
+        ]
+      },
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    },
+    {
+      "mode": "t2v",
+      "document": {
+        "prompt": "",
+        "ref_image_size": "match",
+        "render": {
+          "width": 864,
+          "height": 480,
+          "fps": 24.0
+        },
+        "sampling": {
+          "steps": 25,
+          "seed": 0,
+          "random_seed": true,
+          "sampler": "res_multistep",
+          "scheduler": "simple",
+          "shift": 12.0,
+          "audio_shift": 3.0
+        },
+        "mode": "t2v",
+        "shots": [
+          {
+            "id": "t2v-shot-1",
+            "title": "镜头 01",
+            "prompt": "",
+            "duration_seconds": 5.0,
+            "enabled": true
+          }
+        ]
+      },
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    },
+    {
+      "mode": "v2v",
+      "document": {
+        "prompt": "",
+        "ref_image_size": "match",
+        "render": {
+          "width": 864,
+          "height": 480,
+          "fps": 24.0
+        },
+        "sampling": {
+          "steps": 25,
+          "seed": 0,
+          "random_seed": true,
+          "sampler": "res_multistep",
+          "scheduler": "simple",
+          "shift": 12.0,
+          "audio_shift": 3.0
+        },
+        "mode": "v2v",
+        "shots": [
+          {
+            "id": "v2v-shot-1",
+            "title": "镜头 01",
+            "prompt": "",
+            "duration_seconds": 5.0,
+            "enabled": true,
+            "source_video": null,
+            "source_start_seconds": 0.0,
+            "source_duration_seconds": 5.0
+          }
+        ]
+      },
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    }
+  ],
+  "jobs": [
+    {
+      "id": "baseline-parent-v0",
+      "mode": "timeline",
+      "status": "succeeded",
+      "cancel_requested": 0,
+      "progress": 1.0,
+      "stage": "completed",
+      "prompt_id": "caller-assigned-prompt-v0",
+      "project_id": "default",
+      "outputs": [],
+      "error": null,
+      "config_snapshot": {
+        "timeline": {
+          "version": 4,
+          "title": "Extensible workflow v0 database",
+          "render": {
+            "width": 864,
+            "height": 480,
+            "fps": 24.0
+          },
+          "sampling": {
+            "fl2va": {
+              "steps": 20,
+              "seed": 424242,
+              "random_seed": false,
+              "sampler": "res_multistep",
+              "scheduler": "simple",
+              "shift": 12.0,
+              "audio_shift": 3.0
+            },
+            "ref2va": {
+              "steps": 20,
+              "seed": 424242,
+              "random_seed": false,
+              "sampler": "res_multistep",
+              "scheduler": "simple",
+              "shift": 12.0,
+              "audio_shift": 3.0
+            }
+          },
+          "export_mode": "segments",
+          "segments": [
+            {
+              "id": "baseline-db-segment",
+              "title": "Baseline t2v",
+              "prompt": "Generate the frozen t2v baseline.",
+              "duration_seconds": 5.0,
+              "enabled": true,
+              "mode": "fl2va",
+              "continuity": {
+                "enabled": false,
+                "overlap_frames": 22
+              },
+              "ref_image_size": "match",
+              "audio_mode": "generate",
+              "first_image": null,
+              "last_image": null
+            }
+          ]
+        },
+        "segment_ids": [
+          "baseline-db-segment"
+        ]
+      },
+      "settings_snapshot": {
+        "client_id": "directordeck",
+        "memory_policy": "keep_resident",
+        "raylight_residency_policy": "keep_until_switch",
+        "multi_gpu_enabled": true,
+        "models": {
+          "fl2va": {
+            "filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "device": "default",
+            "lora_name": null,
+            "lora_strength": 1.0,
+            "lora_loader": "auto",
+            "standard_lora_loader_override": null,
+            "lora_low_vram": false,
+            "backend": "auto",
+            "raylight": {
+              "gpu_select": [
+                0
+              ],
+              "ulysses_degree": 1,
+              "ring_degree": 1,
+              "cfg_degree": 1,
+              "dp_degree": 1,
+              "fsdp": false,
+              "cpu_offload": false
+            }
+          },
+          "ref2va": {
+            "filename": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "device": "default",
+            "lora_name": null,
+            "lora_strength": 1.0,
+            "lora_loader": "auto",
+            "standard_lora_loader_override": null,
+            "lora_low_vram": false,
+            "backend": "auto",
+            "raylight": {
+              "gpu_select": [
+                0,
+                1
+              ],
+              "ulysses_degree": 2,
+              "ring_degree": 1,
+              "cfg_degree": 1,
+              "dp_degree": 1,
+              "fsdp": false,
+              "cpu_offload": false
+            }
+          },
+          "clip": {
+            "filename": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+            "device": "default"
+          },
+          "video_vae": {
+            "filename": "minimax_h3_video_vae_fp16.safetensors",
+            "device": "default"
+          },
+          "audio_vae": {
+            "filename": "minimax_h3_audio_vae_fp32.safetensors",
+            "device": "default"
+          }
+        }
+      },
+      "prompt_snapshot": {
+        "1": {
+          "class_type": "CLIPLoader",
+          "inputs": {
+            "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+            "type": "minimax",
+            "device": "default"
+          }
+        },
+        "2": {
+          "class_type": "SelectCLIPDevice",
+          "inputs": {
+            "clip": [
+              "1",
+              0
+            ],
+            "device": "default"
+          }
+        },
+        "3": {
+          "class_type": "VAELoader",
+          "inputs": {
+            "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+          }
+        },
+        "4": {
+          "class_type": "SelectVAEDevice",
+          "inputs": {
+            "vae": [
+              "3",
+              0
+            ],
+            "device": "default"
+          }
+        },
+        "5": {
+          "class_type": "VAELoader",
+          "inputs": {
+            "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+          }
+        },
+        "6": {
+          "class_type": "SelectVAEDevice",
+          "inputs": {
+            "vae": [
+              "5",
+              0
+            ],
+            "device": "default"
+          }
+        },
+        "7": {
+          "class_type": "UNETLoader",
+          "inputs": {
+            "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "weight_dtype": "default"
+          }
+        },
+        "8": {
+          "class_type": "SelectModelDevice",
+          "inputs": {
+            "model": [
+              "7",
+              0
+            ],
+            "device": "default"
+          }
+        },
+        "9": {
+          "class_type": "MiniMaxH3SigmaShift",
+          "inputs": {
+            "model": [
+              "8",
+              0
+            ],
+            "shift_video": 12.0,
+            "shift_audio": 3.0
+          }
+        },
+        "10": {
+          "class_type": "MiniMaxH3ImageToVideo",
+          "inputs": {
+            "clip": [
+              "2",
+              0
+            ],
+            "vae": [
+              "4",
+              0
+            ],
+            "prompt": "Generate the frozen t2v baseline.",
+            "width": 864,
+            "height": 480,
+            "length": 124
+          }
+        },
+        "11": {
+          "class_type": "BasicGuider",
+          "inputs": {
+            "model": [
+              "9",
+              0
+            ],
+            "conditioning": [
+              "10",
+              0
+            ]
+          }
+        },
+        "12": {
+          "class_type": "BasicScheduler",
+          "inputs": {
+            "model": [
+              "9",
+              0
+            ],
+            "scheduler": "simple",
+            "steps": 20,
+            "denoise": 1.0
+          }
+        },
+        "13": {
+          "class_type": "KSamplerSelect",
+          "inputs": {
+            "sampler_name": "res_multistep"
+          }
+        },
+        "14": {
+          "class_type": "RandomNoise",
+          "inputs": {
+            "noise_seed": 424242
+          }
+        },
+        "15": {
+          "class_type": "SamplerCustomAdvanced",
+          "inputs": {
+            "noise": [
+              "14",
+              0
+            ],
+            "guider": [
+              "11",
+              0
+            ],
+            "sampler": [
+              "13",
+              0
+            ],
+            "sigmas": [
+              "12",
+              0
+            ],
+            "latent_image": [
+              "10",
+              1
+            ]
+          }
+        },
+        "16": {
+          "class_type": "VAEDecode",
+          "inputs": {
+            "samples": [
+              "15",
+              0
+            ],
+            "vae": [
+              "4",
+              0
+            ]
+          }
+        },
+        "17": {
+          "class_type": "VAEDecodeAudio",
+          "inputs": {
+            "samples": [
+              "15",
+              0
+            ],
+            "vae": [
+              "6",
+              0
+            ]
+          }
+        },
+        "18": {
+          "class_type": "CreateVideo",
+          "inputs": {
+            "images": [
+              "16",
+              0
+            ],
+            "fps": 24.0,
+            "bit_depth": 8,
+            "audio": [
+              "17",
+              0
+            ]
+          }
+        },
+        "19": {
+          "class_type": "SaveVideo",
+          "inputs": {
+            "video": [
+              "18",
+              0
+            ],
+            "filename_prefix": "video/DirectorDeck_timeline_fixture-_baseline-db-segment",
+            "format": "auto",
+            "codec": "auto"
+          }
+        }
+      },
+      "created_at": "2026-08-21T12:00:00+00:00",
+      "updated_at": "2026-08-21T12:00:00+00:00",
+      "started_at": "2026-08-21T12:00:00+00:00",
+      "completed_at": "2026-08-21T12:00:00+00:00"
+    }
+  ],
+  "job_children": [
+    {
+      "id": "baseline-child-v0",
+      "job_id": "baseline-parent-v0",
+      "group_index": 1,
+      "family": "fl2va",
+      "backend": "standard",
+      "segment_ids": [
+        "baseline-db-segment"
+      ],
+      "output_nodes": {
+        "baseline-db-segment": "19"
+      },
+      "status": "succeeded",
+      "progress": 1.0,
+      "stage": "completed",
+      "prompt_id": "caller-assigned-prompt-v0",
+      "outputs": [
+        {
+          "node_id": "19",
+          "filename": "baseline-db-segment.mp4",
+          "subfolder": "director-baseline",
+          "type": "output"
+        }
+      ],
+      "error": null,
+      "prompt_snapshot": {
+        "1": {
+          "class_type": "CLIPLoader",
+          "inputs": {
+            "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+            "type": "minimax",
+            "device": "default"
+          }
+        },
+        "2": {
+          "class_type": "SelectCLIPDevice",
+          "inputs": {
+            "clip": [
+              "1",
+              0
+            ],
+            "device": "default"
+          }
+        },
+        "3": {
+          "class_type": "VAELoader",
+          "inputs": {
+            "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+          }
+        },
+        "4": {
+          "class_type": "SelectVAEDevice",
+          "inputs": {
+            "vae": [
+              "3",
+              0
+            ],
+            "device": "default"
+          }
+        },
+        "5": {
+          "class_type": "VAELoader",
+          "inputs": {
+            "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+          }
+        },
+        "6": {
+          "class_type": "SelectVAEDevice",
+          "inputs": {
+            "vae": [
+              "5",
+              0
+            ],
+            "device": "default"
+          }
+        },
+        "7": {
+          "class_type": "UNETLoader",
+          "inputs": {
+            "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "weight_dtype": "default"
+          }
+        },
+        "8": {
+          "class_type": "SelectModelDevice",
+          "inputs": {
+            "model": [
+              "7",
+              0
+            ],
+            "device": "default"
+          }
+        },
+        "9": {
+          "class_type": "MiniMaxH3SigmaShift",
+          "inputs": {
+            "model": [
+              "8",
+              0
+            ],
+            "shift_video": 12.0,
+            "shift_audio": 3.0
+          }
+        },
+        "10": {
+          "class_type": "MiniMaxH3ImageToVideo",
+          "inputs": {
+            "clip": [
+              "2",
+              0
+            ],
+            "vae": [
+              "4",
+              0
+            ],
+            "prompt": "Generate the frozen t2v baseline.",
+            "width": 864,
+            "height": 480,
+            "length": 124
+          }
+        },
+        "11": {
+          "class_type": "BasicGuider",
+          "inputs": {
+            "model": [
+              "9",
+              0
+            ],
+            "conditioning": [
+              "10",
+              0
+            ]
+          }
+        },
+        "12": {
+          "class_type": "BasicScheduler",
+          "inputs": {
+            "model": [
+              "9",
+              0
+            ],
+            "scheduler": "simple",
+            "steps": 20,
+            "denoise": 1.0
+          }
+        },
+        "13": {
+          "class_type": "KSamplerSelect",
+          "inputs": {
+            "sampler_name": "res_multistep"
+          }
+        },
+        "14": {
+          "class_type": "RandomNoise",
+          "inputs": {
+            "noise_seed": 424242
+          }
+        },
+        "15": {
+          "class_type": "SamplerCustomAdvanced",
+          "inputs": {
+            "noise": [
+              "14",
+              0
+            ],
+            "guider": [
+              "11",
+              0
+            ],
+            "sampler": [
+              "13",
+              0
+            ],
+            "sigmas": [
+              "12",
+              0
+            ],
+            "latent_image": [
+              "10",
+              1
+            ]
+          }
+        },
+        "16": {
+          "class_type": "VAEDecode",
+          "inputs": {
+            "samples": [
+              "15",
+              0
+            ],
+            "vae": [
+              "4",
+              0
+            ]
+          }
+        },
+        "17": {
+          "class_type": "VAEDecodeAudio",
+          "inputs": {
+            "samples": [
+              "15",
+              0
+            ],
+            "vae": [
+              "6",
+              0
+            ]
+          }
+        },
+        "18": {
+          "class_type": "CreateVideo",
+          "inputs": {
+            "images": [
+              "16",
+              0
+            ],
+            "fps": 24.0,
+            "bit_depth": 8,
+            "audio": [
+              "17",
+              0
+            ]
+          }
+        },
+        "19": {
+          "class_type": "SaveVideo",
+          "inputs": {
+            "video": [
+              "18",
+              0
+            ],
+            "filename_prefix": "video/DirectorDeck_timeline_fixture-_baseline-db-segment",
+            "format": "auto",
+            "codec": "auto"
+          }
+        }
+      },
+      "created_at": "2026-08-21T12:00:00+00:00",
+      "updated_at": "2026-08-21T12:00:00+00:00",
+      "started_at": "2026-08-21T12:00:00+00:00",
+      "completed_at": "2026-08-21T12:00:00+00:00"
+    }
+  ],
+  "segment_takes": [
+    {
+      "id": "baseline-take-v0",
+      "segment_id": "baseline-db-segment",
+      "content_fingerprint": "take-geometry-v1:sha256:887ba8c9fbc6b8f017a4dd5979c838983c7bcf567d45e775963af4e6f2e87634",
+      "project_id": "default",
+      "output_descriptor": {
+        "filename": "baseline-db-segment.mp4",
+        "subfolder": "director-baseline",
+        "type": "output"
+      },
+      "has_audio": 1,
+      "source_job_id": "baseline-parent-v0",
+      "source_child_id": "baseline-child-v0",
+      "completed_at": "2026-08-21T12:00:00+00:00",
+      "created_at": "2026-08-21T12:00:00+00:00"
+    }
+  ],
+  "raylight_runtime_state": [
+    {
+      "singleton": 1,
+      "descriptor": {
+        "current": {
+          "clear_vram_after_sampling": false,
+          "compatibility_key": "director-g0-1-u2-r1-c1-d1-f0-o0-k2eecf88a699ba263647f",
+          "family": "ref2va",
+          "initializer_node_id": "7",
+          "loader_node_id": "8",
+          "loader_subgraph": {
+            "7": {
+              "class_type": "RayInitializerAdvanced",
+              "inputs": {
+                "FSDP": false,
+                "FSDP_CPU_OFFLOAD": false,
+                "GPU": 2,
+                "GPU_SELECT": "0,1",
+                "XFuser_attention": "COMFY_KITCHEN_INT8",
+                "cfg_degree": 1,
+                "clear_vram_after_sampling": false,
+                "dp_degree": 1,
+                "driver_cleanup_policy": "ray_devices",
+                "ram_cache_max_models": 2,
+                "ray_cluster_address": "local",
+                "ray_cluster_namespace": "director-g0-1-u2-r1-c1-d1-f0-o0-k2eecf88a699ba263647f-e7",
+                "ring_degree": 1,
+                "skip_comm_test": false,
+                "sync_ulysses": false,
+                "ulysses_degree": 2,
+                "use_mmap": false
+              }
+            },
+            "8": {
+              "class_type": "RayUNETLoader",
+              "inputs": {
+                "ray_actors_init": [
+                  "7",
+                  0
+                ],
+                "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+                "weight_dtype": "default"
+              }
+            }
+          },
+          "runtime_key": "85a42a31c27737820d06318dfc26aa8bf73b17c69d970586210935d7ce8d0227",
+          "runtime_namespace": "director-g0-1-u2-r1-c1-d1-f0-o0-k2eecf88a699ba263647f-e7",
+          "version": 2
+        },
+        "epoch": 7,
+        "tail_action": "ray_unit",
+        "tail_prompt_id": "baseline-ray-tail-v0",
+        "tail_terminal_certificate": {
+          "action": "ray_unit",
+          "prompt_id": "baseline-ray-tail-v0",
+          "succeeded": false
+        },
+        "tainted": true,
+        "version": 2
+      },
+      "updated_at": "2026-08-21T12:00:00+00:00"
+    }
+  ],
+  "migration_notices": [
+    {
+      "id": "raylight-residency-keyed-switch-v2",
+      "message": "RayLight 已升级为按完整配置 key 常驻并在不兼容任务前显式切池；不再永久锁定 FL2VA 或 Ref2VA。",
+      "created_at": "2026-08-21T12:00:00+00:00"
+    }
+  ],
+  "row_counts": {
+    "asset_trash_batches": 0,
+    "asset_trash_document_changes": 0,
+    "assets": 0,
+    "job_children": 1,
+    "jobs": 1,
+    "migration_notices": 1,
+    "mode_drafts": 6,
+    "projects": 0,
+    "raylight_runtime_state": 1,
+    "segment_takes": 1,
+    "settings": 1,
+    "unified_timeline": 1
+  }
+}

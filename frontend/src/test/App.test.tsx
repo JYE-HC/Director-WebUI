@@ -3,10 +3,12 @@ import { IDBFactory } from "fake-indexeddb";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import App, {
+  FeatureCatalogDriftError,
   QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY,
   QUARANTINED_UNBOUND_RUNTIME_SETTINGS_PENDING_KEY,
   RUNTIME_SETTINGS_PENDING_KEY,
   UNBOUND_RUNTIME_SETTINGS_PENDING_KEY,
+  requireSuccessfulFeaturePreflight,
 } from "../App";
 import { ApiError, directorApi } from "../api/client";
 import {
@@ -15,7 +17,12 @@ import {
   EMPTY_RAYLIGHT_RUNTIME_STATUS,
   type AssetTrashBatch,
   type CapabilityReport,
+  type DirectorDeckConfig,
+  type FeatureCatalog,
+  type FeatureCatalogFetchResult,
+  type FeaturePreflightResponse,
   type GenerationTask,
+  type MediaToolsStatus,
   type TimelineCompileReport,
 } from "../api/types";
 import { MODE_ORDER, type AssetReference } from "../domain/modes";
@@ -32,6 +39,7 @@ import {
   saveLocalTimelineWal,
   localTimelineWalStorageKey,
   UNBOUND_TIMELINE_WAL_STORAGE_KEY,
+  updateLoraFeatureFamily,
 } from "../domain/timelineProject";
 import {
   loadTimelineSegmentSelectionPreference,
@@ -47,6 +55,15 @@ import {
   saveTimelineHistoryJournal,
   timelineHistoryJournalKey,
 } from "../state/timelinePersistence";
+import {
+  LEGACY_RUNTIME_SETTINGS_WAL_QUARANTINE_PREFIX,
+  LEGACY_RUNTIME_SETTINGS_WAL_STORAGE_KEY,
+} from "../state/runtimeSettingsV1Recovery";
+import {
+  LEGACY_RUNTIME_SETTINGS_V2_WAL_STORAGE_KEY,
+  RUNTIME_SETTINGS_V2_WAL_QUARANTINE_PREFIX,
+} from "../state/runtimeSettingsV2Migration";
+import runtimeSettingsWalV0Raw from "./fixtures/extensible-workflow-v0/runtime-settings-wal-v2.json?raw";
 
 class AppTestBroadcastChannel {
   static channels = new Map<string, Set<AppTestBroadcastChannel>>();
@@ -73,6 +90,8 @@ const ACTIVE_DATABASE_PATH = "/srv/director/data/director.sqlite3";
 const ACTIVE_DATABASE = {
   active_database_path: ACTIVE_DATABASE_PATH,
 };
+const RUNTIME_SETTINGS_WAL_STORAGE_KEY_LITERAL =
+  "directordeck:v2:runtime-settings-pending";
 // Test-only shorthand for this realm's exact v7 branch key. Production code
 // enumerates by scope and never treats the v7 prefix as a singleton key.
 const TIMELINE_WAL_STORAGE_KEY = localTimelineWalStorageKey(ACTIVE_DATABASE)!;
@@ -147,12 +166,42 @@ const saveRuntimeSettingsWal = (
   database = ACTIVE_DATABASE,
 ) => localStorage.setItem(RUNTIME_SETTINGS_PENDING_KEY, JSON.stringify({
   format: "director-pending-runtime-settings",
-  version: 1,
+  version: 4,
+  owner_id: "tab-app-test-runtime-settings",
   pending: true,
   active_database_path: database.active_database_path,
   written_at_ms: Date.now(),
   settings,
 }));
+
+function emptyCompileReport(
+  project: ReturnType<typeof createTimelineProject>,
+): TimelineCompileReport {
+  return {
+    template_bundle_version: project.features.template_bundle_version,
+    host_capability_revision: `sha256:${"a".repeat(64)}`,
+    execution_strategy: "native_segment_graph_v1",
+    model_families: [],
+    plans: [],
+    node_policy: {
+      graph_source: "server",
+      accepts_client_workflow: false,
+      allowed_nodes: [],
+      custom_nodes: [],
+      provenance: {},
+    },
+    features: {
+      requested: project.features,
+      effective_by_segment: {},
+      resolutions: [],
+      notices: [],
+    },
+    effective_execution_digest: {
+      algorithm: "sha256-canonical-json-v1",
+      value: `sha256-${"b".repeat(64)}`,
+    },
+  };
+}
 
 const imageAsset: AssetReference = {
   id: "asset-image-app",
@@ -160,7 +209,11 @@ const imageAsset: AssetReference = {
   subfolder: "director",
   type: "input",
   kind: "image",
+  filename: null,
+  path: null,
   preview_url: "/api/assets/asset-image-app/preview",
+  content_hash: null,
+  metadata: null,
 };
 
 function appAssetTrashBatch(
@@ -229,14 +282,194 @@ const ONLINE_CAPABILITIES: CapabilityReport = {
   },
 };
 
+const VALID_FEATURE_PREFLIGHT: FeaturePreflightResponse = {
+  template_bundle_version: 5,
+  host_capability_revision: `sha256:${"a".repeat(64)}`,
+  operational_readiness: {
+    endpoint_online: true,
+    submission_allowed: true,
+    ray_recovery_required: false,
+    ray_tainted: false,
+    invalid_runtime_gpu_indices: [],
+    blocking_reason_codes: [],
+  },
+  valid: true,
+  errors: [],
+  effective_by_segment: {},
+};
+
+const FEATURE_CATALOG_ETAG = `"sha256:${"d".repeat(64)}"`;
+const FEATURE_CATALOG: FeatureCatalog = {
+  template_bundle_version: 5,
+  host_capability_revision: `sha256:${"a".repeat(64)}`,
+  entries: [{
+    id: "lora",
+    version: 1,
+    title: "LoRA",
+    description: "Apply the selected fail-closed LoRA adapter.",
+    mode: "switch",
+    layer: "graph",
+    scopes: ["project"],
+    params_schema: {},
+    defaults: {},
+    backends: ["standard", "raylight"],
+    availability: { state: "conditional", reasons: [] },
+    adapter_options: ([
+      ["model_only", "LoRA加载器（仅模型）", "LoraLoaderModelOnly", true],
+      ["minimax_h3_turbo", "MiniMax-H3 Turbo LoRA", "MiniMaxH3TurboLoRA", false],
+    ] as const).map(([adapter_id, display_name, class_type, is_default], index) => ({
+      adapter_id,
+      display_name,
+      class_type,
+      is_default,
+      backend: "standard" as const,
+      supported_families: ["fl2va", "ref2va"] as const,
+      configuration_options: adapter_id === "minimax_h3_turbo" ? [{
+        id: "low_vram",
+        type: "boolean" as const,
+        label: "low_vram",
+        description: "启用低显存模式",
+        default: false,
+      }] : [],
+      adapter_fingerprint: `sha256:${String(index + 1).repeat(64)}`,
+      capability: {
+        available: true,
+        reasons: [],
+        verified_contracts: ["directordeck.node.test-lora"],
+        runtime_fingerprints: [`sha256:${"c".repeat(64)}`],
+      },
+    })),
+    ui: { visibility: "internal_v4" },
+  }],
+};
+
+describe("feature preflight authority guard", () => {
+  it("accepts only a valid result from the exact catalog and bundle snapshot", () => {
+    expect(() => requireSuccessfulFeaturePreflight(
+      VALID_FEATURE_PREFLIGHT,
+      createTimelineProject(),
+      FEATURE_CATALOG,
+    )).not.toThrow();
+  });
+
+  it("does not turn top-level Ray readiness diagnostics into a feature gate", () => {
+    const runtimeAdvisory = {
+      ...VALID_FEATURE_PREFLIGHT,
+      operational_readiness: {
+        ...VALID_FEATURE_PREFLIGHT.operational_readiness,
+        submission_allowed: false,
+        ray_recovery_required: true,
+        ray_tainted: true,
+        blocking_reason_codes: ["ray_recovery_required"],
+      },
+    };
+    expect(() => requireSuccessfulFeaturePreflight(
+      runtimeAdvisory,
+      createTimelineProject(),
+      FEATURE_CATALOG,
+    )).not.toThrow();
+  });
+
+  it.each([
+    ["missing catalog", null, VALID_FEATURE_PREFLIGHT],
+    ["catalog bundle drift", { ...FEATURE_CATALOG, template_bundle_version: 4 }, VALID_FEATURE_PREFLIGHT],
+    ["preflight bundle drift", FEATURE_CATALOG, { ...VALID_FEATURE_PREFLIGHT, template_bundle_version: 4 }],
+    [
+      "host capability drift",
+      FEATURE_CATALOG,
+      { ...VALID_FEATURE_PREFLIGHT, host_capability_revision: `sha256:${"b".repeat(64)}` },
+    ],
+  ])("rejects %s before trusting readiness", (_label, catalog, result) => {
+    expect(() => requireSuccessfulFeaturePreflight(
+      result,
+      createTimelineProject(),
+      catalog,
+    )).toThrow(FeatureCatalogDriftError);
+  });
+
+  it("surfaces the server remediation for a stable rejected result", () => {
+    expect(() => requireSuccessfulFeaturePreflight(
+      rejectedFeaturePreflight("strict_attention_unavailable", "attention_backend_override"),
+      createTimelineProject(),
+      FEATURE_CATALOG,
+    )).toThrow(/strict_attention_unavailable/);
+  });
+});
+const FRESH_FEATURE_CATALOG: FeatureCatalogFetchResult = {
+  status: "fresh",
+  etag: FEATURE_CATALOG_ETAG,
+  catalog: FEATURE_CATALOG,
+};
+
+const DIRECTORDECK_CONFIG: DirectorDeckConfig = {
+  schema_version: 1,
+  lora: {
+    loaders: [
+      {
+        id: "model_only",
+        display_name: "LoRA加载器（仅模型）",
+        class_type: "LoraLoaderModelOnly",
+        input_contract: "model_only",
+        supported_families: ["fl2va", "ref2va"],
+        options: [],
+      },
+      {
+        id: "minimax_h3_turbo",
+        display_name: "MiniMax-H3 Turbo LoRA",
+        class_type: "MiniMaxH3TurboLoRA",
+        input_contract: "dedicated_model",
+        supported_families: ["fl2va", "ref2va"],
+        options: [{
+          id: "low_vram",
+          type: "boolean",
+          label: "low_vram",
+          description: "启用 MiniMax-H3 Turbo LoRA 节点的低显存模式。",
+          default: false,
+        }],
+      },
+    ],
+    fallback_policy: {
+      loader_ids: ["model_only"],
+      default_loader_id: "model_only",
+    },
+    loader_policies: [{
+      lora_filename: "minimax_h3_turbo_.*\\.safetensors$",
+      loader_ids: ["minimax_h3_turbo"],
+      default_loader_id: "minimax_h3_turbo",
+    }],
+  },
+};
+
+function rejectedFeaturePreflight(
+  message: string,
+  remediation: string,
+  code = "feature_unavailable",
+): FeaturePreflightResponse {
+  return {
+    ...VALID_FEATURE_PREFLIGHT,
+    valid: false,
+    errors: [{
+      code,
+      feature_id: null,
+      segment_id: null,
+      unit_id: null,
+      backend: null,
+      rule: "contextual_capability_required",
+      message,
+      remediation,
+      safe_details: {},
+    }],
+  };
+}
+
 const ORIGINAL_VIEWPORT_WIDTH = window.innerWidth;
 
 const MODEL_INVENTORY = {
-  fl2va: [DEFAULT_SETTINGS.models.fl2va.filename, "alternate-diffusion.safetensors"],
-  ref2va: [DEFAULT_SETTINGS.models.ref2va.filename, "alternate-diffusion.safetensors"],
-  clip: [DEFAULT_SETTINGS.models.clip.filename],
-  video_vae: [DEFAULT_SETTINGS.models.video_vae.filename],
-  audio_vae: [DEFAULT_SETTINGS.models.audio_vae.filename],
+  fl2va: ["fl2va-default.safetensors", "alternate-diffusion.safetensors"],
+  ref2va: ["ref2va-default.safetensors", "alternate-diffusion.safetensors"],
+  clip: ["clip-default.safetensors"],
+  video_vae: ["video-vae-default.safetensors"],
+  audio_vae: ["audio-vae-default.safetensors"],
   loras: ["minimax-h3-turbo.safetensors"],
 };
 
@@ -288,14 +521,24 @@ const succeededTask: GenerationTask = {
 
 function mockCommonRequests(settings = CONFIGURED_SETTINGS) {
   let timelineAuthorityRevision = 0;
+  let settingsAuthority = runtimeAuthority(settings);
   const projectAuthorityRevisions = new Map<string, number>();
   const defaultTimeline = structuredClone(
     seededTimelineServerProject ?? createTimelineProject(),
   );
   vi.spyOn(directorApi, "getSettings").mockResolvedValue(settings);
-  vi.spyOn(directorApi, "getSettingsAuthority").mockResolvedValue(runtimeAuthority(settings));
+  vi.spyOn(directorApi, "getSettingsAuthority").mockImplementation(async () =>
+    structuredClone(settingsAuthority));
+  vi.spyOn(directorApi, "getSettingsMigrationNotices").mockResolvedValue({ notices: [] });
+  vi.spyOn(directorApi, "updateSettingsAuthority").mockImplementation(async (next) => {
+    settingsAuthority = runtimeAuthority(next);
+    return structuredClone(settingsAuthority);
+  });
   vi.spyOn(directorApi, "getStorage").mockResolvedValue(ACTIVE_STORAGE_CONFIGURATION);
   vi.spyOn(directorApi, "getCapabilities").mockResolvedValue(ONLINE_CAPABILITIES);
+  vi.spyOn(directorApi, "getFeatureCatalog").mockResolvedValue(FRESH_FEATURE_CATALOG);
+  vi.spyOn(directorApi, "getDirectorDeckConfig").mockResolvedValue(DIRECTORDECK_CONFIG);
+  vi.spyOn(directorApi, "preflightFeatures").mockResolvedValue(VALID_FEATURE_PREFLIGHT);
   vi.spyOn(directorApi, "getGpus").mockResolvedValue([]);
   vi.spyOn(directorApi, "getRayLightRuntimeStatus").mockResolvedValue(
     EMPTY_RAYLIGHT_RUNTIME_STATUS,
@@ -1431,16 +1674,20 @@ describe("统一长视频时间线应用", () => {
     const unboundRaw = JSON.stringify({ ...staleSettings, client_id: "old-unbound" });
     localStorage.setItem(UNBOUND_RUNTIME_SETTINGS_PENDING_KEY, unboundRaw);
     mockCommonRequests();
-    const updateSettings = vi.spyOn(directorApi, "updateSettings");
+    const updateSettingsAuthority = vi.spyOn(directorApi, "updateSettingsAuthority");
 
     render(<App />);
     await waitUntilReady();
 
-    expect(updateSettings).not.toHaveBeenCalled();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
     expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull();
     expect(localStorage.getItem(QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY)).toBe(mismatchedRaw);
     expect(localStorage.getItem(UNBOUND_RUNTIME_SETTINGS_PENDING_KEY)).toBeNull();
-    expect(localStorage.getItem(QUARANTINED_UNBOUND_RUNTIME_SETTINGS_PENDING_KEY)).toBe(unboundRaw);
+    expect(Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+      .filter((key): key is string =>
+        Boolean(key?.startsWith(LEGACY_RUNTIME_SETTINGS_WAL_QUARANTINE_PREFIX)))
+      .map((key) => localStorage.getItem(key))).toContain(unboundRaw);
+    expect(localStorage.getItem(QUARANTINED_UNBOUND_RUNTIME_SETTINGS_PENDING_KEY)).toBeNull();
   });
 
   it("RuntimeSettings 隔离槽已有旧 WAL 时仍保留第二份跨库 WAL", async () => {
@@ -1452,12 +1699,12 @@ describe("统一长视频时间线应用", () => {
     });
     const raw = localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY);
     mockCommonRequests();
-    const updateSettings = vi.spyOn(directorApi, "updateSettings");
+    const updateSettingsAuthority = vi.spyOn(directorApi, "updateSettingsAuthority");
 
     render(<App />);
     await waitUntilReady();
 
-    expect(updateSettings).not.toHaveBeenCalled();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
     expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull();
     expect(localStorage.getItem(QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY)).toBe(firstQuarantine);
     expect(localStorage.getItem(`${QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY}:1`)).toBe(raw);
@@ -1466,13 +1713,13 @@ describe("统一长视频时间线应用", () => {
   it("旧数据库页面写 RuntimeSettings 前保全 B 页 WAL，迟到清理也不删除 B 的后续 WAL", async () => {
     const user = userEvent.setup();
     const desired = { ...CONFIGURED_SETTINGS, client_id: "database-a-current-tab" };
-    let resolveUpdate!: (settings: typeof CONFIGURED_SETTINGS) => void;
+    let resolveUpdate!: (authority: ReturnType<typeof runtimeAuthority>) => void;
     mockCommonRequests();
     vi.mocked(directorApi.getSettingsAuthority)
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValue(runtimeAuthority(desired));
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockImplementation(
+    const updateSettingsAuthority = vi.spyOn(directorApi, "updateSettingsAuthority").mockImplementation(
       () => new Promise((resolve) => { resolveUpdate = resolve; }),
     );
 
@@ -1481,7 +1728,7 @@ describe("统一长视频时间线应用", () => {
     const databaseBSettings = { ...CONFIGURED_SETTINGS, client_id: "database-b-pending" };
     const databaseBRaw = JSON.stringify({
       format: "director-pending-runtime-settings",
-      version: 2,
+      version: 4,
       owner_id: "database-b-tab",
       pending: true,
       active_database_path: "/srv/director/data/database-b.sqlite3",
@@ -1497,18 +1744,21 @@ describe("统一长视频时间线应用", () => {
 
     expect(localStorage.getItem(QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY)).toBe(databaseBRaw);
     expect(JSON.parse(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)!)).toMatchObject({
-      version: 2,
+      version: 4,
       owner_id: expect.any(String),
       settings: { client_id: desired.client_id },
     });
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(desired));
+    await waitFor(() => expect(updateSettingsAuthority).toHaveBeenCalledWith(
+      desired,
+      expect.any(String),
+    ));
     const laterDatabaseBRaw = JSON.stringify({
       ...JSON.parse(databaseBRaw),
       written_at_ms: Date.now() + 1,
       settings: { ...databaseBSettings, client_id: "database-b-later" },
     });
     localStorage.setItem(RUNTIME_SETTINGS_PENDING_KEY, laterDatabaseBRaw);
-    await act(async () => resolveUpdate(desired));
+    await act(async () => resolveUpdate(runtimeAuthority(desired)));
 
     await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBe(laterDatabaseBRaw));
   });
@@ -1521,11 +1771,490 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValue(runtimeAuthority(pendingSettings));
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(pendingSettings);
+    const updateSettingsAuthority = vi.spyOn(directorApi, "updateSettingsAuthority")
+      .mockResolvedValue(runtimeAuthority(pendingSettings));
 
     render(<App />);
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(pendingSettings));
+    await waitFor(() => expect(updateSettingsAuthority).toHaveBeenCalledWith(
+      pendingSettings,
+      expect.any(String),
+    ));
     await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull());
+  });
+
+  it("同库 RuntimeSettingsV2 WAL 挂载时只隔离展示，不生成 V3 WAL 或自动 PUT", async () => {
+    const user = userEvent.setup();
+    const v2Settings = {
+      schema_version: 2,
+      client_id: "stage6-v2-pending",
+      memory_policy: CONFIGURED_SETTINGS.memory_policy,
+      raylight_residency_policy: CONFIGURED_SETTINGS.raylight_residency_policy,
+      multi_gpu_enabled: CONFIGURED_SETTINGS.multi_gpu_enabled,
+      placement: CONFIGURED_SETTINGS.placement,
+      legacy_lora_resolution_compat: {
+        schema_version: 1,
+        auto_resolution_strategy_version: "v4-known-filename-or-safetensors-metadata-v1",
+        explicit_overrides: [{
+          family: "fl2va",
+          model_filename: "Models/H3/Base.Exact.safetensors",
+          lora_filename: "LoRA/H3/Turbo.Exact.safetensors",
+          loader: "dedicated",
+        }],
+      },
+    };
+    const raw = `${JSON.stringify({
+      format: "director-pending-runtime-settings",
+      version: 3,
+      owner_id: "tab-stage6-v2-pending",
+      pending: true,
+      active_database_path: ACTIVE_DATABASE_PATH,
+      written_at_ms: 123456789,
+      settings: v2Settings,
+    })}\n`;
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_V2_WAL_STORAGE_KEY, raw);
+    mockCommonRequests();
+    const update = vi.mocked(directorApi.updateSettingsAuthority);
+    update.mockClear();
+
+    render(<App />);
+    await waitUntilReady();
+    const recovery = await screen.findByRole("alert", { name: "RuntimeSettingsV2 恢复" });
+    expect(within(recovery).getByText(/页面加载不会自动写入/)).toBeInTheDocument();
+    expect(update).not.toHaveBeenCalled();
+    expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull();
+    expect(localStorage.getItem(LEGACY_RUNTIME_SETTINGS_V2_WAL_STORAGE_KEY)).toBeNull();
+    const quarantineKey = Array.from({ length: localStorage.length }, (_, index) =>
+      localStorage.key(index)).find((key) =>
+      key?.startsWith(RUNTIME_SETTINGS_V2_WAL_QUARANTINE_PREFIX));
+    expect(quarantineKey).toBeTruthy();
+    expect(localStorage.getItem(quarantineKey!)).toBe(raw);
+
+    await user.click(within(recovery).getByRole("button", {
+      name: "仅合并精确 LoRA 映射",
+    }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        schema_version: 3,
+        client_id: CONFIGURED_SETTINGS.client_id,
+        lora_loader_overrides: [{
+          lora_filename: "LoRA/H3/Turbo.Exact.safetensors",
+          adapter_id: "minimax_h3_turbo",
+          options: { low_vram: false },
+        }],
+      }),
+      expect.any(String),
+    );
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "RuntimeSettingsV2 恢复" }))
+      .not.toBeInTheDocument());
+    expect(localStorage.getItem(quarantineKey!)).toBeNull();
+  });
+
+  it("RuntimeSettingsV2 与独立 V3 WAL 同时存在时两份都保留并显示冲突", async () => {
+    const v2Settings = {
+      schema_version: 2,
+      client_id: "stage6-v2-pending",
+      memory_policy: CONFIGURED_SETTINGS.memory_policy,
+      raylight_residency_policy: CONFIGURED_SETTINGS.raylight_residency_policy,
+      multi_gpu_enabled: CONFIGURED_SETTINGS.multi_gpu_enabled,
+      placement: CONFIGURED_SETTINGS.placement,
+      legacy_lora_resolution_compat: {
+        schema_version: 1,
+        auto_resolution_strategy_version: "v4-known-filename-or-safetensors-metadata-v1",
+        explicit_overrides: [],
+      },
+    };
+    const v2Raw = JSON.stringify({
+      format: "director-pending-runtime-settings",
+      version: 3,
+      owner_id: "tab-stage6-v2-conflict",
+      pending: true,
+      active_database_path: ACTIVE_DATABASE_PATH,
+      written_at_ms: 123456789,
+      settings: v2Settings,
+    });
+    const v3Settings = { ...CONFIGURED_SETTINGS, client_id: "independent-v3-pending" };
+    const v3Raw = JSON.stringify({
+      format: "director-pending-runtime-settings",
+      version: 4,
+      owner_id: "tab-app-test-runtime-settings",
+      pending: true,
+      active_database_path: ACTIVE_DATABASE_PATH,
+      written_at_ms: Date.now(),
+      settings: v3Settings,
+    });
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_V2_WAL_STORAGE_KEY, v2Raw);
+    localStorage.setItem(RUNTIME_SETTINGS_PENDING_KEY, v3Raw);
+    mockCommonRequests();
+    vi.mocked(directorApi.updateSettingsAuthority).mockImplementation(() => new Promise(() => {}));
+
+    render(<App />);
+    const recovery = await screen.findByRole("alert", { name: "RuntimeSettingsV2 恢复" });
+    expect(within(recovery).getByText(/独立的 RuntimeSettingsV3 待同步记录/))
+      .toBeInTheDocument();
+    expect(within(recovery).getByRole("button", { name: "仅合并精确 LoRA 映射" }))
+      .toBeDisabled();
+    expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBe(v3Raw);
+    const quarantineKey = Array.from({ length: localStorage.length }, (_, index) =>
+      localStorage.key(index)).find((key) =>
+      key?.startsWith(RUNTIME_SETTINGS_V2_WAL_QUARANTINE_PREFIX));
+    expect(localStorage.getItem(quarantineKey!)).toBe(v2Raw);
+  });
+
+  it("RuntimeSettingsV2 hydration 后另一 tab 新建 V3 WAL 时点击前复查并零 PUT", async () => {
+    const user = userEvent.setup();
+    const v2Raw = JSON.stringify({
+      format: "director-pending-runtime-settings",
+      version: 3,
+      owner_id: "tab-stage6-v2-late-conflict",
+      pending: true,
+      active_database_path: ACTIVE_DATABASE_PATH,
+      written_at_ms: 123456789,
+      settings: {
+        schema_version: 2,
+        client_id: "stage6-v2-pending",
+        memory_policy: CONFIGURED_SETTINGS.memory_policy,
+        raylight_residency_policy: CONFIGURED_SETTINGS.raylight_residency_policy,
+        multi_gpu_enabled: CONFIGURED_SETTINGS.multi_gpu_enabled,
+        placement: CONFIGURED_SETTINGS.placement,
+        legacy_lora_resolution_compat: {
+          schema_version: 1,
+          auto_resolution_strategy_version: "v4-known-filename-or-safetensors-metadata-v1",
+          explicit_overrides: [],
+        },
+      },
+    });
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_V2_WAL_STORAGE_KEY, v2Raw);
+    mockCommonRequests();
+    const update = vi.mocked(directorApi.updateSettingsAuthority);
+
+    render(<App />);
+    await waitUntilReady();
+    const recovery = await screen.findByRole("alert", { name: "RuntimeSettingsV2 恢复" });
+    expect(within(recovery).getByRole("button", { name: "仅合并精确 LoRA 映射" }))
+      .toBeEnabled();
+    const quarantineKey = Array.from({ length: localStorage.length }, (_, index) =>
+      localStorage.key(index)).find((key) =>
+      key?.startsWith(RUNTIME_SETTINGS_V2_WAL_QUARANTINE_PREFIX));
+    update.mockClear();
+    const v3Raw = JSON.stringify({ evidence: "created-after-hydration-by-another-tab" });
+    localStorage.setItem(RUNTIME_SETTINGS_PENDING_KEY, v3Raw);
+
+    await user.click(within(recovery).getByRole("button", {
+      name: "仅合并精确 LoRA 映射",
+    }));
+
+    expect(update).not.toHaveBeenCalled();
+    expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBe(v3Raw);
+    expect(localStorage.getItem(quarantineKey!)).toBe(v2Raw);
+    expect(await within(recovery).findByText(/独立的 RuntimeSettingsV3 待同步记录/))
+      .toBeInTheDocument();
+  });
+
+  it("损坏或跨库 RuntimeSettingsV2 隔离证据可见但只有导出与 compare-delete 放弃", async () => {
+    const user = userEvent.setup();
+    const corruptRaw = JSON.stringify({
+      format: "director-pending-runtime-settings",
+      version: 3,
+      owner_id: "tab-safe-owner",
+      pending: true,
+      active_database_path: "/srv/director/data/other.sqlite3",
+      written_at_ms: 123456789,
+      settings: { invalid: true },
+    });
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_V2_WAL_STORAGE_KEY, corruptRaw);
+    mockCommonRequests();
+    const update = vi.mocked(directorApi.updateSettingsAuthority);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+    const recovery = await screen.findByRole("alert", { name: "RuntimeSettingsV2 恢复" });
+    expect(within(recovery).getByText(/内容已脱敏隐藏，绝不会用于 CAS 恢复/))
+      .toBeInTheDocument();
+    expect(within(recovery).getByText(/浏览器归属 tab-safe-owner/)).toBeInTheDocument();
+    expect(within(recovery).getByText(/数据库归属 其他数据库/)).toBeInTheDocument();
+    expect(within(recovery).getByRole("button", { name: "导出原始记录" })).toBeEnabled();
+    expect(within(recovery).queryByRole("button", { name: "仅合并精确 LoRA 映射" }))
+      .not.toBeInTheDocument();
+    expect(update).not.toHaveBeenCalled();
+    const quarantineKey = Array.from({ length: localStorage.length }, (_, index) =>
+      localStorage.key(index)).find((key) =>
+      key?.startsWith(RUNTIME_SETTINGS_V2_WAL_QUARANTINE_PREFIX));
+
+    await user.click(within(recovery).getByRole("button", { name: "放弃" }));
+
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "RuntimeSettingsV2 恢复" }))
+      .not.toBeInTheDocument());
+    expect(localStorage.getItem(quarantineKey!)).toBeNull();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("阶段 0 RuntimeSettingsV1 WAL 只进入人工四选恢复，放弃时不写任何权威", async () => {
+    const user = userEvent.setup();
+    expect(LEGACY_RUNTIME_SETTINGS_WAL_STORAGE_KEY).toBe(RUNTIME_SETTINGS_WAL_STORAGE_KEY_LITERAL);
+    expect(runtimeSettingsWalV0Raw.endsWith("\n")).toBe(true);
+    const fixtureRaw = runtimeSettingsWalV0Raw.slice(0, -1);
+    const fixture = JSON.parse(fixtureRaw) as {
+      active_database_path: string;
+    };
+    const fixtureDatabase = {
+      active_database_path: fixture.active_database_path,
+    };
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_WAL_STORAGE_KEY, fixtureRaw);
+    mockCommonRequests();
+    vi.mocked(directorApi.getStorage).mockResolvedValue(fixtureDatabase);
+    const updateSettingsAuthority = vi.mocked(directorApi.updateSettingsAuthority);
+    const updateProjectTimelineAuthority = vi.mocked(directorApi.updateProjectTimelineAuthority);
+    updateSettingsAuthority.mockClear();
+    updateProjectTimelineAuthority.mockClear();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await waitUntilReady();
+
+    const recovery = await screen.findByRole("alert", { name: "旧运行设置恢复" });
+    expect(within(recovery).getByRole("button", { name: "应用到所有已迁移项目" }))
+      .toBeEnabled();
+    expect(within(recovery).getByRole("button", { name: "应用到指定项目" }))
+      .toBeDisabled();
+    expect(within(recovery).getByRole("button", { name: "仅保留 Standard LoRA 精确映射" }))
+      .toBeEnabled();
+    expect(within(recovery).getByRole("button", { name: "放弃" })).toBeEnabled();
+    expect(within(recovery).getByLabelText("旧运行设置指定恢复项目")).toHaveValue("");
+    expect(localStorage.getItem(LEGACY_RUNTIME_SETTINGS_WAL_STORAGE_KEY)).toBeNull();
+    const quarantineKey = Array.from({ length: localStorage.length }, (_, index) =>
+      localStorage.key(index)).find((key) =>
+      key?.startsWith(LEGACY_RUNTIME_SETTINGS_WAL_QUARANTINE_PREFIX));
+    expect(quarantineKey).toBeTruthy();
+    expect(localStorage.getItem(quarantineKey!)).toBe(fixtureRaw);
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
+    expect(updateProjectTimelineAuthority).not.toHaveBeenCalled();
+
+    await user.click(within(recovery).getByRole("button", { name: "放弃" }));
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "旧运行设置恢复" }))
+      .not.toBeInTheDocument());
+    expect(localStorage.getItem(quarantineKey!)).toBeNull();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
+    expect(updateProjectTimelineAuthority).not.toHaveBeenCalled();
+  });
+
+  it("RuntimeSettingsV1 WAL 指定项目恢复分别通过 project/settings CAS 后才精确清理", async () => {
+    const user = userEvent.setup();
+    const fixtureRaw = runtimeSettingsWalV0Raw.slice(0, -1);
+    const fixture = JSON.parse(fixtureRaw) as { active_database_path: string };
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_WAL_STORAGE_KEY, fixtureRaw);
+    const target = createTimelineProject();
+    target.title = "显式指定的恢复项目";
+    const unrelatedMapping = {
+      lora_filename: "LoRA/H3/current-only.safetensors",
+      adapter_id: "model_only" as const,
+      options: {},
+    };
+    mockCommonRequests({
+      ...structuredClone(CONFIGURED_SETTINGS),
+      lora_loader_overrides: [unrelatedMapping],
+    });
+    vi.mocked(directorApi.getStorage).mockResolvedValue({
+      active_database_path: fixture.active_database_path,
+    });
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      projects: [
+        {
+          id: DEFAULT_PROJECT_ID,
+          title: "默认项目",
+          created_at: "2026-08-12T00:00:00Z",
+          updated_at: "2026-08-12T00:00:00Z",
+          segment_count: 1,
+        },
+        {
+          id: "explicit-project",
+          title: target.title,
+          created_at: "2026-08-12T00:01:00Z",
+          updated_at: "2026-08-12T00:01:00Z",
+          segment_count: 1,
+        },
+      ],
+    });
+    const getProjectAuthority = vi.mocked(directorApi.getProjectTimelineAuthority)
+      .mockResolvedValue({ document: target, revision: 7 });
+    const updateProjectAuthority = vi.mocked(directorApi.updateProjectTimelineAuthority)
+      .mockImplementation(async (_projectId, document, expectedRevision) => ({
+        document,
+        revision: expectedRevision + 1,
+      }));
+    const updateSettingsAuthority = vi.mocked(directorApi.updateSettingsAuthority);
+
+    render(<App />);
+    await waitUntilReady();
+    const recovery = await screen.findByRole("alert", { name: "旧运行设置恢复" });
+    getProjectAuthority.mockClear();
+    updateProjectAuthority.mockClear();
+    updateSettingsAuthority.mockClear();
+    await user.selectOptions(
+      within(recovery).getByLabelText("旧运行设置指定恢复项目"),
+      "explicit-project",
+    );
+    await user.click(within(recovery).getByRole("button", { name: "应用到指定项目" }));
+
+    await waitFor(() => expect(updateProjectAuthority).toHaveBeenCalledWith(
+      "explicit-project",
+      expect.objectContaining({
+        version: 5,
+        model_stack: expect.objectContaining({
+          fl2va: { filename: "diffusion_models/minimax-h3/fl2va-v0.safetensors" },
+        }),
+      }),
+      7,
+    ));
+    expect(getProjectAuthority).toHaveBeenCalledWith("explicit-project", undefined);
+    expect(updateSettingsAuthority).toHaveBeenCalledWith(
+      expect.objectContaining({
+        schema_version: 3,
+        placement: expect.objectContaining({
+          fl2va: expect.objectContaining({ device: "gpu:1" }),
+        }),
+        lora_loader_overrides: expect.arrayContaining([
+          unrelatedMapping,
+          {
+            lora_filename: "loras/minimax-h3/turbo-v0.safetensors",
+            adapter_id: "minimax_h3_turbo",
+            options: { low_vram: false },
+          },
+        ]),
+      }),
+      expect.any(String),
+    );
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "旧运行设置恢复" }))
+      .not.toBeInTheDocument());
+    expect(Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+      .some((key) => key?.startsWith(LEGACY_RUNTIME_SETTINGS_WAL_QUARANTINE_PREFIX)))
+      .toBe(false);
+  });
+
+  it("RuntimeSettingsV1 WAL 仅保留精确 LoRA 映射时只写 settings authority", async () => {
+    const user = userEvent.setup();
+    const fixtureRaw = runtimeSettingsWalV0Raw.slice(0, -1);
+    const fixture = JSON.parse(fixtureRaw) as { active_database_path: string };
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_WAL_STORAGE_KEY, fixtureRaw);
+    mockCommonRequests();
+    vi.mocked(directorApi.getStorage).mockResolvedValue({
+      active_database_path: fixture.active_database_path,
+    });
+
+    render(<App />);
+    await waitUntilReady();
+    const recovery = await screen.findByRole("alert", { name: "旧运行设置恢复" });
+    const updateSettingsAuthority = vi.mocked(directorApi.updateSettingsAuthority);
+    const updateTimelineAuthority = vi.mocked(directorApi.updateTimelineAuthority);
+    const updateProjectAuthority = vi.mocked(directorApi.updateProjectTimelineAuthority);
+    updateSettingsAuthority.mockClear();
+    updateTimelineAuthority.mockClear();
+    updateProjectAuthority.mockClear();
+    await user.click(within(recovery).getByRole("button", {
+      name: "仅保留 Standard LoRA 精确映射",
+    }));
+
+    await waitFor(() => expect(updateSettingsAuthority).toHaveBeenCalledWith(
+      expect.objectContaining({
+        placement: CONFIGURED_SETTINGS.placement,
+        lora_loader_overrides: [{
+          lora_filename: "loras/minimax-h3/turbo-v0.safetensors",
+          adapter_id: "minimax_h3_turbo",
+          options: { low_vram: false },
+        }],
+      }),
+      expect.any(String),
+    ));
+    expect(updateTimelineAuthority).not.toHaveBeenCalled();
+    expect(updateProjectAuthority).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "旧运行设置恢复" }))
+      .not.toBeInTheDocument());
+  });
+
+  it("RuntimeSettingsV1 WAL 的 LoRA 映射在 256 条满表时拒绝恢复且保留隔离原文", async () => {
+    const user = userEvent.setup();
+    const fixtureRaw = runtimeSettingsWalV0Raw.slice(0, -1);
+    const fixture = JSON.parse(fixtureRaw) as { active_database_path: string };
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_WAL_STORAGE_KEY, fixtureRaw);
+    const fullSettings = {
+      ...structuredClone(CONFIGURED_SETTINGS),
+      lora_loader_overrides: Array.from({ length: 256 }, (_, index) => ({
+        lora_filename: `LoRA/existing-${index.toString().padStart(3, "0")}.safetensors`,
+        adapter_id: "model_only" as const,
+        options: {},
+      })),
+    };
+    mockCommonRequests();
+    vi.mocked(directorApi.getStorage).mockResolvedValue({
+      active_database_path: fixture.active_database_path,
+    });
+    vi.mocked(directorApi.getSettingsAuthority).mockResolvedValue(
+      runtimeAuthority(fullSettings),
+    );
+
+    render(<App />);
+    await waitUntilReady();
+    const recovery = await screen.findByRole("alert", { name: "旧运行设置恢复" });
+    const quarantineKey = Array.from({ length: localStorage.length }, (_, index) =>
+      localStorage.key(index)).find((key) =>
+      key?.startsWith(LEGACY_RUNTIME_SETTINGS_WAL_QUARANTINE_PREFIX));
+    expect(quarantineKey).toBeTruthy();
+    const updateSettingsAuthority = vi.mocked(directorApi.updateSettingsAuthority);
+    const updateProjectAuthority = vi.mocked(directorApi.updateProjectTimelineAuthority);
+    updateSettingsAuthority.mockClear();
+    updateProjectAuthority.mockClear();
+
+    await user.click(within(recovery).getByRole("button", {
+      name: "应用到所有已迁移项目",
+    }));
+
+    expect(await screen.findByText(/旧运行设置恢复记录或所选项目范围已不可验证/))
+      .toBeInTheDocument();
+    expect(screen.getByRole("alert", { name: "旧运行设置恢复" })).toBeInTheDocument();
+    expect(localStorage.getItem(quarantineKey!)).toBe(fixtureRaw);
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
+    expect(updateProjectAuthority).not.toHaveBeenCalled();
+  });
+
+  it("RuntimeSettingsV1 WAL 同 binding 不同 adapter 时所有应用分支零 PUT 并保留证据", async () => {
+    const user = userEvent.setup();
+    const fixtureRaw = runtimeSettingsWalV0Raw.slice(0, -1);
+    const fixture = JSON.parse(fixtureRaw) as { active_database_path: string };
+    localStorage.setItem(LEGACY_RUNTIME_SETTINGS_WAL_STORAGE_KEY, fixtureRaw);
+    const conflictingSettings = {
+      ...structuredClone(CONFIGURED_SETTINGS),
+      lora_loader_overrides: [{
+        lora_filename: "loras/minimax-h3/turbo-v0.safetensors",
+        adapter_id: "model_only" as const,
+        options: {},
+      }],
+    };
+    mockCommonRequests(conflictingSettings);
+    vi.mocked(directorApi.getStorage).mockResolvedValue({
+      active_database_path: fixture.active_database_path,
+    });
+
+    render(<App />);
+    await waitUntilReady();
+    const recovery = await screen.findByRole("alert", { name: "旧运行设置恢复" });
+    const quarantineKey = Array.from({ length: localStorage.length }, (_, index) =>
+      localStorage.key(index)).find((key) =>
+      key?.startsWith(LEGACY_RUNTIME_SETTINGS_WAL_QUARANTINE_PREFIX));
+    const updateSettingsAuthority = vi.mocked(directorApi.updateSettingsAuthority);
+    const updateProjectAuthority = vi.mocked(directorApi.updateProjectTimelineAuthority);
+    updateSettingsAuthority.mockClear();
+    updateProjectAuthority.mockClear();
+
+    await user.click(within(recovery).getByRole("button", {
+      name: "应用到所有已迁移项目",
+    }));
+
+    expect(await screen.findByText(/旧运行设置恢复记录或所选项目范围已不可验证/))
+      .toBeInTheDocument();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
+    expect(updateProjectAuthority).not.toHaveBeenCalled();
+    expect(localStorage.getItem(quarantineKey!)).toBe(fixtureRaw);
   });
 
   it("Windows 盘符数据库身份的同库 RuntimeSettings WAL 正常自动同步并清除", async () => {
@@ -1540,10 +2269,14 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValue(runtimeAuthority(windowsSettings));
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(windowsSettings);
+    const updateSettingsAuthority = vi.spyOn(directorApi, "updateSettingsAuthority")
+      .mockResolvedValue(runtimeAuthority(windowsSettings));
 
     render(<App />);
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(windowsSettings));
+    await waitFor(() => expect(updateSettingsAuthority).toHaveBeenCalledWith(
+      windowsSettings,
+      expect.any(String),
+    ));
     await waitFor(() => expect(localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY)).toBeNull());
   });
 
@@ -2317,26 +3050,15 @@ describe("统一长视频时间线应用", () => {
     expect(await screen.findByText("ComfyUI 离线")).toBeInTheDocument();
     await user.type(screen.getByLabelText("片段提示词"), "雨夜追车");
     expect(screen.getByRole("button", { name: /生成任务/ })).toBeDisabled();
-    expect(screen.getByText(/编辑内容会在 Director 连接恢复后自动同步/)).toBeInTheDocument();
+    expect(screen.getByText(/编辑内容会继续保留，恢复后由服务器实时核对执行能力/)).toBeInTheDocument();
   });
 
-  it("无 LoRA 的 RayLight 不会被条件 RayLoraLoader 能力误拦", async () => {
-    mockCommonRequests({
-      ...CONFIGURED_SETTINGS,
-      models: {
-        ...CONFIGURED_SETTINGS.models,
-        fl2va: {
-          ...CONFIGURED_SETTINGS.models.fl2va,
-          backend: "raylight",
-          lora_name: null,
-          raylight: {
-            ...CONFIGURED_SETTINGS.models.fl2va.raylight,
-            gpu_select: [0, 1],
-            ulysses_degree: 2,
-          },
-        },
-      },
-    });
+  it("无 LoRA 的 RayLight 不会被条件 DirectorDeckRayLoraLoader 能力误拦", async () => {
+    const runtime = structuredClone(CONFIGURED_SETTINGS);
+    runtime.multi_gpu_enabled = true;
+    runtime.placement.fl2va.raylight.gpu_select = [0, 1];
+    runtime.placement.fl2va.raylight.ulysses_degree = 2;
+    mockCommonRequests(runtime);
     vi.mocked(directorApi.getCapabilities).mockResolvedValue({
       ...ONLINE_CAPABILITIES,
       execution_backends: {
@@ -2345,7 +3067,7 @@ describe("统一长视频时间线应用", () => {
           available: true,
           missing_nodes: [],
           conditional_requirements: {
-            lora: { available: false, missing_nodes: ["RayLoraLoader"] },
+            lora: { available: false, missing_nodes: ["DirectorDeckRayLoraLoader"] },
           },
         },
       },
@@ -2358,23 +3080,26 @@ describe("统一长视频时间线应用", () => {
     expect(screen.queryByText(/配置解析为 RayLight 执行，但当前 ComfyUI 不可用/)).not.toBeInTheDocument();
   });
 
-  it("启用 RayLight LoRA 时按条件节点能力失败封闭", async () => {
-    mockCommonRequests({
-      ...CONFIGURED_SETTINGS,
-      models: {
-        ...CONFIGURED_SETTINGS.models,
-        fl2va: {
-          ...CONFIGURED_SETTINGS.models.fl2va,
-          backend: "raylight",
-          lora_name: "minimax-h3-turbo.safetensors",
-          raylight: {
-            ...CONFIGURED_SETTINGS.models.fl2va.raylight,
-            gpu_select: [0, 1],
-            ulysses_degree: 2,
-          },
-        },
+  it("启用 RayLight LoRA 时由服务端统一 preflight 失败封闭", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "RayLight LoRA 预检";
+    project.model_stack.fl2va.filename = MODEL_INVENTORY.fl2va[0];
+    project.features.project.lora = updateLoraFeatureFamily(
+      project.features,
+      "fl2va",
+      {
+        enabled: true,
+        filename: "minimax-h3-turbo.safetensors",
+        strength: 1,
       },
-    });
+    );
+    saveLocalTimeline(project);
+    const runtime = structuredClone(CONFIGURED_SETTINGS);
+    runtime.multi_gpu_enabled = true;
+    runtime.placement.fl2va.raylight.gpu_select = [0, 1];
+    runtime.placement.fl2va.raylight.ulysses_degree = 2;
+    mockCommonRequests(runtime);
     vi.mocked(directorApi.getCapabilities).mockResolvedValue({
       ...ONLINE_CAPABILITIES,
       execution_backends: {
@@ -2383,37 +3108,50 @@ describe("统一长视频时间线应用", () => {
           available: true,
           missing_nodes: [],
           conditional_requirements: {
-            lora: { available: false, missing_nodes: ["RayLoraLoader"] },
+            lora: { available: false, missing_nodes: ["DirectorDeckRayLoraLoader"] },
           },
         },
       },
     });
+    vi.mocked(directorApi.preflightFeatures).mockResolvedValue(
+      rejectedFeaturePreflight(
+        "RayLight LoRA 配置不可用：缺少 DirectorDeckRayLoraLoader",
+        "安装匹配的 RayLight 节点",
+        "raylight_lora_unavailable",
+      ),
+    );
+    const compile = vi.spyOn(directorApi, "compileTimeline");
 
     render(<App />);
     await waitUntilReady();
 
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeDisabled();
-    expect(screen.getByText(/RayLight LoRA 配置不可用.*RayLoraLoader/)).toBeInTheDocument();
+    const preflight = screen.getByRole("button", { name: "预检执行计划" });
+    expect(preflight).toBeEnabled();
+    expect(screen.queryByText(/RayLight LoRA 配置不可用/)).not.toBeInTheDocument();
+    await user.click(preflight);
+    expect(await screen.findByText(/RayLight LoRA 配置不可用.*DirectorDeckRayLoraLoader/))
+      .toBeInTheDocument();
+    expect(directorApi.preflightFeatures).toHaveBeenCalled();
+    expect(compile).not.toHaveBeenCalled();
   });
 
-  it("全局设置是默认关闭的悬浮层，并同时编辑两个共享模型族", async () => {
+  it("全局设置是默认关闭的悬浮层，并把两族模型与 LoRA 直接写入项目文档", async () => {
     const user = userEvent.setup();
-    const initial = structuredClone(CONFIGURED_SETTINGS);
-    initial.models.ref2va.lora_name = "style.safetensors";
-    initial.models.ref2va.standard_lora_loader_override = {
-      loader: "model_only",
-      lora_name: "style.safetensors",
-      model_filename: initial.models.ref2va.filename,
+    const initial = createTimelineProject();
+    initial.model_stack.fl2va.filename = MODEL_INVENTORY.fl2va[0];
+    initial.model_stack.ref2va.filename = MODEL_INVENTORY.ref2va[0];
+    initial.features.project.lora = updateLoraFeatureFamily(initial.features, "ref2va", {
+      enabled: true,
+      filename: "style.safetensors",
+      strength: 1,
+    });
+    initial.features.project.opaque_extension = {
+      enabled: true,
+      params: { profile: "keep" },
     };
-    mockCommonRequests(initial);
-    const confirmed = structuredClone(initial);
-    confirmed.models.ref2va.filename = "alternate-diffusion.safetensors";
-    confirmed.models.ref2va.standard_lora_loader_override = null;
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(initial))
-      .mockResolvedValueOnce(runtimeAuthority(initial))
-      .mockResolvedValue(runtimeAuthority(confirmed));
-    const update = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(confirmed);
+    mockCommonRequests();
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(initial);
+    const update = vi.mocked(directorApi.updateTimeline);
 
     render(<App />);
     await waitUntilReady();
@@ -2423,6 +3161,8 @@ describe("统一长视频时间线应用", () => {
     expect(globalSettings).toBeVisible();
     const specs = within(globalSettings).getByRole("region", { name: "输出规格" });
     expect(specs).toBeVisible();
+    expect(within(globalSettings).queryByLabelText("项目功能点")).not.toBeInTheDocument();
+    expect(within(globalSettings).queryByText("Attention backend override")).not.toBeInTheDocument();
     expect(within(specs).getByLabelText("画幅")).toHaveValue("16:9");
     expect(within(specs).getByLabelText("分辨率")).toHaveValue("864x480");
     expect(within(specs).getByLabelText("导出方式")).toHaveValue("all");
@@ -2473,10 +3213,14 @@ describe("统一长视频时间线应用", () => {
       "alternate-diffusion.safetensors",
     );
     await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
-      models: expect.objectContaining({
-        ref2va: expect.objectContaining({
-          filename: "alternate-diffusion.safetensors",
-          standard_lora_loader_override: null,
+      version: 5,
+      model_stack: expect.objectContaining({
+        ref2va: { filename: "alternate-diffusion.safetensors" },
+      }),
+      features: expect.objectContaining({
+        project: expect.objectContaining({
+          lora: expect.any(Object),
+          opaque_extension: { enabled: true, params: { profile: "keep" } },
         }),
       }),
     })));
@@ -3208,10 +3952,8 @@ describe("统一长视频时间线应用", () => {
     saveLocalTimeline(project);
     mockCommonRequests();
     const compile = vi.spyOn(directorApi, "compileTimeline").mockResolvedValue({
-      execution_strategy: "native_segment_graph_v1",
+      ...emptyCompileReport(project),
       model_families: ["fl2va"],
-      plans: [],
-      node_policy: { graph_source: "server", accepts_client_workflow: false, allowed_nodes: [], custom_nodes: [], provenance: {} },
     });
 
     render(<App />);
@@ -3229,7 +3971,7 @@ describe("统一长视频时间线应用", () => {
     expect(taskToggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByRole("complementary", { name: "任务列表" })).not.toBeInTheDocument();
     await waitFor(() => expect(compile).toHaveBeenCalledWith({
-      config: expect.objectContaining({ version: 4 }),
+      config: expect.objectContaining({ version: 5 }),
       segment_ids: [project.segments[0].id],
     }));
 
@@ -3248,24 +3990,19 @@ describe("统一长视频时间线应用", () => {
     expect(screen.queryByRole("complementary", { name: "任务列表" })).not.toBeInTheDocument();
   });
 
-  it("全局设置删除无操作的自动执行摘要，快捷模型选择仍保留驻留策略", async () => {
+  it("全局设置删除无操作的自动执行摘要，快捷模型选择只写项目且不碰驻留策略", async () => {
     const user = userEvent.setup();
-    const initial = structuredClone(CONFIGURED_SETTINGS);
-    initial.raylight_residency_policy = "release_after_sampling";
-    initial.models.fl2va.backend = "auto";
-    initial.models.fl2va.raylight = {
-      ...initial.models.fl2va.raylight,
-      gpu_select: [0, 1],
-      ulysses_degree: 2,
-    };
-    const confirmed = structuredClone(initial);
-    confirmed.models.fl2va.filename = "alternate-diffusion.safetensors";
-    mockCommonRequests(initial);
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(initial))
-      .mockResolvedValueOnce(runtimeAuthority(initial))
-      .mockResolvedValue(runtimeAuthority(confirmed));
-    const update = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(confirmed);
+    const runtime = structuredClone(CONFIGURED_SETTINGS);
+    runtime.raylight_residency_policy = "release_after_sampling";
+    runtime.multi_gpu_enabled = true;
+    runtime.placement.fl2va.raylight.gpu_select = [0, 1];
+    runtime.placement.fl2va.raylight.ulysses_degree = 2;
+    const project = createTimelineProject();
+    project.model_stack.fl2va.filename = MODEL_INVENTORY.fl2va[0];
+    mockCommonRequests(runtime);
+    vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
+    const update = vi.mocked(directorApi.updateTimeline);
+    const updateRuntime = vi.mocked(directorApi.updateSettingsAuthority);
 
     render(<App />);
     await waitUntilReady();
@@ -3281,30 +4018,42 @@ describe("统一长视频时间线应用", () => {
     await user.selectOptions(screen.getByLabelText("FL2VA Diffusion 模型快捷选择"), "alternate-diffusion.safetensors");
 
     await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
-      raylight_residency_policy: "release_after_sampling",
-      models: expect.objectContaining({
-        fl2va: expect.objectContaining({ filename: "alternate-diffusion.safetensors" }),
+      model_stack: expect.objectContaining({
+        fl2va: { filename: "alternate-diffusion.safetensors" },
       }),
     })));
+    expect(updateRuntime).not.toHaveBeenCalled();
   });
 
-  it("原生子图连续性能力缺省为关闭，旧草稿必须显式清除才能提交", async () => {
+  it("连续性不读取旧能力摘要，生成时由权威提交接口判定", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "延续镜头";
     project.segments[0].continuity.enabled = true;
     saveLocalTimeline(project);
     mockCommonRequests();
+    const submit = vi.spyOn(directorApi, "createTimelineTask")
+      .mockRejectedValueOnce(new ApiError("当前模板不支持所选片段的段间接续", 409))
+      .mockResolvedValue(queuedTimelineTask);
 
     render(<App />);
     await waitUntilReady();
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeDisabled();
-    expect(screen.getByText(/当前原生分段子图不支持所选片段的段间接续/)).toBeInTheDocument();
+    const generate = screen.getByRole("button", { name: /生成任务/ });
+    expect(generate).toBeEnabled();
+    expect(screen.queryByText(/当前原生分段子图不支持所选片段的段间接续/))
+      .not.toBeInTheDocument();
+    await user.click(generate);
+    expect(await screen.findByText(/当前模板不支持所选片段的段间接续/))
+      .toBeInTheDocument();
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(directorApi.preflightFeatures).not.toHaveBeenCalled();
 
     const continuityToggle = screen.getByRole("checkbox", { name: "启用当前片段连续性" });
     expect(continuityToggle).toBeChecked();
+    expect(continuityToggle).toBeEnabled();
     await user.click(continuityToggle);
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeEnabled();
+    await user.click(generate);
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
   });
 
   it("段间接续只选后段时保留显式勾选，并把历史前驱解析交给服务端", async () => {
@@ -3398,7 +4147,8 @@ describe("统一长视频时间线应用", () => {
     expect(generate).toHaveAttribute("title", expect.stringContaining("请延长前段或降低接续尾帧数"));
   });
 
-  it("所选执行后端不可用时禁止提交原生子图", async () => {
+  it("所选执行后端不可用时由权威提交接口返回诊断", async () => {
+    const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "雾中森林";
     saveLocalTimeline(project);
@@ -3410,11 +4160,19 @@ describe("统一长视频时间线应用", () => {
         standard: { available: false, missing_nodes: ["SamplerCustomAdvanced"] },
       },
     });
+    const submit = vi.spyOn(directorApi, "createTimelineTask")
+      .mockRejectedValue(new ApiError("标准执行后端不可用：缺少 SamplerCustomAdvanced", 409));
 
     render(<App />);
     await waitUntilReady();
-    expect(screen.getByRole("alert")).toHaveTextContent("SamplerCustomAdvanced");
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeDisabled();
+    const generate = screen.getByRole("button", { name: /生成任务/ });
+    expect(generate).toBeEnabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await user.click(generate);
+    expect(await screen.findByText(/标准执行后端不可用.*SamplerCustomAdvanced/))
+      .toBeInTheDocument();
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(directorApi.preflightFeatures).not.toHaveBeenCalled();
   });
 
   it("实时同步和生成使用统一 timeline API，而不是旧六模式接口", async () => {
@@ -3432,7 +4190,7 @@ describe("统一长视频时间线应用", () => {
       target: { value: "雨夜街头，低机位推进" },
     });
     await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
-      version: 4,
+      version: 5,
       segments: [expect.objectContaining({ mode: "fl2va", prompt: "雨夜街头，低机位推进" })],
     })));
     expect(screen.queryByRole("button", { name: /保存时间线/ })).not.toBeInTheDocument();
@@ -3440,7 +4198,7 @@ describe("统一长视频时间线应用", () => {
     await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
     await waitFor(() => expect(submit).toHaveBeenCalledWith({
       config: expect.objectContaining({
-        version: 4,
+        version: 5,
         segments: [expect.objectContaining({ mode: "fl2va" })],
       }),
       segment_ids: [expect.any(String)],
@@ -3554,8 +4312,10 @@ describe("统一长视频时间线应用", () => {
     const serverProject = structuredClone(project);
     serverProject.segments[0].prompt = "服务器基线";
     vi.mocked(directorApi.getTimeline).mockResolvedValue(serverProject);
-    const confirmed = structuredClone(CONFIGURED_SETTINGS);
-    confirmed.models.fl2va.filename = "alternate-diffusion.safetensors";
+    const confirmed = {
+      ...structuredClone(CONFIGURED_SETTINGS),
+      client_id: "queued-during-generation",
+    };
     vi.mocked(directorApi.getSettingsAuthority)
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
@@ -3568,7 +4328,8 @@ describe("统一长视频时间线应用", () => {
     const createTask = vi.spyOn(directorApi, "createTimelineTask").mockImplementation(
       () => new Promise((resolve) => { resolveTask = resolve; }),
     );
-    const updateSettings = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(confirmed);
+    const updateSettingsAuthority = vi.spyOn(directorApi, "updateSettingsAuthority")
+      .mockResolvedValue(runtimeAuthority(confirmed));
 
     render(<App />);
     await waitUntilReady();
@@ -3577,19 +4338,18 @@ describe("统一长视频时间线应用", () => {
     });
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
-    await openGlobalSettings(user);
-    await user.selectOptions(
-      screen.getByLabelText("FL2VA Diffusion 模型快捷选择"),
-      "alternate-diffusion.safetensors",
-    );
+    await user.click(screen.getByRole("button", { name: "系统设置" }));
+    fireEvent.change(screen.getByLabelText("客户端 ID"), {
+      target: { value: confirmed.client_id },
+    });
     await new Promise((resolve) => window.setTimeout(resolve, 350));
-    expect(updateSettings).not.toHaveBeenCalled();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
 
     await act(async () => resolveTimeline(project));
     await waitFor(() => expect(createTask).toHaveBeenCalledTimes(1));
-    expect(updateSettings).not.toHaveBeenCalled();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
     await act(async () => resolveTask(queuedTimelineTask));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1), { timeout: 3_000 });
+    await waitFor(() => expect(updateSettingsAuthority).toHaveBeenCalledTimes(1), { timeout: 3_000 });
   });
 
   it("预检与生成使用同一显式分段集合，勾选变化会丢弃在途旧报告", async () => {
@@ -3613,10 +4373,8 @@ describe("统一长视频时间线应用", () => {
 
     await user.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
     await act(async () => resolveCompile({
-      execution_strategy: "native_segment_graph_v1",
+      ...emptyCompileReport({ ...createTimelineProject(), segments: [first, second] }),
       model_families: ["fl2va"],
-      plans: [],
-      node_policy: { graph_source: "server", accepts_client_workflow: false, allowed_nodes: [], custom_nodes: [], provenance: {} },
     }));
     expect(screen.queryByRole("region", { name: "服务端执行计划" })).not.toBeInTheDocument();
     expect(screen.getByText(/时间线、分段选择或运行设置已变化，请重新预检/)).toBeInTheDocument();
@@ -3685,6 +4443,7 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
     expect(update.mock.invocationCallOrder[0]).toBeLessThan(submit.mock.invocationCallOrder[0]);
+    expect(directorApi.preflightFeatures).not.toHaveBeenCalled();
     expect(update.mock.calls[0][0].sampling.fl2va.seed).toBe(303);
     const submitted = submit.mock.calls[0][0].config!;
     expect(submitted.sampling.fl2va).toMatchObject({ seed: 303, random_seed: true });
@@ -3696,7 +4455,7 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByLabelText("Ref2VA Seed")).toHaveValue(202);
   });
 
-  it("预检同样在提交前重掷随机 Seed，compile 报告携带实际值并同步灰显框", async () => {
+  it("预检只在临时草稿具体化随机 Seed，不写时间线、项目或撤销历史", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "预检重掷";
@@ -3714,36 +4473,41 @@ describe("统一长视频时间线应用", () => {
     );
     mockCommonRequests();
     const update = vi.spyOn(directorApi, "updateTimeline").mockImplementation(async (value) => value);
+    const capabilityPreflight = vi.mocked(directorApi.preflightFeatures);
     const compile = vi.spyOn(directorApi, "compileTimeline").mockResolvedValue({
-      execution_strategy: "native_segment_graph_v1",
+      ...emptyCompileReport(project),
       model_families: ["fl2va"],
-      plans: [],
-      node_policy: {
-        graph_source: "server",
-        accepts_client_workflow: false,
-        allowed_nodes: [],
-        custom_nodes: [],
-        provenance: {},
-      },
     });
 
     render(<App />);
     await waitUntilReady();
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     update.mockClear();
+    const walBefore = timelineWalStorageRaw();
+    const undoBefore = screen.getByRole("button", { name: "撤销" });
+    const undoDisabledBefore = undoBefore.hasAttribute("disabled");
+    const undoTitleBefore = undoBefore.getAttribute("title");
 
     await user.click(screen.getByRole("button", { name: "预检执行计划" }));
-    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(compile).toHaveBeenCalledTimes(1));
-    expect(update.mock.invocationCallOrder[0]).toBeLessThan(compile.mock.invocationCallOrder[0]);
-    expect(update.mock.calls[0][0].sampling.fl2va.seed).toBe(303);
+    expect(update).not.toHaveBeenCalled();
+    expect(capabilityPreflight).toHaveBeenCalledTimes(1);
+    expect(capabilityPreflight.mock.invocationCallOrder[0])
+      .toBeLessThan(compile.mock.invocationCallOrder[0]);
+    expect(capabilityPreflight.mock.calls[0][0].config.sampling.fl2va)
+      .toMatchObject({ seed: 303, random_seed: true });
+    expect(capabilityPreflight.mock.calls[0][0].project_id).toBe(DEFAULT_PROJECT_ID);
     const compiled = compile.mock.calls[0][0].config!;
     expect(compiled.sampling.fl2va).toMatchObject({ seed: 303, random_seed: true });
     expect(compiled.sampling.ref2va).toMatchObject({ seed: 202, random_seed: false });
+    expect(timelineWalStorageRaw()).toBe(walBefore);
+    const undoAfter = screen.getByRole("button", { name: "撤销" });
+    expect(undoAfter.hasAttribute("disabled")).toBe(undoDisabledBefore);
+    expect(undoAfter.getAttribute("title")).toBe(undoTitleBefore);
 
     await openGlobalSettings(user);
     expect(screen.getByLabelText("FL2VA Seed")).toBeDisabled();
-    expect(screen.getByLabelText("FL2VA Seed")).toHaveValue(303);
+    expect(screen.getByLabelText("FL2VA Seed")).toHaveValue(101);
     expect(screen.getByLabelText("Ref2VA Seed")).toHaveValue(202);
   });
 
@@ -3846,9 +4610,85 @@ describe("统一长视频时间线应用", () => {
     expect(sidebarToggle).toHaveFocus();
   });
 
+  it("LoRA 映射 CAS 遇到其他 binding 并发写时只重试一次并保留双方记录", async () => {
+    const user = userEvent.setup();
+    mockCommonRequests();
+    const targetFilename = "LoRA/H3/minimax_h3_turbo_Target.Exact.safetensors";
+    const concurrentFilename = "LoRA/Concurrent.safetensors";
+    vi.mocked(directorApi.getModels).mockResolvedValue({
+      ...MODEL_INVENTORY,
+      loras: [targetFilename, concurrentFilename],
+    });
+    const concurrentRecord = {
+      lora_filename: concurrentFilename,
+      adapter_id: "model_only" as const,
+      options: {},
+    };
+    let authority = runtimeAuthority(CONFIGURED_SETTINGS);
+    const getAuthority = vi.mocked(directorApi.getSettingsAuthority)
+      .mockImplementation(async () => structuredClone(authority));
+    let writes = 0;
+    const updateAuthority = vi.mocked(directorApi.updateSettingsAuthority)
+      .mockImplementation(async (document, expectedToken) => {
+        writes += 1;
+        if (writes === 1) {
+          authority = runtimeAuthority({
+            ...CONFIGURED_SETTINGS,
+            lora_loader_overrides: [concurrentRecord],
+          });
+          throw new ApiError(
+            "runtime authority changed",
+            409,
+            undefined,
+            "runtime_settings_authority_conflict",
+          );
+        }
+        expect(expectedToken).toBe(authority.authority_token);
+        authority = runtimeAuthority(document);
+        return structuredClone(authority);
+      });
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "系统设置" }));
+    const loraList = await screen.findByRole("listbox", { name: "LoRA 列表" });
+    await user.click(within(loraList).getByRole("option", {
+      name: (name) => name.includes(targetFilename),
+    }));
+    const loaderList = await screen.findByRole("listbox", { name: "加载器列表" });
+    await user.click(within(loaderList).getByRole("option", {
+      name: /MiniMax-H3 Turbo LoRA/,
+    }));
+    await user.click(screen.getByLabelText("LoRA 加载器配置 low_vram"));
+    await user.click(screen.getByRole("button", { name: "保存映射" }));
+
+    await waitFor(() => expect(updateAuthority).toHaveBeenCalledTimes(2));
+    const rebased = updateAuthority.mock.calls[1][0];
+    expect(rebased.lora_loader_overrides).toEqual([
+      concurrentRecord,
+      {
+        lora_filename: targetFilename,
+        adapter_id: "minimax_h3_turbo",
+        options: { low_vram: true },
+      },
+    ]);
+    expect(getAuthority.mock.calls.length).toBeGreaterThan(0);
+    await waitFor(() => expect(within(screen.getByRole("listbox", {
+      name: "LoRA 列表",
+    })).getByRole("option", {
+      name: (name) => name.includes(concurrentFilename),
+    })).toHaveTextContent("LoRA加载器（仅模型）"));
+  });
+
   it("当前权威 ComfyUI 重启后测试连接会原子刷新 GPU、能力与模型资源", async () => {
     const user = userEvent.setup();
     mockCommonRequests();
+    vi.mocked(directorApi.getFeatureCatalog)
+      .mockResolvedValueOnce(FRESH_FEATURE_CATALOG)
+      .mockResolvedValue({
+        status: "not_modified",
+        etag: FEATURE_CATALOG_ETAG,
+      });
     vi.mocked(directorApi.getGpus)
       .mockResolvedValueOnce([GPU_ZERO])
       .mockResolvedValue([GPU_ZERO, GPU_ONE]);
@@ -3883,6 +4723,94 @@ describe("统一长视频时间线应用", () => {
     expect(directorApi.getGpus).toHaveBeenCalledTimes(2);
     expect(directorApi.getModels).toHaveBeenCalledTimes(2);
     expect(directorApi.getRayLightRuntimeStatus).toHaveBeenCalledTimes(2);
+    expect(directorApi.getFeatureCatalog).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(directorApi.getFeatureCatalog).mock.calls[0][0]).toBeUndefined();
+    expect(vi.mocked(directorApi.getFeatureCatalog).mock.calls[1][0])
+      .toBe(FEATURE_CATALOG_ETAG);
+  });
+
+  it("ffmpeg 安装轮询变为 ready 后重取宿主资源与 catalog", async () => {
+    const user = userEvent.setup();
+    mockCommonRequests();
+    vi.mocked(directorApi.getFeatureCatalog)
+      .mockResolvedValueOnce(FRESH_FEATURE_CATALOG)
+      .mockResolvedValue({
+        status: "not_modified",
+        etag: FEATURE_CATALOG_ETAG,
+      });
+    const runningMedia: MediaToolsStatus = {
+      ffmpeg_available: false,
+      ffprobe_available: false,
+      ffmpeg_path: null,
+      encoders_ok: false,
+      ready: false,
+      install: {
+        state: "running",
+        log_tail: ["installing"],
+        returncode: null,
+        error: null,
+        started_at: 1,
+      },
+    };
+    const readyMedia: MediaToolsStatus = {
+      ...runningMedia,
+      ffmpeg_available: true,
+      ffprobe_available: true,
+      ffmpeg_path: "/redacted/ffmpeg",
+      encoders_ok: true,
+      ready: true,
+      install: {
+        ...runningMedia.install,
+        state: "ready",
+        returncode: 0,
+      },
+    };
+    const mediaSetup = vi.spyOn(directorApi, "getMediaSetup")
+      .mockResolvedValueOnce(runningMedia)
+      .mockResolvedValue(readyMedia);
+    vi.spyOn(directorApi, "getRayLightSetup").mockResolvedValue({
+      enabled: false,
+      platform_supported: true,
+      dependencies_installed: false,
+      requirements_available: true,
+      install: {
+        state: "idle",
+        log_tail: [],
+        returncode: null,
+        error: null,
+        started_at: null,
+      },
+    });
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "系统设置" }));
+    expect(await screen.findByText(/正在安装 ffmpeg/)).toBeInTheDocument();
+
+    await waitFor(() => expect(mediaSetup).toHaveBeenCalledTimes(2), { timeout: 3_000 });
+    await waitFor(() => expect(directorApi.getFeatureCatalog).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(directorApi.getFeatureCatalog).mock.calls[1][0])
+      .toBe(FEATURE_CATALOG_ETAG);
+  }, 5_000);
+
+  it("功能目录或 provider 加载失败时显示明确状态并锁定生成与预检", async () => {
+    const project = createTimelineProject();
+    project.segments[0].prompt = "等待功能目录";
+    saveLocalTimeline(project);
+    mockCommonRequests();
+    vi.mocked(directorApi.getFeatureCatalog).mockRejectedValue(
+      new Error("宿主 capability provider 暂不可用"),
+    );
+
+    render(<App />);
+    await waitUntilTimelineReady();
+
+    expect(await screen.findByText(
+      /功能目录与宿主能力不可用：宿主 capability provider 暂不可用；生成与预检保持锁定/,
+    )).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeDisabled();
+    expect(directorApi.preflightFeatures).not.toHaveBeenCalled();
   });
 
   it("直接资源刷新的 head 已是同 URL 新设置时先重建设置权威", async () => {
@@ -3901,7 +4829,7 @@ describe("统一长视频时间线应用", () => {
       ok: true,
       message: "连接成功",
     });
-    const updateSettings = vi.spyOn(directorApi, "updateSettings");
+    const updateSettingsAuthority = vi.spyOn(directorApi, "updateSettingsAuthority");
 
     render(<App />);
     await waitUntilReady();
@@ -3912,11 +4840,11 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(screen.getByLabelText("客户端 ID")).toHaveValue(
       externallyChanged.client_id,
     ));
-    expect(updateSettings).not.toHaveBeenCalled();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
     expect(directorApi.getCapabilities).toHaveBeenCalledTimes(3);
   });
 
-  it("旧 RayLight GPU 状态阻断执行，且 POST 回包后仍等待权威状态 GET 才解锁", async () => {
+  it("旧 RayLight 状态由服务端 evaluator 阻断，恢复操作仍等待权威 GET 收敛", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "重启确认后建立新 RayLight 池";
@@ -3953,9 +4881,9 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
-    expect(await screen.findByText(/旧 RayLight 运行状态引用了当前不可见 GPU；请打开系统设置/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeDisabled();
+    expect(await screen.findByText(/旧 RayLight 运行状态引用了当前不可见 GPU/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeEnabled();
 
     await user.click(screen.getByRole("button", { name: "系统设置" }));
     const recover = await screen.findByRole("button", {
@@ -3986,7 +4914,8 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeEnabled();
   });
 
-  it("首次 RayLight 状态读取失败时保持预检与生成关闭", async () => {
+  it("旧 RayLight 状态读取失败不复制服务端 evaluator 门禁", async () => {
+    const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "状态读取失败不得生成";
     saveLocalTimeline(project);
@@ -3997,8 +4926,10 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitFor(() => expect(directorApi.getRayLightRuntimeStatus).toHaveBeenCalled());
-    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "预检执行计划" }));
+    await waitFor(() => expect(directorApi.preflightFeatures).toHaveBeenCalledTimes(1));
   });
 
   it("四资源部分失败时不展示未形成同源权威的 RayLight 告警", async () => {
@@ -4062,7 +4993,7 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
-    expect(await screen.findByText(/旧 RayLight 运行状态引用了当前不可见 GPU；请打开系统设置/)).toBeInTheDocument();
+    expect(await screen.findByText(/旧 RayLight 运行状态引用了当前不可见 GPU/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "系统设置" }));
     await user.click(await screen.findByRole("button", {
       name: "确认 ComfyUI 已重启并恢复 RayLight",
@@ -4306,7 +5237,7 @@ describe("统一长视频时间线应用", () => {
     expect(directorApi.getRayLightRuntimeStatus).toHaveBeenCalledTimes(2);
   });
 
-  it("当前地址资源刷新部分失败时保留同源旧快照并锁定执行，重试完整成功后再更新", async () => {
+  it("设置页资源刷新失败时保留旧快照但执行仍交由服务端 evaluator", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "重启后重新核对资源";
@@ -4332,8 +5263,8 @@ describe("统一长视频时间线应用", () => {
       ok: true,
       message: "连接成功",
     });
-    const updateSettings = vi.spyOn(directorApi, "updateSettings")
-      .mockImplementation(async (settings) => settings);
+    const updateSettingsAuthority = vi.spyOn(directorApi, "updateSettingsAuthority")
+      .mockImplementation(async (settings) => runtimeAuthority(settings));
 
     render(<App />);
     await waitUntilReady();
@@ -4347,15 +5278,15 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(directorApi.getModels).toHaveBeenCalledTimes(2));
     expect(within(gpuPanel).getByText("A6000-0")).toBeInTheDocument();
     expect(within(gpuPanel).queryByText("A6000-1")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeDisabled();
-    expect(updateSettings).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeEnabled();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
 
     await waitFor(() => expect(directorApi.getModels).toHaveBeenCalledTimes(3), { timeout: 3_000 });
     await waitFor(() => expect(within(gpuPanel).getByText("A6000-1")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "预检执行计划" })).toBeEnabled();
     expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeEnabled();
-    expect(updateSettings).not.toHaveBeenCalled();
+    expect(updateSettingsAuthority).not.toHaveBeenCalled();
   }, 5_000);
 
   it("系统设置连续输入只提交最终快照且 PUT 严格单在途", async () => {
@@ -4369,10 +5300,10 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(firstConfirmed))
       .mockResolvedValueOnce(runtimeAuthority(firstConfirmed))
       .mockResolvedValue(runtimeAuthority(finalConfirmed));
-    let resolveFirst!: (value: typeof firstConfirmed) => void;
-    const update = vi.spyOn(directorApi, "updateSettings")
+    let resolveFirst!: (value: ReturnType<typeof runtimeAuthority>) => void;
+    const update = vi.spyOn(directorApi, "updateSettingsAuthority")
       .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
-      .mockImplementation(async (value) => value);
+      .mockImplementation(async (value) => runtimeAuthority(value));
 
     render(<App />);
     await waitUntilReady();
@@ -4386,17 +5317,20 @@ describe("统一长视频时间线应用", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 350));
     expect(update).toHaveBeenCalledTimes(1);
 
-    await act(async () => resolveFirst(firstConfirmed));
+    await act(async () => resolveFirst(runtimeAuthority(firstConfirmed)));
     await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
-    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ client_id: "final-version" }));
+    expect(update).toHaveBeenLastCalledWith(
+      expect.objectContaining({ client_id: "final-version" }),
+      expect.stringMatching(/^[0-9a-f]{64}$/),
+    );
   });
 
   it("系统设置确定性 422 不受其他 autosave kick 重试，下一次有效编辑才恢复", async () => {
     const user = userEvent.setup();
     mockCommonRequests();
-    const update = vi.spyOn(directorApi, "updateSettings")
+    const update = vi.spyOn(directorApi, "updateSettingsAuthority")
       .mockRejectedValueOnce(new ApiError("客户端 ID 无效", 422))
-      .mockImplementation(async (value) => value);
+      .mockImplementation(async (value) => runtimeAuthority(value));
 
     render(<App />);
     await waitUntilReady();
@@ -4474,23 +5408,21 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByText(file.name)).toBeInTheDocument();
   });
 
-  it("工作区快捷模型自动同步期间仍可打开设置，但阻断素材删除、compile 和生成", async () => {
+  it("工作区快捷模型项目 CAS 期间仍可打开设置，但阻断素材删除、compile 和生成", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "雾中推进";
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(project);
     vi.mocked(directorApi.listAssets).mockResolvedValue(appAssetList([imageAsset]));
-    const confirmed = structuredClone(CONFIGURED_SETTINGS);
-    confirmed.models.ref2va.filename = "alternate-diffusion.safetensors";
-    vi.mocked(directorApi.getSettingsAuthority)
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
-      .mockResolvedValue(runtimeAuthority(confirmed));
-    let resolvePut!: (settings: typeof confirmed) => void;
-    const update = vi.spyOn(directorApi, "updateSettings").mockImplementation(
-      () => new Promise((resolve) => { resolvePut = resolve; }),
-    );
+    const confirmed = structuredClone(project);
+    confirmed.model_stack.ref2va.filename = "alternate-diffusion.safetensors";
+    let resolvePut!: (authority: { document: typeof confirmed; revision: number }) => void;
+    const update = vi.mocked(directorApi.updateTimelineAuthority)
+      .mockImplementationOnce((_document, expectedRevision) => new Promise((resolve) => {
+        resolvePut = resolve;
+        expect(expectedRevision).toBe(0);
+      }));
     const compile = vi.spyOn(directorApi, "compileTimeline");
     const submit = vi.spyOn(directorApi, "createTimelineTask");
     const trash = vi.mocked(directorApi.trashAssets);
@@ -4516,16 +5448,16 @@ describe("统一长视频时间线应用", () => {
     expect(submit).not.toHaveBeenCalled();
     expect(trash).not.toHaveBeenCalled();
 
-    await act(async () => resolvePut(confirmed));
+    await act(async () => resolvePut({ document: confirmed, revision: 1 }));
     await waitFor(
       () => expect(screen.getByRole("button", { name: /生成任务/ })).toBeEnabled(),
       { timeout: 10_000 },
     );
     expect(update).toHaveBeenCalledWith(expect.objectContaining({
-      models: expect.objectContaining({
-        ref2va: expect.objectContaining({ filename: "alternate-diffusion.safetensors" }),
+      model_stack: expect.objectContaining({
+        ref2va: { filename: "alternate-diffusion.safetensors" },
       }),
-    }));
+    }), 0);
   });
 
   it("PUT 丢失响应但权威 GET 已确认目标设置时按成功收敛", async () => {
@@ -4539,7 +5471,7 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValue(runtimeAuthority(confirmed));
-    vi.spyOn(directorApi, "updateSettings").mockRejectedValue(new Error("PUT response lost"));
+    vi.spyOn(directorApi, "updateSettingsAuthority").mockRejectedValue(new Error("PUT response lost"));
 
     render(<App />);
     await waitUntilReady();
@@ -4547,7 +5479,7 @@ describe("统一长视频时间线应用", () => {
     const clientId = screen.getByLabelText("客户端 ID");
     await user.clear(clientId);
     await user.type(clientId, confirmed.client_id);
-    await waitFor(() => expect(directorApi.updateSettings).toHaveBeenCalled());
+    await waitFor(() => expect(directorApi.updateSettingsAuthority).toHaveBeenCalled());
     await waitFor(() => expect(directorApi.getSettingsAuthority).toHaveBeenCalledTimes(4));
     expect(clientId).toHaveValue(confirmed.client_id);
     expect(screen.queryByText("PUT response lost")).not.toBeInTheDocument();
@@ -4566,19 +5498,18 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockRejectedValueOnce(new Error("temporary GET failure"))
       .mockResolvedValue(runtimeAuthority(confirmed));
-    vi.spyOn(directorApi, "updateSettings").mockResolvedValue(confirmed);
+    vi.spyOn(directorApi, "updateSettingsAuthority")
+      .mockResolvedValue(runtimeAuthority(confirmed));
 
     render(<App />);
     await waitUntilReady();
     await user.click(screen.getByRole("button", { name: "系统设置" }));
-    expect(screen.getAllByRole("option", { name: "alternate-diffusion.safetensors" }).length).toBeGreaterThan(0);
     const clientId = screen.getByLabelText("客户端 ID");
     await user.clear(clientId);
     await user.type(clientId, confirmed.client_id);
-    await waitFor(() => expect(directorApi.updateSettings).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(directorApi.updateSettingsAuthority).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(directorApi.getSettingsAuthority).toHaveBeenCalledTimes(3), { timeout: 2000 });
     expect(screen.getByText("ComfyUI 在线")).toBeInTheDocument();
-    expect(screen.getAllByRole("option", { name: "alternate-diffusion.safetensors" }).length).toBeGreaterThan(0);
 
     await waitFor(() => expect(directorApi.getSettingsAuthority).toHaveBeenCalledTimes(5), { timeout: 3000 });
     await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
@@ -4599,7 +5530,8 @@ describe("统一长视频时间线应用", () => {
     vi.mocked(directorApi.getCapabilities)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveInitialCapabilities = resolve; }))
       .mockResolvedValue(ONLINE_CAPABILITIES);
-    const update = vi.spyOn(directorApi, "updateSettings").mockResolvedValue(confirmed);
+    const update = vi.spyOn(directorApi, "updateSettingsAuthority")
+      .mockResolvedValue(runtimeAuthority(confirmed));
 
     render(<App />);
     await user.click(screen.getByRole("button", { name: "系统设置" }));
@@ -4616,7 +5548,6 @@ describe("统一长视频时间线应用", () => {
       message: "迟到的旧读取",
     }));
     expect(screen.getByText("ComfyUI 在线")).toBeInTheDocument();
-    expect(screen.getAllByRole("option", { name: "alternate-diffusion.safetensors" }).length).toBeGreaterThan(0);
     await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
     await waitFor(() => expect(screen.getByRole("button", { name: /生成任务/ })).toBeEnabled());
   }, 8_000);
@@ -4628,7 +5559,7 @@ describe("统一长视频时间线应用", () => {
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockResolvedValueOnce(runtimeAuthority(CONFIGURED_SETTINGS))
       .mockRejectedValue(new Error("readback unavailable"));
-    const update = vi.spyOn(directorApi, "updateSettings")
+    const update = vi.spyOn(directorApi, "updateSettingsAuthority")
       .mockRejectedValue(new ApiError("客户端 ID 被服务器拒绝", 422));
 
     render(<App />);
@@ -4899,7 +5830,7 @@ describe("统一长视频时间线应用", () => {
         ...(importCreated ? [imported] : []),
       ],
     }));
-    vi.spyOn(directorApi, "importProject").mockImplementation(async () => {
+    vi.spyOn(directorApi, "saveHistoricalJobAsProject").mockImplementation(async () => {
       importCreated = true;
       return imported;
     });
@@ -4933,6 +5864,113 @@ describe("统一长视频时间线应用", () => {
         segment_ids: [second.id],
       }),
     ));
+  });
+
+  it("从历史任务只读 creative view 导出可移植 v5 配置，不触发另存", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.title = "历史任务创作配置";
+    project.model_stack.fl2va.filename = "historical-fl2va.safetensors";
+    mockCommonRequests();
+    vi.mocked(directorApi.listTasks).mockResolvedValue({ jobs: [succeededTask] });
+    const getTaskProject = vi.spyOn(directorApi, "getTaskProject").mockResolvedValue({
+      job_id: succeededTask.id,
+      project,
+      segment_ids: [project.segments[0].id],
+    });
+    const saveAs = vi.spyOn(directorApi, "saveHistoricalJobAsProject");
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "任务，0 个进行中" }));
+    await user.click(await screen.findByRole("button", { name: "任务 job-term 的更多操作" }));
+    await user.click(screen.getByRole("menuitem", { name: "导出配置" }));
+
+    await waitFor(() => expect(getTaskProject).toHaveBeenCalledWith(succeededTask.id));
+    await waitFor(() => expect(anchorClick).toHaveBeenCalledTimes(1));
+    expect(saveAs).not.toHaveBeenCalled();
+  });
+
+  it("项目工具通过 preflight 与显式 commit 导入 v5 JSON 后切换到新项目", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const importedDocument = createTimelineProject();
+    importedDocument.title = "显式导入项目";
+    const imported = {
+      id: "project-json-import",
+      title: importedDocument.title,
+      created_at: "2026-08-22T00:00:00Z",
+      updated_at: "2026-08-22T00:00:00Z",
+      segment_count: importedDocument.segments.length,
+    };
+    mockCommonRequests();
+    const digest = {
+      algorithm: "sha256-canonical-json-v1" as const,
+      value: `sha256-${"f".repeat(64)}`,
+    };
+    const preflightImport = vi.spyOn(directorApi, "preflightProjectImport")
+      .mockResolvedValue({
+        schema_version: 1,
+        status: "ready",
+        input_digest: digest,
+        proposed_document: importedDocument,
+        missing_context: [],
+        missing_model_bindings: [],
+        capability_issues: [],
+        commit_token: "i".repeat(64),
+        expires_at: "2026-08-22T01:00:00Z",
+      });
+    const commitImport = vi.spyOn(directorApi, "commitProjectImport")
+      .mockResolvedValue(imported);
+    // Reproduce the production visibility race: commit and the imported
+    // authority GET succeed, while the first project-list refresh still sees
+    // the pre-commit membership snapshot.
+    vi.mocked(directorApi.listProjects).mockImplementation(async () => ({
+      projects: [{
+        id: DEFAULT_PROJECT_ID,
+        title: "未命名长视频",
+        created_at: "2026-08-12T00:00:00Z",
+        updated_at: "2026-08-12T00:00:00Z",
+        segment_count: 1,
+      }],
+    }));
+    const getImportedAuthority = vi.mocked(directorApi.getProjectTimelineAuthority)
+      .mockResolvedValue({
+      document: importedDocument,
+      revision: 0,
+    });
+
+    render(<App />);
+    await waitUntilReady();
+    await user.upload(
+      screen.getByLabelText("选择项目 JSON 文件"),
+      new File([JSON.stringify(importedDocument)], "portable.json", {
+        type: "application/json",
+      }),
+    );
+    await waitFor(() => expect(preflightImport).toHaveBeenCalledWith({
+      title: importedDocument.title,
+      document: importedDocument,
+    }));
+    expect(commitImport).not.toHaveBeenCalled();
+    await user.click(await screen.findByRole("button", { name: "提交导入项目" }));
+
+    await waitFor(() => expect(commitImport).toHaveBeenCalledWith({
+      commit_token: "i".repeat(64),
+      input_digest: digest,
+    }));
+    await waitFor(() => expect(getImportedAuthority).toHaveBeenCalledWith(
+      imported.id,
+      undefined,
+    ));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "切换项目" }))
+      .toHaveValue(imported.id));
+    expect(screen.getByRole("option", { name: imported.title })).toBeInTheDocument();
+    expect(screen.getByRole("button", {
+      name: `重命名项目，当前名称：${importedDocument.title}`,
+    })).toBeInTheDocument();
   });
 
   it("批量取消超过服务端单批上限时按 100 个父任务安全分批", async () => {

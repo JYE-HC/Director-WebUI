@@ -10,8 +10,10 @@ import type {
   GenerationTask,
   TaskDiagnostic,
   TaskGenerationDetails,
+  TaskProjectSnapshotResponse,
   TaskStatus,
 } from "../api/types";
+import { downloadHistoricalProjectConfig } from "../domain/historicalProjectExport";
 import { MODE_META } from "../domain/modes";
 import {
   loadTimelineWorkspacePreferences,
@@ -95,6 +97,7 @@ export interface TaskDrawerProps {
   onDelete: (id: string) => void | Promise<void>;
   onClearCompleted: () => void | Promise<void>;
   onLoadProject?: (id: string) => void | Promise<void>;
+  onExportProjectConfig?: (id: string) => Promise<TaskProjectSnapshotResponse>;
   onExportDiagnostic?: (id: string) => Promise<TaskDiagnostic>;
   onLoadGenerationDetails?: (id: string) => Promise<TaskGenerationDetails>;
   onImportOutput?: (
@@ -837,6 +840,7 @@ export function TaskDrawer(props: TaskDrawerProps) {
     onDelete,
     onClearCompleted,
     onLoadProject,
+    onExportProjectConfig,
     onExportDiagnostic,
     onLoadGenerationDetails,
     onImportOutput,
@@ -1384,6 +1388,13 @@ export function TaskDrawer(props: TaskDrawerProps) {
             void onLoadProject?.(menuTask.id);
             setMenu(null);
           }}>另存为新项目</button>
+          <button type="button" role="menuitem" disabled={!onExportProjectConfig} onClick={() => {
+            const taskId = menuTask.id;
+            setMenu(null);
+            void onExportProjectConfig?.(taskId).then((snapshot) => {
+              downloadHistoricalProjectConfig(taskId, snapshot);
+            }).catch(() => undefined);
+          }}>导出配置</button>
           <button type="button" role="menuitem" disabled={!onLoadGenerationDetails} onClick={() => {
             modalReturnFocusRef.current = menuTriggerRef.current;
             openGenerationDetails(menuTask.id);

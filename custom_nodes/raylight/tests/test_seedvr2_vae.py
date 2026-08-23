@@ -12,10 +12,10 @@ RAYLIGHT_ROOT = Path(__file__).resolve().parents[1]
 COMFYUI_ROOT = Path(
     os.environ.get("COMFYUI_ROOT", str(RAYLIGHT_ROOT.parents[1]))
 ).expanduser().resolve()
-sys.path.insert(0, str(RAYLIGHT_ROOT))
+sys.path.insert(0, str(RAYLIGHT_ROOT / "src"))
 sys.path.insert(0, str(COMFYUI_ROOT))
 
-from src.raylight.distributed_worker.ray_worker_vae import (
+from directordeck_raylight.distributed_worker.ray_worker_vae import (
     ray_vae_decode_partial_impl,
     combine_dist_vae_partials,
     _get_upscale_func,
@@ -37,7 +37,7 @@ def test_load_vae_model_rejects_invalid_vae():
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "test.safetensors")
         comfy_utils.save_torch_file(state_dict, path)
-        from src.raylight.distributed_worker.ray_worker_vae import load_vae_model
+        from directordeck_raylight.distributed_worker.ray_worker_vae import load_vae_model
         try:
             vae = load_vae_model(path)
             assert False, "Expected RuntimeError for invalid VAE"
@@ -79,7 +79,7 @@ def test_load_vae_model_sets_chunked_io_flag():
 
 
 def test_normalize_seedvr2_latent_accepts_native_and_collapsed_layouts():
-    from src.raylight.distributed_worker.ray_worker_vae import normalize_seedvr2_latent
+    from directordeck_raylight.distributed_worker.ray_worker_vae import normalize_seedvr2_latent
 
     native_5d = torch.randn(2, 4, 8, 64, 64)
     result = normalize_seedvr2_latent(native_5d, 4)
@@ -91,7 +91,7 @@ def test_normalize_seedvr2_latent_accepts_native_and_collapsed_layouts():
 
 
 def test_seedvr2_spatial_tile_ranges_match_owned_tiler_edges():
-    from src.raylight.distributed_worker.ray_worker_vae import seedvr2_spatial_tile_ranges
+    from directordeck_raylight.distributed_worker.ray_worker_vae import seedvr2_spatial_tile_ranges
 
     ranges, overlap = seedvr2_spatial_tile_ranges(64, 64, 16, 4)
     assert len(ranges) > 0
@@ -102,7 +102,7 @@ def test_seedvr2_spatial_tile_ranges_match_owned_tiler_edges():
 
 
 def test_combine_seedvr2_partials_reconstructs_two_ranks_without_temporal_blending():
-    from src.raylight.distributed_worker.ray_worker_vae import combine_seedvr2_vae_partials
+    from directordeck_raylight.distributed_worker.ray_worker_vae import combine_seedvr2_vae_partials
 
     latent_h, latent_w = 8, 8
     spatial_scale = 8
@@ -164,7 +164,7 @@ def test_seedvr2_workers_keep_the_complete_temporal_sequence():
     with patch.object(model_management, "load_models_gpu", lambda *args, **kwargs: None), patch.object(
         model_management, "cuda_device_context", lambda device: nullcontext()
     ):
-        from src.raylight.distributed_worker.ray_worker_vae import ray_seedvr2_vae_decode_partial_impl, combine_seedvr2_vae_partials
+        from directordeck_raylight.distributed_worker.ray_worker_vae import ray_seedvr2_vae_decode_partial_impl, combine_seedvr2_vae_partials
         partials = [
             ray_seedvr2_vae_decode_partial_impl(worker, samples, tile_size=8, overlap=4, job_rank=rank, job_world_size=2)
             for rank in range(2)
@@ -985,7 +985,7 @@ def test_out_of_bounds_tile_rejected():
 
 
 def test_feather_gte_tile_extent_yields_all_ones():
-    from src.raylight.distributed_worker.ray_worker_vae import _linear_feather
+    from directordeck_raylight.distributed_worker.ray_worker_vae import _linear_feather
 
     tile_size = 32
     feather = 32  # feather >= tile extent

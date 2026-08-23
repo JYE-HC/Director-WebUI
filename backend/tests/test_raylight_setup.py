@@ -168,10 +168,21 @@ async def test_setup_install_and_cancel_flow(
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("# fake\n")
     client.director_app.state.raylight_requirements_path = requirements
-    _patch_command(
-        monkeypatch,
-        [sys.executable, "-c", "import time; time.sleep(30)"],
-    )
+    async def cancellable_install(
+        manager: RayLightInstallManager,
+        _command: list[str],
+    ) -> None:
+        # The manager tests above cover real subprocess termination, including
+        # the pre-spawn race.  Keep this endpoint test focused on API
+        # single-flight/cancel delegation; some sandbox child watchers can
+        # observe SIGTERM yet never wake Process.wait().
+        while not manager._cancel_requested:
+            await asyncio.sleep(0)
+        manager.returncode = -15
+        manager.state = "idle"
+        manager._append("install cancelled by user")
+
+    monkeypatch.setattr(RayLightInstallManager, "_execute", cancellable_install)
     started = await client.post("/api/raylight/setup/install")
     assert started.status_code == 200, started.text
     assert started.json()["state"] == "running"

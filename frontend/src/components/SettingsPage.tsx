@@ -1,36 +1,56 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { directorApi } from "../api/client";
 import {
-  rayLightResidencyPolicyAfterBindingChange,
+  normalizeLoraLoaderOverrides,
   resolveExecutionBackend,
   type CapabilityReport,
   type ConnectionTestResult,
   type DeviceTarget,
-  type DiffusionModelBinding,
+  type DirectorDeckConfig,
+  type FeatureCatalog,
+  type FeatureCapabilityEvaluation,
   type GPUResource,
+  type LoraLoaderAdapterId,
+  type LoraLoaderOverrideRecord,
   type MediaToolsStatus,
   type ModelInventory,
   type ModelRole,
   type RayLightProfile,
-  type RayLightInstallSnapshot,
   type RayLightRuntimeStatus,
   type RayLightSetupStatus,
   type RuntimeSettings,
-  type StandardLoraLoader,
   type StorageConfiguration,
 } from "../api/types";
-import {
-  TIMELINE_MODE_META,
-  TIMELINE_MODE_ORDER,
-} from "../domain/timelineProject";
+import type { LoraLoaderOverrideEdit } from "../state/loraLoaderOverrides";
 import type { UiTheme } from "../domain/theme";
-import { DeferredNumberInput, Field, formatBytes, Panel, Spinner, StatusDot } from "./ui";
+import { Field, formatBytes, Panel, Spinner, StatusDot } from "./ui";
 
 function sameSettings(left: RuntimeSettings, right: RuntimeSettings): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
 const HIDDEN_PATH_VALUE = "••••••••••••••••";
+
+interface LoraLoaderMappingDraft {
+  lora_filename: string;
+  adapter_id: LoraLoaderAdapterId | "";
+  options: Record<string, boolean>;
+}
+
+interface LoraLoaderChoice {
+  adapter_id: LoraLoaderAdapterId;
+  display_name: string;
+  class_type: string;
+  is_default: boolean;
+  configuration_options: DirectorDeckConfig["lora"]["loaders"][number]["options"];
+  capability: FeatureCapabilityEvaluation | null;
+}
+
+const EMPTY_LORA_LOADER_MAPPING_DRAFT: LoraLoaderMappingDraft = {
+  lora_filename: "",
+  adapter_id: "",
+  options: {},
+};
 
 function VisibilityToggle({
   label,
@@ -72,14 +92,9 @@ const MODEL_META: Record<ModelRole, { label: string; description: string; allowC
   audio_vae: { label: "音频 VAE", description: "共享音频编码与解码", allowCpu: false },
 };
 
-const STANDARD_LORA_LOADER_LABELS: Record<StandardLoraLoader, string> = {
-  dedicated: "MiniMax H3 专用",
-  bypass_model_only: "量化旁路 Model Only",
-  model_only: "ComfyUI 通用 Model Only",
-};
-
 export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[] {
   const errors: string[] = [];
+  if (settings.schema_version !== 3) errors.push("运行设置 schema 必须为 v3");
   if (!/^[A-Za-z0-9._:-]{1,128}$/.test(settings.client_id))
     errors.push("客户端 ID 只能包含字母、数字、点、下划线、冒号和连字符");
   if (settings.memory_policy !== "keep_resident")
@@ -89,31 +104,20 @@ export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[]
     "keep_until_switch",
   ].includes(settings.raylight_residency_policy))
     errors.push("RayLight 显存驻留策略无效");
-  for (const [role, binding] of Object.entries(settings.models) as [ModelRole, RuntimeSettings["models"][ModelRole]][]) {
-    if (!binding.filename || binding.filename.length > 1024)
-      errors.push(`${MODEL_META[role].label}必须选择有效模型文件`);
+  const placements = {
+    fl2va: settings.placement.fl2va,
+    ref2va: settings.placement.ref2va,
+    clip: { device: settings.placement.clip_device },
+    video_vae: { device: settings.placement.video_vae_device },
+    audio_vae: { device: settings.placement.audio_vae_device },
+  };
+  for (const [role, binding] of Object.entries(placements) as [ModelRole, (typeof placements)[ModelRole]][]) {
     if (!/^(default|cpu|gpu:(0|[1-9][0-9]*))$/.test(binding.device))
       errors.push(`${MODEL_META[role].label}设备值无效`);
     if (!MODEL_META[role].allowCpu && binding.device === "cpu")
       errors.push(`${MODEL_META[role].label}不允许放在 CPU`);
     if (role === "fl2va" || role === "ref2va") {
-      const diffusion = binding as DiffusionModelBinding;
-      if (diffusion.lora_name !== null && (!diffusion.lora_name || diffusion.lora_name.length > 1024))
-        errors.push(`${MODEL_META[role].label}的 LoRA 文件无效`);
-      if (!Number.isFinite(diffusion.lora_strength) || diffusion.lora_strength < -10 || diffusion.lora_strength > 10)
-        errors.push(`${MODEL_META[role].label}的 LoRA 强度必须在 -10–10 之间`);
-      if (diffusion.lora_loader !== "auto" || diffusion.lora_low_vram)
-        errors.push(`${MODEL_META[role].label}的 LoRA 加载方式必须由系统自动选择`);
-      const override = diffusion.standard_lora_loader_override;
-      if (override !== null && (
-        !["dedicated", "bypass_model_only", "model_only"].includes(String(override.loader)) ||
-        diffusion.lora_name === null ||
-        override.lora_name !== diffusion.lora_name ||
-        override.model_filename !== diffusion.filename ||
-        resolveExecutionBackend(diffusion) !== "standard"
-      )) errors.push(`${MODEL_META[role].label}的 Standard LoRA 加载器覆盖与底模或 LoRA 不匹配`);
-      if (diffusion.backend !== "auto")
-        errors.push(`${MODEL_META[role].label}的执行后端必须由逻辑 GPU 池自动选择`);
+      const diffusion = binding as RuntimeSettings["placement"]["fl2va"];
       const raylight = diffusion.raylight;
       if (
         !Array.isArray(raylight.gpu_select) ||
@@ -141,13 +145,23 @@ export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[]
         errors.push(`${MODEL_META[role].label}使用 RayLight 时标准执行设备必须为 default`);
     }
   }
+  const overrides = settings.lora_loader_overrides;
+  const normalizedOverrides = normalizeLoraLoaderOverrides(overrides);
+  if (
+    overrides.length > 256 ||
+    normalizedOverrides.length !== overrides.length ||
+    normalizedOverrides.some((record, index) =>
+      JSON.stringify(record) !== JSON.stringify(overrides[index]))
+  ) errors.push("Standard LoRA 精确加载器映射无效");
   return errors;
 }
 
-export function SettingsPage({ settings, confirmedSettings = settings, resourcesReady = false, capabilities, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, overlay = false, theme = "dark", onThemeChange = () => undefined, onDraftChange = () => undefined, onSaved, onConnectionTestSucceeded = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
+export function SettingsPage({ settings, confirmedSettings = settings, resourcesReady = false, capabilities, featureCatalog = null, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, overlay = false, theme = "dark", onThemeChange = () => undefined, onDraftChange = () => undefined, onSaved, onSaveLoraLoaderOverride, onConnectionTestSucceeded = () => undefined, onHostCapabilitiesChanged = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
   settings: RuntimeSettings; confirmedSettings?: RuntimeSettings; capabilities: CapabilityReport; gpus: GPUResource[];
   /** True once App has confirmed the four runtime resources against the host. */
   resourcesReady?: boolean;
+  /** Last host-revision-verified feature catalog; null means adapter editing is unavailable. */
+  featureCatalog?: FeatureCatalog | null;
   models: ModelInventory;
   rayLightRuntimeStatus?: RayLightRuntimeStatus | null;
   rayLightRecoveryPending?: boolean;
@@ -163,8 +177,12 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   onRequestClose?: (restoreFocus?: boolean) => void;
   /** App-owned whole-document write followed by its authoritative runtime GET. */
   onSaved: (settings: RuntimeSettings) => Promise<RuntimeSettings>;
+  /** App-owned exact mapping CAS with a single binding-safe rebase. */
+  onSaveLoraLoaderOverride: (edit: LoraLoaderOverrideEdit) => Promise<RuntimeSettings>;
   /** App re-reads capabilities/GPU/models after a successful host probe. */
   onConnectionTestSucceeded?: () => void;
+  /** A completed install changed the live host snapshot and catalog identity. */
+  onHostCapabilitiesChanged?: () => void;
   /** App-owned explicit restart certificate followed by authoritative refresh. */
   onConfirmRayLightRuntimeRecovery?: () => Promise<void>;
 }) {
@@ -180,11 +198,25 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   const [storageConfiguration, setStorageConfiguration] = useState<StorageConfiguration | null>(null);
   const [currentDatabaseVisible, setCurrentDatabaseVisible] = useState(false);
   const [storageLoading, setStorageLoading] = useState(true);
+  const [mappingDraft, setMappingDraft] = useState<LoraLoaderMappingDraft>(
+    EMPTY_LORA_LOADER_MAPPING_DRAFT,
+  );
+  const [mappingOriginal, setMappingOriginal] = useState<LoraLoaderOverrideRecord | null>(null);
+  const [mappingEditBase, setMappingEditBase] = useState<RuntimeSettings>(
+    () => structuredClone(confirmedSettings),
+  );
+  const [mappingEditing, setMappingEditing] = useState(false);
+  const [mappingBusy, setMappingBusy] = useState(false);
+  const [productConfig, setProductConfig] = useState<DirectorDeckConfig | null>(null);
+  const [productConfigError, setProductConfigError] = useState<string | null>(null);
   const editRevision = useRef(0);
   const workingRef = useRef(working);
   const confirmedRef = useRef(structuredClone(confirmedSettings));
   const hasLocalChanges = useRef(false);
   const onSavedRef = useRef(onSaved);
+  const onHostCapabilitiesChangedRef = useRef(onHostCapabilitiesChanged);
+  const rayLightInstallWasRunningRef = useRef(false);
+  const ffmpegInstallWasRunningRef = useRef(false);
   const mountedRef = useRef(true);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const connectionStatusRef = useRef<HTMLDivElement>(null);
@@ -196,13 +228,141 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   const runtimeResourcesReady = !effectiveRuntimeEditingDisabled && capabilities.connection === "online" &&
     resourcesReady;
   const currentRayLightRuntimeStatus = resourcesReady ? rayLightRuntimeStatus : null;
-  const diffusionModels = [...new Set([...models.fl2va, ...models.ref2va])].sort();
   const rayLightFamilies = (["fl2va", "ref2va"] as const)
-    .filter((role) => resolveExecutionBackend(working.models[role]) === "raylight")
+    .filter((role) => resolveExecutionBackend(working.placement[role]) === "raylight")
     .map((role) => role === "fl2va" ? "FL2VA" : "Ref2VA");
+  const mappingAuthorityBlocked = effectiveRuntimeEditingDisabled || mappingBusy ||
+    !sameSettings(working, confirmedRef.current);
+  const observedLoraAdapters = featureCatalog?.entries.find((entry) =>
+    entry.id === "lora")?.adapter_options ?? [];
+  const allStandardLoraAdapterOptions = useMemo<LoraLoaderChoice[]>(() => {
+    if (productConfig) {
+      return productConfig.lora.loaders.map((loader) => ({
+        adapter_id: loader.id,
+        display_name: loader.display_name,
+        class_type: loader.class_type,
+        is_default: loader.id === productConfig.lora.fallback_policy.default_loader_id,
+        configuration_options: loader.options,
+        capability: observedLoraAdapters.find((option) =>
+          option.adapter_id === loader.id)?.capability ?? null,
+      }));
+    }
+    return observedLoraAdapters
+      .filter((option) => option.backend === "standard")
+      .map((option) => ({
+        adapter_id: option.adapter_id,
+        display_name: option.display_name,
+        class_type: option.class_type,
+        is_default: option.is_default,
+        configuration_options: option.configuration_options,
+        capability: option.capability,
+      }));
+  }, [observedLoraAdapters, productConfig]);
+  const compiledLoraLoaderPolicies = useMemo(() => (
+    productConfig?.lora.loader_policies.map((policy) => ({
+      policy,
+      expression: new RegExp(policy.lora_filename),
+    })) ?? []
+  ), [productConfig]);
+  const loraLoaderPolicyFor = useCallback((loraFilename: string) => (
+    compiledLoraLoaderPolicies.find(({ expression }) =>
+      expression.test(loraFilename))?.policy ??
+      productConfig?.lora.fallback_policy ?? null
+  ), [compiledLoraLoaderPolicies, productConfig]);
+  const loraLoaderOptionsFor = useCallback((loraFilename: string) => {
+    const policy = loraLoaderPolicyFor(loraFilename);
+    if (!policy) return allStandardLoraAdapterOptions;
+    const allowed = new Set(policy.loader_ids);
+    return allStandardLoraAdapterOptions.filter((option) =>
+      allowed.has(option.adapter_id));
+  }, [allStandardLoraAdapterOptions, loraLoaderPolicyFor]);
+  const defaultLoraAdapterFor = useCallback((loraFilename: string) => {
+    const policy = loraLoaderPolicyFor(loraFilename);
+    const defaultId = policy?.default_loader_id ??
+      productConfig?.lora.fallback_policy.default_loader_id;
+    return allStandardLoraAdapterOptions.find((option) =>
+      option.adapter_id === defaultId) ??
+      allStandardLoraAdapterOptions.find((option) => option.is_default);
+  }, [allStandardLoraAdapterOptions, loraLoaderPolicyFor, productConfig]);
+  const standardLoraAdapterOptions = loraLoaderOptionsFor(
+    mappingDraft.lora_filename,
+  );
+  const defaultLoraAdapterOption = standardLoraAdapterOptions.find((option) =>
+    option.adapter_id === defaultLoraAdapterFor(
+      mappingDraft.lora_filename,
+    )?.adapter_id);
+  const selectedLoraAdapterOption = allStandardLoraAdapterOptions.find((option) =>
+    option.adapter_id === mappingDraft.adapter_id);
+  const selectedLoraPolicy = loraLoaderPolicyFor(mappingDraft.lora_filename);
+  const selectedLoraAdapterAllowed = !mappingDraft.adapter_id ||
+    selectedLoraPolicy === null ||
+    selectedLoraPolicy.loader_ids.includes(mappingDraft.adapter_id);
 
   onSavedRef.current = onSaved;
+  onHostCapabilitiesChangedRef.current = onHostCapabilitiesChanged;
   workingRef.current = working;
+
+  useEffect(() => {
+    if (mappingBusy || mappingEditing) return;
+    const currentFilename = mappingDraft.lora_filename;
+    const loraFilename = currentFilename && models.loras.includes(currentFilename)
+      ? currentFilename
+      : models.loras[0] ?? "";
+    if (!loraFilename) return;
+    const original = confirmedSettings.lora_loader_overrides.find((record) =>
+      record.lora_filename === loraFilename) ?? null;
+    const adapterId = original?.adapter_id ??
+      defaultLoraAdapterFor(loraFilename)?.adapter_id ?? "";
+    const adapter = allStandardLoraAdapterOptions.find((option) =>
+      option.adapter_id === adapterId);
+    const options = Object.fromEntries((adapter?.configuration_options ?? []).map(
+      (definition) => [
+        definition.id,
+        original?.options[definition.id] ?? definition.default,
+      ],
+    ));
+    if (
+      mappingDraft.lora_filename === loraFilename &&
+      mappingDraft.adapter_id === adapterId &&
+      JSON.stringify(mappingDraft.options) === JSON.stringify(options) &&
+      JSON.stringify(mappingOriginal) === JSON.stringify(original)
+    ) return;
+    setMappingEditBase(structuredClone(confirmedSettings));
+    setMappingOriginal(original ? { ...original, options: { ...original.options } } : null);
+    setMappingDraft({
+      lora_filename: loraFilename,
+      adapter_id: adapterId,
+      options,
+    });
+    setMappingEditing(false);
+  }, [
+    allStandardLoraAdapterOptions,
+    confirmedSettings,
+    defaultLoraAdapterFor,
+    mappingBusy,
+    mappingDraft,
+    mappingEditing,
+    mappingOriginal,
+    models.loras,
+  ]);
+
+  const acceptRayLightSetup = useCallback((status: RayLightSetupStatus) => {
+    const wasRunning = rayLightInstallWasRunningRef.current;
+    rayLightInstallWasRunningRef.current = status.install.state === "running";
+    setRayLightSetup(status);
+    if (wasRunning && (
+      status.install.state === "needs_restart" || status.dependencies_installed
+    )) onHostCapabilitiesChangedRef.current();
+  }, []);
+
+  const acceptMediaSetup = useCallback((status: MediaToolsStatus) => {
+    const wasRunning = ffmpegInstallWasRunningRef.current;
+    ffmpegInstallWasRunningRef.current = status.install.state === "running";
+    setMediaSetup(status);
+    if (wasRunning && (
+      status.install.state === "ready" || status.ready
+    )) onHostCapabilitiesChangedRef.current();
+  }, []);
 
   const requestClose = useCallback((restoreFocus = true) => {
     if (!onRequestClose) return;
@@ -235,6 +395,25 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     void loadStorageConfiguration(controller.signal);
     return () => controller.abort();
   }, [loadStorageConfiguration]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void directorApi.getDirectorDeckConfig(controller.signal)
+      .then((config) => {
+        if (!controller.signal.aborted) {
+          setProductConfig(config);
+          setProductConfigError(null);
+        }
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setProductConfigError(
+            reason instanceof Error ? reason.message : "无法读取加载器清单",
+          );
+        }
+      });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     if (
@@ -345,27 +524,141 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     });
   };
 
+  const mappingOptionsFor = (
+    adapterId: string,
+    values: Record<string, boolean> = {},
+  ): Record<string, boolean> => {
+    const adapter = allStandardLoraAdapterOptions.find((option) =>
+      option.adapter_id === adapterId);
+    if (!adapter) return {};
+    return Object.fromEntries(adapter.configuration_options.map((definition) => [
+      definition.id,
+      values[definition.id] ?? definition.default,
+    ]));
+  };
+
+  const beginMappingEdit = (loraFilename: string) => {
+    if (effectiveRuntimeEditingDisabled || mappingBusy) return;
+    const original = confirmedRef.current.lora_loader_overrides.find((record) =>
+      record.lora_filename === loraFilename) ?? null;
+    const adapterId = original?.adapter_id ??
+      defaultLoraAdapterFor(loraFilename)?.adapter_id ?? "";
+    setMappingEditBase(structuredClone(confirmedRef.current));
+    setMappingOriginal(original ? { ...original, options: { ...original.options } } : null);
+    setMappingDraft({
+      lora_filename: loraFilename,
+      adapter_id: adapterId,
+      options: mappingOptionsFor(adapterId, original?.options),
+    });
+    setMappingEditing(false);
+    setMessage(null);
+  };
+
+  const updateMappingDraft = (patch: Partial<LoraLoaderMappingDraft>) => {
+    if (effectiveRuntimeEditingDisabled || mappingBusy) return;
+    if (!mappingEditing) {
+      setMappingEditBase(structuredClone(confirmedRef.current));
+      setMappingEditing(true);
+    }
+    setMappingDraft((current) => ({ ...current, ...patch }));
+    setMessage(null);
+  };
+
+  const acceptMappingAuthority = (confirmed: RuntimeSettings) => {
+    const selectedFilename = mappingDraft.lora_filename;
+    const next = structuredClone(confirmed);
+    confirmedRef.current = next;
+    workingRef.current = structuredClone(next);
+    hasLocalChanges.current = false;
+    setWorking(structuredClone(next));
+    onDraftChange(structuredClone(next));
+    const original = next.lora_loader_overrides.find((record) =>
+      record.lora_filename === selectedFilename) ?? null;
+    const adapterId = original?.adapter_id ??
+      defaultLoraAdapterFor(selectedFilename)?.adapter_id ?? "";
+    setMappingOriginal(original ? { ...original, options: { ...original.options } } : null);
+    setMappingDraft({
+      lora_filename: selectedFilename,
+      adapter_id: adapterId,
+      options: mappingOptionsFor(adapterId, original?.options),
+    });
+    setMappingEditing(false);
+  };
+
+  const saveMapping = async () => {
+    if (
+      !mappingEditing || mappingBusy || effectiveRuntimeEditingDisabled ||
+      !mappingDraft.lora_filename ||
+      !mappingDraft.adapter_id || !selectedLoraAdapterOption
+    ) return;
+    const next: LoraLoaderOverrideRecord = {
+      lora_filename: mappingDraft.lora_filename,
+      adapter_id: mappingDraft.adapter_id,
+      options: mappingOptionsFor(mappingDraft.adapter_id, mappingDraft.options),
+    };
+    setMappingBusy(true);
+    setMessage(null);
+    try {
+      const confirmed = await onSaveLoraLoaderOverride({
+        base_settings: structuredClone(mappingEditBase),
+        original: mappingOriginal
+          ? { ...mappingOriginal, options: { ...mappingOriginal.options } }
+          : null,
+        next,
+      });
+      if (!mountedRef.current) return;
+      acceptMappingAuthority(confirmed);
+    } catch (reason) {
+      if (mountedRef.current) {
+        setMessage(reason instanceof Error ? reason.message : "LoRA 加载器映射保存失败");
+      }
+    } finally {
+      if (mountedRef.current) setMappingBusy(false);
+    }
+  };
+
+  const restoreMappingDefault = async (record: LoraLoaderOverrideRecord) => {
+    if (mappingBusy || effectiveRuntimeEditingDisabled) return;
+    setMappingBusy(true);
+    setMessage(null);
+    try {
+      const confirmed = await onSaveLoraLoaderOverride({
+        base_settings: structuredClone(confirmedRef.current),
+        original: { ...record, options: { ...record.options } },
+        next: null,
+      });
+      if (!mountedRef.current) return;
+      acceptMappingAuthority(confirmed);
+    } catch (reason) {
+      if (mountedRef.current) {
+        setMessage(reason instanceof Error ? reason.message : "恢复系统默认映射失败");
+      }
+    } finally {
+      if (mountedRef.current) setMappingBusy(false);
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     void directorApi.getRayLightSetup().then((status) => {
-      if (!cancelled) setRayLightSetup(status);
+      if (!cancelled) acceptRayLightSetup(status);
     }).catch(() => {
       if (!cancelled) setRayLightSetup(null);
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [acceptRayLightSetup]);
 
   useEffect(() => {
     if (rayLightSetup?.install.state !== "running") return;
     const timer = window.setTimeout(() => {
       void directorApi.getRayLightSetup().then((status) => {
-        if (mountedRef.current) setRayLightSetup(status);
+        if (mountedRef.current) acceptRayLightSetup(status);
       }).catch(() => undefined);
     }, 1500);
     return () => window.clearTimeout(timer);
-  }, [rayLightSetup]);
+  }, [acceptRayLightSetup, rayLightSetup]);
 
   const startRayLightInstall = async () => {
     const confirmed = window.confirm(
@@ -376,8 +669,11 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     if (!confirmed) return;
     setRayLightInstallBusy(true);
     try {
-      await directorApi.installRayLight();
-      setRayLightSetup(await directorApi.getRayLightSetup());
+      const started = await directorApi.installRayLight();
+      if (started.state === "running" || started.state === "needs_restart") {
+        rayLightInstallWasRunningRef.current = true;
+      }
+      acceptRayLightSetup(await directorApi.getRayLightSetup());
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : "多卡组件安装启动失败");
     } finally {
@@ -388,7 +684,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   const cancelRayLightInstall = async () => {
     try {
       await directorApi.cancelRayLightInstall();
-      setRayLightSetup(await directorApi.getRayLightSetup());
+      acceptRayLightSetup(await directorApi.getRayLightSetup());
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : "取消安装失败");
     }
@@ -397,24 +693,24 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   useEffect(() => {
     let cancelled = false;
     void directorApi.getMediaSetup().then((status) => {
-      if (!cancelled) setMediaSetup(status);
+      if (!cancelled) acceptMediaSetup(status);
     }).catch(() => {
       if (!cancelled) setMediaSetup(null);
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [acceptMediaSetup]);
 
   useEffect(() => {
     if (mediaSetup?.install.state !== "running") return;
     const timer = window.setTimeout(() => {
       void directorApi.getMediaSetup().then((status) => {
-        if (mountedRef.current) setMediaSetup(status);
+        if (mountedRef.current) acceptMediaSetup(status);
       }).catch(() => undefined);
     }, 1500);
     return () => window.clearTimeout(timer);
-  }, [mediaSetup]);
+  }, [acceptMediaSetup, mediaSetup]);
 
   const startFfmpegInstall = async () => {
     const confirmed = window.confirm(
@@ -425,8 +721,11 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     if (!confirmed) return;
     setFfmpegInstallBusy(true);
     try {
-      await directorApi.installFfmpeg();
-      setMediaSetup(await directorApi.getMediaSetup());
+      const started = await directorApi.installFfmpeg();
+      if (started.state === "running" || started.state === "ready") {
+        ffmpegInstallWasRunningRef.current = true;
+      }
+      acceptMediaSetup(await directorApi.getMediaSetup());
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : "ffmpeg 安装启动失败");
     } finally {
@@ -437,7 +736,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   const cancelFfmpegInstall = async () => {
     try {
       await directorApi.cancelFfmpegInstall();
-      setMediaSetup(await directorApi.getMediaSetup());
+      acceptMediaSetup(await directorApi.getMediaSetup());
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : "取消安装失败");
     }
@@ -486,50 +785,47 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
       rayLightRecoveryRequestRef.current = false;
     }
   };
-  const setModel = (role: ModelRole, key: "filename" | "device", value: string) => {
-    if (key === "device" && !MODEL_META[role].allowCpu && value === "cpu") return;
-    const current = working.models[role];
-    const next = {
-      ...current,
-      [key]: value,
-      ...(key === "filename" && (role === "fl2va" || role === "ref2va")
-        ? { standard_lora_loader_override: null }
-        : {}),
-    };
-    change({ ...working, models: { ...working.models, [role]: next } });
+  const setPlacementDevice = (role: ModelRole, value: DeviceTarget) => {
+    if (!MODEL_META[role].allowCpu && value === "cpu") return;
+    if (role === "fl2va" || role === "ref2va") {
+      const current = working.placement[role];
+      if (resolveExecutionBackend(current) === "raylight" && value !== "default") return;
+      change({
+        ...working,
+        placement: {
+          ...working.placement,
+          [role]: { ...current, device: value },
+        },
+      });
+      return;
+    }
+    const key = `${role}_device` as "clip_device" | "video_vae_device" | "audio_vae_device";
+    change({ ...working, placement: { ...working.placement, [key]: value } });
   };
-  const setDiffusion = (
+  const setDiffusionPlacement = (
     role: "fl2va" | "ref2va",
-    patch: Partial<DiffusionModelBinding>,
+    patch: Partial<RuntimeSettings["placement"]["fl2va"]>,
   ) => {
-    const currentBinding = working.models[role];
-    const selectedArtifactChanged =
-      ("lora_name" in patch && patch.lora_name !== currentBinding.lora_name) ||
-      ("filename" in patch && patch.filename !== currentBinding.filename);
-    const nextBinding = {
-      ...currentBinding,
-      ...patch,
-      ...(selectedArtifactChanged ? { standard_lora_loader_override: null } : {}),
-    };
-    const nextResidencyPolicy = rayLightResidencyPolicyAfterBindingChange(
-      working,
-      role,
-      nextBinding,
-    );
-    if (nextResidencyPolicy !== working.raylight_residency_policy) {
+    const currentPlacement = working.placement[role];
+    const nextPlacement = { ...currentPlacement, ...patch };
+    const switchedToRayLight =
+      resolveExecutionBackend(currentPlacement) === "standard" &&
+      resolveExecutionBackend(nextPlacement) === "raylight";
+    const nextResidencyPolicy = switchedToRayLight && working.raylight_residency_policy === "release_after_sampling"
+      ? "keep_until_switch"
+      : working.raylight_residency_policy;
+    if (switchedToRayLight) {
       const label = role === "fl2va" ? "FL2VA" : "Ref2VA";
       setResidencyNotice(
-        nextResidencyPolicy === "release_after_sampling"
-          ? `${label} 使用 RayLight，但会在每次采样后释放。`
-          : `${label} 已切换为 RayLight，已自动选择“按运行配置常驻”。同一配置直接复用；切换模型族、模型、LoRA、GPU 池、拓扑或 Standard 时由 Director 先安全释放旧池。`,
+        `${label} 已切换为 RayLight，已自动选择“按运行配置常驻”。切换运行拓扑时由 Director 先安全释放旧池。`,
       );
     }
     change({
       ...working,
       raylight_residency_policy: nextResidencyPolicy,
-      models: {
-        ...working.models,
-        [role]: nextBinding,
+      placement: {
+        ...working.placement,
+        [role]: nextPlacement,
       },
     });
   };
@@ -542,17 +838,9 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
       cpu_offload: raylight.fsdp ? raylight.cpu_offload : false,
     };
     const resolvesToRayLight = normalizedRayLight.gpu_select.length >= 2;
-    setDiffusion(role, {
-      backend: "auto",
+    setDiffusionPlacement(role, {
       raylight: normalizedRayLight,
-      ...(resolvesToRayLight
-        ? {
-            device: "default" as const,
-            lora_low_vram: false,
-            lora_loader: "auto" as const,
-            standard_lora_loader_override: null,
-          }
-        : {}),
+      ...(resolvesToRayLight ? { device: "default" as const } : {}),
     });
   };
   const setMultiGpuEnabled = (enabled: boolean) => {
@@ -567,22 +855,22 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     change({
       ...working,
       multi_gpu_enabled: false,
-      models: {
-        ...working.models,
+      placement: {
+        ...working.placement,
         fl2va: {
-          ...working.models.fl2va,
+          ...working.placement.fl2va,
           raylight: {
-            ...working.models.fl2va.raylight,
-            gpu_select: [working.models.fl2va.raylight.gpu_select[0] ?? 0],
+            ...working.placement.fl2va.raylight,
+            gpu_select: [working.placement.fl2va.raylight.gpu_select[0] ?? 0],
             ulysses_degree: 1,
             ring_degree: 1,
           },
         },
         ref2va: {
-          ...working.models.ref2va,
+          ...working.placement.ref2va,
           raylight: {
-            ...working.models.ref2va.raylight,
-            gpu_select: [working.models.ref2va.raylight.gpu_select[0] ?? 0],
+            ...working.placement.ref2va.raylight,
+            gpu_select: [working.placement.ref2va.raylight.gpu_select[0] ?? 0],
             ulysses_degree: 1,
             ring_degree: 1,
           },
@@ -595,7 +883,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     index: number,
     selected: boolean,
   ) => {
-    const current = working.models[role].raylight;
+    const current = working.placement[role].raylight;
     const nextPool = selected
       ? [...new Set([...current.gpu_select, index])].sort((left, right) => left - right)
       : current.gpu_select.filter((candidate) => candidate !== index);
@@ -615,7 +903,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     axis: "ulysses_degree" | "ring_degree",
     value: number,
   ) => {
-    const current = working.models[role].raylight;
+    const current = working.placement[role].raylight;
     const other = current.gpu_select.length / value;
     if (!Number.isInteger(other)) return;
     setRayLight(role, {
@@ -714,7 +1002,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
               <div className="fixed-runtime-value" aria-label="片段间显存策略"><strong>Standard 稳定 loader 复用</strong><small>原生分段子任务固定策略</small></div>
             </Field>
             <Field label="RayLight 驻留" hint={working.raylight_residency_policy === "keep_until_switch"
-              ? "family、模型、LoRA、GPU 池和拓扑完全一致时复用 CUDA 权重；任一项变化会先运行 RayKill 安全屏障并重建 Ray 池，切到 Standard 也一样。无需重启 ComfyUI。"
+              ? "family、模型、LoRA、GPU 池和拓扑完全一致时复用 CUDA 权重；任一项变化会先运行 RayLight 清理屏障并重建 Ray 池，切到 Standard 也一样。无需重启 ComfyUI。"
               : "每次 Ray 采样结束后卸载 worker CUDA 权重，下一次任务必须重新加载。"}>
               <select
                 aria-label="RayLight 显存驻留策略"
@@ -769,30 +1057,144 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
               <details className="raylight-setup-log"><summary>安装日志</summary><pre>{rayLightSetup.install.log_tail.join("\n")}</pre></details>
             )}
           </Panel>
-          <Panel eyebrow="模型" title="模型与运行设备" description="模型和设备修改会自动应用。VAE 只允许 default 或 GPU。" action={loadingModels ? <Spinner label="读取模型" /> : undefined}>
+          <Panel eyebrow="宿主知识" title="Standard LoRA 加载器映射" description="为 LoRA 选择当前版本允许的加载器。">
+            {models.loras.length === 0
+              ? <div className="notice" role="status">当前 ComfyUI 没有可选 LoRA 文件。</div>
+              : <div className="lora-loader-mapping-workbench">
+                <section className="lora-loader-choice-panel" aria-label="LoRA 列表区域">
+                  <header><strong>LoRA 列表</strong><small>{models.loras.length} 个</small></header>
+                  <div className="lora-loader-choice-list" role="listbox" aria-label="LoRA 列表">
+                    {models.loras.map((filename) => {
+                      const override = working.lora_loader_overrides.find((record) =>
+                        record.lora_filename === filename);
+                      const loader = allStandardLoraAdapterOptions.find((option) =>
+                        option.adapter_id === override?.adapter_id) ??
+                        defaultLoraAdapterFor(filename);
+                      const overrideAllowed = !override ||
+                        (loraLoaderPolicyFor(filename)?.loader_ids.includes(
+                          override.adapter_id,
+                        ) ?? true);
+                      return <button
+                        type="button"
+                        role="option"
+                        title={filename}
+                        aria-selected={mappingDraft.lora_filename === filename}
+                        className={mappingDraft.lora_filename === filename ? "is-selected" : ""}
+                        key={filename}
+                        disabled={mappingAuthorityBlocked}
+                        onClick={() => beginMappingEdit(filename)}
+                      >
+                        <code title={filename}>{filename}</code>
+                        <small>{override
+                          ? `${loader?.display_name ?? override.adapter_id}${overrideAllowed ? "" : " · 与当前规则不兼容"}`
+                          : `${loader?.display_name ?? "默认加载器"}（默认）`}</small>
+                      </button>;
+                    })}
+                  </div>
+                </section>
+                <section className="lora-loader-choice-panel" aria-label="加载器列表区域">
+                  <header><strong>加载器列表</strong><small>版本内置</small></header>
+                  <div className="lora-loader-choice-list" role="listbox" aria-label="加载器列表">
+                    {standardLoraAdapterOptions.length === 0 && <p className="muted">
+                      {productConfigError ?? "正在读取加载器清单…"}
+                    </p>}
+                    {standardLoraAdapterOptions.map((option) => <button
+                      type="button"
+                      role="option"
+                      aria-selected={mappingDraft.adapter_id === option.adapter_id}
+                      className={mappingDraft.adapter_id === option.adapter_id ? "is-selected" : ""}
+                      key={option.adapter_id}
+                      disabled={mappingAuthorityBlocked || !mappingDraft.lora_filename}
+                      onClick={() => updateMappingDraft({
+                        adapter_id: option.adapter_id,
+                        options: mappingOptionsFor(option.adapter_id),
+                      })}
+                    >
+                      <strong>{option.display_name}</strong>
+                      <small>{option.class_type}{
+                        option.adapter_id === defaultLoraAdapterOption?.adapter_id
+                          ? " · 默认"
+                          : ""
+                      }</small>
+                    </button>)}
+                  </div>
+                </section>
+                <section className="lora-loader-config-panel" aria-label="加载器配置项区域">
+                  <header><strong>配置项</strong><small>{selectedLoraAdapterOption?.display_name ?? "未选择"}</small></header>
+                  {!selectedLoraAdapterAllowed && <div className="notice notice--warning" role="alert">
+                    这条历史映射不在当前 LoRA 的允许清单中。它会保留供复核，但不能再次保存或用于新任务；请选择允许的加载器，或恢复系统默认。
+                  </div>}
+                  {selectedLoraAdapterOption?.configuration_options.length
+                    ? <div className="lora-loader-config-fields">
+                      {selectedLoraAdapterOption.configuration_options.map((definition) => <label
+                        className="check-field"
+                        key={definition.id}
+                      >
+                        <input
+                          type="checkbox"
+                          aria-label={`LoRA 加载器配置 ${definition.label}`}
+                          disabled={mappingAuthorityBlocked}
+                          checked={mappingDraft.options[definition.id] ?? definition.default}
+                          onChange={(event) => updateMappingDraft({
+                            options: {
+                              ...mappingDraft.options,
+                              [definition.id]: event.target.checked,
+                            },
+                          })}
+                        />
+                        <span><strong>{definition.label}</strong><small>{definition.description}</small></span>
+                      </label>)}
+                    </div>
+                    : <p className="muted">此加载器没有额外配置项。</p>}
+                  {selectedLoraAdapterOption && <div
+                    className={`lora-loader-adapter-evidence${selectedLoraAdapterOption.capability?.available === false ? " lora-loader-adapter-evidence--unavailable" : ""}`}
+                    role="status"
+                    aria-label="LoRA 映射节点检测"
+                  >
+                    <strong>{selectedLoraAdapterOption.capability === null
+                      ? "节点状态尚未读取"
+                      : selectedLoraAdapterOption.capability.available
+                        ? "当前已检测到节点"
+                        : "当前未检测到节点"}</strong>
+                    <p>{selectedLoraAdapterOption.capability === null
+                      ? "加载器清单仍可选择和保存；节点状态由宿主能力检查更新。"
+                      : selectedLoraAdapterOption.capability.available
+                      ? "这里只表示宿主当前存在同名节点，不认证其来源或实现。"
+                      : "仍可保存配置；实际使用时若节点缺失，任务会返回明确错误。"}</p>
+                  </div>}
+                  <div className="lora-loader-mapping-actions">
+                    <button
+                      type="button"
+                      className="button button--primary"
+                      disabled={
+                        mappingAuthorityBlocked || !mappingEditing ||
+                        !mappingDraft.lora_filename || !mappingDraft.adapter_id ||
+                        !selectedLoraAdapterOption || !selectedLoraAdapterAllowed
+                      }
+                      onClick={() => void saveMapping()}
+                    >{mappingBusy ? "保存中…" : "保存映射"}</button>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      disabled={mappingAuthorityBlocked || !mappingOriginal}
+                      onClick={() => mappingOriginal && void restoreMappingDefault(mappingOriginal)}
+                    >恢复系统默认</button>
+                  </div>
+                </section>
+              </div>}
+          </Panel>
+          <Panel eyebrow="运行" title="运行设备与 RayLight 拓扑" description="这里只保存 runtime placement；模型文件与 LoRA 请在当前项目的全局设置中编辑。">
             <div className="model-bindings">
               {(Object.keys(MODEL_META) as ModelRole[]).map((role) => {
-                const meta = MODEL_META[role]; const binding = working.models[role];
+                const meta = MODEL_META[role];
+                const diffusionRole: "fl2va" | "ref2va" | null = role === "fl2va" || role === "ref2va" ? role : null;
+                const diffusion = diffusionRole ? working.placement[diffusionRole] : null;
+                const binding = diffusion ?? {
+                  device: working.placement[`${role}_device` as "clip_device" | "video_vae_device" | "audio_vae_device"],
+                };
                 const discoveredDevices: DeviceTarget[] = gpus.filter((gpu) => gpu.visible).map((gpu) => `gpu:${gpu.index}` as const);
                 const devices: DeviceTarget[] = [...new Set(["default" as const, ...(meta.allowCpu ? ["cpu" as const] : []), ...discoveredDevices, binding.device])];
-                const availableModels = role === "fl2va" || role === "ref2va" ? diffusionModels : models[role];
-                // An authoritative inventory lists exactly what the endpoint
-                // holds. A stale configured name stays visible only while the
-                // inventory is not authoritative yet (offline/loading), never
-                // as a phantom entry next to the real list.
-                const inventoryAuthoritative = runtimeResourcesReady && !loadingModels;
-                const filenameMissing = Boolean(binding.filename) && !availableModels.includes(binding.filename);
-                const filenames = filenameMissing && !inventoryAuthoritative ? [binding.filename, ...availableModels] : availableModels;
-                const diffusionRole: "fl2va" | "ref2va" | null = role === "fl2va" || role === "ref2va" ? role : null;
-                const diffusion = diffusionRole ? binding as DiffusionModelBinding : null;
-                const loraMissing = Boolean(diffusion?.lora_name) && !models.loras.includes(diffusion!.lora_name as string);
-                const loras = loraMissing && !inventoryAuthoritative && diffusion?.lora_name
-                  ? [diffusion.lora_name, ...models.loras]
-                  : models.loras;
                 const resolvedBackend = diffusion ? resolveExecutionBackend(diffusion) : null;
-                const backendCapability = resolvedBackend
-                  ? capabilities.execution_backends?.[resolvedBackend]
-                  : undefined;
                 const rayGpuIndexes = diffusion
                   ? [...new Set([
                       ...gpus.filter((gpu) => gpu.visible).map((gpu) => gpu.index),
@@ -808,16 +1210,14 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                 return <div className="model-binding-group" key={role}>
                   <div className={`model-row ${diffusion ? "model-row--diffusion" : ""}`}>
                     <div className="model-row__name"><strong>{meta.label}</strong><small>{meta.description}</small></div>
-                    <Field label="模型文件"><select required disabled={!runtimeResourcesReady} aria-label={`${meta.label}模型`} value={inventoryAuthoritative && filenameMissing ? "" : binding.filename} onChange={(event) => setModel(role, "filename", event.target.value)}><option value="">请选择模型</option>{filenames.map((filename) => <option key={filename} value={filename}>{filename}</option>)}</select>{inventoryAuthoritative && filenameMissing && <small className="inline-error">已配置的文件不在当前 ComfyUI 模型清单中：{binding.filename}</small>}</Field>
-                    <Field label={diffusion ? "标准执行设备" : "运行设备"} hint={diffusion && resolvedBackend === "raylight" ? "RayLight 固定为 default；切回 Standard 后可重新选择逻辑设备。" : diffusion ? "标准原生节点使用此 ComfyUI 逻辑设备。" : undefined}><select required disabled={!runtimeResourcesReady || resolvedBackend === "raylight"} aria-label={`${meta.label}设备`} value={binding.device} onChange={(event) => setModel(role, "device", event.target.value)}>{devices.map((device) => <option key={device} value={device}>{device === "default" ? "default（ComfyUI 自动）" : device}</option>)}</select></Field>
+                    <Field label={diffusion ? "Standard 执行设备" : "运行设备"} hint={diffusion && resolvedBackend === "raylight" ? "RayLight 固定为 default；切回 Standard 后可重新选择逻辑设备。" : diffusion ? "标准原生节点使用此 ComfyUI 逻辑设备。" : undefined}><select required disabled={!runtimeResourcesReady || resolvedBackend === "raylight"} aria-label={`${meta.label}设备`} value={binding.device} onChange={(event) => setPlacementDevice(role, event.target.value as DeviceTarget)}>{devices.map((device) => <option key={device} value={device}>{device === "default" ? "default（ComfyUI 自动）" : device}</option>)}</select></Field>
                   </div>
                   {diffusion && diffusionRole && <section className="model-execution-panel" aria-label={`${meta.label}执行拓扑`}>
                     <header>
                       <div><strong>自动执行</strong></div>
-                      <span className={`execution-badge ${backendCapability?.available === true ? "is-ready" : "is-unavailable"}`}>{resolvedBackend === "raylight" ? `RAYLIGHT · ${diffusion.raylight.gpu_select.length} 卡` : `STANDARD · ${binding.device}`}</span>
+                      <span className="execution-badge">{resolvedBackend === "raylight" ? `RAYLIGHT · ${diffusion.raylight.gpu_select.length} 卡` : `STANDARD · ${binding.device}`}</span>
                     </header>
                     <p>{resolvedBackend === "standard" ? `GPU 池只有 1 张卡，自动使用标准原生子图；gpu:N 是 ComfyUI 进程内逻辑编号。` : `GPU 池有 ${diffusion.raylight.gpu_select.length} 张卡，自动使用 RayLight；逻辑 GPU ${diffusion.raylight.gpu_select.join(", ")}，U${diffusion.raylight.ulysses_degree} × R${diffusion.raylight.ring_degree} × 条件1 × 数据1。`}</p>
-                    {backendCapability?.available !== true && <p className="inline-error">当前 ComfyUI 的 {resolvedBackend === "raylight" ? "RayLight" : "标准"}后端不可用：{backendCapability?.missing_nodes.join("、") || "尚未报告执行能力"}</p>}
                     <div className="raylight-topology">
                       <fieldset disabled={!runtimeResourcesReady || !working.multi_gpu_enabled}>
                         <legend>RayLight 逻辑 GPU 池</legend>
@@ -834,23 +1234,6 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                     </div>
                     <small className="raylight-contract-note">1 卡自动走 Standard；2–8 卡自动走 RayLight。拓扑必须满足 Ulysses × Ring × 条件并行 × 数据并行 = 逻辑 GPU 池大小；修改 GPU 池会原子重置为 U=池大小、Ring=1。</small>
                   </section>}
-                  {diffusion && diffusionRole && <div className="lora-row">
-                    <div className="model-row__name"><strong>共享 LoRA</strong><small>{diffusion.lora_name ? "应用到该模型族的所有任务模式" : "不加载 LoRA"}</small></div>
-                    <Field label="LoRA 文件"><select disabled={!runtimeResourcesReady} aria-label={`${meta.label} LoRA`} value={inventoryAuthoritative && loraMissing ? "" : (diffusion.lora_name ?? "")} onChange={(event) => setDiffusion(diffusionRole!, { lora_name: event.target.value || null })}><option value="">不使用 LoRA</option>{loras.map((filename) => <option key={filename} value={filename}>{filename}</option>)}</select>{inventoryAuthoritative && loraMissing && <small className="inline-error">已配置的 LoRA 不在当前 ComfyUI 清单中：{diffusion.lora_name}</small>}</Field>
-                    <Field label="模型强度"><DeferredNumberInput aria-label={`${meta.label} LoRA 强度`} min="-10" max="10" step="0.01" disabled={!runtimeResourcesReady || !diffusion.lora_name} value={diffusion.lora_strength} onValueCommit={(value) => setDiffusion(diffusionRole!, { lora_strength: value })} /></Field>
-                    {resolvedBackend === "raylight" ? <div className="fixed-runtime-value" aria-label={`${meta.label} LoRA 加载状态`}><span>加载方式</span><strong>RayLoraLoader</strong><small>RayLight 固定使用；切回 Standard 后重新自动探测</small></div> : <Field label="Standard 加载器" hint="默认由 ComfyUI safetensors metadata 自动识别；只有识别失败时才需要显式选择。"><select aria-label={`${meta.label} Standard LoRA 加载器`} disabled={!runtimeResourcesReady || !diffusion.lora_name} value={diffusion.standard_lora_loader_override?.loader ?? ""} onChange={(event) => {
-                      const loader = event.target.value as StandardLoraLoader | "";
-                      setDiffusion(diffusionRole, {
-                        standard_lora_loader_override: loader && diffusion.lora_name
-                          ? {
-                              loader,
-                              lora_name: diffusion.lora_name,
-                              model_filename: diffusion.filename,
-                            }
-                          : null,
-                      });
-                    }}><option value="">自动探测（推荐）</option>{(Object.entries(STANDARD_LORA_LOADER_LABELS) as [StandardLoraLoader, string][]).map(([loader, label]) => <option value={loader} key={loader}>{label}</option>)}</select></Field>}
-                  </div>}
                 </div>;
               })}
             </div>
@@ -858,7 +1241,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
         </div>
         <aside className="settings-aside">
           <Panel eyebrow="资源" title="GPU 状态"><div className="gpu-list">{gpus.length === 0 && <p className="muted">尚未读取 GPU 数据</p>}{gpus.map((gpu) => { const used = gpu.vram_total ? Math.round((1 - gpu.vram_free / gpu.vram_total) * 100) : 0; return <div className="gpu-card" key={gpu.index}><header><span>GPU {gpu.index}</span><small>ComfyUI 逻辑编号</small></header><strong>{gpu.name}</strong><div className="progress"><span style={{ width: `${used}%` }} /></div><footer><span>显存 {used}%</span><span>{formatBytes(gpu.vram_free)} 可用</span></footer></div>;})}</div></Panel>
-          <Panel eyebrow="能力" title="模型族就绪情况"><ul className="capability-list">{TIMELINE_MODE_ORDER.map((mode) => { const familyAvailable = capabilities.native_timeline?.supported === true && capabilities.native_timeline.modes.includes(mode); const ready = runtimeResourcesReady && familyAvailable; return <li key={mode}><span className={ready ? "capability-ok" : "capability-missing"}>{ready ? "✓" : "!"}</span><span><strong>{TIMELINE_MODE_META[mode].shortLabel}</strong><small>{TIMELINE_MODE_META[mode].label}</small></span><em>{ready ? "可用" : "未就绪"}</em></li>; })}</ul>{capabilities.missing_nodes.length > 0 && <div className="missing-nodes"><strong>缺少节点</strong><code>{capabilities.missing_nodes.join(", ")}</code></div>}</Panel>
+          <Panel eyebrow="能力" title="服务端统一预检"><p className="muted">功能、模型、LoRA 与执行后端是否可用，由生成和执行计划预检使用当前宿主快照统一判定。</p></Panel>
         </aside>
       </div>
     </section>

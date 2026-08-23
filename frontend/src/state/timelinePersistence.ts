@@ -1,5 +1,9 @@
 import {
+  migrateLegacyTimelineProjectToV5,
+  migrateTimelineFeatureBundle4To5,
+  normalizeLegacyTimelineProject,
   normalizeTimelineProject,
+  type LegacyTimelineProjectV4,
   type TimelineProject,
 } from "../domain/timelineProject";
 import { isStoragePath } from "../domain/storagePath";
@@ -10,6 +14,11 @@ import {
   type SerializedTimelineHistoryEnvelope,
   type TimelineHistoryState,
 } from "./timelineHistory";
+import {
+  legacyClientDocumentDigest,
+  migrateLegacyTimelineHistoryEnvelope,
+  type ProjectMigrationReceipt,
+} from "./timelineV5Migration";
 
 const TIMELINE_HISTORY_DATABASE = "directordeck-timeline-history";
 const TIMELINE_HISTORY_DATABASE_VERSION = 1;
@@ -59,6 +68,20 @@ interface TimelineHistoryJournalRecordV2 {
   updatedAtMs: number;
 }
 
+interface LegacyV4TimelineHistoryJournalRecordV2 {
+  key: string;
+  format: typeof TIMELINE_HISTORY_JOURNAL_FORMAT;
+  version: typeof TIMELINE_HISTORY_JOURNAL_VERSION;
+  scope: TimelinePersistenceScope;
+  writeToken: string;
+  confirmedRevision: number;
+  confirmedDocumentHash: string;
+  confirmedDocument: LegacyTimelineProjectV4;
+  headDocumentHash: string;
+  history: unknown;
+  updatedAtMs: number;
+}
+
 interface LegacyTimelineHistoryJournalRecordV1 {
   key: string;
   format: typeof TIMELINE_HISTORY_JOURNAL_FORMAT;
@@ -77,6 +100,8 @@ interface DecodedTimelineHistoryJournal {
   confirmedDocument: TimelineProject;
   history: TimelineHistoryState;
   project: TimelineProject;
+  /** Legacy receipt recovery accepts only its exact destination revision. */
+  receiptAuthorityMatched?: boolean;
 }
 
 interface TimelineHistoryJournalLoadMetadata {
@@ -328,7 +353,7 @@ function canonicalDigestValue(value: unknown): unknown {
 }
 
 /** Hash is an integrity hint; exact normalized document equality remains the authority gate. */
-export async function timelineProjectDigest(project: TimelineProject): Promise<string> {
+export async function timelineProjectDigest(project: unknown): Promise<string> {
   // Persistence hashes must not change format when WebCrypto is unavailable,
   // temporarily rejects, or becomes available after a reload. The module's
   // synchronous SHA-256 implementation is deterministic in every realm.
@@ -550,6 +575,60 @@ function parseJournalV2(
   };
 }
 
+function parseLegacyV4JournalV2(
+  value: unknown,
+  expectedScope: TimelinePersistenceScope,
+): LegacyV4TimelineHistoryJournalRecordV2 | null {
+  if (!hasExactKeys(value, [
+    "confirmedDocument",
+    "confirmedDocumentHash",
+    "confirmedRevision",
+    "format",
+    "headDocumentHash",
+    "history",
+    "key",
+    "scope",
+    "updatedAtMs",
+    "version",
+    "writeToken",
+  ])) return null;
+  if (
+    value.format !== TIMELINE_HISTORY_JOURNAL_FORMAT ||
+    value.version !== TIMELINE_HISTORY_JOURNAL_VERSION ||
+    value.key !== timelineHistoryJournalKey(expectedScope) ||
+    typeof value.writeToken !== "string" ||
+    !WRITE_TOKEN_PATTERN.test(value.writeToken) ||
+    !hasExactKeys(value.scope, ["databasePath", "projectId", "ownerId"]) ||
+    value.scope.databasePath !== expectedScope.databasePath ||
+    value.scope.projectId !== expectedScope.projectId ||
+    value.scope.ownerId !== expectedScope.ownerId ||
+    !Number.isSafeInteger(value.confirmedRevision) ||
+    (value.confirmedRevision as number) < 0 ||
+    typeof value.confirmedDocumentHash !== "string" ||
+    typeof value.headDocumentHash !== "string" ||
+    !Number.isSafeInteger(value.updatedAtMs) ||
+    (value.updatedAtMs as number) <= 0
+  ) return null;
+  const confirmedDocument = normalizeLegacyTimelineProject(value.confirmedDocument);
+  if (
+    !confirmedDocument || confirmedDocument.version !== 4 ||
+    canonicalSnapshotJson(confirmedDocument) !== canonicalSnapshotJson(value.confirmedDocument)
+  ) return null;
+  return {
+    key: value.key,
+    format: TIMELINE_HISTORY_JOURNAL_FORMAT,
+    version: TIMELINE_HISTORY_JOURNAL_VERSION,
+    scope: structuredClone(expectedScope),
+    writeToken: value.writeToken,
+    confirmedRevision: value.confirmedRevision as number,
+    confirmedDocumentHash: value.confirmedDocumentHash,
+    confirmedDocument,
+    headDocumentHash: value.headDocumentHash,
+    history: value.history,
+    updatedAtMs: value.updatedAtMs as number,
+  };
+}
+
 function parseLegacyJournalV1(
   value: unknown,
   expectedScope: TimelinePersistenceProjectScope,
@@ -587,6 +666,7 @@ function parseLegacyJournalV1(
 
 async function decodeJournal(
   record: TimelineHistoryJournalRecordV2 | LegacyTimelineHistoryJournalRecordV1,
+  authority: TimelinePersistenceAuthority,
 ): Promise<DecodedTimelineHistoryJournal | null> {
   const history = deserializeTimelineHistory(record.history);
   if (!history?.head) return null;
@@ -598,11 +678,124 @@ async function decodeJournal(
     confirmedHash !== record.confirmedDocumentHash ||
     headHash !== record.headDocumentHash
   ) return null;
-  return {
+  const decoded: DecodedTimelineHistoryJournal = {
     confirmedRevision: record.confirmedRevision,
     confirmedDocument: structuredClone(record.confirmedDocument),
     history,
     project: structuredClone(history.head),
+  };
+  const upgradedConfirmed = migrateTimelineFeatureBundle4To5(decoded.confirmedDocument);
+  const upgradedHead = migrateTimelineFeatureBundle4To5(decoded.project);
+  if (!upgradedConfirmed || !upgradedHead) return decoded;
+  const confirmedProjectionMatches =
+    authority.revision === decoded.confirmedRevision + 1 &&
+    timelineProjectsEqual(authority.document, upgradedConfirmed);
+  const acknowledgedProjectionMatches =
+    authority.revision === decoded.confirmedRevision + 2 &&
+    timelineProjectsEqual(authority.document, upgradedHead);
+  if (!confirmedProjectionMatches && !acknowledgedProjectionMatches) return decoded;
+
+  try {
+    const upgradedHistory = deserializeTimelineHistory(serializeTimelineHistory({
+      ...history,
+      checkpoints: history.checkpoints.map((checkpoint) => {
+        const project = migrateTimelineFeatureBundle4To5(checkpoint.project);
+        if (!project) throw new TypeError("Timeline checkpoint is not bundle 4.");
+        return { ...checkpoint, project };
+      }),
+      head: upgradedHead,
+    }));
+    if (!upgradedHistory?.head) return null;
+    return {
+      confirmedRevision: authority.revision,
+      confirmedDocument: structuredClone(authority.document),
+      history: upgradedHistory,
+      project: structuredClone(upgradedHistory.head),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function decodeLegacyV4Journal(
+  record: LegacyV4TimelineHistoryJournalRecordV2,
+  receipt: ProjectMigrationReceipt,
+  authority: TimelinePersistenceAuthority,
+): Promise<DecodedTimelineHistoryJournal | null> {
+  const rawHistory = isRecord(record.history) && isRecord(record.history.payload)
+    ? record.history.payload
+    : null;
+  const rawHead = rawHistory?.head;
+  const legacyHead = normalizeLegacyTimelineProject(rawHead);
+  if (
+    receipt.project_id !== record.scope.projectId ||
+    !legacyHead ||
+    await timelineProjectDigest(record.confirmedDocument) !== record.confirmedDocumentHash ||
+    await timelineProjectDigest(rawHead) !== record.headDocumentHash
+  ) return null;
+  const baseMatchesReceipt =
+    receipt.old_revision === record.confirmedRevision &&
+    legacyClientDocumentDigest(record.confirmedDocument)?.value ===
+      receipt.old_client_digest.value &&
+    record.confirmedDocumentHash === receipt.old_server_digest.value;
+  const pendingMatchesReceipt =
+    receipt.old_revision === record.confirmedRevision + 1 &&
+    legacyClientDocumentDigest(legacyHead)?.value === receipt.old_client_digest.value &&
+    record.headDocumentHash === receipt.old_server_digest.value;
+  if (!baseMatchesReceipt && !pendingMatchesReceipt) return null;
+  const receiptSource = baseMatchesReceipt ? record.confirmedDocument : legacyHead;
+  const frozenReceiptContext = {
+    ...receipt.legacy_creative_binding_context,
+    template_bundle_version: 4,
+  };
+  const receiptDestination = migrateLegacyTimelineProjectToV5(
+    receiptSource,
+    frozenReceiptContext,
+  );
+  if (
+    !receiptDestination ||
+    legacyClientDocumentDigest(receiptDestination)?.value !==
+      receipt.new_client_digest.value
+  ) return null;
+  const upgradedReceiptDestination = migrateTimelineFeatureBundle4To5(
+    receiptDestination,
+  );
+  const directAuthority =
+    authority.revision === receipt.new_revision &&
+    timelineProjectsEqual(authority.document, receiptDestination);
+  const upgradedRevision = receipt.new_revision + 1;
+  const upgradedAuthority =
+    upgradedReceiptDestination !== null &&
+    Number.isSafeInteger(upgradedRevision) &&
+    authority.revision === upgradedRevision &&
+    timelineProjectsEqual(authority.document, upgradedReceiptDestination);
+  // An authority at the post-receipt revision is represented in current bundle
+  // form even when it contains an unrelated edit. Classification below keeps
+  // that valid local branch as conflict evidence instead of calling it corrupt.
+  const targetBundleVersion = upgradedAuthority || authority.revision >= upgradedRevision
+    ? 5
+    : 4;
+  const migrationContext = {
+    ...receipt.legacy_creative_binding_context,
+    template_bundle_version: targetBundleVersion,
+  };
+  const migratedConfirmed = migrateLegacyTimelineProjectToV5(
+    record.confirmedDocument,
+    migrationContext,
+  );
+  const migratedHistory = migrateLegacyTimelineHistoryEnvelope(
+    record.history,
+    migrationContext,
+  );
+  if (!migratedConfirmed || !migratedHistory?.history.head) return null;
+  return {
+    confirmedRevision: targetBundleVersion === 5
+      ? upgradedRevision
+      : receipt.new_revision,
+    confirmedDocument: migratedConfirmed,
+    history: migratedHistory.history,
+    project: structuredClone(migratedHistory.history.head),
+    receiptAuthorityMatched: directAuthority || upgradedAuthority,
   };
 }
 
@@ -610,6 +803,7 @@ function classifyDecodedJournal(
   decoded: DecodedTimelineHistoryJournal,
   authority: TimelinePersistenceAuthority,
 ): "restored" | "acknowledged" | "conflict" {
+  if (decoded.receiptAuthorityMatched === false) return "conflict";
   // A clean journal commonly records confirmedDocument === history.head. It
   // must be classified as acknowledged before the exact-base replay check, or
   // a fresh owner will mistake ordinary durable undo history for pending work.
@@ -697,10 +891,39 @@ export async function readTimelineHistoryJournalVersionToken(
   }
 }
 
+/**
+ * Cheap read-only probe used only to decide whether hydration should request a
+ * v4→v5 receipt. It never classifies, rewrites, or adopts the legacy branch.
+ */
+export async function hasLegacyV4TimelineHistoryJournalEvidence(
+  scope: TimelinePersistenceProjectScope,
+): Promise<boolean> {
+  if (!validProjectScope(scope)) return false;
+  let values: unknown[] | null;
+  try {
+    values = await readAllJournals();
+  } catch {
+    return false;
+  }
+  if (!values) return false;
+  const expectedDigest = timelineHistoryProjectScopeDigest(scope);
+  return values.some((value) => {
+    if (!isRecord(value) || typeof value.key !== "string") return false;
+    const v2Key = parseV2JournalKey(value.key);
+    const legacyScope = parseLegacyJournalKey(value.key);
+    const matches = v2Key?.scopeDigest === expectedDigest ||
+      Boolean(legacyScope && sameProjectScope(legacyScope, scope));
+    if (!matches || !isRecord(value.confirmedDocument) ||
+      value.confirmedDocument.version !== 4 || !isRecord(value.history)) return false;
+    return value.history.schemaVersion === 1;
+  });
+}
+
 /** Reads only the current owner branch; foreign and legacy evidence is never replayed here. */
 export async function loadTimelineHistoryJournal(
   scope: TimelinePersistenceScope,
   authority: TimelinePersistenceAuthority,
+  legacyReceipt?: ProjectMigrationReceipt | null,
 ): Promise<TimelineHistoryJournalLoadResult> {
   const authorityDocument = parseExactTimelineProject(authority.document);
   if (
@@ -725,15 +948,20 @@ export async function loadTimelineHistoryJournal(
   const token = versionTokenForStoredValue(value, key);
   const updatedAtMs = journalUpdatedAt(value);
   const record = parseJournalV2(value, scope);
-  if (!record) return { status: "corrupt", token, updatedAtMs };
-  const decoded = await decodeJournal(record);
+  const legacyRecord = record ? null : parseLegacyV4JournalV2(value, scope);
+  if (!record && !legacyRecord) return { status: "corrupt", token, updatedAtMs };
+  const decoded = record
+    ? await decodeJournal(record, normalizedAuthority)
+    : legacyReceipt && legacyRecord
+      ? await decodeLegacyV4Journal(legacyRecord, legacyReceipt, normalizedAuthority)
+      : null;
   if (!decoded) return { status: "corrupt", token, updatedAtMs };
   if (!token) return { status: "corrupt", token: null, updatedAtMs };
 
   const metadata: TimelineHistoryJournalLoadMetadata = {
     ownerId: scope.ownerId,
     token,
-    updatedAtMs: record.updatedAtMs,
+    updatedAtMs: (record ?? legacyRecord)!.updatedAtMs,
   };
   const classification = classifyDecodedJournal(decoded, normalizedAuthority);
   if (classification === "restored" || classification === "acknowledged") {
@@ -777,6 +1005,7 @@ async function classifyBranchEvidence(
   ownerId: string | null,
   currentScope: TimelinePersistenceScope,
   authority: TimelinePersistenceAuthority,
+  legacyReceipt?: ProjectMigrationReceipt | null,
 ): Promise<TimelineHistoryJournalBranchEvidence> {
   const ownership: TimelineHistoryJournalBranchOwnership = ownerId === null
     ? "legacy"
@@ -794,8 +1023,15 @@ async function classifyBranchEvidence(
   const record = ownerId === null
     ? parseLegacyJournalV1(value, projectScope)
     : parseJournalV2(value, { ...projectScope, ownerId });
-  if (!record) return { ...metadata, status: "corrupt" };
-  const decoded = await decodeJournal(record);
+  const legacyRecord = record || ownerId === null
+    ? null
+    : parseLegacyV4JournalV2(value, { ...projectScope, ownerId });
+  if (!record && !legacyRecord) return { ...metadata, status: "corrupt" };
+  const decoded = record
+    ? await decodeJournal(record, authority)
+    : legacyReceipt && legacyRecord
+      ? await decodeLegacyV4Journal(legacyRecord, legacyReceipt, authority)
+      : null;
   if (!decoded) return { ...metadata, status: "corrupt" };
   return {
     ...metadata,
@@ -814,6 +1050,7 @@ async function classifyBranchEvidence(
 export async function listTimelineHistoryJournalBranches(
   scope: TimelinePersistenceScope,
   authority: TimelinePersistenceAuthority,
+  legacyReceipt?: ProjectMigrationReceipt | null,
 ): Promise<TimelineHistoryJournalBranchListResult> {
   const authorityDocument = parseExactTimelineProject(authority.document);
   if (
@@ -852,7 +1089,14 @@ export async function listTimelineHistoryJournalBranches(
     }
   }
   const branches = (await Promise.all(matching.map(({ value, key, ownerId }) =>
-    classifyBranchEvidence(value, key, ownerId, scope, normalizedAuthority))))
+    classifyBranchEvidence(
+      value,
+      key,
+      ownerId,
+      scope,
+      normalizedAuthority,
+      legacyReceipt,
+    ))))
     .sort(newestBranchFirst);
   return {
     status: "available",

@@ -7,25 +7,57 @@ import pytest
 
 from directordeck.app import _UPLOAD_LIMITS, _media_response, _read_upload_limited
 from directordeck.database import Database
-from directordeck.schemas import default_settings
+from directordeck.schemas import (
+    default_settings,
+    mode_draft_to_timeline,
+    validate_mode_draft,
+)
 
-from .conftest import runnable_draft, wait_for_submission_tasks
+from .conftest import (
+    runnable_draft,
+    submit_legacy_mode_job,
+    v5_timeline_document,
+    wait_for_submission_tasks,
+)
 
 
-async def test_default_empty_draft_can_still_be_saved(client) -> None:
+async def _v5_mode_document(client, mode: str) -> dict:
+    legacy = mode_draft_to_timeline(
+        validate_mode_draft(mode, runnable_draft(mode))
+    )
+    return await v5_timeline_document(
+        client,
+        legacy.model_dump(mode="json"),
+    )
+
+
+async def _raw_save_v5(client, document: dict):
+    authority = await client.get("/api/timeline/authority")
+    assert authority.status_code == 200, authority.text
+    return await client.put(
+        "/api/timeline/authority",
+        json={
+            "document": document,
+            "expected_revision": authority.json()["revision"],
+        },
+    )
+
+
+async def test_legacy_draft_write_is_retired(client) -> None:
     draft = (await client.get("/api/drafts/i2v")).json()
     assert draft["shots"][0]["first_image"] is None
 
     response = await client.put("/api/drafts/i2v", json=draft)
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"]["code"] == "legacy_generation_api_retired"
 
 
 async def test_draft_rejects_asset_without_upload_id(client) -> None:
-    draft = runnable_draft("i2v")
-    draft["shots"][0]["first_image"].pop("id")
+    draft = await _v5_mode_document(client, "i2v")
+    draft["segments"][0]["first_image"].pop("id")
 
-    response = await client.put("/api/drafts/i2v", json=draft)
+    response = await _raw_save_v5(client, draft)
 
     assert response.status_code == 422
     assert '"id"' in response.text
@@ -33,11 +65,11 @@ async def test_draft_rejects_asset_without_upload_id(client) -> None:
 
 
 async def test_draft_rejects_unknown_asset_id_even_on_a_disabled_shot(client) -> None:
-    draft = runnable_draft("i2v")
-    draft["shots"][0]["enabled"] = False
-    draft["shots"][0]["first_image"]["id"] = "not-uploaded"
+    draft = await _v5_mode_document(client, "i2v")
+    draft["segments"][0]["enabled"] = False
+    draft["segments"][0]["first_image"]["id"] = "not-uploaded"
 
-    response = await client.put("/api/drafts/i2v", json=draft)
+    response = await _raw_save_v5(client, draft)
 
     assert response.status_code == 422
     assert "is not registered" in response.text
@@ -54,21 +86,21 @@ async def test_draft_rejects_unknown_asset_id_even_on_a_disabled_shot(client) ->
 async def test_draft_rejects_forged_asset_identity_or_path(
     client, field: str, value: str, expected: str
 ) -> None:
-    draft = runnable_draft("i2v")
-    draft["shots"][0]["first_image"][field] = value
+    draft = await _v5_mode_document(client, "i2v")
+    draft["segments"][0]["first_image"][field] = value
 
-    response = await client.put("/api/drafts/i2v", json=draft)
+    response = await _raw_save_v5(client, draft)
 
     assert response.status_code == 422
     assert expected in response.text
 
 
 async def test_draft_rejects_claimed_kind_that_differs_from_registered_asset(client) -> None:
-    draft = runnable_draft("i2v")
-    reference = draft["shots"][0]["first_image"]
+    draft = await _v5_mode_document(client, "i2v")
+    reference = draft["segments"][0]["first_image"]
     reference.update(name="voice.wav", id="fixture-audio-voice.wav", kind="image")
 
-    response = await client.put("/api/drafts/i2v", json=draft)
+    response = await _raw_save_v5(client, draft)
 
     assert response.status_code == 422
     assert "kind" in response.text
@@ -76,22 +108,20 @@ async def test_draft_rejects_claimed_kind_that_differs_from_registered_asset(cli
 
 @pytest.mark.parametrize("bad_id", [None, "not-uploaded"])
 async def test_job_create_revalidates_asset_upload_identity(client, fake_comfy, bad_id) -> None:
-    draft = runnable_draft("v2v")
+    draft = await _v5_mode_document(client, "v2v")
     if bad_id is None:
-        draft["shots"][0]["source_video"].pop("id")
+        draft["segments"][0]["source_video"].pop("id")
     else:
-        draft["shots"][0]["source_video"]["id"] = bad_id
+        draft["segments"][0]["source_video"]["id"] = bad_id
 
-    response = await client.post("/api/jobs", json={"mode": "v2v", "config": draft})
+    response = await client.post("/api/jobs", json={"config": draft})
 
     assert response.status_code == 422
     assert fake_comfy.prompts == []
 
 
 async def test_job_create_accepts_an_exact_registered_asset(client, fake_comfy) -> None:
-    response = await client.post(
-        "/api/jobs", json={"mode": "i2v", "config": runnable_draft("i2v")}
-    )
+    response = await submit_legacy_mode_job(client, "i2v", runnable_draft("i2v"))
 
     assert response.status_code == 200, response.text
     await wait_for_submission_tasks(client)
@@ -99,10 +129,10 @@ async def test_job_create_accepts_an_exact_registered_asset(client, fake_comfy) 
 
 
 async def test_draft_rejects_forged_video_metadata(client) -> None:
-    draft = runnable_draft("v2v")
-    draft["shots"][0]["source_video"]["metadata"]["duration"] = 120.0
+    draft = await _v5_mode_document(client, "v2v")
+    draft["segments"][0]["source_video"]["metadata"]["duration"] = 120.0
 
-    response = await client.put("/api/drafts/v2v", json=draft)
+    response = await _raw_save_v5(client, draft)
 
     assert response.status_code == 422
     assert "metadata" in response.text

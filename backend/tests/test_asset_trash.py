@@ -9,9 +9,10 @@ import pytest
 
 import directordeck.database as database_module
 from directordeck.database import Database
+from directordeck.migrations.timeline_v4_v5 import migrate_timeline_v4_to_v5
 from directordeck.schemas import default_settings, default_timeline_draft
 
-from .conftest import asset, runnable_draft
+from .conftest import asset, runnable_draft, save_timeline_document
 
 
 def timeline_with_anchors(*, first: bool = True, last: bool = True) -> dict[str, Any]:
@@ -44,20 +45,27 @@ async def test_multi_asset_cascade_and_exact_inverse_restore_advance_each_revisi
 ) -> None:
     first = asset("first.png", "image")
     last = asset("last.png", "image")
-    default_saved = await client.put("/api/timeline", json=timeline_with_anchors())
+    default_saved = await save_timeline_document(client, timeline_with_anchors())
     assert default_saved.status_code == 200, default_saved.text
 
     created = (await client.post("/api/projects", json={"title": "回收站项目"})).json()
     project_document = timeline_with_anchors()
     project_document["title"] = "回收站项目"
     project_document["segments"][0]["id"] = "project-trash-segment"
-    project_saved = await client.put(
-        f"/api/projects/{created['id']}/timeline", json=project_document
+    project_saved = await save_timeline_document(
+        client,
+        project_document,
+        project_id=created["id"],
+        legacy_settings=default_settings().model_dump(mode="json"),
     )
     assert project_saved.status_code == 200, project_saved.text
 
-    draft_saved = await client.put("/api/drafts/i2v", json=runnable_draft("i2v"))
-    assert draft_saved.status_code == 200, draft_saved.text
+    retired = await client.put("/api/drafts/i2v", json=runnable_draft("i2v"))
+    assert retired.status_code == 410, retired.text
+    draft_saved = client.director_app.state.database.validate_and_put_draft(
+        "i2v",
+        database_module.validate_mode_draft("i2v", runnable_draft("i2v")),
+    )
     default_before = (await client.get("/api/timeline/authority")).json()
     project_before = (
         await client.get(f"/api/projects/{created['id']}/timeline/authority")
@@ -90,7 +98,13 @@ async def test_multi_asset_cascade_and_exact_inverse_restore_advance_each_revisi
     }
     assert first["id"] not in listed_ids and last["id"] not in listed_ids
     assert (await client.get(f"/api/assets/{first['id']}/preview")).status_code == 404
-    refused_reference = await client.put("/api/timeline", json=default_before["document"])
+    refused_reference = await client.put(
+        "/api/timeline/authority",
+        json={
+            "document": default_before["document"],
+            "expected_revision": after_default["revision"],
+        },
+    )
     assert refused_reference.status_code == 422
     trash_list = (await client.get("/api/asset-trash")).json()
     assert [item["batch_id"] for item in trash_list["batches"]] == [
@@ -119,7 +133,9 @@ async def test_multi_asset_cascade_and_exact_inverse_restore_advance_each_revisi
     assert restored_project["document"] == project_before["document"]
     assert restored_default["revision"] == after_default["revision"] + 1
     assert restored_project["revision"] == after_project["revision"] + 1
-    assert (await client.get("/api/drafts/i2v")).json() == draft_saved.json()
+    assert (await client.get("/api/drafts/i2v")).json() == draft_saved.model_dump(
+        mode="json"
+    )
     assert (await client.get("/api/asset-trash")).json()["batches"] == []
 
 
@@ -128,7 +144,7 @@ async def test_batch_without_cascade_refuses_all_assets_without_partial_tombston
 ) -> None:
     first = asset("first.png", "image")
     last = asset("last.png", "image")
-    saved = await client.put("/api/timeline", json=timeline_with_anchors())
+    saved = await save_timeline_document(client, timeline_with_anchors())
     assert saved.status_code == 200
     before = (await client.get("/api/timeline/authority")).json()
 
@@ -154,8 +170,8 @@ async def test_restore_conflict_is_atomic_and_registration_only_is_safe_fallback
     client,
 ) -> None:
     first = asset("first.png", "image")
-    saved = await client.put(
-        "/api/timeline", json=timeline_with_anchors(first=True, last=False)
+    saved = await save_timeline_document(
+        client, timeline_with_anchors(first=True, last=False)
     )
     assert saved.status_code == 200
     trashed = await client.post(
@@ -211,8 +227,8 @@ async def test_restore_checks_exact_document_digest_even_if_revision_is_unchange
     client,
 ) -> None:
     first = asset("first.png", "image")
-    await client.put(
-        "/api/timeline", json=timeline_with_anchors(first=True, last=False)
+    await save_timeline_document(
+        client, timeline_with_anchors(first=True, last=False)
     )
     trashed = (
         await client.post(
@@ -245,14 +261,17 @@ async def test_conflict_in_one_project_prevents_partial_restore_everywhere(
     client,
 ) -> None:
     first = asset("first.png", "image")
-    await client.put(
-        "/api/timeline", json=timeline_with_anchors(first=True, last=False)
+    await save_timeline_document(
+        client, timeline_with_anchors(first=True, last=False)
     )
     created = (await client.post("/api/projects", json={"title": "冲突项目"})).json()
     project_document = timeline_with_anchors(first=True, last=False)
     project_document["title"] = "冲突项目"
-    await client.put(
-        f"/api/projects/{created['id']}/timeline", json=project_document
+    await save_timeline_document(
+        client,
+        project_document,
+        project_id=created["id"],
+        legacy_settings=default_settings().model_dump(mode="json"),
     )
     trashed = (
         await client.post(
@@ -294,9 +313,16 @@ def test_multi_asset_cascade_validation_failure_rolls_back_batch_and_documents(
     database = client.director_app.state.database
     document = default_timeline_draft()
     raw = timeline_with_anchors()
-    database.validate_and_put_timeline(document.model_validate(raw))
+    current_revision = database.get_timeline_authority()[1]
+    database.validate_and_put_timeline_authority(
+        migrate_timeline_v4_to_v5(
+            document.model_validate(raw),
+            default_settings(),
+        ),
+        expected_revision=current_revision,
+    )
     before, before_revision = database.get_timeline_authority()
-    original = database_module.validate_timeline_draft
+    original = database_module.validate_timeline_draft_v5
 
     def fail_after_both_anchors_are_unbound(value: Any):
         if isinstance(value, dict):
@@ -311,7 +337,9 @@ def test_multi_asset_cascade_validation_failure_rolls_back_batch_and_documents(
         return original(value)
 
     monkeypatch.setattr(
-        database_module, "validate_timeline_draft", fail_after_both_anchors_are_unbound
+        database_module,
+        "validate_timeline_draft_v5",
+        fail_after_both_anchors_are_unbound,
     )
     with pytest.raises(ValueError, match="forced multi-asset cascade failure"):
         database.trash_assets(

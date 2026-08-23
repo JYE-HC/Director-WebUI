@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import datetime, timezone
+import json
+import math
+import re
 import secrets
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -16,6 +19,13 @@ from pydantic import (
 )
 
 from .h3_capabilities import H3_REFERENCE_LIMITS
+from .config_manager import get_directordeck_config
+from .workflow.compile_report import (
+    CompiledCapabilityEvaluation,
+    CompiledFeatureNotice,
+)
+from .workflow.canonical import utf16_sort_key
+from .workflow.contracts import FeatureResolution
 
 
 GenerationMode = Literal["t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v"]
@@ -35,7 +45,7 @@ AssetKind = Literal["image", "audio", "video"]
 DeviceTarget = Annotated[str, Field(pattern=r"^(default|cpu|gpu:(0|[1-9][0-9]*))$")]
 VaeDeviceTarget = Annotated[str, Field(pattern=r"^(default|gpu:(0|[1-9][0-9]*))$")]
 StandardLoraLoader: TypeAlias = Literal[
-    "dedicated", "bypass_model_only", "model_only"
+    "dedicated", "bypass_model_only", "model_only", "minimax_h3_turbo"
 ]
 
 MODE_ORDER: tuple[GenerationMode, ...] = ("t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v")
@@ -44,6 +54,13 @@ MINIMAX_H3_PROMPT_MAX_CHARACTERS = 7_000
 # browser. Keep the durable counter inside JavaScript's safe-integer range just
 # like timeline seeds; silently rounding a CAS value would defeat the lock.
 MAX_TIMELINE_REVISION = 2**53 - 1
+MAX_FEATURES_PER_SCOPE = 64
+MAX_FEATURE_PARAMETER_DEPTH = 8
+MAX_FEATURE_OBJECT_KEYS = 64
+MAX_FEATURE_ARRAY_ITEMS = 128
+MAX_FEATURE_STRING_LENGTH = 4_096
+MAX_FEATURE_PARAMS_BYTES = 65_536
+_FEATURE_ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 MODEL_ROUTE: dict[GenerationMode | TimelineMode, TimelineMode] = {
     "t2v": "fl2va",
     "i2v": "fl2va",
@@ -124,12 +141,12 @@ class DiffusionModelBinding(ModelBinding):
     lora_name: Annotated[str, Field(min_length=1, max_length=1024)] | None = None
     lora_strength: Annotated[float, Field(ge=-10, le=10, allow_inf_nan=False)] = 1.0
     lora_loader: Literal[
-        "auto", "dedicated", "bypass_model_only", "model_only"
+        "auto", "dedicated", "bypass_model_only", "model_only", "minimax_h3_turbo"
     ] = "auto"
     # This is deliberately separate from the obsolete ``lora_loader`` wire
     # field.  Old databases and browser WAL entries may still carry a hidden
-    # non-auto value there; only this new, visible setting may override
-    # metadata-based Standard loader detection.
+    # non-auto value there; only this new, visible exact mapping authorizes a
+    # Standard loader choice.
     standard_lora_loader_override: StandardLoraLoaderOverride | None = None
     lora_low_vram: bool = False
     backend: Literal["auto", "standard", "raylight"] = "auto"
@@ -163,6 +180,26 @@ class SettingsModels(StrictModel):
     audio_vae: VaeModelBinding
 
 
+class ModelFileSelection(StrictModel):
+    """One creative model-file choice; ``None`` is a saved incomplete state."""
+
+    filename: Annotated[str, Field(min_length=1, max_length=1024)] | None
+
+
+class DiffusionModelSelection(ModelFileSelection):
+    """A diffusion-family creative selection, intentionally without placement."""
+
+
+class ModelStack(StrictModel):
+    """All project-owned model selections for a v5 creative document."""
+
+    fl2va: DiffusionModelSelection
+    ref2va: DiffusionModelSelection
+    clip: ModelFileSelection
+    video_vae: ModelFileSelection
+    audio_vae: ModelFileSelection
+
+
 class RuntimeSettings(StrictModel):
     # The ComfyUI address is not a setting: the plugin embeds Director in one
     # ComfyUI process and create_app injects that instance's loopback URL.
@@ -189,6 +226,275 @@ class RuntimeSettings(StrictModel):
     models: SettingsModels
 
 
+# ``RuntimeSettings`` is the frozen pre-v5 contract used only by historical
+# snapshots and the v4 compatibility compiler.  Give it an explicit name so
+# no new code has to infer which settings generation it is parsing.
+RuntimeSettingsV1 = RuntimeSettings
+
+
+class RuntimeDiffusionPlacement(StrictModel):
+    """Host placement for one diffusion family, with no creative filename."""
+
+    device: DeviceTarget = "default"
+    raylight: RayLightProfile = Field(default_factory=RayLightProfile)
+
+
+class RuntimePlacementV2(StrictModel):
+    """The complete runtime-only placement authority after the v5 migration."""
+
+    fl2va: RuntimeDiffusionPlacement = Field(
+        default_factory=RuntimeDiffusionPlacement
+    )
+    ref2va: RuntimeDiffusionPlacement = Field(
+        default_factory=RuntimeDiffusionPlacement
+    )
+    clip_device: DeviceTarget = "default"
+    video_vae_device: VaeDeviceTarget = "default"
+    audio_vae_device: VaeDeviceTarget = "default"
+
+
+class LegacyStandardLoraOverrideEvidence(StrictModel):
+    """One exact v1 override retained temporarily as host compatibility data."""
+
+    family: TimelineMode
+    model_filename: Annotated[str, Field(min_length=1, max_length=1024)]
+    lora_filename: Annotated[str, Field(min_length=1, max_length=1024)]
+    loader: StandardLoraLoader
+
+
+class LegacyLoraResolutionCompat(StrictModel):
+    """Bounded Stage-6 bridge to the frozen Standard LoRA resolver."""
+
+    schema_version: Literal[1] = 1
+    auto_resolution_strategy_version: Literal[
+        "v4-known-filename-or-safetensors-metadata-v1"
+    ] = "v4-known-filename-or-safetensors-metadata-v1"
+    explicit_overrides: Annotated[
+        list[LegacyStandardLoraOverrideEvidence], Field(max_length=2)
+    ] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def unique_sorted_families(self) -> "LegacyLoraResolutionCompat":
+        families = [record.family for record in self.explicit_overrides]
+        if len(families) != len(set(families)):
+            raise ValueError("legacy LoRA override families must be unique")
+        if families != sorted(families):
+            raise ValueError("legacy LoRA overrides must use stable family order")
+        return self
+
+
+class RuntimeSettingsV2(StrictModel):
+    """Runtime/host authority after creative model choices move into projects."""
+
+    schema_version: Literal[2]
+    client_id: Annotated[
+        str,
+        Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
+    ]
+    memory_policy: Literal["keep_resident"] = "keep_resident"
+    raylight_residency_policy: Literal[
+        "release_after_sampling", "keep_until_switch"
+    ] = "keep_until_switch"
+    multi_gpu_enabled: bool = False
+    placement: RuntimePlacementV2 = Field(default_factory=RuntimePlacementV2)
+    legacy_lora_resolution_compat: LegacyLoraResolutionCompat = Field(
+        default_factory=LegacyLoraResolutionCompat
+    )
+
+
+class LoraLoaderOverrideRecord(StrictModel):
+    """One exact LoRA-path mapping to a supported loader and its options."""
+
+    lora_filename: Annotated[str, Field(min_length=1, max_length=1024)]
+    adapter_id: Annotated[
+        str,
+        Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]{0,63}$"),
+    ]
+    options: Annotated[dict[str, bool], Field(max_length=16)] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_record(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        normalized.pop("family", None)
+        normalized.pop("model_filename", None)
+        adapter_id = normalized.get("adapter_id")
+        if adapter_id == "dedicated":
+            normalized["adapter_id"] = "minimax_h3_turbo"
+        elif adapter_id == "bypass_model_only":
+            normalized["adapter_id"] = "model_only"
+        normalized.setdefault("options", {})
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_supported_loader(self) -> "LoraLoaderOverrideRecord":
+        config = get_directordeck_config()
+        try:
+            normalized = config.normalize_lora_loader_options(
+                self.adapter_id,
+                self.options,
+            )
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"unsupported LoRA loader or options: {self.adapter_id}"
+            ) from exc
+        self.options = normalized
+        return self
+
+    def binding_tuple(self) -> tuple[str]:
+        return (self.lora_filename,)
+
+
+def lora_loader_binding_utf16_sort_key(
+    record: LoraLoaderOverrideRecord,
+) -> tuple[bytes]:
+    """Match ECMAScript path ordering without case/path normalization."""
+
+    return (utf16_sort_key(record.lora_filename),)
+
+
+class RuntimeSettingsV3(StrictModel):
+    """Runtime authority with one optional mapping per exact LoRA path."""
+
+    schema_version: Literal[3]
+    client_id: Annotated[
+        str,
+        Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
+    ]
+    memory_policy: Literal["keep_resident"] = "keep_resident"
+    raylight_residency_policy: Literal[
+        "release_after_sampling", "keep_until_switch"
+    ] = "keep_until_switch"
+    multi_gpu_enabled: bool = False
+    placement: RuntimePlacementV2 = Field(default_factory=RuntimePlacementV2)
+    lora_loader_overrides: Annotated[
+        list[LoraLoaderOverrideRecord], Field(max_length=256)
+    ] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_exact_triple_mappings(cls, value: Any) -> Any:
+        """Collapse the staged exact-triple shape into LoRA-only mappings.
+
+        Existing dedicated mappings are more specific than the two historical
+        model-only variants when several old triples collapse onto one LoRA.
+        This migration is deterministic and is persisted canonically by the
+        database startup normalizer.
+        """
+
+        if not isinstance(value, dict):
+            return value
+        records = value.get("lora_loader_overrides")
+        if not isinstance(records, list) or not any(
+            isinstance(record, dict)
+            and ("family" in record or "model_filename" in record)
+            for record in records
+        ):
+            return value
+        collapsed: dict[str, dict[str, Any]] = {}
+        for raw in records:
+            if not isinstance(raw, dict):
+                continue
+            lora_filename = raw.get("lora_filename")
+            if not isinstance(lora_filename, str):
+                continue
+            adapter_id = raw.get("adapter_id")
+            if adapter_id == "dedicated":
+                adapter_id = "minimax_h3_turbo"
+            elif adapter_id == "bypass_model_only":
+                adapter_id = "model_only"
+            candidate = {
+                "lora_filename": lora_filename,
+                "adapter_id": adapter_id,
+                "options": raw.get("options", {}),
+            }
+            previous = collapsed.get(lora_filename)
+            if previous is None or (
+                candidate["adapter_id"] == "minimax_h3_turbo"
+                and previous.get("adapter_id") != "minimax_h3_turbo"
+            ):
+                collapsed[lora_filename] = candidate
+        normalized = dict(value)
+        normalized["lora_loader_overrides"] = list(collapsed.values())
+        return normalized
+
+    @field_validator("lora_loader_overrides")
+    @classmethod
+    def exact_unique_stable_overrides(
+        cls, value: list[LoraLoaderOverrideRecord]
+    ) -> list[LoraLoaderOverrideRecord]:
+        seen: set[tuple[str]] = set()
+        for record in value:
+            binding = record.binding_tuple()
+            if binding in seen:
+                raise ValueError("LoRA loader override paths must be unique")
+            seen.add(binding)
+        return sorted(value, key=lora_loader_binding_utf16_sort_key)
+
+
+class RuntimeSettingsMigrationNotice(StrictModel):
+    """Typed, durable action required after removing legacy auto resolution."""
+
+    schema_version: Literal[1] = 1
+    id: Annotated[
+        str,
+        Field(min_length=1, max_length=128, pattern=r"^[a-z0-9._-]+$"),
+    ]
+    code: Literal["legacy_lora_resolution_review_required"]
+    severity: Literal["warning"] = "warning"
+    action: Literal["review_lora_loader_mappings"]
+    legacy_strategy_version: Literal[
+        "v4-known-filename-or-safetensors-metadata-v1"
+    ]
+    message: Annotated[str, Field(min_length=1, max_length=1024)]
+    created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def timezone_required(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("migration notice timestamp must include a timezone")
+        return value
+
+
+class RuntimeSettingsMigrationNoticeListRead(StrictModel):
+    notices: Annotated[list[RuntimeSettingsMigrationNotice], Field(max_length=256)]
+
+
+class RuntimeSettingsAuthorityV2Read(StrictModel):
+    settings: RuntimeSettingsV2
+    authority_token: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class RuntimeSettingsAuthorityV1WriteRequest(StrictModel):
+    """Frozen stale-writer shape retained only for a structured tombstone."""
+
+    document: RuntimeSettingsV1
+    expected_authority_token: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    schema_version: Literal[1]
+
+
+class RuntimeSettingsAuthorityV2WriteRequest(StrictModel):
+    document: RuntimeSettingsV2
+    expected_authority_token: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    schema_version: Literal[2]
+
+
+class RuntimeSettingsAuthorityV3Read(StrictModel):
+    settings: RuntimeSettingsV3
+    authority_token: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class RuntimeSettingsAuthorityV3WriteRequest(StrictModel):
+    document: RuntimeSettingsV3
+    expected_authority_token: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    schema_version: Literal[3]
+
+
 class RuntimeSettingsAuthorityRead(StrictModel):
     settings: RuntimeSettings
     authority_token: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -200,9 +506,8 @@ def canonicalize_live_runtime_settings(settings: RuntimeSettings) -> RuntimeSett
     ``backend`` and the legacy ``lora_loader`` remain accepted in the
     wire/schema shape so an older browser or database can upgrade without
     becoming unreadable. They are no longer authorities: the execution backend
-    comes from the logical GPU pool, while automatic Standard LoRA selection is
-    metadata-driven. A user can override an ambiguous Standard LoRA only via
-    the new visible ``standard_lora_loader_override`` field. Historical job
+    comes from the logical GPU pool, while Standard LoRA selection requires the
+    user's exact visible ``standard_lora_loader_override`` mapping. Historical job
     snapshots are deliberately not passed through this helper, preserving their
     audit payload verbatim.
     """
@@ -265,6 +570,57 @@ def default_settings() -> RuntimeSettings:
                 },
             },
         }
+    )
+
+
+def default_model_stack() -> ModelStack:
+    """Creative model defaults used only for the fresh singleton project."""
+
+    models = default_settings().models
+    return ModelStack.model_validate(
+        {
+            role: {"filename": getattr(models, role).filename}
+            for role in ("fl2va", "ref2va", "clip", "video_vae", "audio_vae")
+        }
+    )
+
+
+def empty_model_stack() -> ModelStack:
+    """Return the explicit five-slot incomplete creative editing state."""
+
+    return ModelStack.model_validate(
+        {
+            role: {"filename": None}
+            for role in ("fl2va", "ref2va", "clip", "video_vae", "audio_vae")
+        }
+    )
+
+
+def default_runtime_settings_v2() -> RuntimeSettingsV2:
+    """Return runtime-only defaults; no creative model file is smuggled in."""
+
+    return RuntimeSettingsV2(
+        schema_version=2,
+        client_id="directordeck",
+        memory_policy="keep_resident",
+        raylight_residency_policy="keep_until_switch",
+        multi_gpu_enabled=False,
+        placement=RuntimePlacementV2(),
+        legacy_lora_resolution_compat=LegacyLoraResolutionCompat(),
+    )
+
+
+def default_runtime_settings_v3() -> RuntimeSettingsV3:
+    """Return current runtime defaults without inferred LoRA mappings."""
+
+    return RuntimeSettingsV3(
+        schema_version=3,
+        client_id="directordeck",
+        memory_policy="keep_resident",
+        raylight_residency_policy="keep_until_switch",
+        multi_gpu_enabled=False,
+        placement=RuntimePlacementV2(),
+        lora_loader_overrides=[],
     )
 
 
@@ -398,7 +754,7 @@ class SamplingConfig(StrictModel):
     sampler: Literal["res_multistep", "euler", "dpmpp_2m"] = "res_multistep"
     # Keep this as a deliberately small, audited subset of ComfyUI's
     # scheduler registry.  Both stock BasicScheduler and RayLight's
-    # RayBasicScheduler consume these exact wire values.
+    # DirectorDeckRayBasicScheduler consumes these exact wire values.
     scheduler: SchedulerName = "simple"
     shift: Annotated[float, Field(ge=0.01, le=100)] = 12.0
     audio_shift: Annotated[float, Field(ge=0.01, le=100)] = 3.0
@@ -941,6 +1297,174 @@ class UnifiedTimelineDraft(StrictModel):
         return self
 
 
+# Frozen historical/compatibility name. ``UnifiedTimelineDraft`` remains an
+# alias for this model during the Stage-6 integration window so the v4 compiler
+# and immutable fixture builders cannot accidentally start accepting v5.
+UnifiedTimelineDraftV4 = UnifiedTimelineDraft
+
+
+FeatureIdentifier: TypeAlias = Annotated[
+    str,
+    Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9._-]{0,63}$"),
+]
+
+
+def _validate_feature_json_value(value: Any, *, depth: int, path: str) -> None:
+    if depth > MAX_FEATURE_PARAMETER_DEPTH:
+        raise ValueError(
+            f"feature params exceed maximum nesting depth at {path}"
+        )
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        if len(value) > MAX_FEATURE_STRING_LENGTH:
+            raise ValueError(f"feature string is too long at {path}")
+        return
+    if isinstance(value, int):
+        if abs(value) > 2**53 - 1:
+            raise ValueError(f"feature integer is outside JSON-safe range at {path}")
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"feature number must be finite at {path}")
+        return
+    if isinstance(value, list):
+        if len(value) > MAX_FEATURE_ARRAY_ITEMS:
+            raise ValueError(f"feature array is too large at {path}")
+        for index, item in enumerate(value):
+            _validate_feature_json_value(
+                item,
+                depth=depth + 1,
+                path=f"{path}[{index}]",
+            )
+        return
+    if isinstance(value, dict):
+        if len(value) > MAX_FEATURE_OBJECT_KEYS:
+            raise ValueError(f"feature object has too many keys at {path}")
+        for key, item in value.items():
+            if not isinstance(key, str) or _FEATURE_ID_PATTERN.fullmatch(key) is None:
+                raise ValueError(f"feature object has an invalid key at {path}")
+            _validate_feature_json_value(
+                item,
+                depth=depth + 1,
+                path=f"{path}.{key}",
+            )
+        return
+    raise ValueError(f"feature params contain a non-JSON value at {path}")
+
+
+class FeatureSelection(StrictModel):
+    enabled: bool = False
+    params: dict[FeatureIdentifier, Any] = Field(default_factory=dict)
+
+    @field_validator("params")
+    @classmethod
+    def bounded_json_params(
+        cls, value: dict[FeatureIdentifier, Any]
+    ) -> dict[FeatureIdentifier, Any]:
+        _validate_feature_json_value(value, depth=0, path="params")
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) > MAX_FEATURE_PARAMS_BYTES:
+            raise ValueError("feature params exceed the encoded byte limit")
+        return value
+
+
+class FeatureConfiguration(StrictModel):
+    template_bundle_version: Annotated[int, Field(ge=1, le=2_147_483_647)]
+    project: Annotated[
+        dict[FeatureIdentifier, FeatureSelection],
+        Field(max_length=MAX_FEATURES_PER_SCOPE),
+    ] = Field(default_factory=dict)
+    by_segment: Annotated[
+        dict[
+            Annotated[str, Field(min_length=1, max_length=128)],
+            Annotated[
+                dict[FeatureIdentifier, FeatureSelection],
+                Field(max_length=MAX_FEATURES_PER_SCOPE),
+            ],
+        ],
+        Field(max_length=128),
+    ] = Field(default_factory=dict)
+
+
+class LoraFamilyFeatureSelection(StrictModel):
+    enabled: bool = False
+    filename: Annotated[str, Field(min_length=1, max_length=1024)] | None = None
+    strength: Annotated[
+        float, Field(ge=-10, le=10, allow_inf_nan=False)
+    ] = 1.0
+
+
+class LoraFeatureParams(StrictModel):
+    by_family: dict[TimelineMode, LoraFamilyFeatureSelection]
+
+    @field_validator("by_family")
+    @classmethod
+    def exact_families(
+        cls, value: dict[TimelineMode, LoraFamilyFeatureSelection]
+    ) -> dict[TimelineMode, LoraFamilyFeatureSelection]:
+        if set(value) != {"fl2va", "ref2va"}:
+            raise ValueError("LoRA feature params require both model families")
+        return value
+
+
+class UnifiedTimelineDraftV5(StrictModel):
+    """The sole creative authority for all newly saved and submitted projects."""
+
+    version: Literal[5]
+    title: Annotated[str, Field(min_length=1, max_length=256)] = "未命名长视频"
+    render: RenderConfig = Field(default_factory=RenderConfig)
+    sampling: TimelineSamplingConfig = Field(default_factory=TimelineSamplingConfig)
+    export_mode: Literal["all", "segments"] = "all"
+    model_stack: ModelStack
+    features: FeatureConfiguration
+    segments: Annotated[
+        list[
+            Annotated[
+                UnifiedFL2VASegment | UnifiedRef2VASegment,
+                Field(discriminator="mode"),
+            ]
+        ],
+        Field(min_length=1, max_length=128),
+    ]
+
+    @model_validator(mode="after")
+    def validate_segment_feature_identity(self) -> "UnifiedTimelineDraftV5":
+        ids = [segment.id for segment in self.segments]
+        duplicates = sorted(
+            {segment_id for segment_id in ids if ids.count(segment_id) > 1}
+        )
+        if duplicates:
+            raise ValueError(
+                "segment ids must be unique; duplicates: " + ", ".join(duplicates)
+            )
+        unknown_override_ids = sorted(set(self.features.by_segment) - set(ids))
+        if unknown_override_ids:
+            raise ValueError(
+                "feature overrides reference unknown segments: "
+                + ", ".join(unknown_override_ids)
+            )
+        lora = self.features.project.get("lora")
+        if lora is not None:
+            LoraFeatureParams.model_validate(lora.params)
+        for segment_id, selections in self.features.by_segment.items():
+            segment_lora = selections.get("lora")
+            if segment_lora is not None:
+                try:
+                    LoraFeatureParams.model_validate(segment_lora.params)
+                except ValidationError as exc:
+                    raise ValueError(
+                        f"segment {segment_id} has invalid LoRA feature params"
+                    ) from exc
+        return self
+
+
 ModeDraft: TypeAlias = T2VDraft | I2VDraft | FL2VDraft | R2VDraft | V2VDraft | RV2VDraft
 ModeDraftAdapter = TypeAdapter(Annotated[ModeDraft, Field(discriminator="mode")])
 MODE_MODELS: dict[GenerationMode, type[DraftBase]] = {
@@ -990,7 +1514,7 @@ def iter_draft_assets(draft: ModeDraft) -> Iterator[tuple[str, AssetReference]]:
 
 
 def iter_timeline_assets(
-    draft: UnifiedTimelineDraft,
+    draft: UnifiedTimelineDraft | UnifiedTimelineDraftV5,
     *,
     segment_ids: set[str] | None = None,
 ) -> Iterator[tuple[str, AssetReference]]:
@@ -1073,6 +1597,30 @@ def validate_timeline_draft(value: Any) -> UnifiedTimelineDraft:
     return UnifiedTimelineDraft.model_validate(value)
 
 
+def validate_timeline_draft_v4(value: Any) -> UnifiedTimelineDraftV4:
+    """Parse only the frozen v1-v4 migration domain."""
+
+    return UnifiedTimelineDraftV4.model_validate(value)
+
+
+def validate_timeline_draft_v5(value: Any) -> UnifiedTimelineDraftV5:
+    """Parse only the current v5 creative authority; never upgrades v4."""
+
+    return UnifiedTimelineDraftV5.model_validate(value)
+
+
+def validate_timeline_snapshot(
+    value: Any,
+) -> UnifiedTimelineDraftV4 | UnifiedTimelineDraftV5:
+    """Explicitly dispatch immutable job snapshots without latest-schema guessing."""
+
+    if not isinstance(value, dict):
+        raise TypeError("timeline snapshot must be an object")
+    if value.get("version") == 5:
+        return validate_timeline_draft_v5(value)
+    return validate_timeline_draft_v4(value)
+
+
 def default_timeline_draft() -> UnifiedTimelineDraft:
     return UnifiedTimelineDraft.model_validate(
         {
@@ -1112,6 +1660,48 @@ def default_timeline_draft() -> UnifiedTimelineDraft:
                     "audio_mode": "generate",
                 }
             ],
+        }
+    )
+
+
+def default_timeline_draft_v5(
+    initial_model_stack: ModelStack | None = None,
+) -> UnifiedTimelineDraftV5:
+    """Create a v5 project; omitted model choices remain visibly incomplete."""
+
+    legacy = default_timeline_draft()
+    return UnifiedTimelineDraftV5.model_validate(
+        {
+            **legacy.model_dump(mode="json", exclude={"version"}),
+            "version": 5,
+            "model_stack": (
+                initial_model_stack.model_dump(mode="json")
+                if initial_model_stack is not None
+                else empty_model_stack().model_dump(mode="json")
+            ),
+            "features": {
+                "template_bundle_version": 5,
+                "project": {
+                    "lora": {
+                        "enabled": False,
+                        "params": {
+                            "by_family": {
+                                "fl2va": {
+                                    "enabled": False,
+                                    "filename": None,
+                                    "strength": 1.0,
+                                },
+                                "ref2va": {
+                                    "enabled": False,
+                                    "filename": None,
+                                    "strength": 1.0,
+                                },
+                            }
+                        },
+                    }
+                },
+                "by_segment": {},
+            },
         }
     )
 
@@ -1212,8 +1802,29 @@ class CreateJobRequest(StrictModel):
 
 
 class TimelineJobRequest(StrictModel):
-    config: UnifiedTimelineDraft | None = None
+    # Stage 6 accepts only an explicit v5 creative snapshot for every new job.
+    # Loading mutable project/settings state after request validation would
+    # reintroduce the split authority this migration removes.
+    config: UnifiedTimelineDraftV5
     segment_ids: Annotated[list[Annotated[str, Field(min_length=1, max_length=128)]], Field(min_length=1, max_length=128)] | None = None
+
+    @field_validator("segment_ids")
+    @classmethod
+    def unique_segment_selection(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError("segment_ids must be unique")
+        return value
+
+
+class FeaturePreflightRequest(StrictModel):
+    """Read-only preflight input for the current v5 creative authority."""
+
+    config: UnifiedTimelineDraftV5 | None = None
+    segment_ids: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=128)]],
+        Field(min_length=1, max_length=128),
+    ] | None = None
+    project_id: Annotated[str, Field(min_length=1, max_length=128)] | None = None
 
     @field_validator("segment_ids")
     @classmethod
@@ -1283,11 +1894,157 @@ class TimelineNodePolicyRead(StrictModel):
     ]
 
 
+class TimelineCompileDigestRead(StrictModel):
+    algorithm: Literal["sha256-canonical-json-v1"]
+    value: Annotated[str, Field(pattern=r"^sha256-[0-9a-f]{64}$")]
+
+
+class TimelineCompileFeatureResolutionRead(StrictModel):
+    segment_id: Annotated[str, Field(min_length=1, max_length=128)]
+    unit_id: Annotated[str, Field(min_length=1, max_length=256)]
+    feature_id: Annotated[str, Field(min_length=1, max_length=128)]
+    version: Annotated[int, Field(ge=1, le=2_147_483_647)]
+    backend: Literal["standard", "raylight"]
+    family: TimelineMode
+    template_id: Annotated[str, Field(min_length=1, max_length=128)]
+    resolution: FeatureResolution
+    adapter_fingerprint: Annotated[
+        str, Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ]
+    capability: CompiledCapabilityEvaluation
+
+
+class TimelineCompileEffectiveFeatureRead(StrictModel):
+    id: Annotated[str, Field(min_length=1, max_length=128)]
+    version: Annotated[int, Field(ge=1, le=2_147_483_647)]
+    state: Literal["active", "noop"]
+    adapter_fingerprint: Annotated[
+        str, Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ]
+    capability: CompiledCapabilityEvaluation
+
+
+class TimelineCompileEffectiveSegmentRead(StrictModel):
+    unit_id: Annotated[str, Field(min_length=1, max_length=256)]
+    backend: Literal["standard", "raylight"]
+    family: TimelineMode
+    template_id: Annotated[str, Field(min_length=1, max_length=128)]
+    features: Annotated[
+        list[TimelineCompileEffectiveFeatureRead],
+        Field(min_length=1, max_length=64),
+    ]
+
+    @model_validator(mode="after")
+    def validate_feature_identities(self) -> "TimelineCompileEffectiveSegmentRead":
+        identities = [(item.id, item.version) for item in self.features]
+        if len(identities) != len(set(identities)):
+            raise ValueError("effective compile features must be unique")
+        return self
+
+
+class TimelineCompileFeaturesRead(StrictModel):
+    requested: FeatureConfiguration
+    effective_by_segment: Annotated[
+        dict[
+            Annotated[str, Field(min_length=1, max_length=128)],
+            TimelineCompileEffectiveSegmentRead,
+        ],
+        Field(max_length=128),
+    ]
+    resolutions: Annotated[
+        list[TimelineCompileFeatureResolutionRead],
+        Field(max_length=8_192),
+    ]
+    notices: Annotated[
+        list[CompiledFeatureNotice],
+        Field(max_length=256),
+    ] = Field(default_factory=list)
+
+
 class TimelineCompileRead(StrictModel):
+    template_bundle_version: Annotated[int, Field(ge=1, le=2_147_483_647)]
+    host_capability_revision: Annotated[
+        str, Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ]
     execution_strategy: Literal["native_segment_graph_v1"] = "native_segment_graph_v1"
     model_families: list[Literal["fl2va", "ref2va"]]
     plans: list[TimelineSegmentPlanRead]
     node_policy: TimelineNodePolicyRead
+    features: TimelineCompileFeaturesRead
+    effective_execution_digest: TimelineCompileDigestRead
+
+    @model_validator(mode="after")
+    def validate_compile_report_authorities(self) -> "TimelineCompileRead":
+        if self.features.requested.template_bundle_version != self.template_bundle_version:
+            raise ValueError("requested feature bundle differs from compiled bundle")
+        plan_ids = [plan.segment_id for plan in self.plans]
+        if len(plan_ids) != len(set(plan_ids)):
+            raise ValueError("compile report plan segment ids must be unique")
+        if set(self.features.effective_by_segment) != set(plan_ids):
+            raise ValueError("effective feature scopes must exactly cover compiled plans")
+        plans_by_segment = {plan.segment_id: plan for plan in self.plans}
+        resolutions_by_segment: dict[
+            str, list[TimelineCompileFeatureResolutionRead]
+        ] = {segment_id: [] for segment_id in plan_ids}
+        for item in self.features.resolutions:
+            if item.segment_id not in plans_by_segment:
+                raise ValueError("feature resolution references an uncompiled segment")
+            resolutions_by_segment[item.segment_id].append(item)
+        for segment_id, effective in self.features.effective_by_segment.items():
+            plan = plans_by_segment[segment_id]
+            if effective.backend != plan.backend or effective.family != plan.model_family:
+                raise ValueError("effective feature route differs from its plan")
+            actual = resolutions_by_segment[segment_id]
+            if not actual:
+                raise ValueError("compiled segment has no feature resolutions")
+            if any(
+                item.unit_id != effective.unit_id
+                or item.backend != effective.backend
+                or item.family != effective.family
+                or item.template_id != effective.template_id
+                for item in actual
+            ):
+                raise ValueError("feature resolution route differs from effective scope")
+            expected_features = [
+                (
+                    item.id,
+                    item.version,
+                    item.state,
+                    item.adapter_fingerprint,
+                    item.capability,
+                )
+                for item in effective.features
+            ]
+            actual_features = [
+                (
+                    item.feature_id,
+                    item.version,
+                    item.resolution.state,
+                    item.adapter_fingerprint,
+                    item.capability,
+                )
+                for item in actual
+            ]
+            if expected_features != actual_features:
+                raise ValueError("effective feature summary differs from resolutions")
+        resolution_notice_keys = {
+            (item.segment_id, item.unit_id, item.feature_id)
+            for item in self.features.resolutions
+        }
+        if any(
+            (notice.segment_id, notice.unit_id, notice.feature_id)
+            not in resolution_notice_keys
+            for notice in self.features.notices
+        ):
+            raise ValueError("compile notice has no matching feature resolution")
+        expected_families = [
+            family
+            for family in ("fl2va", "ref2va")
+            if any(plan.model_family == family for plan in self.plans)
+        ]
+        if self.model_families != expected_families:
+            raise ValueError("compile report family summary differs from plans")
+        return self
 
 
 class AssetListRead(StrictModel):
@@ -1599,7 +2356,7 @@ class JobGenerationDetailsRead(StrictModel):
 
 class JobProjectSnapshotRead(StrictModel):
     job_id: str
-    project: UnifiedTimelineDraft
+    project: UnifiedTimelineDraftV5
     segment_ids: list[str] | None = None
 
 
@@ -1645,6 +2402,7 @@ class ProjectListRead(StrictModel):
 
 class ProjectCreateRequest(StrictModel):
     title: Annotated[str, Field(min_length=0, max_length=256)] = ""
+    initial_model_stack: ModelStack | None = None
 
 
 class ProjectRenameRequest(StrictModel):
@@ -1660,20 +2418,20 @@ class ProjectImportRequest(StrictModel):
     """
 
     title: Annotated[str, Field(min_length=0, max_length=256)] = ""
-    document: UnifiedTimelineDraft
+    document: UnifiedTimelineDraftV5
 
 
 class TimelineAuthorityRead(StrictModel):
     """One timeline document together with its durable server CAS revision."""
 
-    document: UnifiedTimelineDraft
+    document: UnifiedTimelineDraftV5
     revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
 
 
 class TimelineAuthorityWriteRequest(StrictModel):
     """A conditional timeline replacement based on an exact server revision."""
 
-    document: UnifiedTimelineDraft
+    document: UnifiedTimelineDraftV5
     expected_revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
 
 

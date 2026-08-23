@@ -83,6 +83,14 @@ export function timelineTransactionPolicy(
       return documentPolicy(
         `修改 ${action.family === "fl2va" ? "FL2VA" : "Ref2VA"} 推理参数`,
       );
+    case "project/update-model":
+      return documentPolicy("修改创作模型");
+    case "feature/set-project":
+      return documentPolicy(action.featureId === "lora" ? "修改 LoRA" : "修改项目扩展配置");
+    case "feature/set-segment":
+      return documentPolicy("修改片段扩展配置");
+    case "feature/clear-segment":
+      return documentPolicy("清理不兼容片段配置", { context: "structural" });
     case "history/restore":
       return {
         scope: "replay",

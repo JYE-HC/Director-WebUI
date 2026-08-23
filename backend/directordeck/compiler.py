@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import re
 from typing import Any, Literal
 
@@ -60,14 +61,45 @@ def timeline_segment_take_fingerprint(
     visible-frame geometry still match the current predecessor slot.
     """
 
+    return segment_take_geometry_fingerprint(
+        width=draft.render.width,
+        height=draft.render.height,
+        fps=draft.render.fps,
+        visible_frame_count=align_h3_frames(
+            segment.duration_seconds,
+            draft.render.fps,
+        ),
+    )
+
+
+def segment_take_geometry_fingerprint(
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    visible_frame_count: int,
+) -> str:
+    """Fingerprint the actual reusable media geometry of one segment take."""
+
+    if (
+        isinstance(width, bool)
+        or isinstance(height, bool)
+        or isinstance(visible_frame_count, bool)
+        or width < 1
+        or height < 1
+        or visible_frame_count < 1
+        or isinstance(fps, bool)
+        or not isinstance(fps, (int, float))
+        or not math.isfinite(float(fps))
+        or fps <= 0
+    ):
+        raise ValueError("segment take geometry must contain positive finite values")
     payload: dict[str, Any] = {
         "schema": "director-segment-take-geometry-v1",
-        "width": draft.render.width,
-        "height": draft.render.height,
-        "fps": draft.render.fps,
-        "visible_frame_count": align_h3_frames(
-            segment.duration_seconds, draft.render.fps
-        ),
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "visible_frame_count": visible_frame_count,
     }
     canonical = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")

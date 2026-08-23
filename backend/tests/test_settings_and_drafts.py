@@ -7,29 +7,67 @@ import pytest
 
 from directordeck.app import _raylight_recovery_history_state
 from directordeck.database import Database
-from directordeck.schemas import RuntimeSettings, default_settings, default_timeline_draft
+from directordeck.native_templates import (
+    build_raylight_shutdown_unit,
+    compile_native_timeline,
+    raylight_runtime_descriptor,
+)
+from directordeck.schemas import (
+    RuntimeSettings,
+    default_settings,
+    default_timeline_draft,
+    validate_mode_draft,
+)
 
-from .conftest import runnable_draft, runtime_authority_headers
+from .conftest import (
+    legacy_settings_document,
+    runnable_draft,
+    runtime_authority_headers,
+    save_database_legacy_settings,
+    save_legacy_settings_document,
+    save_timeline_document,
+)
 
 
-async def test_settings_round_trip(client) -> None:
-    settings = (await client.get("/api/settings")).json()
-    settings["client_id"] = "director-test"
-    settings["models"]["fl2va"]["device"] = "gpu:1"
-    settings["models"]["fl2va"].update(
-        lora_name="style.safetensors",
-        lora_strength=0.65,
-        lora_loader="model_only",
-        lora_low_vram=False,
+async def test_runtime_and_creative_authorities_round_trip_separately(client) -> None:
+    runtime = (await client.get("/api/settings/authority")).json()
+    runtime["settings"]["client_id"] = "director-test"
+    runtime["settings"]["placement"]["fl2va"]["device"] = "gpu:1"
+    saved_runtime = await client.put(
+        "/api/settings/authority",
+        json={
+            "document": runtime["settings"],
+            "expected_authority_token": runtime["authority_token"],
+            "schema_version": 3,
+        },
     )
+    assert saved_runtime.status_code == 200, saved_runtime.text
 
-    response = await client.put("/api/settings", json=settings)
+    timeline = (await client.get("/api/timeline/authority")).json()
+    timeline["document"]["model_stack"]["fl2va"]["filename"] = (
+        "generic_h3_diffusion.safetensors"
+    )
+    lora = timeline["document"]["features"]["project"]["lora"]
+    lora["enabled"] = True
+    lora["params"]["by_family"]["fl2va"].update(
+        enabled=True,
+        filename="style.safetensors",
+        strength=0.65,
+    )
+    saved_timeline = await save_timeline_document(
+        client,
+        timeline["document"],
+    )
+    assert saved_timeline.status_code == 200, saved_timeline.text
 
-    assert response.status_code == 200
-    assert response.json()["client_id"] == "director-test"
-    assert (await client.get("/api/settings")).json()["models"]["fl2va"]["device"] == "gpu:1"
-    assert response.json()["models"]["fl2va"]["lora_name"] == "style.safetensors"
-    assert response.json()["models"]["fl2va"]["lora_strength"] == 0.65
+    current_runtime = (await client.get("/api/settings")).json()
+    current_timeline = (await client.get("/api/timeline")).json()
+    assert current_runtime["client_id"] == "director-test"
+    assert current_runtime["placement"]["fl2va"]["device"] == "gpu:1"
+    assert current_timeline["model_stack"]["fl2va"]["filename"] == (
+        "generic_h3_diffusion.safetensors"
+    )
+    assert current_timeline["features"]["project"]["lora"] == lora
 
 
 @pytest.mark.parametrize(
@@ -56,17 +94,22 @@ async def test_runtime_resource_authority_token_rejects_aba_settings_switch(
     assert "comfy_url" not in initial["settings"]
     assert len(initial["authority_token"]) == 64
     database = client.director_app.state.database
-    original = database.get_settings()
+    original, original_token = database.get_settings_authority()
 
     async def switch_away_and_back() -> object:
-        changed = RuntimeSettings.model_validate(
-            {
-                **original.model_dump(mode="json"),
-                "client_id": "temporary-switch",
-            }
+        changed = original.model_copy(
+            update={"client_id": "temporary-switch"}
         )
-        database.put_settings(changed)
-        database.put_settings(original)
+        _changed, changed_token = database.put_settings_v3_authority(
+            changed,
+            expected_authority_token=original_token,
+            schema_version=3,
+        )
+        database.put_settings_v3_authority(
+            original,
+            expected_authority_token=changed_token,
+            schema_version=3,
+        )
         return payload
 
     monkeypatch.setattr(fake_comfy, upstream_method, switch_away_and_back)
@@ -101,45 +144,35 @@ async def test_runtime_resource_requires_authority_token(client, endpoint: str) 
     assert malformed.json()["detail"]["code"] == "runtime_authority_required"
 
 
-async def test_settings_canonicalize_obsolete_backend_and_lora_loader(client) -> None:
-    settings = (await client.get("/api/settings")).json()
-    settings["models"]["fl2va"].update(
-        backend="standard",
-        device="gpu:7",
-        lora_name=(
-            "minimax_h3_fl2v_turbo_4step_v1.0_768p_"
-            "10ErosMax_beta1_pruned_compat_v001_T8.safetensors"
-        ),
-        lora_loader="model_only",
-        lora_low_vram=True,
-        raylight={
-            "gpu_select": [0, 1],
-            "ulysses_degree": 2,
-            "ring_degree": 1,
-            "cfg_degree": 1,
-            "dp_degree": 1,
-            "fsdp": False,
-            "cpu_offload": False,
-        },
-    )
-
-    response = await client.put("/api/settings", json=settings)
-
-    assert response.status_code == 200, response.text
-    binding = response.json()["models"]["fl2va"]
-    assert binding["backend"] == "auto"
-    assert binding["lora_loader"] == "auto"
-    assert binding["standard_lora_loader_override"] is None
-    assert binding["lora_low_vram"] is False
-    assert binding["device"] == "default"
-    assert binding["raylight"]["gpu_select"] == [0, 1]
-    assert (await client.get("/api/settings")).json()["models"]["fl2va"] == binding
-
-
-async def test_settings_preserve_only_a_scoped_visible_standard_lora_override(
+async def test_v1_settings_write_is_retired_and_v3_rejects_creative_fields(
     client,
 ) -> None:
-    settings = (await client.get("/api/settings")).json()
+    retired = await client.put(
+        "/api/settings",
+        json=default_settings().model_dump(mode="json"),
+    )
+    assert retired.status_code == 409, retired.text
+    assert retired.json()["detail"]["code"] == "runtime_settings_schema_migrated"
+
+    authority = (await client.get("/api/settings/authority")).json()
+    authority["settings"]["models"] = default_settings().model_dump(
+        mode="json"
+    )["models"]
+    rejected = await client.put(
+        "/api/settings/authority",
+        json={
+            "document": authority["settings"],
+            "expected_authority_token": authority["authority_token"],
+            "schema_version": 3,
+        },
+    )
+    assert rejected.status_code == 422, rejected.text
+
+
+async def test_settings_persist_only_a_lora_loader_mapping(
+    client,
+) -> None:
+    settings = await legacy_settings_document(client)
     binding = settings["models"]["fl2va"]
     binding["lora_name"] = "style.safetensors"
     binding["lora_loader"] = "dedicated"  # obsolete hidden value
@@ -149,40 +182,87 @@ async def test_settings_preserve_only_a_scoped_visible_standard_lora_override(
         "model_filename": binding["filename"],
     }
 
-    response = await client.put("/api/settings", json=settings)
+    response = await save_legacy_settings_document(client, settings)
 
     assert response.status_code == 200, response.text
     saved = response.json()["models"]["fl2va"]
-    assert saved["lora_loader"] == "auto"
     assert saved["standard_lora_loader_override"] == {
         "loader": "model_only",
         "lora_name": "style.safetensors",
         "model_filename": binding["filename"],
     }
 
+    timeline = (await client.get("/api/timeline")).json()
+    saved_runtime = (await client.get("/api/settings")).json()
+    assert timeline["features"]["project"]["lora"]["enabled"] is True
+    assert saved_runtime["lora_loader_overrides"] == [
+        {
+            "lora_filename": "style.safetensors",
+            "adapter_id": "model_only",
+            "options": {},
+        }
+    ]
+    assert "legacy_lora_resolution_compat" not in saved_runtime
+
     stale = response.json()
     stale["models"]["fl2va"]["lora_name"] = "renamed_generic.safetensors"
-    assert (await client.put("/api/settings", json=stale)).status_code == 422
+    with pytest.raises(ValueError, match="must match"):
+        RuntimeSettings.model_validate(stale)
 
 
 async def test_settings_rejects_unknown_fields_and_cpu_vae(client) -> None:
-    settings = (await client.get("/api/settings")).json()
+    authority = (await client.get("/api/settings/authority")).json()
+    settings = authority["settings"]
     settings["raylight"] = {"gpus": 4}
-    assert (await client.put("/api/settings", json=settings)).status_code == 422
+    unknown = await client.put(
+        "/api/settings/authority",
+        json={
+            "document": settings,
+            "expected_authority_token": authority["authority_token"],
+            "schema_version": 3,
+        },
+    )
+    assert unknown.status_code == 422
 
     settings.pop("raylight")
-    settings["models"]["video_vae"]["device"] = "cpu"
-    assert (await client.put("/api/settings", json=settings)).status_code == 422
+    settings["placement"]["video_vae_device"] = "cpu"
+    invalid_vae = await client.put(
+        "/api/settings/authority",
+        json={
+            "document": settings,
+            "expected_authority_token": authority["authority_token"],
+            "schema_version": 3,
+        },
+    )
+    assert invalid_vae.status_code == 422
 
 
 async def test_settings_rejects_invalid_lora_loader_and_strength(client) -> None:
-    settings = (await client.get("/api/settings")).json()
-    settings["models"]["fl2va"]["lora_loader"] = "guess"
-    assert (await client.put("/api/settings", json=settings)).status_code == 422
+    authority = (await client.get("/api/timeline/authority")).json()
+    document = authority["document"]
+    family = document["features"]["project"]["lora"]["params"][
+        "by_family"
+    ]["fl2va"]
+    family["lora_loader"] = "guess"
+    invalid_loader = await client.put(
+        "/api/timeline/authority",
+        json={
+            "document": document,
+            "expected_revision": authority["revision"],
+        },
+    )
+    assert invalid_loader.status_code == 422
 
-    settings["models"]["fl2va"]["lora_loader"] = "model_only"
-    settings["models"]["fl2va"]["lora_strength"] = 10.01
-    assert (await client.put("/api/settings", json=settings)).status_code == 422
+    family.pop("lora_loader")
+    family["strength"] = 10.01
+    invalid_strength = await client.put(
+        "/api/timeline/authority",
+        json={
+            "document": document,
+            "expected_revision": authority["revision"],
+        },
+    )
+    assert invalid_strength.status_code == 422
 
 
 def test_initialize_migrates_legacy_mode_seed_above_json_safe_range(tmp_path) -> None:
@@ -230,6 +310,13 @@ def test_initialize_migrates_legacy_timeline_seed_above_json_safe_range(tmp_path
             "UPDATE unified_timeline SET document = ? WHERE singleton = 1",
             (json.dumps(document),),
         )
+        # A legacy timeline and v2 runtime settings cannot be published as one
+        # authority state.  Reconstruct the coherent pre-v5 pair so startup
+        # first normalizes the v1 timeline and then atomically migrates both.
+        connection.execute(
+            "UPDATE settings SET document = ? WHERE singleton = 1",
+            (default_settings().model_dump_json(),),
+        )
 
     database.initialize()
 
@@ -242,41 +329,43 @@ def test_initialize_migrates_legacy_timeline_seed_above_json_safe_range(tmp_path
         assert "cfg" not in sampling.model_dump(mode="json")
 
 @pytest.mark.parametrize("mode", ["t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v"])
-async def test_each_mode_has_an_independent_persisted_draft(client, mode: str) -> None:
+async def test_each_legacy_mode_is_read_only_after_retirement(
+    client, mode: str
+) -> None:
+    original = (await client.get(f"/api/drafts/{mode}")).json()
     draft = runnable_draft(mode)
     draft["prompt"] = f"saved-{mode}"
     response = await client.put(f"/api/drafts/{mode}", json=draft)
-    assert response.status_code == 200, response.text
-    assert (await client.get(f"/api/drafts/{mode}")).json()["prompt"] == f"saved-{mode}"
 
-    other = "i2v" if mode == "t2v" else "t2v"
-    assert (await client.get(f"/api/drafts/{other}")).json()["prompt"] != f"saved-{mode}"
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"]["code"] == "legacy_generation_api_retired"
+    assert (await client.get(f"/api/drafts/{mode}")).json() == original
 
 
 async def test_mode_specific_fields_are_forbidden_in_other_modes(client) -> None:
+    del client
     t2v = runnable_draft("t2v")
     t2v["shots"][0]["first_image"] = {
         "name": "leak.png", "subfolder": "", "type": "input", "kind": "image"
     }
-    response = await client.put("/api/drafts/t2v", json=t2v)
-    assert response.status_code == 422
-    assert "first_image" in response.text
+    with pytest.raises(ValueError, match="first_image"):
+        validate_mode_draft("t2v", t2v)
 
 
-async def test_path_and_body_mode_must_match(client) -> None:
+async def test_legacy_write_returns_tombstone_before_body_validation(client) -> None:
     response = await client.put("/api/drafts/t2v", json=runnable_draft("r2v"))
-    assert response.status_code == 422
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"]["code"] == "legacy_generation_api_retired"
 
 
 async def test_negative_prompt_fields_are_no_longer_part_of_the_api(client) -> None:
+    del client
     draft = runnable_draft("t2v")
     draft["negative_prompt"] = "legacy"
     draft["shots"][0]["negative_prompt"] = "legacy shot"
 
-    response = await client.put("/api/drafts/t2v", json=draft)
-
-    assert response.status_code == 422
-    assert "negative_prompt" in response.text
+    with pytest.raises(ValueError, match="negative_prompt"):
+        validate_mode_draft("t2v", draft)
 
 
 def test_source_range_allows_only_machine_epsilon_at_video_end() -> None:
@@ -284,8 +373,6 @@ def test_source_range_allows_only_machine_epsilon_at_video_end() -> None:
     draft["shots"][0]["source_video"]["metadata"]["duration"] = 3.02
     draft["shots"][0]["source_start_seconds"] = 0.26576
     draft["shots"][0]["source_duration_seconds"] = 2.7542400000000002
-
-    from directordeck.schemas import validate_mode_draft
 
     validate_mode_draft("rv2v", draft)
     draft["shots"][0]["source_duration_seconds"] += 1e-4
@@ -298,6 +385,7 @@ def test_initialize_migrates_legacy_negative_prompts_and_new_defaults(tmp_path) 
     database = Database(path)
     database.initialize()
     now = "2026-08-12T00:00:00+00:00"
+    legacy_settings = default_settings().model_dump(mode="json")
     database.create_job({
         "id": "legacy-ray-settings-job",
         "mode": "timeline",
@@ -308,7 +396,7 @@ def test_initialize_migrates_legacy_negative_prompts_and_new_defaults(tmp_path) 
         "outputs": [],
         "error": None,
         "config_snapshot": {},
-        "settings_snapshot": database.get_settings().model_dump(mode="json"),
+        "settings_snapshot": legacy_settings,
         "prompt_snapshot": {},
         "created_at": now,
         "updated_at": now,
@@ -316,11 +404,7 @@ def test_initialize_migrates_legacy_negative_prompts_and_new_defaults(tmp_path) 
         "completed_at": now,
     })
     with sqlite3.connect(path) as connection:
-        settings = json.loads(
-            connection.execute(
-                "SELECT document FROM settings WHERE singleton = 1"
-            ).fetchone()[0]
-        )
+        settings = legacy_settings
         for role in ("fl2va", "ref2va"):
             settings["models"][role].pop("lora_name", None)
             settings["models"][role].pop("lora_strength", None)
@@ -336,6 +420,10 @@ def test_initialize_migrates_legacy_negative_prompts_and_new_defaults(tmp_path) 
         connection.execute(
             "UPDATE settings SET document = ? WHERE singleton = 1",
             (json.dumps(settings),),
+        )
+        connection.execute(
+            "UPDATE unified_timeline SET document = ? WHERE singleton = 1",
+            (default_timeline_draft().model_dump_json(),),
         )
         connection.execute(
             "UPDATE jobs SET settings_snapshot = ? WHERE id = ?",
@@ -356,22 +444,19 @@ def test_initialize_migrates_legacy_negative_prompts_and_new_defaults(tmp_path) 
 
     database.initialize()
     migrated = database.get_draft("t2v").model_dump(mode="json")
-    migrated_settings = database.get_settings().model_dump(mode="json")
+    migrated_settings = database.get_settings()
+    migrated_timeline = database.get_timeline().model_dump(mode="json")
 
     assert migrated["ref_image_size"] == "match"
     assert "negative_prompt" not in migrated
     assert "negative_prompt" not in migrated["shots"][0]
-    assert migrated_settings["models"]["fl2va"]["lora_name"] is None
-    assert migrated_settings["models"]["ref2va"]["lora_loader"] == "auto"
-    assert migrated_settings["memory_policy"] == "keep_resident"
-    assert migrated_settings["raylight_residency_policy"] == (
-        "keep_until_switch"
-    )
-    assert migrated_settings["models"]["fl2va"]["raylight"]["fsdp"] is False
-    assert migrated_settings["models"]["fl2va"]["raylight"]["cpu_offload"] is False
-    assert migrated_settings["models"]["fl2va"]["backend"] == "auto"
-    assert migrated_settings["models"]["fl2va"]["lora_loader"] == "auto"
-    assert migrated_settings["models"]["fl2va"]["lora_low_vram"] is False
+    assert migrated_settings.schema_version == 3
+    assert migrated_settings.memory_policy == "keep_resident"
+    assert migrated_settings.raylight_residency_policy == "keep_until_switch"
+    assert migrated_settings.placement.fl2va.raylight.fsdp is False
+    assert migrated_settings.placement.fl2va.raylight.cpu_offload is False
+    assert migrated_timeline["version"] == 5
+    assert migrated_timeline["features"]["project"]["lora"]["enabled"] is False
     migrated_job = database.get_job("legacy-ray-settings-job")
     assert migrated_job is not None
     assert migrated_job["settings_snapshot"]["raylight_residency_policy"] == (
@@ -416,7 +501,7 @@ def test_initialize_preserves_explicit_release_and_records_keyed_migration(
     release_settings = _fl_raylight_settings(
         residency_policy="release_after_sampling"
     )
-    database.put_settings(release_settings)
+    saved_runtime = save_database_legacy_settings(database, release_settings)
     now = "2026-08-13T00:00:00+00:00"
     database.create_job(
         {
@@ -429,7 +514,7 @@ def test_initialize_preserves_explicit_release_and_records_keyed_migration(
             "outputs": [],
             "error": None,
             "config_snapshot": {},
-            "settings_snapshot": release_settings.model_dump(mode="json"),
+            "settings_snapshot": saved_runtime.model_dump(mode="json"),
             "prompt_snapshot": {},
             "created_at": now,
             "updated_at": now,
@@ -468,11 +553,15 @@ def test_initialize_migrates_old_dedicated_policy_to_keyed_switch(
     database = Database(path)
     database.initialize()
     with sqlite3.connect(path) as connection:
-        document = database.get_settings().model_dump(mode="json")
+        document = default_settings().model_dump(mode="json")
         document["raylight_residency_policy"] = "dedicated_keep_fl2va"
         connection.execute(
             "UPDATE settings SET document = ? WHERE singleton = 1",
             (json.dumps(document),),
+        )
+        connection.execute(
+            "UPDATE unified_timeline SET document = ? WHERE singleton = 1",
+            (default_timeline_draft().model_dump_json(),),
         )
         connection.execute(
             "DELETE FROM migration_notices WHERE id = ?",
@@ -494,8 +583,8 @@ def test_fresh_single_gpu_standard_settings_default_to_keyed_switch(tmp_path) ->
     database.initialize()
 
     settings = database.get_settings()
-    assert settings.models.fl2va.raylight.gpu_select == [0]
-    assert settings.models.ref2va.raylight.gpu_select == [0]
+    assert settings.placement.fl2va.raylight.gpu_select == [0]
+    assert settings.placement.ref2va.raylight.gpu_select == [0]
     assert settings.raylight_residency_policy == "keep_until_switch"
 
 
@@ -551,6 +640,60 @@ def test_legacy_raylight_runtime_descriptor_is_discarded_not_falsely_replayed(
         "tail_action": None,
         "tainted": True,
         "legacy_unknown": True,
+    }
+
+
+def test_v2_raylight_loader_ids_migrate_to_directordeck_namespace(tmp_path) -> None:
+    path = tmp_path / "legacy-raylight-class-ids.sqlite3"
+    database = Database(path)
+    database.initialize()
+    raw_settings = default_settings().model_dump(mode="json")
+    raw_settings["multi_gpu_enabled"] = True
+    raw_settings["models"]["fl2va"]["lora_name"] = "style.safetensors"
+    raw_settings["models"]["fl2va"]["raylight"].update(
+        gpu_select=[0, 1],
+        ulysses_degree=2,
+    )
+    compiled = compile_native_timeline(
+        default_timeline_draft(),
+        RuntimeSettings.model_validate(raw_settings),
+        "legacy-raylight-descriptor",
+    )
+    descriptor = raylight_runtime_descriptor(compiled.workflows[0])
+    assert descriptor is not None
+    legacy_aliases = {
+        "DirectorDeckRayInitializerAdvanced": "RayInitializerAdvanced",
+        "DirectorDeckRayLoraLoader": "RayLoraLoader",
+        "DirectorDeckRayUNETLoader": "RayUNETLoader",
+    }
+    for node in descriptor["loader_subgraph"].values():
+        node["class_type"] = legacy_aliases[node["class_type"]]
+    legacy_state = {
+        "version": 2,
+        "epoch": 4,
+        "current": descriptor,
+        "tail_prompt_id": None,
+        "tail_action": None,
+        "tainted": False,
+    }
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO raylight_runtime_state(singleton, descriptor, updated_at) "
+            "VALUES(1, ?, ?)",
+            (json.dumps(legacy_state), "2026-08-22T00:00:00+00:00"),
+        )
+
+    migrated = database.get_raylight_runtime_state()
+
+    assert migrated is not None
+    current = migrated["current"]
+    assert current is not None
+    barrier = build_raylight_shutdown_unit(current, unit_id="legacy-alias-switch")
+    assert {node["class_type"] for node in barrier.prompt.values()} == {
+        "DirectorDeckRayInitializerAdvanced",
+        "DirectorDeckRayLoraLoader",
+        "DirectorDeckRayUNETLoader",
+        "DirectorDeckRayKill",
     }
 
 
@@ -718,7 +861,7 @@ async def test_raylight_recovery_maps_malformed_exact_history_to_structured_502(
             "initializer_node_id": "initializer",
             "loader_subgraph": {
                 "initializer": {
-                    "class_type": "RayInitializerAdvanced",
+                    "class_type": "DirectorDeckRayInitializerAdvanced",
                     "inputs": {"GPU": 3, "GPU_SELECT": "0,1,2"},
                 }
             },

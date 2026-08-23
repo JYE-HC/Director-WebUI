@@ -1,29 +1,25 @@
-import type {
-  DiffusionModelBinding,
-  DiffusionModelRole,
-  ModelInventory,
-  RuntimeSettings,
-} from "../api/types";
-import { describeLoraLoader } from "../api/types";
+import type { ModelInventory } from "../api/types";
 import {
   closestTimelineOutputResolution,
   inferTimelineOutputAspect,
   isTimelineOutputResolution,
   timelineOutputResolutions,
+  loraFeatureSelection,
+  type LoraFamilySelection,
+  type ModelStack,
   type TimelineOutputAspect,
+  type TimelineGenerationMode,
   type TimelineProject,
 } from "../domain/timelineProject";
 import { randomSafeSeed, SAMPLING_SCHEDULERS, type SamplingConfig } from "../domain/modes";
-import { DeferredNumberInput, Field, Spinner } from "./ui";
+import { DeferredNumberInput, Field } from "./ui";
 
 interface TimelineGlobalSettingsProps {
   id: string;
   open: boolean;
   project: TimelineProject;
-  settings: RuntimeSettings;
   models: ModelInventory;
   runtimeReady: boolean;
-  modelSaving: boolean;
   onClose: () => void;
   onProjectPatch: (
     patch: Partial<Pick<TimelineProject, "render" | "export_mode">>,
@@ -32,9 +28,10 @@ interface TimelineGlobalSettingsProps {
     family: keyof TimelineProject["sampling"],
     patch: Partial<SamplingConfig>,
   ) => void;
-  onRuntimeModelChange: (
-    role: DiffusionModelRole,
-    patch: Partial<DiffusionModelBinding>,
+  onModelChange: (role: keyof ModelStack, filename: string | null) => void;
+  onLoraChange: (
+    family: TimelineGenerationMode,
+    patch: Partial<LoraFamilySelection>,
   ) => void;
 }
 
@@ -105,14 +102,13 @@ export function TimelineGlobalSettings({
   id,
   open,
   project,
-  settings,
   models,
   runtimeReady,
-  modelSaving,
   onClose,
   onProjectPatch,
   onSamplingChange,
-  onRuntimeModelChange,
+  onModelChange,
+  onLoraChange,
 }: TimelineGlobalSettingsProps) {
   const updateSampling = (
     role: keyof TimelineProject["sampling"],
@@ -128,17 +124,31 @@ export function TimelineGlobalSettings({
 
       <div className="timeline-global-settings__body">
         <GlobalOutputSpecs project={project} onProjectPatch={onProjectPatch} />
+        <section className="timeline-family-settings" aria-labelledby={`${id}-shared-models-title`}>
+          <header>
+            <div className="timeline-family-settings__title"><strong id={`${id}-shared-models-title`}>共享模型</strong><small>直接保存到当前项目 model_stack</small></div>
+            <div className="timeline-family-settings__models" data-timeline-history-ignore>
+              {(["clip", "video_vae", "audio_vae"] as const).map((role) => {
+                const labels = { clip: "CLIP", video_vae: "Video VAE", audio_vae: "Audio VAE" } as const;
+                const selected = project.model_stack[role].filename;
+                return <Field label={labels[role]} className="field--inline" key={role}><select aria-label={`${labels[role]} 模型选择`} disabled={!runtimeReady} value={selected ?? ""} onChange={(event) => onModelChange(role, event.target.value || null)}><option value="">未绑定</option>{modelOptions(selected, models[role]).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>;
+              })}
+            </div>
+          </header>
+        </section>
         {(["fl2va", "ref2va"] as const).map((role) => {
-          const binding = settings.models[role];
+          const modelSelection = project.model_stack[role];
+          const lora = loraFeatureSelection(project.features).params.by_family[role];
           const sampling = project.sampling[role];
           const label = role === "fl2va" ? "FL2VA" : "Ref2VA";
           return (
             <section className="timeline-family-settings" aria-labelledby={`${id}-${role}-title`} key={role}>
               <header>
-                <div className="timeline-family-settings__title"><strong id={`${id}-${role}-title`}>{label}</strong><small>{role === "fl2va" ? "文 / 图 / 首尾帧生成" : "参考 / 源视频生成"}</small><small>LoRA 加载：{describeLoraLoader(binding)}</small>{modelSaving && <Spinner label={`同步 ${label} 模型`} />}</div>
+                <div className="timeline-family-settings__title"><strong id={`${id}-${role}-title`}>{label}</strong><small>{role === "fl2va" ? "文 / 图 / 首尾帧生成" : "参考 / 源视频生成"}</small><small>模型与 LoRA 是当前项目创作配置；加载器由服务端预检解析</small></div>
                 <div className="timeline-family-settings__models" data-timeline-history-ignore>
-                  <Field label="Diffusion 模型" className="field--inline"><select aria-label={`${role.toUpperCase()} Diffusion 模型快捷选择`} disabled={!runtimeReady} value={binding.filename} onChange={(event) => onRuntimeModelChange(role, { filename: event.target.value })}>{modelOptions(binding.filename, models[role]).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>
-                  <Field label="LoRA" className="field--inline"><select aria-label={`${role.toUpperCase()} LoRA 模型快捷选择`} disabled={!runtimeReady} value={binding.lora_name ?? ""} onChange={(event) => onRuntimeModelChange(role, { lora_name: event.target.value || null })}><option value="">不使用 LoRA</option>{modelOptions(binding.lora_name, models.loras).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>
+                  <Field label="Diffusion 模型" className="field--inline"><select aria-label={`${role.toUpperCase()} Diffusion 模型快捷选择`} disabled={!runtimeReady} value={modelSelection.filename ?? ""} onChange={(event) => onModelChange(role, event.target.value || null)}><option value="">未绑定</option>{modelOptions(modelSelection.filename, models[role]).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>
+                  <Field label="LoRA" className="field--inline"><select aria-label={`${role.toUpperCase()} LoRA 模型快捷选择`} disabled={!runtimeReady} value={lora.enabled ? lora.filename ?? "" : ""} onChange={(event) => onLoraChange(role, { enabled: Boolean(event.target.value), filename: event.target.value || null })}><option value="">不使用 LoRA</option>{modelOptions(lora.filename, models.loras).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>
+                  <Field label="LoRA 强度" className="field--inline"><DeferredNumberInput aria-label={`${label} LoRA 强度`} min="-10" max="10" step="0.01" disabled={!runtimeReady || !lora.enabled || !lora.filename} value={lora.strength} onValueCommit={(strength) => onLoraChange(role, { strength })} /></Field>
                 </div>
               </header>
               <div className="timeline-family-settings__sampling">

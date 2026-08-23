@@ -59,30 +59,37 @@ def test_legacy_compiler_has_no_negative_conditioning_and_resolves_random_seed(
 
 
 @pytest.mark.parametrize(
-    ("obsolete_loader", "lora_name", "expected_node"),
+    ("adapter_id", "lora_name", "expected_node"),
     [
-        ("auto", "minimax_h3_turbo_v4_step600_ema.safetensors", "MiniMaxH3TurboLoRA"),
+        ("dedicated", "minimax_h3_turbo_v4_step600_ema.safetensors", "MiniMaxH3TurboLoRA"),
         (
-            "dedicated",
+            "bypass_model_only",
             "minimax_h3_fl2v_turbo_4step_v1.0_768p_10ErosMax_beta1_pruned_compat_v001_T8.safetensors",
             "LoraLoaderBypassModelOnly",
         ),
         (
-            "bypass_model_only",
+            "model_only",
             "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
             "LoraLoaderModelOnly",
         ),
-        ("model_only", "minimax_h3_turbo_v4_step600.safetensors", "MiniMaxH3TurboLoRA"),
     ],
 )
-def test_legacy_compiler_derives_lora_dialect_and_ignores_obsolete_selection(
-    obsolete_loader: str, lora_name: str, expected_node: str
+def test_legacy_compiler_uses_only_an_exact_explicit_lora_adapter(
+    adapter_id: str, lora_name: str, expected_node: str
 ) -> None:
     raw = default_settings().model_dump(mode="json")
+    model_filename = raw["models"]["fl2va"]["filename"]
     raw["models"]["fl2va"].update(
         lora_name=lora_name,
-        lora_loader=obsolete_loader,
+        # The obsolete selector is deliberately contradictory: only the exact
+        # binding record below may choose the adapter.
+        lora_loader="auto",
         lora_strength=0.75,
+        standard_lora_loader_override={
+            "loader": adapter_id,
+            "lora_name": lora_name,
+            "model_filename": model_filename,
+        },
     )
     prompt = compile_prompt(
         validate_mode_draft("t2v", runnable_draft("t2v")),
@@ -107,7 +114,10 @@ def test_legacy_compiler_refuses_unknown_lora_even_with_obsolete_override(
     raw["models"]["fl2va"].update(
         lora_name=lora_name, lora_loader="model_only"
     )
-    with pytest.raises(DraftNotRunnable, match="cannot be inferred safely"):
+    with pytest.raises(
+        DraftNotRunnable,
+        match="requires an explicit compatible loader mapping",
+    ):
         compile_prompt(
             validate_mode_draft("t2v", runnable_draft("t2v")),
             RuntimeSettings.model_validate(raw),

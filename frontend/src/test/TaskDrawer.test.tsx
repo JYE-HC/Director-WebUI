@@ -1,8 +1,14 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
-import type { GenerationTask, TaskGenerationDetails } from "../api/types";
+import type {
+  GenerationTask,
+  TaskGenerationDetails,
+  TaskProjectSnapshotResponse,
+} from "../api/types";
 import { TaskDrawer } from "../components/TaskDrawer";
+import { buildHistoricalProjectConfigDownload } from "../domain/historicalProjectExport";
+import { createTimelineProject } from "../domain/timelineProject";
 import { loadTimelineWorkspacePreferences } from "../domain/workspacePreferences";
 
 const baseTask: GenerationTask = {
@@ -424,6 +430,16 @@ describe("ComfyUI 风格的任务历史抽屉", () => {
   it("更多菜单支持项目恢复、ID/错误处理和脱敏诊断入口", async () => {
     const user = userEvent.setup();
     const onLoadProject = vi.fn();
+    const historicalProject = createTimelineProject();
+    historicalProject.title = "不可变历史创作配置";
+    const historicalSnapshot: TaskProjectSnapshotResponse = {
+      job_id: "job-menu-failed",
+      project: historicalProject,
+      segment_ids: [historicalProject.segments[0].id],
+    };
+    const onExportProjectConfig = vi.fn().mockResolvedValue(historicalSnapshot);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
     const onExportDiagnostic = vi.fn(
       () => new Promise<never>(() => undefined),
     );
@@ -434,7 +450,12 @@ describe("ComfyUI 风格的任务历史抽屉", () => {
       error: "服务器错误详情",
       completed_at: "2026-08-12T15:03:00Z",
     };
-    renderDrawer({ tasks: [failedTask], onLoadProject, onExportDiagnostic });
+    renderDrawer({
+      tasks: [failedTask],
+      onLoadProject,
+      onExportProjectConfig,
+      onExportDiagnostic,
+    });
 
     const menuTrigger = screen.getByRole("button", { name: "任务 job-menu 的更多操作" });
     expect(menuTrigger).toHaveAttribute("aria-expanded", "false");
@@ -443,6 +464,7 @@ describe("ComfyUI 风格的任务历史抽屉", () => {
     expect(menuTrigger).toHaveAttribute("aria-expanded", "true");
     expect(menuTrigger).toHaveAttribute("aria-controls", menu.id);
     expect(menu).toHaveTextContent("另存为新项目");
+    expect(menu).toHaveTextContent("导出配置");
     expect(menu).toHaveTextContent("导出脱敏诊断");
     expect(menu).toHaveTextContent("复制任务 ID");
     expect(menu).toHaveTextContent("查看错误详情");
@@ -451,12 +473,39 @@ describe("ComfyUI 风格的任务历史抽屉", () => {
     expect(onLoadProject).toHaveBeenCalledWith(failedTask.id);
 
     await user.click(screen.getByRole("button", { name: "任务 job-menu 的更多操作" }));
+    await user.click(screen.getByRole("menuitem", { name: "导出配置" }));
+    await waitFor(() => expect(onExportProjectConfig).toHaveBeenCalledWith(failedTask.id));
+    await waitFor(() => expect(anchorClick).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "任务 job-menu 的更多操作" }));
     await user.click(screen.getByRole("menuitem", { name: "导出脱敏诊断" }));
     expect(onExportDiagnostic).toHaveBeenCalledWith(failedTask.id);
 
     await user.click(screen.getByRole("button", { name: "任务 job-menu 的更多操作" }));
     await user.click(screen.getByRole("menuitem", { name: "查看错误详情" }));
     expect(screen.getByRole("dialog", { name: "任务错误详情" })).toHaveTextContent("服务器错误详情");
+  });
+
+  it("历史配置下载只序列化只读 v5 creative view，可原样再次导入", () => {
+    const project = createTimelineProject();
+    project.title = "历史可移植配置";
+    project.model_stack.fl2va.filename = "historical-fl2va.safetensors";
+    const snapshot = {
+      job_id: "job/history unsafe",
+      project,
+      segment_ids: [project.segments[0].id],
+      runtime_settings: { comfy_base_url: "http://private.example" },
+    } as TaskProjectSnapshotResponse & { runtime_settings: unknown };
+
+    const download = buildHistoricalProjectConfigDownload(snapshot.job_id, snapshot);
+
+    expect(download.filename).toBe("director-project-job-history-unsafe.json");
+    expect(download.mimeType).toBe("application/json");
+    expect(JSON.parse(download.contents)).toEqual(project);
+    expect(download.contents).not.toContain("runtime_settings");
+    expect(download.contents).not.toContain("private.example");
+    expect(() => buildHistoricalProjectConfigDownload("different-job", snapshot))
+      .toThrow("任务来源项目与请求任务不匹配");
   });
 
   it("生成参数按需加载到可关闭、可回焦的结构化弹窗", async () => {

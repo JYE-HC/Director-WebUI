@@ -1,6 +1,15 @@
 import "fake-indexeddb/auto";
-import { createTimelineProject } from "../domain/timelineProject";
-import { createTimelineHistory, recordTimelineHistory } from "../state/timelineHistory";
+import {
+  createTimelineProject,
+  migrateTimelineFeatureBundle4To5,
+  type TimelineProject,
+} from "../domain/timelineProject";
+import {
+  createTimelineHistory,
+  recordTimelineHistory,
+  redoTimelineHistory,
+  undoTimelineHistory,
+} from "../state/timelineHistory";
 import {
   deleteTimelineHistoryJournal,
   deleteTimelineHistoryDatabaseForTests,
@@ -86,6 +95,12 @@ describe("timeline IndexedDB persistence", () => {
       after: edited,
     });
     return { base, edited, history };
+  }
+
+  function bundle4Project(): TimelineProject {
+    const project = createTimelineProject();
+    project.features.template_bundle_version = 4;
+    return project;
   }
 
   it("只在数据库、项目、revision 与权威基线全部精确匹配时恢复", async () => {
@@ -189,6 +204,156 @@ describe("timeline IndexedDB persistence", () => {
       status: "acknowledged",
       project: edited,
     });
+  });
+
+  it("bundle 4 current journal 跨 marker revision 重建 pending 历史、checkpoint 与 Undo/Redo", async () => {
+    const base = bundle4Project();
+    let before = base;
+    let history = createTimelineHistory();
+    for (let index = 1; index <= 22; index += 1) {
+      const after = { ...structuredClone(before), title: `bundle 4 edit ${index}` };
+      history = recordTimelineHistory(history, {
+        label: `编辑 ${index}`,
+        before,
+        after,
+        now: index,
+      });
+      before = after;
+    }
+    history = undoTimelineHistory(history)!.history;
+    history = undoTimelineHistory(history)!.history;
+    await saveTimelineHistoryJournal(scope, { document: base, revision: 10 }, history);
+    const rawBefore = JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope)));
+    const upgradedBase = migrateTimelineFeatureBundle4To5(base)!;
+
+    const restored = await loadTimelineHistoryJournal(scope, {
+      document: upgradedBase,
+      revision: 11,
+    });
+    expect(restored).toMatchObject({
+      status: "restored",
+      confirmedRevision: 11,
+      confirmedDocument: upgradedBase,
+      project: {
+        title: "bundle 4 edit 20",
+        features: { template_bundle_version: 5 },
+      },
+    });
+    if (restored.status !== "restored") throw new Error("expected projected journal replay");
+    expect(restored.history.checkpoints.length).toBeGreaterThanOrEqual(2);
+    expect(restored.history.checkpoints.every(
+      (checkpoint) => checkpoint.project.features.template_bundle_version === 5,
+    )).toBe(true);
+
+    let audit = restored.history;
+    let undoCount = 0;
+    for (;;) {
+      const undone = undoTimelineHistory(audit);
+      if (!undone) break;
+      expect(undone.snapshot.project.features.template_bundle_version).toBe(5);
+      audit = undone.history;
+      undoCount += 1;
+    }
+    expect(undoCount).toBe(20);
+    expect(audit.head?.title).toBe(base.title);
+    let redoCount = 0;
+    for (;;) {
+      const redone = redoTimelineHistory(audit);
+      if (!redone) break;
+      expect(redone.snapshot.project.features.template_bundle_version).toBe(5);
+      audit = redone.history;
+      redoCount += 1;
+    }
+    expect(redoCount).toBe(22);
+    expect(audit.head?.title).toBe("bundle 4 edit 22");
+    expect(JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope))))
+      .toBe(rawBefore);
+  });
+
+  it("bundle 4 current journal 精确覆盖 clean 与 marker 后 lost ACK", async () => {
+    const base = bundle4Project();
+    const edited = { ...structuredClone(base), title: "已经提交的 bundle 4 head" };
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "编辑",
+      before: base,
+      after: edited,
+    });
+
+    await saveTimelineHistoryJournal(scope, { document: edited, revision: 20 }, history);
+    const cleanRaw = JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope)));
+    const upgradedEdited = migrateTimelineFeatureBundle4To5(edited)!;
+    await expect(loadTimelineHistoryJournal(scope, {
+      document: upgradedEdited,
+      revision: 21,
+    })).resolves.toMatchObject({
+      status: "acknowledged",
+      confirmedRevision: 21,
+      confirmedDocument: upgradedEdited,
+      project: upgradedEdited,
+    });
+    expect(JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope))))
+      .toBe(cleanRaw);
+
+    await saveTimelineHistoryJournal(scope, { document: base, revision: 30 }, history);
+    const lostAckRaw = JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope)));
+    const lostAck = await loadTimelineHistoryJournal(scope, {
+      document: upgradedEdited,
+      revision: 32,
+    });
+    expect(lostAck).toMatchObject({
+      status: "acknowledged",
+      confirmedRevision: 32,
+      confirmedDocument: upgradedEdited,
+      project: upgradedEdited,
+    });
+    if (lostAck.status !== "acknowledged") throw new Error("expected projected lost ACK");
+    expect(lostAck.history.past).toHaveLength(1);
+    expect(undoTimelineHistory(lostAck.history)?.snapshot.project).toMatchObject({
+      title: base.title,
+      features: { template_bundle_version: 5 },
+    });
+    expect(JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope))))
+      .toBe(lostAckRaw);
+  });
+
+  it("bundle 4 current journal 遇到同 revision 的无关服务器编辑仍保留冲突证据", async () => {
+    const base = bundle4Project();
+    const edited = { ...structuredClone(base), title: "本地待同步" };
+    const history = recordTimelineHistory(createTimelineHistory(), {
+      label: "本地编辑",
+      before: base,
+      after: edited,
+    });
+    await saveTimelineHistoryJournal(scope, { document: base, revision: 40 }, history);
+    const rawBefore = JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope)));
+    const remote = {
+      ...migrateTimelineFeatureBundle4To5(base)!,
+      title: "服务器无关编辑",
+    };
+
+    await expect(loadTimelineHistoryJournal(scope, {
+      document: remote,
+      revision: 41,
+    })).resolves.toMatchObject({
+      status: "conflict",
+      confirmedRevision: 40,
+      confirmedDocument: base,
+      localProject: edited,
+    });
+    const listed = await listTimelineHistoryJournalBranches({
+      ...scope,
+      ownerId: "fresh-owner",
+    }, {
+      document: remote,
+      revision: 41,
+    });
+    expect(listed.status === "available" ? listed.foreign : []).toMatchObject([{
+      status: "conflict",
+      confirmedRevision: 40,
+      project: edited,
+    }]);
+    expect(JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope))))
+      .toBe(rawBefore);
   });
 
   it("WebCrypto 保存时失败、读取时恢复也不会改变 journal digest 算法", async () => {

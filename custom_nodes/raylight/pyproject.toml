@@ -3,9 +3,9 @@ requires = ["setuptools>=70.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "raylight"
-version = "1.8.0"
-description = "Enable tensor split multi gpu capability in Comfy UI"
+name = "directordeck-raylight"
+version = "1.8.0+director.1"
+description = "DirectorDeck-maintained bundled RayLight fork"
 authors = [
   {name = "Micko Lesmana", email = "mickolesmana@gmail.com"}
 ]
@@ -34,15 +34,12 @@ homepage = "https://github.com/komikndr/raylight"
 Repository = "https://github.com/komikndr/raylight"
 
 
-[tool.comfy]
-PublisherId = "komikndr"
-DisplayName = "raylight"
-repository = "https://github.com/komikndr/raylight"
-Icon = "https://github.com/komikndr/raylight/blob/main/icon.png?raw=true"
-
-
 [tool.setuptools.package-data]
 "*" = ["*.*"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["directordeck_raylight*"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

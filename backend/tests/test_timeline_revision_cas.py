@@ -10,7 +10,7 @@ import pytest
 from directordeck.database import Database, TimelineRevisionConflict
 from directordeck.schemas import (
     MAX_TIMELINE_REVISION,
-    UnifiedTimelineDraft,
+    UnifiedTimelineDraftV5,
     default_settings,
     default_timeline_draft,
 )
@@ -18,8 +18,10 @@ from directordeck.schemas import (
 from .conftest import asset
 
 
-def _titled_timeline(title: str) -> UnifiedTimelineDraft:
-    return default_timeline_draft().model_copy(update={"title": title}, deep=True)
+def _titled_timeline(
+    base: UnifiedTimelineDraftV5, title: str
+) -> UnifiedTimelineDraftV5:
+    return base.model_copy(update={"title": title}, deep=True)
 
 
 async def test_default_authority_cas_success_and_stale_conflict_are_exact(
@@ -109,15 +111,19 @@ async def test_project_authority_is_isolated_and_default_alias_delegates(
     assert saved.status_code == 200, saved.text
     assert saved.json()["revision"] == 1
 
-    legacy_document = saved.json()["document"]
-    legacy_document["title"] = "项目裸 PUT"
-    legacy = await client.put(
-        f"/api/projects/{project_id}/timeline", json=legacy_document
+    bare_document = saved.json()["document"]
+    bare_document["title"] = "项目裸 PUT"
+    bare = await client.put(
+        f"/api/projects/{project_id}/timeline", json=bare_document
     )
-    assert legacy.status_code == 200, legacy.text
-    assert (
-        await client.get(f"/api/projects/{project_id}/timeline/authority")
-    ).json()["revision"] == 2
+    assert bare.status_code == 409, bare.text
+    assert bare.json()["detail"]["code"] == "timeline_authority_required"
+    second = await client.put(
+        f"/api/projects/{project_id}/timeline/authority",
+        json={"document": bare_document, "expected_revision": 1},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["revision"] == 2
     stale = await client.put(
         f"/api/projects/{project_id}/timeline/authority",
         json={"document": document, "expected_revision": 1},
@@ -149,38 +155,64 @@ async def test_project_authority_is_isolated_and_default_alias_delegates(
     assert missing_put.status_code == 404
 
 
-async def test_legacy_put_and_project_rename_advance_revision(client) -> None:
+async def test_bare_put_and_standalone_project_rename_are_retired(client) -> None:
     default_before = (await client.get("/api/timeline/authority")).json()
-    legacy_document = default_before["document"]
-    legacy_document["title"] = "裸 PUT 仍兼容"
-    legacy = await client.put("/api/timeline", json=legacy_document)
-    assert legacy.status_code == 200, legacy.text
+    bare_document = json.loads(json.dumps(default_before["document"]))
+    bare_document["title"] = "裸 PUT 已退役"
+    bare = await client.put("/api/timeline", json=bare_document)
+    assert bare.status_code == 409, bare.text
+    assert bare.json()["detail"]["code"] == "timeline_authority_required"
     default_after = (await client.get("/api/timeline/authority")).json()
-    assert default_after["revision"] == default_before["revision"] + 1
+    assert default_after == default_before
 
-    stale = await client.put(
+    saved = await client.put(
         "/api/timeline/authority",
         json={
-            "document": default_before["document"],
+            "document": bare_document,
             "expected_revision": default_before["revision"],
         },
     )
-    assert stale.status_code == 409
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["revision"] == default_before["revision"] + 1
 
     created = (await client.post("/api/projects", json={"title": "改名前"})).json()
     project_id = created["id"]
     assert (
         await client.get(f"/api/projects/{project_id}/timeline/authority")
     ).json()["revision"] == 0
-    renamed = await client.patch(
+    retired = await client.patch(
         f"/api/projects/{project_id}", json={"title": "改名后"}
     )
-    assert renamed.status_code == 200, renamed.text
-    renamed_authority = (
+    assert retired.status_code == 410, retired.text
+    assert retired.json()["detail"] == {
+        "code": "project_rename_api_retired",
+        "message": (
+            "Project titles are part of timeline creative authority; update "
+            "document.title through timeline authority CAS."
+        ),
+        "required_endpoint": (
+            f"/api/projects/{project_id}/timeline/authority"
+        ),
+        "required_schema": 5,
+    }
+    unchanged_authority = (
         await client.get(f"/api/projects/{project_id}/timeline/authority")
     ).json()
-    assert renamed_authority["revision"] == 1
-    assert renamed_authority["document"]["title"] == "改名后"
+    assert unchanged_authority["revision"] == 0
+    assert unchanged_authority["document"]["title"] == "改名前"
+
+    renamed_document = json.loads(json.dumps(unchanged_authority["document"]))
+    renamed_document["title"] = "改名后"
+    renamed = await client.put(
+        f"/api/projects/{project_id}/timeline/authority",
+        json={"document": renamed_document, "expected_revision": 0},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["revision"] == 1
+    assert renamed.json()["document"]["title"] == "改名后"
+    summary = await client.get(f"/api/projects/{project_id}")
+    assert summary.status_code == 200, summary.text
+    assert summary.json()["title"] == "改名后"
 
 
 async def test_revision_exhaustion_is_an_explicit_409_for_default_and_project(
@@ -233,20 +265,32 @@ async def test_revision_exhaustion_is_an_explicit_409_for_default_and_project(
 
 async def test_asset_cascade_advances_only_changed_project_revisions(client) -> None:
     first = asset("first.png", "image")
-    default_document = (await client.get("/api/timeline")).json()
+    default_authority = (await client.get("/api/timeline/authority")).json()
+    default_document = default_authority["document"]
     default_document["segments"][0]["first_image"] = first
-    assert (await client.put("/api/timeline", json=default_document)).status_code == 200
+    default_saved = await client.put(
+        "/api/timeline/authority",
+        json={
+            "document": default_document,
+            "expected_revision": default_authority["revision"],
+        },
+    )
+    assert default_saved.status_code == 200, default_saved.text
 
     changed = (await client.post("/api/projects", json={"title": "受影响"})).json()
-    changed_document = (
-        await client.get(f"/api/projects/{changed['id']}/timeline")
+    changed_authority = (
+        await client.get(f"/api/projects/{changed['id']}/timeline/authority")
     ).json()
+    changed_document = changed_authority["document"]
     changed_document["segments"][0]["first_image"] = first
-    assert (
-        await client.put(
-            f"/api/projects/{changed['id']}/timeline", json=changed_document
-        )
-    ).status_code == 200
+    changed_saved = await client.put(
+        f"/api/projects/{changed['id']}/timeline/authority",
+        json={
+            "document": changed_document,
+            "expected_revision": changed_authority["revision"],
+        },
+    )
+    assert changed_saved.status_code == 200, changed_saved.text
 
     untouched = (await client.post("/api/projects", json={"title": "不受影响"})).json()
     before_default = (await client.get("/api/timeline/authority")).json()["revision"]
@@ -274,7 +318,7 @@ async def test_asset_cascade_advances_only_changed_project_revisions(client) -> 
     assert changed_after["document"]["segments"][0]["first_image"] is None
 
 
-def test_initialize_adds_revision_columns_without_rewriting_current_documents(
+def test_initialize_adds_revision_columns_and_migrates_v5_exactly_once(
     tmp_path,
 ) -> None:
     path = tmp_path / "legacy-without-timeline-revisions.sqlite3"
@@ -317,8 +361,16 @@ def test_initialize_adds_revision_columns_without_rewriting_current_documents(
     database = Database(path)
     database.initialize()
 
-    assert database.get_timeline_authority()[1] == 0
-    assert database.get_project_timeline_authority("legacy-project")[1] == 0
+    default_document, default_revision = database.get_timeline_authority()
+    project_document, project_revision = database.get_project_timeline_authority(
+        "legacy-project"
+    )
+    assert default_revision == 2
+    assert project_revision == 2
+    assert default_document.version == 5
+    assert project_document.version == 5
+    assert default_document.features.template_bundle_version == 5
+    assert project_document.features.template_bundle_version == 5
     with sqlite3.connect(path) as connection:
         timeline_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(unified_timeline)")
@@ -331,8 +383,8 @@ def test_initialize_adds_revision_columns_without_rewriting_current_documents(
 
     # Repeated startup is idempotent when canonical storage did not change.
     database.initialize()
-    assert database.get_timeline_authority()[1] == 0
-    assert database.get_project_timeline_authority("legacy-project")[1] == 0
+    assert database.get_timeline_authority()[1] == 2
+    assert database.get_project_timeline_authority("legacy-project")[1] == 2
 
 
 def test_startup_canonicalization_advances_revision_once(tmp_path) -> None:
@@ -351,28 +403,34 @@ def test_startup_canonicalization_advances_revision_once(tmp_path) -> None:
             "UPDATE unified_timeline SET document = ?, revision = 7 WHERE singleton = 1",
             (json.dumps(legacy),),
         )
+        connection.execute(
+            "UPDATE settings SET document = ? WHERE singleton = 1",
+            (default_settings().model_dump_json(),),
+        )
 
     database.initialize()
     document, revision = database.get_timeline_authority()
-    assert revision == 8
-    assert document.version == 4
+    assert revision == 10
+    assert document.version == 5
+    assert document.features.template_bundle_version == 5
     assert document.segments[0].ref_image_size == "max"
     assert document.segments[0].audio_mode == "mute"
 
     database.initialize()
-    assert database.get_timeline_authority()[1] == 8
+    assert database.get_timeline_authority()[1] == 10
 
 
 def test_two_concurrent_cas_writers_have_exactly_one_winner(tmp_path) -> None:
     database = Database(tmp_path / "concurrent-cas.sqlite3")
     database.initialize()
+    base = database.get_timeline()
     barrier = threading.Barrier(2)
 
     def write(title: str):
         barrier.wait(timeout=2)
         try:
             return database.validate_and_put_timeline_authority(
-                _titled_timeline(title),
+                _titled_timeline(base, title),
                 expected_revision=0,
             )
         except TimelineRevisionConflict as exc:

@@ -194,6 +194,8 @@ export interface TimelineSegmentCopyOptions {
   refImageSize: boolean;
   prompt: boolean;
   promptReferences: boolean;
+  /** Segment-scoped feature selections. Creative project features are never copied here. */
+  features?: boolean;
 }
 
 export const DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS: TimelineSegmentCopyOptions = {
@@ -204,10 +206,148 @@ export const DEFAULT_TIMELINE_SEGMENT_COPY_OPTIONS: TimelineSegmentCopyOptions =
   refImageSize: true,
   prompt: false,
   promptReferences: false,
+  features: false,
 };
 
+export interface ModelFileSelection {
+  filename: string | null;
+}
+
+export type DiffusionModelSelection = ModelFileSelection;
+
+export interface ModelStack {
+  fl2va: DiffusionModelSelection;
+  ref2va: DiffusionModelSelection;
+  clip: ModelFileSelection;
+  video_vae: ModelFileSelection;
+  audio_vae: ModelFileSelection;
+}
+
+export type FeatureJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | FeatureJsonValue[]
+  | { [key: string]: FeatureJsonValue };
+
+export interface FeatureSelection {
+  enabled: boolean;
+  params: { [key: string]: FeatureJsonValue };
+}
+
+export interface FeatureConfiguration {
+  template_bundle_version: number;
+  project: Record<string, FeatureSelection>;
+  by_segment: Record<string, Record<string, FeatureSelection>>;
+}
+
+export interface LoraFamilySelection {
+  [key: string]: FeatureJsonValue;
+  enabled: boolean;
+  filename: string | null;
+  strength: number;
+}
+
+export interface LoraFeatureParams {
+  [key: string]: FeatureJsonValue;
+  by_family: {
+    [key: string]: LoraFamilySelection;
+    fl2va: LoraFamilySelection;
+    ref2va: LoraFamilySelection;
+  };
+}
+
+export const DEFAULT_MODEL_STACK: ModelStack = {
+  fl2va: { filename: null },
+  ref2va: { filename: null },
+  clip: { filename: null },
+  video_vae: { filename: null },
+  audio_vae: { filename: null },
+};
+
+export const DEFAULT_LORA_FEATURE_SELECTION: FeatureSelection = {
+  enabled: false,
+  params: {
+    by_family: {
+      fl2va: { enabled: false, filename: null, strength: 1 },
+      ref2va: { enabled: false, filename: null, strength: 1 },
+    },
+  },
+};
+
+export const CURRENT_TEMPLATE_BUNDLE_VERSION = 5;
+
+export const DEFAULT_FEATURE_CONFIGURATION: FeatureConfiguration = {
+  template_bundle_version: CURRENT_TEMPLATE_BUNDLE_VERSION,
+  project: { lora: DEFAULT_LORA_FEATURE_SELECTION },
+  by_segment: {},
+};
+
+function normalizeLoraFamilySelection(value: unknown): LoraFamilySelection | null {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== 3 ||
+    typeof value.enabled !== "boolean" ||
+    !(
+      value.filename === null ||
+      (typeof value.filename === "string" && value.filename.length >= 1 && value.filename.length <= 1_024)
+    ) ||
+    typeof value.strength !== "number" ||
+    !Number.isFinite(value.strength) ||
+    value.strength < -10 ||
+    value.strength > 10
+  ) return null;
+  return {
+    enabled: value.enabled,
+    filename: value.filename,
+    strength: value.strength,
+  };
+}
+
+export function loraFeatureSelection(
+  features: FeatureConfiguration,
+): FeatureSelection & { params: LoraFeatureParams } {
+  const selection = features.project.lora;
+  const byFamily = isRecord(selection?.params?.by_family)
+    ? selection.params.by_family
+    : null;
+  const fl2va = normalizeLoraFamilySelection(byFamily?.fl2va);
+  const ref2va = normalizeLoraFamilySelection(byFamily?.ref2va);
+  if (selection && fl2va && ref2va) {
+    return {
+      enabled: selection.enabled,
+      params: { by_family: { fl2va, ref2va } },
+    };
+  }
+  return structuredClone(DEFAULT_LORA_FEATURE_SELECTION) as FeatureSelection & {
+    params: LoraFeatureParams;
+  };
+}
+
+export function updateLoraFeatureFamily(
+  features: FeatureConfiguration,
+  family: TimelineGenerationMode,
+  patch: Partial<LoraFamilySelection>,
+): FeatureSelection {
+  const current = loraFeatureSelection(features);
+  const nextFamily = normalizeLoraFamilySelection({
+    ...current.params.by_family[family],
+    ...patch,
+  });
+  if (!nextFamily) return current;
+  const byFamily = {
+    ...current.params.by_family,
+    [family]: nextFamily,
+  };
+  return {
+    enabled: byFamily.fl2va.enabled || byFamily.ref2va.enabled,
+    params: { by_family: byFamily },
+  };
+}
+
 export interface TimelineProject {
-  version: 4;
+  version: 5;
   title: string;
   render: RenderConfig;
   sampling: {
@@ -215,6 +355,18 @@ export interface TimelineProject {
     ref2va: SamplingConfig;
   };
   export_mode: "all" | "segments";
+  model_stack: ModelStack;
+  features: FeatureConfiguration;
+  segments: TimelineSegment[];
+}
+
+/** Frozen shape used only by migration fixtures, receipts and historical tasks. */
+export interface LegacyTimelineProjectV4 {
+  version: 4;
+  title: string;
+  render: RenderConfig;
+  sampling: TimelineProject["sampling"];
+  export_mode: TimelineProject["export_mode"];
   segments: TimelineSegment[];
 }
 
@@ -475,7 +627,7 @@ export function createTimelineSegment(
 
 export function createTimelineProject(): TimelineProject {
   return {
-    version: 4,
+    version: 5,
     title: "未命名长视频",
     render: { width: 864, height: 480, fps: 24 },
     sampling: {
@@ -483,6 +635,8 @@ export function createTimelineProject(): TimelineProject {
       ref2va: { ...DEFAULT_TIMELINE_SAMPLING, seed: randomSafeSeed() },
     },
     export_mode: "all",
+    model_stack: structuredClone(DEFAULT_MODEL_STACK),
+    features: structuredClone(DEFAULT_FEATURE_CONFIGURATION),
     segments: [createTimelineSegment("fl2va", 1)],
   };
 }
@@ -714,6 +868,80 @@ function touchProject(project: TimelineProject, segments: TimelineSegment[]): Ti
   return { ...project, segments };
 }
 
+function segmentFeatureScope(
+  project: TimelineProject,
+  segmentId: string,
+): Record<string, FeatureSelection> | undefined {
+  return project.features.by_segment[segmentId];
+}
+
+function cloneSegmentFeatureScope(
+  project: TimelineProject,
+  sourceId: string,
+  targetId: string,
+): FeatureConfiguration {
+  const source = segmentFeatureScope(project, sourceId);
+  if (!source || !Object.keys(source).length) return project.features;
+  return {
+    ...project.features,
+    by_segment: {
+      ...project.features.by_segment,
+      [targetId]: structuredClone(source),
+    },
+  };
+}
+
+function cloneSegmentFeatureScopes(
+  project: TimelineProject,
+  pairs: readonly { sourceId: string; targetId: string }[],
+): FeatureConfiguration {
+  let features = project.features;
+  for (const pair of pairs) {
+    const projected = { ...project, features };
+    features = cloneSegmentFeatureScope(projected, pair.sourceId, pair.targetId);
+  }
+  return features;
+}
+
+function retainFeatureScopesForSegments(
+  project: TimelineProject,
+  segmentIds: ReadonlySet<string>,
+): FeatureConfiguration {
+  const retained = Object.fromEntries(
+    Object.entries(project.features.by_segment)
+      .filter(([segmentId]) => segmentIds.has(segmentId))
+      .map(([segmentId, scope]) => [segmentId, scope]),
+  );
+  return Object.keys(retained).length === Object.keys(project.features.by_segment).length
+    ? project.features
+    : { ...project.features, by_segment: retained };
+}
+
+function segmentFeatureScopesEqual(
+  project: TimelineProject,
+  segmentIds: readonly string[],
+): boolean {
+  if (segmentIds.length < 2) return true;
+  const first = canonicalTimelineJson(segmentFeatureScope(project, segmentIds[0]) ?? {});
+  return first !== null && segmentIds.slice(1).every(
+    (segmentId) => canonicalTimelineJson(segmentFeatureScope(project, segmentId) ?? {}) === first,
+  );
+}
+
+function hasActiveSegmentFeatureOverride(project: TimelineProject, segmentId: string): boolean {
+  return Object.values(segmentFeatureScope(project, segmentId) ?? {})
+    .some((selection) => selection.enabled);
+}
+
+/** Import/save-as boundary: no orphan override may survive a structural projection. */
+export function retainTimelineFeatureOverrides(project: TimelineProject): TimelineProject {
+  const features = retainFeatureScopesForSegments(
+    project,
+    new Set(project.segments.map((segment) => segment.id)),
+  );
+  return features === project.features ? project : { ...project, features };
+}
+
 const MAX_TIMELINE_SEGMENT_ID_LENGTH = 128;
 
 /**
@@ -904,7 +1132,13 @@ export function deleteSelectedSegments(
   )];
   return clampTimelinePlayhead({
     ...state,
-    project: touchProject(state.project, segments),
+    project: {
+      ...touchProject(state.project, segments),
+      features: retainFeatureScopesForSegments(
+        state.project,
+        new Set(segments.map((segment) => segment.id)),
+      ),
+    },
     selected_segment_ids: [first.id],
     active_segment_id: first.id,
     selection_anchor_id: first.id,
@@ -980,7 +1214,10 @@ function selectedContiguousSegments(state: TimelineEditorState): TimelineSegment
   if (indexes.some((index, offset) => offset > 0 && index !== indexes[offset - 1] + 1))
     return null;
   const segments = indexes.map((index) => state.project.segments[index]);
-  return mergeCompatible(segments, state.project.render.fps) ? segments : null;
+  return mergeCompatible(segments, state.project.render.fps) &&
+      segmentFeatureScopesEqual(state.project, segments.map((segment) => segment.id))
+    ? segments
+    : null;
 }
 
 export function canMergeSelectedSegments(state: TimelineEditorState): boolean {
@@ -1016,7 +1253,13 @@ export function mergeSelectedSegments(state: TimelineEditorState): TimelineEdito
   });
   return clampTimelinePlayhead({
     ...state,
-    project: touchProject(state.project, segments),
+    project: {
+      ...touchProject(state.project, segments),
+      features: retainFeatureScopesForSegments(
+        state.project,
+        new Set(segments.map((segment) => segment.id)),
+      ),
+    },
     selected_segment_ids: [merged.id],
     active_segment_id: merged.id,
     selection_anchor_id: merged.id,
@@ -1070,7 +1313,10 @@ export function splitSelectedSegment(
   segments.splice(index, 1, left, right);
   return clampTimelinePlayhead({
     ...state,
-    project: touchProject(state.project, segments),
+    project: {
+      ...touchProject(state.project, segments),
+      features: cloneSegmentFeatureScope(state.project, source.id, right.id),
+    },
     selected_segment_ids: [left.id, right.id],
     active_segment_id: right.id,
     selection_anchor_id: right.id,
@@ -1140,7 +1386,16 @@ export function splitTimelineSourceSegmentAtCuts(
   segments.splice(index, 1, ...replacements);
   return clampTimelinePlayhead({
     ...state,
-    project: touchProject(state.project, segments),
+    project: {
+      ...touchProject(state.project, segments),
+      features: cloneSegmentFeatureScopes(
+        state.project,
+        replacements.slice(1).map((segment) => ({
+          sourceId: source.id,
+          targetId: segment.id,
+        })),
+      ),
+    },
     selected_segment_ids: replacements.map((segment) => segment.id),
     active_segment_id: replacements[0].id,
     selection_anchor_id: replacements[0].id,
@@ -1218,7 +1473,16 @@ export function duplicateSelectedSegments(
   segments.splice(lastSelectedIndex + 1, 0, ...copies);
   return {
     ...state,
-    project: touchProject(state.project, segments),
+    project: {
+      ...touchProject(state.project, segments),
+      features: cloneSegmentFeatureScopes(
+        state.project,
+        sources.map((segment, index) => ({
+          sourceId: segment.id,
+          targetId: copies[index].id,
+        })),
+      ),
+    },
     selected_segment_ids: copies.map((segment) => segment.id),
     active_segment_id: copies[0].id,
     selection_anchor_id: copies[0].id,
@@ -1306,8 +1570,10 @@ export function applyTimelineSegmentConfiguration(
   if (options.promptReferences && (!options.prompt || !options.mode)) return state;
   if (!Object.values(options).some(Boolean)) return state;
   const source = state.project.segments[sourceIndex];
+  const sourceFeatureScope = state.project.features.by_segment[sourceId];
   const selected = new Set(state.selected_segment_ids);
   let copiedCount = 0;
+  const copiedTargetIds: string[] = [];
   const segments = state.project.segments.map((target, index) => {
     const included = scope === "following"
       ? index > sourceIndex
@@ -1315,10 +1581,26 @@ export function applyTimelineSegmentConfiguration(
     if (!included) return target;
     const copied = copyTimelineSegmentConfiguration(source, target, options);
     if (copied !== target) copiedCount += 1;
+    if (options.features) copiedTargetIds.push(target.id);
     return copied;
   });
-  if (!copiedCount) return state;
-  return clampTimelinePlayhead({ ...state, project: touchProject(state.project, segments) });
+  let features = state.project.features;
+  if (copiedTargetIds.length) {
+    const bySegment = { ...features.by_segment };
+    for (const targetId of copiedTargetIds) {
+      if (sourceFeatureScope && Object.keys(sourceFeatureScope).length) {
+        bySegment[targetId] = structuredClone(sourceFeatureScope);
+      } else {
+        delete bySegment[targetId];
+      }
+    }
+    features = { ...features, by_segment: bySegment };
+  }
+  if (!copiedCount && features === state.project.features) return state;
+  return clampTimelinePlayhead({
+    ...state,
+    project: { ...touchProject(state.project, segments), features },
+  });
 }
 
 export function updateTimelineSegment(
@@ -1430,6 +1712,10 @@ export type TimelineAction =
     }
   | { type: "project/patch"; patch: Partial<Pick<TimelineProject, "title" | "render" | "sampling" | "export_mode">> }
   | { type: "project/update-sampling"; family: keyof TimelineProject["sampling"]; patch: Partial<SamplingConfig> }
+  | { type: "project/update-model"; role: keyof ModelStack; filename: string | null }
+  | { type: "feature/set-project"; featureId: string; selection: FeatureSelection | null }
+  | { type: "feature/set-segment"; segmentId: string; featureId: string; selection: FeatureSelection | null }
+  | { type: "feature/clear-segment"; segmentIds: string[]; featureIds?: string[] }
   | { type: "segment/select"; id: string; additive?: boolean; range?: boolean }
   | { type: "segment/toggle-selection"; id: string }
   | { type: "segment/set-selection"; ids: string[] }
@@ -1461,7 +1747,14 @@ export type TimelineAction =
   | { type: "segment/bind-asset"; id: string; asset: AssetReference; target?: SegmentAssetTarget; select?: boolean }
   | { type: "segment/bind-assets"; id: string; assets: AssetReference[]; target?: SegmentAssetTarget; select?: boolean }
   | { type: "segment/reorder-reference"; id: string; kind: SegmentReferenceKind; draggedAssetId: string; targetAssetId: string }
-  | { type: "segment/set-mode"; ids: string[]; mode: TimelineGenerationMode }
+  | {
+      type: "segment/set-mode";
+      ids: string[];
+      mode: TimelineGenerationMode;
+      compatibleFeatureIds?: string[];
+      /** Explicit user-approved cleanup, applied atomically with the family switch. */
+      clearIncompatibleFeatureIds?: string[];
+    }
   | { type: "segment/insert-reference-token"; id: string; token: string; selectionStart: number; selectionEnd: number; expectedMention: string }
   | { type: "segment/insert-subject-token"; id: string; token: string; selectionStart: number; selectionEnd: number; expectedMention: string }
   | { type: "segment/apply-config"; sourceId: string; scope: "following" | "selected"; options: TimelineSegmentCopyOptions }
@@ -1549,6 +1842,100 @@ export function timelineEditorReducer(
           },
         },
       });
+    case "project/update-model": {
+      if (
+        action.filename !== null &&
+        (typeof action.filename !== "string" ||
+          action.filename.length < 1 ||
+          action.filename.length > 1_024)
+      ) return state;
+      if (state.project.model_stack[action.role].filename === action.filename) return state;
+      return {
+        ...state,
+        project: {
+          ...state.project,
+          model_stack: {
+            ...state.project.model_stack,
+            [action.role]: { filename: action.filename },
+          },
+        },
+      };
+    }
+    case "feature/set-project": {
+      if (!FEATURE_ID_PATTERN.test(action.featureId)) return state;
+      const normalized = action.selection === null
+        ? null
+        : normalizeFeatureSelection(action.selection);
+      if (action.selection !== null && !normalized) return state;
+      const projectFeatures = { ...state.project.features.project };
+      if (normalized) projectFeatures[action.featureId] = normalized;
+      else delete projectFeatures[action.featureId];
+      if (Object.keys(projectFeatures).length > MAX_FEATURES_PER_SCOPE) return state;
+      return {
+        ...state,
+        project: {
+          ...state.project,
+          features: { ...state.project.features, project: projectFeatures },
+        },
+      };
+    }
+    case "feature/set-segment": {
+      if (
+        !FEATURE_ID_PATTERN.test(action.featureId) ||
+        !state.project.segments.some((segment) => segment.id === action.segmentId)
+      ) return state;
+      const normalized = action.selection === null
+        ? null
+        : normalizeFeatureSelection(action.selection);
+      if (action.selection !== null && !normalized) return state;
+      const bySegment = { ...state.project.features.by_segment };
+      const scope = { ...(bySegment[action.segmentId] ?? {}) };
+      if (normalized) scope[action.featureId] = normalized;
+      else delete scope[action.featureId];
+      if (Object.keys(scope).length > MAX_FEATURES_PER_SCOPE) return state;
+      if (Object.keys(scope).length) bySegment[action.segmentId] = scope;
+      else delete bySegment[action.segmentId];
+      return {
+        ...state,
+        project: {
+          ...state.project,
+          features: { ...state.project.features, by_segment: bySegment },
+        },
+      };
+    }
+    case "feature/clear-segment": {
+      const segmentIds = new Set(action.segmentIds);
+      const featureIds = action.featureIds ? new Set(action.featureIds) : null;
+      const bySegment = { ...state.project.features.by_segment };
+      let changed = false;
+      for (const segmentId of segmentIds) {
+        const current = bySegment[segmentId];
+        if (!current) continue;
+        if (!featureIds) {
+          delete bySegment[segmentId];
+          changed = true;
+          continue;
+        }
+        const next = { ...current };
+        for (const featureId of featureIds) {
+          if (Object.prototype.hasOwnProperty.call(next, featureId)) {
+            delete next[featureId];
+            changed = true;
+          }
+        }
+        if (Object.keys(next).length) bySegment[segmentId] = next;
+        else delete bySegment[segmentId];
+      }
+      return changed
+        ? {
+            ...state,
+            project: {
+              ...state.project,
+              features: { ...state.project.features, by_segment: bySegment },
+            },
+          }
+        : state;
+    }
     case "segment/select": {
       const target = state.project.segments.find((segment) => segment.id === action.id);
       if (!target) return state;
@@ -1717,14 +2104,38 @@ export function timelineEditorReducer(
         ));
     case "segment/set-mode": {
       const ids = new Set(action.ids);
+      const compatible = new Set(action.compatibleFeatureIds ?? []);
+      const approvedCleanup = new Set(action.clearIncompatibleFeatureIds ?? []);
+      const incompatibleBySegment = new Map<string, string[]>();
+      for (const segment of state.project.segments) {
+        if (!ids.has(segment.id) || segment.mode === action.mode) continue;
+        const incompatible = Object.entries(segmentFeatureScope(state.project, segment.id) ?? {})
+          .filter(([featureId, selection]) => selection.enabled && !compatible.has(featureId))
+          .map(([featureId]) => featureId);
+        if (incompatible.length) incompatibleBySegment.set(segment.id, incompatible);
+      }
+      const incompatibleActiveOverride = [...incompatibleBySegment.values()]
+        .some((featureIds) => featureIds.some((featureId) => !approvedCleanup.has(featureId)));
+      // Changing family/backend must not silently discard or reinterpret an active override.
+      if (incompatibleActiveOverride) return state;
+      const bySegment = { ...state.project.features.by_segment };
+      for (const [segmentId, featureIds] of incompatibleBySegment) {
+        const scope = { ...(bySegment[segmentId] ?? {}) };
+        for (const featureId of featureIds) delete scope[featureId];
+        if (Object.keys(scope).length) bySegment[segmentId] = scope;
+        else delete bySegment[segmentId];
+      }
       return {
         ...state,
-        project: touchProject(
-          state.project,
-          state.project.segments.map((segment) =>
-            ids.has(segment.id) ? changeSegmentMode(segment, action.mode) : segment,
+        project: {
+          ...touchProject(
+            state.project,
+            state.project.segments.map((segment) =>
+              ids.has(segment.id) ? changeSegmentMode(segment, action.mode) : segment,
+            ),
           ),
-        ),
+          features: { ...state.project.features, by_segment: bySegment },
+        },
       };
     }
     case "segment/insert-reference-token":
@@ -2075,6 +2486,9 @@ function normalizeFamilySegment(
   value: unknown,
   legacyContinuity?: TimelineSegmentContinuity,
   legacySettings?: Pick<TimelineSegmentBase<TimelineGenerationMode>, "ref_image_size" | "audio_mode">,
+  includeContentHash = true,
+  requireContentHash = false,
+  completeAssetWireShape = false,
 ): TimelineSegment | null {
   if (!isRecord(value)) return null;
   const base = normalizeSegmentBase(value, legacyContinuity, legacySettings);
@@ -2084,8 +2498,12 @@ function normalizeFamilySegment(
       return {
         ...base,
         mode: "fl2va",
-        first_image: normalizeAssetReference(value.first_image, "image"),
-        last_image: normalizeAssetReference(value.last_image, "image"),
+        first_image: normalizeAssetReference(value.first_image, "image", {
+          includeContentHash, requireContentHash, completeWireShape: completeAssetWireShape,
+        }),
+        last_image: normalizeAssetReference(value.last_image, "image", {
+          includeContentHash, requireContentHash, completeWireShape: completeAssetWireShape,
+        }),
       };
     case "ref2va":
       if (!finiteNumber(value.source_start_seconds) || !finiteNumber(value.source_duration_seconds))
@@ -2093,7 +2511,9 @@ function normalizeFamilySegment(
       return {
         ...base,
         mode: "ref2va",
-        source_video: normalizeAssetReference(value.source_video, "video"),
+        source_video: normalizeAssetReference(value.source_video, "video", {
+          includeContentHash, requireContentHash, completeWireShape: completeAssetWireShape,
+        }),
         source_start_seconds: value.source_start_seconds,
         source_duration_seconds: value.source_duration_seconds,
         source_audio_as_reference: value.source_audio_as_reference === true,
@@ -2101,16 +2521,19 @@ function normalizeFamilySegment(
           value.reference_images,
           "image",
           maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.referenceImages),
+          { includeContentHash, requireContentHash, completeWireShape: completeAssetWireShape },
         ),
         reference_audios: normalizeSlottedAssetList(
           value.reference_audios,
           "audio",
           maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.referenceAudios),
+          { includeContentHash, requireContentHash, completeWireShape: completeAssetWireShape },
         ),
         reference_videos: normalizeSlottedAssetList(
           value.reference_videos,
           "video",
           maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.totalReferenceVideos),
+          { includeContentHash, requireContentHash, completeWireShape: completeAssetWireShape },
         ),
       };
     default:
@@ -2162,15 +2585,15 @@ function migrateV1Segment(
       return {
         ...base,
         mode: "fl2va",
-        first_image: normalizeAssetReference(value.first_image, "image"),
+        first_image: normalizeAssetReference(value.first_image, "image", { includeContentHash: false }),
         last_image: null,
       };
     case "fl2v":
       return {
         ...base,
         mode: "fl2va",
-        first_image: normalizeAssetReference(value.first_image, "image"),
-        last_image: normalizeAssetReference(value.last_image, "image"),
+        first_image: normalizeAssetReference(value.first_image, "image", { includeContentHash: false }),
+        last_image: normalizeAssetReference(value.last_image, "image", { includeContentHash: false }),
       };
     case "r2v":
       return {
@@ -2184,16 +2607,19 @@ function migrateV1Segment(
           value.reference_images,
           "image",
           maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.referenceImages),
+          { includeContentHash: false },
         ),
         reference_audios: normalizeSlottedAssetList(
           value.reference_audios,
           "audio",
           maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.referenceAudios),
+          { includeContentHash: false },
         ),
         reference_videos: normalizeSlottedAssetList(
           value.reference_videos,
           "video",
           maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.totalReferenceVideos),
+          { includeContentHash: false },
         ),
       };
     case "v2v":
@@ -2202,7 +2628,7 @@ function migrateV1Segment(
         !finiteNumber(value.source_start_seconds) ||
         !finiteNumber(value.source_duration_seconds)
       ) return null;
-      const source = normalizeAssetReference(value.source_video, "video");
+      const source = normalizeAssetReference(value.source_video, "video", { includeContentHash: false });
       const sourceFields = {
         source_video: source,
         source_start_seconds: value.source_start_seconds,
@@ -2216,15 +2642,17 @@ function migrateV1Segment(
         reference_images: value.mode === "rv2v"
           ? normalizeSlottedAssetList(
               value.reference_images,
-              "image",
-              maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.referenceImages),
+            "image",
+            maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.referenceImages),
+            { includeContentHash: false },
             )
           : [],
         reference_audios: value.mode === "rv2v"
           ? normalizeSlottedAssetList(
               value.reference_audios,
-              "audio",
-              maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.referenceAudios),
+            "audio",
+            maxSlotForCapacity(MINIMAX_H3_REFERENCE_LIMITS.referenceAudios),
+            { includeContentHash: false },
             )
           : [],
         reference_videos: [],
@@ -2235,8 +2663,8 @@ function migrateV1Segment(
   }
 }
 
-/** Rebuilds API/local data into v4, migrating shared v1-v3 segment settings. */
-export function normalizeTimelineProject(value: unknown): TimelineProject | null {
+/** Rebuilds frozen legacy data into v4 for receipts, WAL replay and historical jobs only. */
+export function normalizeLegacyTimelineProject(value: unknown): LegacyTimelineProjectV4 | null {
   if (
     !isRecord(value) ||
     (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4) ||
@@ -2297,7 +2725,7 @@ export function normalizeTimelineProject(value: unknown): TimelineProject | null
       };
   const normalizeSegment = value.version === 1
     ? (segment: unknown) => migrateV1Segment(segment, legacyContinuity, legacySettings)
-    : (segment: unknown) => normalizeFamilySegment(segment, legacyContinuity, legacySettings);
+    : (segment: unknown) => normalizeFamilySegment(segment, legacyContinuity, legacySettings, false);
   const segments = value.segments.map(normalizeSegment).map((segment) =>
     segment && !segment.prompt.trim() && legacyPrompt.trim()
       ? { ...segment, prompt: legacyPrompt }
@@ -2315,10 +2743,286 @@ export function normalizeTimelineProject(value: unknown): TimelineProject | null
       // Native H3 latent and reference-video semantics are fixed at 24fps.
       fps: 24,
     },
-    sampling: familySampling as TimelineProject["sampling"],
+    sampling: familySampling as LegacyTimelineProjectV4["sampling"],
     export_mode: value.export_mode === "segments" ? "segments" : "all",
     segments: segments as TimelineSegment[],
   };
+}
+
+const V5_TOP_LEVEL_KEYS = new Set([
+  "version",
+  "title",
+  "render",
+  "sampling",
+  "export_mode",
+  "model_stack",
+  "features",
+  "segments",
+]);
+const MODEL_STACK_ROLES = ["fl2va", "ref2va", "clip", "video_vae", "audio_vae"] as const;
+const FEATURE_ID_PATTERN = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/;
+const MAX_FEATURES_PER_SCOPE = 64;
+const MAX_FEATURE_JSON_DEPTH = 8;
+const MAX_FEATURE_JSON_NODES = 65_536;
+const MAX_FEATURE_ARRAY_LENGTH = 128;
+const MAX_FEATURE_OBJECT_KEYS = 64;
+const MAX_FEATURE_STRING_LENGTH = 4_096;
+const MAX_FEATURE_PARAMS_BYTES = 65_536;
+
+function normalizeModelStack(value: unknown): ModelStack | null {
+  if (!isRecord(value) || Object.keys(value).length !== MODEL_STACK_ROLES.length) return null;
+  const result = {} as ModelStack;
+  for (const role of MODEL_STACK_ROLES) {
+    const selection = value[role];
+    if (
+      !isRecord(selection) ||
+      Object.keys(selection).length !== 1 ||
+      !Object.prototype.hasOwnProperty.call(selection, "filename") ||
+      !(
+        selection.filename === null ||
+        (typeof selection.filename === "string" &&
+          selection.filename.length >= 1 &&
+          selection.filename.length <= 1_024)
+      )
+    ) return null;
+    result[role] = { filename: selection.filename as string | null };
+  }
+  return result;
+}
+
+function normalizeFeatureJson(
+  value: unknown,
+  depth: number,
+  budget: { nodes: number },
+): FeatureJsonValue | undefined {
+  budget.nodes += 1;
+  if (budget.nodes > MAX_FEATURE_JSON_NODES || depth > MAX_FEATURE_JSON_DEPTH) return undefined;
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    return Number.isFinite(value) &&
+      (!Number.isInteger(value) || Math.abs(value) <= Number.MAX_SAFE_INTEGER)
+      ? value
+      : undefined;
+  }
+  if (typeof value === "string") {
+    return value.length <= MAX_FEATURE_STRING_LENGTH ? value : undefined;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_FEATURE_ARRAY_LENGTH) return undefined;
+    const result: FeatureJsonValue[] = [];
+    for (const item of value) {
+      const normalized = normalizeFeatureJson(item, depth + 1, budget);
+      if (normalized === undefined) return undefined;
+      result.push(normalized);
+    }
+    return result;
+  }
+  if (!isRecord(value) || Object.keys(value).length > MAX_FEATURE_OBJECT_KEYS) return undefined;
+  const result: { [key: string]: FeatureJsonValue } = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!FEATURE_ID_PATTERN.test(key)) return undefined;
+    const normalized = normalizeFeatureJson(item, depth + 1, budget);
+    if (normalized === undefined) return undefined;
+    result[key] = normalized;
+  }
+  return result;
+}
+
+export function normalizeFeatureSelection(value: unknown): FeatureSelection | null {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== 2 ||
+    typeof value.enabled !== "boolean" ||
+    !isRecord(value.params)
+  ) return null;
+  const params = normalizeFeatureJson(value.params, 0, { nodes: 0 });
+  if (!isRecord(params)) return null;
+  const encodedBytes = new TextEncoder().encode(JSON.stringify(params)).byteLength;
+  return encodedBytes <= MAX_FEATURE_PARAMS_BYTES
+    ? { enabled: value.enabled, params: params as FeatureSelection["params"] }
+    : null;
+}
+
+function normalizeFeatureScope(value: unknown): Record<string, FeatureSelection> | null {
+  if (!isRecord(value) || Object.keys(value).length > MAX_FEATURES_PER_SCOPE) return null;
+  const result: Record<string, FeatureSelection> = {};
+  for (const [featureId, rawSelection] of Object.entries(value)) {
+    if (!FEATURE_ID_PATTERN.test(featureId)) return null;
+    const selection = normalizeFeatureSelection(rawSelection);
+    if (!selection) return null;
+    result[featureId] = selection;
+  }
+  return result;
+}
+
+export function normalizeFeatureConfiguration(
+  value: unknown,
+  segmentIds: ReadonlySet<string>,
+): FeatureConfiguration | null {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== 3 ||
+    !Number.isInteger(value.template_bundle_version) ||
+    (value.template_bundle_version as number) < 1 ||
+    (value.template_bundle_version as number) > 2_147_483_647 ||
+    !isRecord(value.by_segment) ||
+    Object.keys(value.by_segment).length > 128
+  ) return null;
+  const project = normalizeFeatureScope(value.project);
+  if (!project) return null;
+  const bySegment: FeatureConfiguration["by_segment"] = {};
+  for (const [segmentId, rawScope] of Object.entries(value.by_segment)) {
+    if (!segmentIds.has(segmentId)) return null;
+    const scope = normalizeFeatureScope(rawScope);
+    if (!scope) return null;
+    if (Object.keys(scope).length) bySegment[segmentId] = scope;
+  }
+  return {
+    template_bundle_version: value.template_bundle_version as number,
+    project,
+    by_segment: bySegment,
+  };
+}
+
+function strictV5Segment(value: unknown): TimelineSegment | null {
+  if (!isRecord(value)) return null;
+  const common = [
+    "id", "mode", "title", "prompt", "duration_seconds", "enabled",
+    "continuity", "ref_image_size", "audio_mode",
+  ];
+  const allowed = value.mode === "fl2va"
+    ? [...common, "first_image", "last_image"]
+    : value.mode === "ref2va"
+      ? [
+          ...common,
+          "source_video",
+          "source_start_seconds",
+          "source_duration_seconds",
+          "source_audio_as_reference",
+          "reference_images",
+          "reference_audios",
+          "reference_videos",
+        ]
+      : null;
+  if (!allowed || Object.keys(value).some((key) => !allowed.includes(key))) return null;
+  return normalizeFamilySegment(value, undefined, undefined, true, true, true);
+}
+
+/** Strict current-authority parser. It never fills creative fields from RuntimeSettings. */
+export function normalizeTimelineProject(value: unknown): TimelineProject | null {
+  if (
+    !isRecord(value) ||
+    value.version !== 5 ||
+    Object.keys(value).some((key) => !V5_TOP_LEVEL_KEYS.has(key)) ||
+    Object.keys(value).length !== V5_TOP_LEVEL_KEYS.size ||
+    typeof value.title !== "string" ||
+    value.title.length < 1 ||
+    value.title.length > 256 ||
+    !Array.isArray(value.segments) ||
+    value.segments.length < 1 ||
+    value.segments.length > 128 ||
+    !isRecord(value.render) ||
+    Object.keys(value.render).some((key) => !["width", "height", "fps"].includes(key)) ||
+    Object.keys(value.render).length !== 3 ||
+    !isRecord(value.sampling) ||
+    Object.keys(value.sampling).some((key) => !["fl2va", "ref2va"].includes(key)) ||
+    Object.keys(value.sampling).length !== 2
+  ) return null;
+  const { render, sampling } = value;
+  if (![render.width, render.height, render.fps].every(finiteNumber)) return null;
+  const fl2va = normalizeTimelineSampling(sampling.fl2va);
+  const ref2va = normalizeTimelineSampling(sampling.ref2va);
+  if (!fl2va || !ref2va) return null;
+  const segments = value.segments.map(strictV5Segment);
+  if (
+    segments.some((segment) => segment === null) ||
+    new Set(segments.map((segment) => segment?.id)).size !== segments.length
+  ) return null;
+  const segmentIds = new Set((segments as TimelineSegment[]).map((segment) => segment.id));
+  const modelStack = normalizeModelStack(value.model_stack);
+  const features = normalizeFeatureConfiguration(value.features, segmentIds);
+  if (!modelStack || !features) return null;
+  const normalized: TimelineProject = {
+    version: 5,
+    title: value.title,
+    render: {
+      width: render.width as number,
+      height: render.height as number,
+      fps: render.fps as number,
+    },
+    sampling: { fl2va, ref2va },
+    export_mode: value.export_mode === "segments" ? "segments" : "all",
+    model_stack: modelStack,
+    features,
+    segments: segments as TimelineSegment[],
+  };
+  // v5 is an authority boundary, not a repair boundary. Nested asset,
+  // sampling, continuity, enum, and export fields must survive normalization
+  // byte-semantically (object key order is intentionally ignored). This keeps
+  // stale tabs and malformed API payloads from being silently defaulted into
+  // a writable current document.
+  return canonicalTimelineJson(value) === canonicalTimelineJson(normalized)
+    ? normalized
+    : null;
+}
+
+export interface TimelineV5MigrationContext {
+  model_stack: ModelStack;
+  lora: FeatureSelection;
+  template_bundle_version?: number;
+}
+
+/** Pure full-document migration. Callers must obtain this exact context from a receipt. */
+export function migrateLegacyTimelineProjectToV5(
+  project: LegacyTimelineProjectV4,
+  context: TimelineV5MigrationContext,
+): TimelineProject | null {
+  const modelStack = normalizeModelStack(context.model_stack);
+  const lora = normalizeFeatureSelection(context.lora);
+  if (!modelStack || !lora) return null;
+  const withV5Asset = (asset: AssetReference | null): AssetReference | null =>
+    asset ? normalizeAssetReference(asset, asset.kind, {
+      includeContentHash: true,
+      completeWireShape: true,
+    }) : null;
+  const segments = project.segments.map((segment): TimelineSegment => segment.mode === "fl2va"
+    ? {
+        ...structuredClone(segment),
+        first_image: withV5Asset(segment.first_image),
+        last_image: withV5Asset(segment.last_image),
+      }
+    : {
+        ...structuredClone(segment),
+        source_video: withV5Asset(segment.source_video),
+        reference_images: segment.reference_images.map((asset) => ({
+          ...withV5Asset(asset)!,
+          slot: asset.slot,
+        })),
+        reference_audios: segment.reference_audios.map((asset) => ({
+          ...withV5Asset(asset)!,
+          slot: asset.slot,
+        })),
+        reference_videos: segment.reference_videos.map((asset) => ({
+          ...withV5Asset(asset)!,
+          slot: asset.slot,
+        })),
+      });
+  const migrated: TimelineProject = {
+    ...structuredClone(project),
+    version: 5,
+    segments,
+    model_stack: modelStack,
+    features: {
+      template_bundle_version:
+        Number.isInteger(context.template_bundle_version) &&
+        Number(context.template_bundle_version) > 0
+          ? Number(context.template_bundle_version)
+          : CURRENT_TEMPLATE_BUNDLE_VERSION,
+      project: { lora },
+      by_segment: {},
+    },
+  };
+  return normalizeTimelineProject(migrated);
 }
 
 export type SegmentAssetTarget =
@@ -3283,18 +3987,18 @@ export const QUARANTINED_LEGACY_V5_TIMELINE_WAL_STORAGE_KEY =
   "directordeck:v5:timeline-wal-quarantine";
 /**
  * The v6 WAL used one process-wide key. Keep it byte-for-byte as foreign
- * evidence: a v7 page must never promote, overwrite, or silently quarantine
+ * evidence: a current page must never promote, overwrite, or silently quarantine
  * it merely because another page has opened the same project.
  */
 export const LEGACY_V6_TIMELINE_WAL_STORAGE_KEY = "directordeck:v6:timeline-wal";
-/** @deprecated This is a v7 key prefix, not a complete localStorage key. */
-export const TIMELINE_WAL_STORAGE_KEY = "directordeck:v7:timeline-wal:";
+/** Current v5-document WAL key prefix; legacy v7/v4 bytes are receipt-migrated separately. */
+export const TIMELINE_WAL_STORAGE_KEY = "directordeck:v8:timeline-wal:";
 export const TIMELINE_WAL_STORAGE_PREFIX = TIMELINE_WAL_STORAGE_KEY;
 export const QUARANTINED_MISMATCHED_TIMELINE_WAL_STORAGE_KEY =
   "directordeck:v6:timeline-wal-quarantine";
 export const TIMELINE_WAL_FORMAT = "director-revision-aware-timeline-wal";
 const LEGACY_V6_TIMELINE_WAL_VERSION = 1;
-export const TIMELINE_WAL_VERSION = 2;
+export const TIMELINE_WAL_VERSION = 3;
 let timelineWalOwnerCache: string | null = null;
 interface TimelineWalStorageToken {
   key: string;
@@ -3586,12 +4290,25 @@ export function timelineProjectDocumentHash(project: TimelineProject): string {
 }
 
 function normalizeExactTimelineProject(value: unknown): TimelineProject | null {
-  if (!isRecord(value) || value.version !== 4) return null;
+  if (!isRecord(value) || value.version !== 5) return null;
   const raw = canonicalTimelineJson(value);
   if (raw === null) return null;
   const normalized = normalizeTimelineProject(value);
   if (!normalized || canonicalTimelineJson(normalized) !== raw) return null;
   return structuredClone(normalized);
+}
+
+/**
+ * Projects the post-schema-migration feature authority from bundle 4 to 5.
+ * This intentionally changes only the marker: callers must independently
+ * prove the corresponding one-revision server authority transition.
+ */
+export function migrateTimelineFeatureBundle4To5(value: unknown): TimelineProject | null {
+  const source = normalizeExactTimelineProject(value);
+  if (source?.features.template_bundle_version !== 4) return null;
+  const candidate = structuredClone(source);
+  candidate.features.template_bundle_version = 5;
+  return normalizeExactTimelineProject(candidate);
 }
 
 function timelineProjectDocumentsEqual(left: TimelineProject, right: TimelineProject): boolean {
@@ -3930,6 +4647,30 @@ export function resolveLocalTimelineWal(
   ) throw new TypeError("Invalid timeline WAL resolution input.");
 
   const serverHash = timelineProjectDocumentHash(serverProject);
+  const upgradedBase = migrateTimelineFeatureBundle4To5(parsedWal.base_project);
+  const upgradedPending = migrateTimelineFeatureBundle4To5(parsedWal.pending_project);
+  if (
+    upgradedBase && upgradedPending &&
+    authority.revision === parsedWal.base_server_revision + 1 &&
+    timelineProjectDocumentsEqual(serverProject, upgradedBase)
+  ) {
+    return {
+      status: "replay",
+      project: upgradedPending,
+      expected_server_revision: authority.revision,
+    };
+  }
+  if (
+    upgradedPending &&
+    authority.revision === parsedWal.base_server_revision + 2 &&
+    timelineProjectDocumentsEqual(serverProject, upgradedPending)
+  ) {
+    return {
+      status: "acknowledged",
+      project: structuredClone(serverProject),
+      server_revision: authority.revision,
+    };
+  }
   if (
     authority.revision > parsedWal.base_server_revision &&
     serverHash === parsedWal.head_document_hash &&
