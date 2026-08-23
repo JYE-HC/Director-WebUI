@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "lora": {
+    "loaders": [
+      {
+        "id": "model_only",
+        "display_name": "LoRA加载器（仅模型）",
+        "class_type": "LoraLoaderModelOnly",
+        "input_contract": "model_only",
+        "supported_families": ["fl2va", "ref2va"],
+        "options": []
+      },
+      {
+        "id": "minimax_h3_turbo",
+        "display_name": "MiniMax-H3 Turbo LoRA",
+        "class_type": "MiniMaxH3TurboLoRA",
+        "input_contract": "dedicated_model",
+        "supported_families": ["fl2va", "ref2va"],
+        "options": [
+          {
+            "id": "low_vram",
+            "type": "boolean",
+            "label": "low_vram",
+            "description": "启用 MiniMax-H3 Turbo LoRA 节点的低显存模式。",
+            "default": false
+          }
+        ]
+      }
+    ],
+    "fallback_policy": {
+      "loader_ids": [
+        "model_only"
+      ],
+      "default_loader_id": "model_only"
+    },
+    "loader_policies": [
+      {
+        "lora_filename": "minimax_h3_turbo_.*\\.safetensors$",
+        "loader_ids": [
+          "minimax_h3_turbo"
+        ],
+        "default_loader_id": "minimax_h3_turbo"
+      }
+    ]
+  }
+}

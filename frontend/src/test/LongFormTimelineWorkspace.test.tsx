@@ -24,6 +24,7 @@ import {
 import {
   loadTimelineSegmentCopyOptions,
   loadTimelineWorkspacePreferences,
+  TIMELINE_SEGMENT_COPY_OPTIONS_KEY,
 } from "../domain/workspacePreferences";
 
 const image: AssetReference = {
@@ -127,6 +128,8 @@ describe("统一时间线关键交互", () => {
     const second = { ...createTimelineSegment("fl2va", 2), prompt: "第二段" };
     state.project.segments = [first, second];
     const report: TimelineCompileReport = {
+      template_bundle_version: state.project.features.template_bundle_version,
+      host_capability_revision: `sha256:${"a".repeat(64)}`,
       execution_strategy: "native_segment_graph_v1",
       model_families: ["fl2va"],
       plans: [{
@@ -158,6 +161,24 @@ describe("统一时间线关键交互", () => {
           MiniMaxH3AddGuide: "comfy-core-official-minimax-h3",
           SamplerCustomAdvanced: "comfy-extras",
         },
+      },
+      features: {
+        requested: state.project.features,
+        effective_by_segment: {
+          [second.id]: {
+            unit_id: `segment:${second.id}`,
+            backend: "raylight",
+            family: "fl2va",
+            template_id: "h3_raylight_segment",
+            features: [],
+          },
+        },
+        resolutions: [],
+        notices: [],
+      },
+      effective_execution_digest: {
+        algorithm: "sha256-canonical-json-v1",
+        value: `sha256-${"b".repeat(64)}`,
       },
     };
 
@@ -752,7 +773,7 @@ describe("统一时间线关键交互", () => {
     expect(readState().project.render).toEqual({ width: 640, height: 640, fps: 24 });
   });
 
-  it("不支持连续性时仍可在片段编辑中清除迁移来的旧值", async () => {
+  it("旧能力摘要不控制连续性编辑，只保留结构边界校验", async () => {
     const user = userEvent.setup();
     const state = createTimelineEditorState();
     const second = createTimelineSegment("fl2va", 2);
@@ -767,10 +788,13 @@ describe("统一时间线关键交互", () => {
     expect(toggle).toBeEnabled();
     expect(toggle).toBeChecked();
     expect(screen.getByRole("group", { name: "当前片段连续性" })).toHaveAccessibleDescription(
-      /不支持这个片段的连续性/,
+      /最后 22 帧；导出时会裁掉引导帧/,
     );
     await user.click(toggle);
     expect(readState().project.segments[1].continuity.enabled).toBe(false);
+    expect(toggle).toBeEnabled();
+    await user.click(toggle);
+    expect(readState().project.segments[1].continuity.enabled).toBe(true);
   });
 
   it("每个片段独立保存连续性开关和接续帧数", async () => {
@@ -1418,6 +1442,63 @@ describe("统一时间线关键交互", () => {
     });
   });
 
+  it("不显示通用扩展卡片，并忽略旧偏好中隐藏配置的复制开关", async () => {
+    const user = userEvent.setup();
+    const state = createTimelineEditorState();
+    const source = {
+      ...state.project.segments[0],
+      duration_seconds: 8,
+    };
+    const target = {
+      ...createTimelineSegment("fl2va", 2),
+      duration_seconds: 4,
+    };
+    state.project = {
+      ...state.project,
+      segments: [source, target],
+      features: {
+        ...state.project.features,
+        project: {
+          ...state.project.features.project,
+          attention_backend_override: { enabled: true, params: { mode: "pytorch" } },
+        },
+        by_segment: {
+          [source.id]: { source_extension: { enabled: true, params: { preset: "source" } } },
+          [target.id]: { target_extension: { enabled: true, params: { preset: "target" } } },
+        },
+      },
+    };
+    localStorage.setItem(TIMELINE_SEGMENT_COPY_OPTIONS_KEY, JSON.stringify({
+      version: 1,
+      mode: false,
+      duration: true,
+      continuity: false,
+      audioMode: false,
+      refImageSize: false,
+      prompt: false,
+      promptReferences: false,
+      features: true,
+    }));
+
+    render(<Harness initial={state} />);
+    expect(screen.queryByLabelText("片段功能点")).not.toBeInTheDocument();
+    expect(screen.queryByText("Attention backend override")).not.toBeInTheDocument();
+    expect(loadTimelineSegmentCopyOptions().features).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "复制设置" }));
+    expect(screen.getByRole("region", { name: "复制设置" })).not.toHaveTextContent("功能点配置");
+    await user.click(screen.getByRole("button", { name: "应用到后续" }));
+
+    const next = readState();
+    expect(next.project.segments[1].duration_seconds).toBe(8);
+    expect(next.project.features.by_segment[target.id]).toEqual({
+      target_extension: { enabled: true, params: { preset: "target" } },
+    });
+    expect(next.project.features.by_segment[source.id]).toEqual({
+      source_extension: { enabled: true, params: { preset: "source" } },
+    });
+  });
+
   it("复制设置悬浮窗支持 Escape 回焦和点外关闭", async () => {
     const user = userEvent.setup();
     render(<Harness initial={createTimelineEditorState()} />);
@@ -2058,6 +2139,24 @@ describe("统一时间线关键交互", () => {
 
     await user.selectOptions(screen.getByLabelText("片段生成模式"), "ref2va");
     expect(screen.getByLabelText("生成时长（秒）")).toBeEnabled();
+  });
+
+  it("切换生成模式时保留没有通用编辑器的片段扩展配置", async () => {
+    const user = userEvent.setup();
+    const state = createTimelineEditorState();
+    const segment = state.project.segments[0];
+    state.project.features.by_segment[segment.id] = {
+      opaque_extension: { enabled: true, params: { profile: "keep" } },
+    };
+    const before = structuredClone(state.project.features.by_segment[segment.id]);
+    const confirm = vi.spyOn(window, "confirm");
+
+    render(<Harness initial={state} />);
+    await user.selectOptions(screen.getByLabelText("片段生成模式"), "ref2va");
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(readState().project.segments[0].mode).toBe("ref2va");
+    expect(readState().project.features.by_segment[segment.id]).toEqual(before);
   });
 
   it("把全选和禁用所选放在标题旁，并移除标题说明文字", () => {

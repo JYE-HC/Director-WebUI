@@ -10,6 +10,7 @@ the current process, so the install takes effect without a restart.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess  # noqa: S404 - fixed argv, no shell
 from typing import Any
@@ -24,13 +25,27 @@ def _binary_on_path(name: str) -> str | None:
     return shutil.which(name)
 
 
+def _tool_responds(executable: str) -> bool:
+    try:
+        result = subprocess.run(
+            [executable, "-version"],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def ensure_media_tools_on_path() -> None:
     """Make ffmpeg/ffprobe resolvable when a bundled copy exists.
 
     Cheap no-op when the tools are already on PATH or static-ffmpeg is not
     installed. Called once at backend startup and after a successful install.
     """
-    if _binary_on_path("ffmpeg") and _binary_on_path("ffprobe"):
+    if media_tools_status()["ready"]:
         return
     try:
         import static_ffmpeg
@@ -49,24 +64,33 @@ def _encoders_ok(ffmpeg_path: str) -> bool:
             timeout=_PROBE_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
         return False
     listing = result.stdout + result.stderr
-    return "libx264" in listing and "aac" in listing
+    encoder_names = {
+        match.group(1)
+        for line in listing.splitlines()
+        if (
+            match := re.match(r"^\s*[A-Z.]{6}\s+(\S+)(?:\s|$)", line)
+        ) is not None
+    }
+    return {"libx264", "aac"} <= encoder_names
 
 
 def media_tools_status() -> dict[str, Any]:
     ffmpeg_path = _binary_on_path("ffmpeg")
     ffprobe_path = _binary_on_path("ffprobe")
-    encoders_ok = _encoders_ok(ffmpeg_path) if ffmpeg_path else False
+    ffmpeg_available = bool(ffmpeg_path and _tool_responds(ffmpeg_path))
+    ffprobe_available = bool(ffprobe_path and _tool_responds(ffprobe_path))
+    encoders_ok = _encoders_ok(ffmpeg_path) if ffmpeg_available else False
     return {
-        "ffmpeg_available": ffmpeg_path is not None,
-        "ffprobe_available": ffprobe_path is not None,
+        "ffmpeg_available": ffmpeg_available,
+        "ffprobe_available": ffprobe_available,
         "ffmpeg_path": ffmpeg_path,
         "encoders_ok": encoders_ok,
-        "ready": (
-            ffmpeg_path is not None and ffprobe_path is not None and encoders_ok
-        ),
+        "ready": ffmpeg_available and ffprobe_available and encoders_ok,
     }
 
 

@@ -14,7 +14,20 @@ from pydantic import ValidationError
 from .comfy import ComfyClientProtocol
 from .media import create_24fps_proxy_bytes
 from .public_url import public_api_url
-from .schemas import AssetReference, UnifiedTimelineDraft
+from .schemas import (
+    AssetReference,
+    UnifiedTimelineDraft,
+    UnifiedTimelineDraftV5,
+)
+from .workflow.execution import (
+    CompiledExecutionPlan,
+    LockedSubmissionPlan,
+    ObservedArtifactSpec,
+    ObservedAssemblyArtifactSpec,
+    compiled_execution_plan_digest,
+    ordered_compiled_segment_units,
+    sha256_document_digest,
+)
 
 
 class AssetRegistry(Protocol):
@@ -41,6 +54,208 @@ _VIDEO_EXTENSIONS = frozenset(
 )
 _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._\-()\u4e00-\u9fff]+")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+_TYPED_PARENT_OUTPUT_AUTHORITY = "_typed_parent_output_authority"
+_COMPILED_EXECUTION_PLAN_AUTHORITY = "_compiled_execution_plan_authority"
+_OBSERVED_ASSEMBLY_AUTHORITY = "_observed_assembly_authority"
+
+
+def attach_parent_output_authority(
+    job: Mapping[str, Any],
+    *,
+    typed: bool,
+    compiled_plan: CompiledExecutionPlan | None,
+    observed_assembly: ObservedAssemblyArtifactSpec | None,
+) -> dict[str, Any]:
+    """Attach trusted, process-local contracts without mutating durable columns."""
+
+    enriched = dict(job)
+    enriched[_TYPED_PARENT_OUTPUT_AUTHORITY] = typed
+    enriched[_COMPILED_EXECUTION_PLAN_AUTHORITY] = compiled_plan
+    enriched[_OBSERVED_ASSEMBLY_AUTHORITY] = observed_assembly
+    return enriched
+
+
+def attached_compiled_execution_plan(
+    job: Mapping[str, Any],
+) -> CompiledExecutionPlan | None:
+    """Read the process-local typed plan attached by the app projector.
+
+    The private key never crosses a response or persistence boundary. Keeping
+    this accessor beside the attachment helper prevents other modules from
+    duplicating its sentinel name or accepting an unvalidated mapping.
+    """
+
+    plan = job.get(_COMPILED_EXECUTION_PLAN_AUTHORITY)
+    return plan if isinstance(plan, CompiledExecutionPlan) else None
+
+
+def ordered_observed_artifacts(
+    job: Mapping[str, Any],
+) -> tuple[ObservedArtifactSpec, ...]:
+    """Resolve every typed segment in captured timeline order, or fail closed."""
+
+    plan = job.get(_COMPILED_EXECUTION_PLAN_AUTHORITY)
+    if not isinstance(plan, CompiledExecutionPlan):
+        raise TaskManagementError(
+            "任务没有可信的编译执行计划",
+            status_code=409,
+        )
+    children = job.get("children")
+    if not isinstance(children, list):
+        raise TaskManagementError("任务没有可信的分段执行记录", status_code=409)
+    config_snapshot = job.get("config_snapshot")
+    if not isinstance(config_snapshot, Mapping):
+        raise TaskManagementError("任务没有可信的时间线快照", status_code=409)
+    try:
+        ordered_units = ordered_compiled_segment_units(plan, config_snapshot)
+    except ValueError as exc:
+        raise TaskManagementError(
+            "任务的时间线顺序与编译执行计划不一致",
+            status_code=409,
+        ) from exc
+    plan_digest = compiled_execution_plan_digest(plan)
+    ordered: list[ObservedArtifactSpec] = []
+    for unit in ordered_units:
+        matches: list[ObservedArtifactSpec] = []
+        for child in children:
+            if not isinstance(child, Mapping):
+                continue
+            evidence = child.get("execution_evidence")
+            if not isinstance(evidence, Mapping):
+                continue
+            locked_plan = evidence.get("locked_submission_plan")
+            snapshot = evidence.get("exact_prompt_snapshot")
+            expected = (
+                snapshot.expected_output_spec
+                if hasattr(snapshot, "expected_output_spec")
+                else None
+            )
+            artifact = child.get("observed_artifact")
+            if (
+                not isinstance(locked_plan, LockedSubmissionPlan)
+                or snapshot is None
+                or expected is None
+                or not isinstance(artifact, ObservedArtifactSpec)
+                or str(evidence.get("child_id") or "")
+                != str(child.get("id") or "")
+                or str(child.get("job_id") or "") != str(job.get("id") or "")
+                or child.get("status") != "succeeded"
+                or child.get("segment_ids") != [unit.owner_segment_id]
+                or locked_plan.source_compiled_plan_digest != plan_digest
+                or locked_plan.source_unit_id != unit.id
+                or snapshot.unit_id != unit.id
+                or snapshot.owner_segment_id != unit.owner_segment_id
+                or expected != unit.expected_output_spec
+                or artifact.child_id != str(child.get("id") or "")
+                or artifact.segment_id != unit.owner_segment_id
+            ):
+                continue
+            matches.append(artifact)
+        if len(matches) != 1:
+            raise TaskManagementError(
+                "任务分段缺少唯一的 Expected+Observed 输出证据",
+                status_code=409,
+            )
+        ordered.append(matches[0])
+    return tuple(ordered)
+
+
+def _is_full_timeline_selection(snapshot: Mapping[str, Any]) -> bool:
+    segment_ids = snapshot.get("segment_ids")
+    if segment_ids is None:
+        return True
+    timeline = snapshot.get("timeline")
+    if not isinstance(segment_ids, list) or not isinstance(timeline, Mapping):
+        return False
+    segments = timeline.get("segments")
+    if not isinstance(segments, list):
+        return False
+    enabled_ids = {
+        str(segment["id"])
+        for segment in segments
+        if isinstance(segment, Mapping)
+        and isinstance(segment.get("id"), str)
+        and segment.get("enabled", True) is True
+    }
+    return bool(enabled_ids) and {str(item) for item in segment_ids} == enabled_ids
+
+
+def authoritative_parent_outputs(
+    job: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Return the only parent output projection accepted by every API path."""
+
+    if not bool(job.get(_TYPED_PARENT_OUTPUT_AUTHORITY)):
+        outputs = job.get("outputs")
+        if not isinstance(outputs, list):
+            return []
+        return [dict(output) for output in outputs if isinstance(output, Mapping)]
+
+    if job.get("status") != "succeeded":
+        return []
+
+    plan = job.get(_COMPILED_EXECUTION_PLAN_AUTHORITY)
+    if not isinstance(plan, CompiledExecutionPlan):
+        return []
+    config_snapshot = job.get("config_snapshot")
+    if not isinstance(config_snapshot, Mapping):
+        return []
+    try:
+        ordered_units = ordered_compiled_segment_units(plan, config_snapshot)
+        artifacts = ordered_observed_artifacts(job)
+    except (TaskManagementError, ValueError):
+        return []
+    outputs = [
+        {
+            "node_id": unit.expected_output_spec.node_id,
+            **artifact.output_descriptor.model_dump(mode="json"),
+        }
+        for unit, artifact in zip(ordered_units, artifacts, strict=True)
+    ]
+
+    timeline = (
+        config_snapshot.get("timeline")
+        if isinstance(config_snapshot, Mapping)
+        else None
+    )
+    if not isinstance(timeline, Mapping):
+        return []
+    assemble_full_timeline = (
+        timeline.get("export_mode") == "all"
+        and _is_full_timeline_selection(config_snapshot)
+    )
+    if not assemble_full_timeline or len(artifacts) == 1:
+        return outputs
+
+    assembly = job.get(_OBSERVED_ASSEMBLY_AUTHORITY)
+    if not isinstance(assembly, ObservedAssemblyArtifactSpec):
+        return []
+    expected_plan_digest = compiled_execution_plan_digest(plan)
+    if (
+        assembly.job_id != str(job.get("id") or "")
+        or assembly.source_compiled_plan_digest != expected_plan_digest
+        or len(assembly.source_artifacts) != len(artifacts)
+    ):
+        return []
+    for source, unit, artifact in zip(
+        assembly.source_artifacts,
+        ordered_units,
+        artifacts,
+        strict=True,
+    ):
+        if (
+            source.segment_id != unit.owner_segment_id
+            or source.child_id != artifact.child_id
+            or source.observed_artifact_digest
+            != sha256_document_digest(artifact.model_dump(mode="json"))
+        ):
+            return []
+    return [
+        {
+            "node_id": "assembly",
+            **assembly.output_descriptor.model_dump(mode="json"),
+        }
+    ]
 
 
 def _safe_filename(value: str) -> str:
@@ -98,8 +313,16 @@ def _segment_output(job: Mapping[str, Any], segment_id: str) -> dict[str, str]:
     snapshot = job.get("config_snapshot")
     if not isinstance(snapshot, Mapping):
         raise TaskManagementError("该历史任务没有有效的项目快照", status_code=409)
+    raw_timeline = snapshot.get("timeline")
     try:
-        timeline = UnifiedTimelineDraft.model_validate(snapshot.get("timeline"))
+        if not isinstance(raw_timeline, Mapping):
+            raise ValueError("timeline snapshot is not an object")
+        if raw_timeline.get("version") == 5:
+            timeline = UnifiedTimelineDraftV5.model_validate(raw_timeline)
+        else:
+            # Historical v4 jobs remain readable, but future/unknown schema
+            # versions never get projected by guessing.
+            timeline = UnifiedTimelineDraft.model_validate(raw_timeline)
     except ValueError as exc:
         raise TaskManagementError(
             "该历史任务的项目快照不符合当前时间线契约",
@@ -110,11 +333,40 @@ def _segment_output(job: Mapping[str, Any], segment_id: str) -> dict[str, str]:
         raise TaskManagementError("任务快照中不存在该分段", status_code=404)
 
     matches: list[dict[str, str]] = []
+    typed_segment = False
     children = job.get("children")
     if not isinstance(children, list):
         raise TaskManagementError("任务没有可用的分段输出记录", status_code=404)
     for child in children:
         if not isinstance(child, Mapping):
+            continue
+        execution_evidence = child.get("execution_evidence")
+        if isinstance(execution_evidence, Mapping):
+            if segment_id in child.get("segment_ids", []):
+                # Mutable membership is used only to report an unavailable
+                # typed result, never to locate or expose a file.
+                typed_segment = True
+            snapshot = execution_evidence.get("exact_prompt_snapshot")
+            expected = (
+                snapshot.expected_output_spec
+                if hasattr(snapshot, "expected_output_spec")
+                else None
+            )
+            if expected is None or expected.segment_id != segment_id:
+                continue
+            typed_segment = True
+            artifact = child.get("observed_artifact")
+            if (
+                isinstance(artifact, ObservedArtifactSpec)
+                and child.get("status") == "succeeded"
+                and artifact.child_id == str(child.get("id") or "")
+                and artifact.segment_id == expected.segment_id
+            ):
+                matches.append(
+                    _output_reference(
+                        artifact.output_descriptor.model_dump(mode="json")
+                    )
+                )
             continue
         declared = child.get("segment_ids")
         output_nodes = child.get("output_nodes")
@@ -135,6 +387,11 @@ def _segment_output(job: Mapping[str, Any], segment_id: str) -> dict[str, str]:
                 and str(output.get("node_id") or "") == node_id
             ):
                 matches.append(_output_reference(output))
+    if typed_segment and not matches:
+        raise TaskManagementError(
+            "该分段尚无可信的实际媒体探测结果",
+            status_code=409,
+        )
     if not matches:
         raise TaskManagementError("未找到该分段的生成结果", status_code=404)
     if len(matches) != 1:
@@ -160,8 +417,8 @@ def resolve_job_output(
         or output_index < 0
     ):
         raise TaskManagementError("任务输出序号无效")
-    outputs = job.get("outputs")
-    if not isinstance(outputs, list) or output_index >= len(outputs):
+    outputs = authoritative_parent_outputs(job)
+    if output_index >= len(outputs):
         raise TaskManagementError("任务输出不存在", status_code=404)
     return _output_reference(outputs[output_index])
 

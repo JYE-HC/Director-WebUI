@@ -11,12 +11,12 @@ custom_nodes/raylight/tests/fsdp_quant_compare.py
 ```
 
 CPU / gloo uses eager patch files:
-- `custom_nodes/raylight/src/raylight/comfy_dist/kitchen_patches/fp8_eager.py`
-- `custom_nodes/raylight/src/raylight/comfy_dist/kitchen_patches/nvfp4_eager.py`
+- `custom_nodes/raylight/src/directordeck_raylight/comfy_dist/kitchen_patches/fp8_eager.py`
+- `custom_nodes/raylight/src/directordeck_raylight/comfy_dist/kitchen_patches/nvfp4_eager.py`
 
 CUDA / nccl uses active patch files:
-- `custom_nodes/raylight/src/raylight/comfy_dist/kitchen_patches/fp8.py`
-- `custom_nodes/raylight/src/raylight/comfy_dist/kitchen_patches/nvfp4.py`
+- `custom_nodes/raylight/src/directordeck_raylight/comfy_dist/kitchen_patches/fp8.py`
+- `custom_nodes/raylight/src/directordeck_raylight/comfy_dist/kitchen_patches/nvfp4.py`
 
 Tiny smoke tests:
 

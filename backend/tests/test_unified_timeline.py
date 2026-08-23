@@ -25,7 +25,20 @@ from directordeck.schemas import (
     timeline_segment_recipe,
 )
 
-from .conftest import asset, runnable_draft, wait_for_submission_tasks
+from .conftest import (
+    adapt_legacy_workflow_requests,
+    asset,
+    runnable_draft,
+    save_timeline_document,
+    v5_timeline_document,
+    v5_timeline_fixture,
+    wait_for_submission_tasks,
+)
+
+
+@pytest.fixture(autouse=True)
+def _stage6_v5_request_adapter(client, monkeypatch) -> None:
+    adapt_legacy_workflow_requests(client, monkeypatch)
 
 
 def timeline(*segments: dict, **overrides) -> dict:
@@ -273,7 +286,7 @@ def test_v1_six_modes_migrate_losslessly_to_v3_families_and_recipes() -> None:
     })
 
 
-async def test_fastapi_boundary_migrates_all_six_v1_modes_before_discrimination(
+async def test_legacy_timeline_put_requires_the_v5_revision_authority(
     client,
 ) -> None:
     legacy_segments = [
@@ -289,25 +302,9 @@ async def test_fastapi_boundary_migrates_all_six_v1_modes_before_discrimination(
         json=timeline(*legacy_segments),
     )
 
-    assert response.status_code == 200, response.text
-    migrated = UnifiedTimelineDraft.model_validate(response.json())
-    assert migrated.version == 4
-    assert [item.mode for item in migrated.segments] == [
-        "fl2va",
-        "fl2va",
-        "fl2va",
-        "ref2va",
-        "ref2va",
-        "ref2va",
-    ]
-    assert [timeline_segment_recipe(item) for item in migrated.segments] == [
-        "t2v",
-        "i2v",
-        "fl2v",
-        "r2v",
-        "v2v",
-        "rv2v",
-    ]
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "timeline_authority_required"
+    assert (await client.get("/api/timeline")).json()["version"] == 5
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -615,7 +612,7 @@ async def test_complete_long_source_autosave_succeeds_before_split(client) -> No
         )
     )
 
-    saved = await client.put("/api/timeline", json=draft)
+    saved = await save_timeline_document(client, draft)
     compile_response = await client.post("/api/timeline/compile", json={"config": draft})
 
     assert saved.status_code == 200, saved.text
@@ -627,7 +624,7 @@ async def test_complete_long_source_autosave_succeeds_before_split(client) -> No
 async def test_empty_ref2va_can_be_saved_but_not_submitted(client, fake_comfy) -> None:
     draft = timeline(segment("ref2va", "unfinished"))
 
-    saved = await client.put("/api/timeline", json=draft)
+    saved = await save_timeline_document(client, draft)
     submitted = await client.post("/api/timeline/jobs", json={"config": draft})
 
     assert saved.status_code == 200, saved.text
@@ -866,6 +863,10 @@ def test_initialize_imports_only_one_custom_legacy_draft(tmp_path) -> None:
     database.initialize()
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE unified_timeline")
+        connection.execute(
+            "UPDATE settings SET document = ? WHERE singleton = 1",
+            (default_settings().model_dump_json(),),
+        )
         custom = runnable_draft("i2v")
         custom["prompt"] = "Imported legacy prompt"
         connection.execute(
@@ -885,6 +886,10 @@ def test_initialize_does_not_invent_order_for_multiple_legacy_drafts(tmp_path) -
     database.initialize()
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE unified_timeline")
+        connection.execute(
+            "UPDATE settings SET document = ? WHERE singleton = 1",
+            (default_settings().model_dump_json(),),
+        )
         for mode in ("t2v", "r2v"):
             custom = runnable_draft(mode)
             custom["prompt"] = f"custom-{mode}"
@@ -893,7 +898,12 @@ def test_initialize_does_not_invent_order_for_multiple_legacy_drafts(tmp_path) -
                 (json.dumps(custom), mode),
             )
     database.initialize()
-    assert database.get_timeline() == default_timeline_draft()
+    expected = v5_timeline_fixture(
+        default_timeline_draft().model_dump(mode="json"),
+        default_settings().model_dump(mode="json"),
+    )
+    expected["features"]["template_bundle_version"] = 5
+    assert database.get_timeline().model_dump(mode="json") == expected
     with sqlite3.connect(path) as connection:
         notice = connection.execute(
             "SELECT message FROM migration_notices WHERE id = 'multiple-legacy-mode-drafts'"
@@ -1016,9 +1026,13 @@ async def test_timeline_routes_are_redacted_and_submit_native_children(
     client, fake_comfy
 ) -> None:
     draft = timeline(segment("t2v", "ready"))
-    assert (await client.put("/api/timeline", json=draft)).status_code == 200
+    saved = await save_timeline_document(client, draft)
+    assert saved.status_code == 200, saved.text
+    config = saved.json()
 
-    response = await client.post("/api/timeline/compile", json={})
+    response = await client.post(
+        "/api/timeline/compile", json={"config": config}
+    )
     assert response.status_code == 200, response.text
     compiled = response.json()
     assert compiled["execution_strategy"] == "native_segment_graph_v1"
@@ -1030,7 +1044,9 @@ async def test_timeline_routes_are_redacted_and_submit_native_children(
     assert {"prompt", "workflow", "timeline_data"}.isdisjoint(compiled)
     assert compiled["node_policy"]["accepts_client_workflow"] is False
 
-    response = await client.post("/api/timeline/jobs", json={})
+    response = await client.post(
+        "/api/timeline/jobs", json={"config": config}
+    )
     assert response.status_code == 200, response.text
     job = await _submitted_job(client, response.json())
     assert job["mode"] == "timeline"
@@ -1039,6 +1055,25 @@ async def test_timeline_routes_are_redacted_and_submit_native_children(
     types = {node["class_type"] for node in fake_comfy.prompts[-1]["prompt"].values()}
     assert "MiniMaxH3Director" not in types
     assert "SaveVideo" in types
+
+
+async def test_public_preflight_uses_compiled_execution_plan_only(
+    client, monkeypatch
+) -> None:
+    def forbidden_legacy_compile(*_args, **_kwargs):
+        raise AssertionError("public preflight must not call NativeCompileResult")
+
+    monkeypatch.setattr(
+        "directordeck.native_templates.compile_native_timeline",
+        forbidden_legacy_compile,
+    )
+    response = await client.post(
+        "/api/timeline/compile",
+        json={"config": timeline(segment("t2v", "plan-only-preflight"))},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["plans"][0]["segment_id"] == "plan-only-preflight"
 
 
 async def test_random_seed_report_and_submit_use_the_same_visible_safe_value(
@@ -1065,7 +1100,10 @@ async def test_random_seed_report_and_submit_use_the_same_visible_safe_value(
 
 
 async def test_fixed_seed_above_browser_safe_integer_is_rejected(client) -> None:
-    draft = timeline(segment("t2v", "unsafe-seed"))
+    draft = await v5_timeline_document(
+        client,
+        timeline(segment("t2v", "unsafe-seed")),
+    )
     draft["sampling"]["fl2va"]["seed"] = 2**53
 
     response = await client.post("/api/timeline/compile", json={"config": draft})
@@ -1105,7 +1143,8 @@ async def test_selected_compile_does_not_validate_unselected_stale_asset(client)
     body["segment_ids"] = ["later"]
     blocked = await client.post("/api/timeline/compile", json=body)
     assert blocked.status_code == 422
-    assert "not-registered" in blocked.text
+    assert blocked.json()["detail"]["code"] == "asset_unavailable"
+    assert "not-registered" not in blocked.text
 
 
 async def test_timeline_submission_requires_every_selected_native_node(
@@ -1115,33 +1154,37 @@ async def test_timeline_submission_requires_every_selected_native_node(
     response = await client.post(
         "/api/timeline/jobs", json={"config": timeline(segment("t2v", "ready"))}
     )
-    assert response.status_code == 409
-    assert "BasicGuider" in response.text
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "node_unavailable"
+    assert any(
+        reason["safe_details"] == {"class_type": "BasicGuider"}
+        for reason in detail["reasons"]
+    )
     assert fake_comfy.prompts == []
 
 
-async def test_timeline_submission_rejects_wrong_runtime_node_provenance(
+async def test_timeline_submission_does_not_pin_host_owned_node_provenance(
     client, fake_comfy
 ) -> None:
     fake_comfy.node_provenance["UNETLoader"] = "custom_nodes.lookalike"
     response = await client.post(
         "/api/timeline/jobs", json={"config": timeline(segment("t2v", "ready"))}
     )
-    assert response.status_code == 409
-    assert "UNETLoader" in response.text
-    assert "provenance" in response.text
-    assert fake_comfy.prompts == []
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    assert fake_comfy.prompts
 
 
 @pytest.mark.parametrize("raylight", [False, True])
 async def test_timeline_preflight_rejects_unavailable_logical_gpu(
     client, fake_comfy, raylight: bool
 ) -> None:
-    settings = (await client.get("/api/settings")).json()
+    authority = (await client.get("/api/settings/authority")).json()
+    settings = authority["settings"]
     if raylight:
         settings["multi_gpu_enabled"] = True
-        settings["models"]["fl2va"].update(
-            backend="raylight",
+        settings["placement"]["fl2va"].update(
             device="default",
             raylight={
                 "gpu_select": [0, 2],
@@ -1154,15 +1197,34 @@ async def test_timeline_preflight_rejects_unavailable_logical_gpu(
             },
         )
     else:
-        settings["models"]["fl2va"].update(backend="standard", device="gpu:3")
-    assert (await client.put("/api/settings", json=settings)).status_code == 200
+        settings["placement"]["fl2va"]["device"] = "gpu:3"
+    saved = await client.put(
+        "/api/settings/authority",
+        json={
+            "document": settings,
+            "expected_authority_token": authority["authority_token"],
+            "schema_version": 3,
+        },
+    )
+    assert saved.status_code == 200, saved.text
 
     response = await client.post(
         "/api/timeline/jobs", json={"config": timeline(segment("t2v", "ready"))}
     )
 
-    assert response.status_code == 409
-    assert ("gpu:2" if raylight else "gpu:3") in response.text
+    assert response.status_code == 422
+    if raylight:
+        detail = response.json()["detail"]
+        assert detail["code"] == "invalid_runtime_gpu_indices"
+        assert detail["reasons"][0]["safe_details"] == {
+            "invalid_indices": [2]
+        }
+    else:
+        detail = response.json()["detail"]
+        assert detail["code"] == "runtime_placement_unavailable"
+        assert detail["reasons"][0]["safe_details"] == {
+            "devices": ["gpu:3"]
+        }
     assert fake_comfy.prompts == []
 
 
@@ -1181,14 +1243,14 @@ async def test_asset_library_refuses_referenced_delete(
     draft = timeline(
         segment("i2v", "image-shot", first_image=asset("first.png", "image"))
     )
-    assert (await client.put("/api/timeline", json=draft)).status_code == 200
+    assert (await save_timeline_document(client, draft)).status_code == 200
     blocked = await client.delete("/api/assets/fixture-image-first.png")
     assert blocked.status_code == 409
     assert blocked.json()["detail"]["usages"] == [
         "timeline.segments[0](image-shot).first_image"
     ]
 
-    await client.put("/api/timeline", json=timeline(segment("t2v", "clear")))
+    await save_timeline_document(client, timeline(segment("t2v", "clear")))
     deleted = await client.delete("/api/assets/fixture-image-first.png")
     assert deleted.status_code == 200
     assert deleted.json()["outputs_preserved"] is True

@@ -15,6 +15,13 @@ from typing import Any
 
 import pytest
 
+from directordeck.host_artifacts import (
+    HostOutputProbeError,
+    HostOutputProbeResult,
+)
+from directordeck.schemas import VideoMetadata
+from directordeck.workflow.execution import OutputDescriptor
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_ENTRY = Path(
@@ -148,8 +155,8 @@ def loaded_plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     )
     comfy_package.cli_args = cli_args_module
 
-    # The deliberately old version prevents the import-time bootstrap from
-    # creating a thread. Individual tests invoke _run_backend with fake
+    # Version compatibility is advisory, so suppress only the import-time
+    # bootstrap thread itself. Individual tests invoke _run_backend with fake
     # uvicorn/directordeck modules after resetting the state.
     version_module = types.ModuleType("comfyui_version")
     version_module.__version__ = "0.0.0"
@@ -181,7 +188,27 @@ def loaded_plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
-    spec.loader.exec_module(module)
+
+    original_thread = threading.Thread
+
+    class DeferredBootstrapThread:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return False
+
+    threading.Thread = DeferredBootstrapThread  # type: ignore[assignment]
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        threading.Thread = original_thread
 
     module._state = module._BackendState()
     module._proxy_session = None
@@ -208,6 +235,238 @@ class FakeBackendControl:
         self.lock_error: str | None = None
         self.server: Any = None
         self.app_kwargs: dict[str, Any] | None = None
+
+
+def test_bundled_pack_loader_supports_dataclasses_and_keeps_exact_module(
+    loaded_plugin: Any,
+    tmp_path: Path,
+) -> None:
+    plugin = loaded_plugin.module
+    pack = tmp_path / "DirectorDeck-Strict-Test"
+    pack.mkdir()
+    (pack / "__init__.py").write_text(
+        "from dataclasses import dataclass\n"
+        "@dataclass(frozen=True)\n"
+        "class Evidence:\n"
+        "    value: str\n"
+        "class StrictNode:\n"
+        "    pass\n"
+        "NODE_CLASS_MAPPINGS = {'DirectorStrictTest': StrictNode}\n"
+        "NODE_DISPLAY_NAME_MAPPINGS = {'DirectorStrictTest': 'Strict Test'}\n",
+        encoding="utf-8",
+    )
+    unique_name = "director_deck_strict_dataclass_test"
+    logical_module = "custom_nodes.DirectorDeck-Strict-Test"
+
+    try:
+        count = plugin._load_node_pack(
+            pack,
+            unique_name,
+            logical_module=logical_module,
+        )
+
+        assert count == 1
+        assert (
+            sys.modules[unique_name]
+            is plugin._BUNDLED_NODE_MODULES[logical_module]
+        )
+        assert (
+            plugin.NODE_CLASS_MAPPINGS["DirectorStrictTest"]
+            is sys.modules[unique_name].StrictNode
+        )
+        assert sys.modules[unique_name].Evidence("proved").value == "proved"
+    finally:
+        plugin.NODE_CLASS_MAPPINGS.pop("DirectorStrictTest", None)
+        plugin.NODE_DISPLAY_NAME_MAPPINGS.pop("DirectorStrictTest", None)
+        plugin._BUNDLED_NODE_MODULES.pop(logical_module, None)
+        sys.modules.pop(unique_name, None)
+
+
+def test_bundled_pack_loader_rolls_back_module_and_registries_on_failure(
+    loaded_plugin: Any,
+    tmp_path: Path,
+) -> None:
+    plugin = loaded_plugin.module
+    pack = tmp_path / "Broken-Strict-Pack"
+    pack.mkdir()
+    (pack / "__init__.py").write_text(
+        "NODE_CLASS_MAPPINGS = {'PartialNode': object}\n"
+        "raise RuntimeError('synthetic import failure')\n",
+        encoding="utf-8",
+    )
+    unique_name = "director_deck_broken_strict_test"
+
+    with pytest.raises(RuntimeError, match="synthetic import failure"):
+        plugin._load_node_pack(
+            pack,
+            unique_name,
+            logical_module="custom_nodes.Broken-Strict-Pack",
+        )
+
+    assert unique_name not in sys.modules
+    assert "PartialNode" not in plugin.NODE_CLASS_MAPPINGS
+    assert "custom_nodes.Broken-Strict-Pack" not in plugin._BUNDLED_NODE_MODULES
+
+
+def test_bundled_raylight_exports_only_director_namespaced_aliases(
+    loaded_plugin: Any,
+    tmp_path: Path,
+) -> None:
+    plugin = loaded_plugin.module
+    pack = tmp_path / "DirectorDeck-RayLight"
+    pack.mkdir()
+    source_names = tuple(plugin._DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES)
+    (pack / "__init__.py").write_text(
+        "SOURCE_NAMES = " + repr(source_names) + "\n"
+        "NODE_CLASS_MAPPINGS = {name: type(name, (), {}) for name in SOURCE_NAMES}\n"
+        "NODE_DISPLAY_NAME_MAPPINGS = {name: name for name in SOURCE_NAMES}\n",
+        encoding="utf-8",
+    )
+    logical_module = plugin._DIRECTOR_RAYLIGHT_RUNTIME_MODULE
+    unique_name = "director_deck_raylight_alias_test"
+    previous_host_mappings = dict(plugin._PREEXISTING_HOST_NODE_MAPPINGS)
+    plugin._PREEXISTING_HOST_NODE_MAPPINGS.update(
+        {source: object() for source in source_names}
+    )
+
+    try:
+        count = plugin._load_node_pack(
+            pack,
+            unique_name,
+            logical_module=logical_module,
+            class_type_aliases=plugin._DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES,
+        )
+
+        aliases = set(plugin._DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES.values())
+        assert count == len(aliases) == 8
+        assert aliases <= set(plugin.NODE_CLASS_MAPPINGS)
+        assert not set(source_names).intersection(plugin.NODE_CLASS_MAPPINGS)
+        assert sys.modules[unique_name] is plugin._BUNDLED_NODE_MODULES[logical_module]
+    finally:
+        for alias in plugin._DIRECTOR_RAYLIGHT_CLASS_TYPE_ALIASES.values():
+            plugin.NODE_CLASS_MAPPINGS.pop(alias, None)
+            plugin.NODE_DISPLAY_NAME_MAPPINGS.pop(alias, None)
+        plugin._BUNDLED_NODE_MODULES.pop(logical_module, None)
+        plugin._PREEXISTING_HOST_NODE_MAPPINGS.clear()
+        plugin._PREEXISTING_HOST_NODE_MAPPINGS.update(previous_host_mappings)
+        sys.modules.pop(unique_name, None)
+
+
+def test_raylight_gate_ignores_external_raylight_directory(
+    loaded_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin = loaded_plugin.module
+    (tmp_path / "comfyui" / "custom_nodes" / "raylight").mkdir(parents=True)
+    monkeypatch.setattr(plugin.sys, "platform", "linux")
+    monkeypatch.setattr(plugin.importlib.util, "find_spec", lambda _name: object())
+
+    assert plugin._raylight_gate() == "ok"
+
+
+def test_bundled_loader_never_registers_external_lora_node_packs(
+    loaded_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin = loaded_plugin.module
+    bundled_root = tmp_path / "assembled-nodes"
+    for package_name in (
+        "DirectorDeck-Strict-Attention",
+        "DirectorDeck-Strict-H3",
+        "DirectorDeck-Strict-LoRA",
+        "ComfyUI-MiniMax-H3-Turbo",
+    ):
+        (bundled_root / package_name).mkdir(parents=True)
+
+    loaded_packs: list[tuple[str, str]] = []
+
+    def fake_load_node_pack(
+        pack_dir: Path,
+        _unique_name: str,
+        *,
+        logical_module: str,
+    ) -> int:
+        loaded_packs.append((pack_dir.name, logical_module))
+        return 1
+
+    monkeypatch.setattr(plugin, "_NODES_DIR", bundled_root)
+    monkeypatch.setattr(plugin, "_load_node_pack", fake_load_node_pack)
+    monkeypatch.setattr(plugin, "_raylight_gate", lambda: "platform_unsupported")
+
+    plugin._load_bundled_nodes()
+
+    assert loaded_packs == [
+        (
+            "DirectorDeck-Strict-Attention",
+            "custom_nodes.DirectorDeck-Strict-Attention",
+        ),
+        ("DirectorDeck-Strict-H3", "custom_nodes.DirectorDeck-Strict-H3"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    (
+        ("0.32.9", False),
+        ("0.33.0", True),
+        ("0.40.1", True),
+        ("v0.33.0+local", True),
+        ("unknown", False),
+    ),
+)
+def test_comfyui_version_warning_uses_public_version_floor(
+    loaded_plugin: Any,
+    version: str,
+    supported: bool,
+) -> None:
+    plugin = loaded_plugin.module
+    sys.modules["comfyui_version"].__version__ = version
+
+    warning = plugin._comfyui_version_check()
+
+    if supported:
+        assert warning is None
+    else:
+        assert warning is not None
+        assert version in warning
+        assert "0.33.0" in warning
+        assert "startup will continue" in warning
+        assert "commit" not in warning.lower()
+
+
+def test_comfyui_version_warning_does_not_block_backend_start(
+    loaded_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin = loaded_plugin.module
+    started: list[object] = []
+
+    class FakeThread:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        def start(self) -> None:
+            started.append(self)
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(plugin, "_comfyui_version_check", lambda: "advisory")
+    monkeypatch.setattr(plugin, "_database_location", lambda: tmp_path / "director.sqlite3")
+    monkeypatch.setattr(plugin.threading, "Thread", FakeThread)
+    monkeypatch.setattr(plugin.atexit, "register", lambda _callback: None)
+
+    plugin._start_backend()
+
+    assert started == [plugin._state.thread]
+    assert plugin._state.status == "starting"
+    assert plugin._state.error is None
 
 
 def install_fake_backend(
@@ -291,6 +550,119 @@ async def read_status(loaded_plugin: Any) -> dict[str, Any]:
     handler = loaded_plugin.routes.handlers[("GET", "/directordeck/status")]
     response = await handler(None)
     return json.loads(response.body)
+
+
+def test_host_output_probe_reads_contained_file_directly_without_hashing(
+    loaded_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin = loaded_plugin.module
+    output_root = tmp_path / "output"
+    candidate = output_root / "director" / "take.mp4"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"not-read-by-provider")
+    folder_paths = sys.modules["folder_paths"]
+    monkeypatch.setattr(
+        folder_paths,
+        "get_output_directory",
+        lambda: str(output_root),
+        raising=False,
+    )
+    calls: list[tuple[Path, dict[str, Any]]] = []
+
+    def fake_probe(path: Path, **kwargs: Any) -> VideoMetadata:
+        calls.append((Path(path), dict(kwargs)))
+        return VideoMetadata(
+            duration=2.0,
+            native_fps=24.0,
+            frame_count=48,
+            width=1280,
+            height=720,
+            probe_method="directordeck_host_ffprobe_v1",
+            has_audio=True,
+        )
+
+    monkeypatch.setattr("directordeck.media.probe_video_path", fake_probe)
+
+    result = plugin._ComfyOutputProbeProvider().probe_output(
+        OutputDescriptor(
+            filename="take.mp4",
+            subfolder="director",
+        )
+    )
+
+    assert isinstance(result, HostOutputProbeResult)
+    assert result.model_dump() == {
+        "width": 1280,
+        "height": 720,
+        "fps": 24.0,
+        "frame_count": 48,
+        "duration_seconds": 2.0,
+        "has_audio": True,
+        "media_probe_version": "directordeck_host_ffprobe_v1",
+    }
+    assert calls == [
+        (
+            candidate.resolve(),
+            {
+                "probe_method": "directordeck_host_ffprobe_v1",
+                "allow_frame_count_estimate_on_timeout": True,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        {"filename": "take.mp4", "subfolder": "", "type": "input"},
+        {"filename": "../take.mp4", "subfolder": "", "type": "output"},
+        {"filename": "take.mp4", "subfolder": "../escape", "type": "output"},
+        {"filename": "take.mp4", "subfolder": "/absolute", "type": "output"},
+        {"filename": "take.txt", "subfolder": "", "type": "output"},
+    ],
+)
+def test_host_output_probe_rejects_unsafe_or_non_video_descriptors(
+    loaded_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    descriptor: dict[str, str],
+) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    monkeypatch.setattr(
+        sys.modules["folder_paths"],
+        "get_output_directory",
+        lambda: str(output_root),
+        raising=False,
+    )
+
+    with pytest.raises(HostOutputProbeError, match="unsafe"):
+        loaded_plugin.module._ComfyOutputProbeProvider().probe_output(descriptor)
+
+
+def test_host_output_probe_rejects_symlink_escape(
+    loaded_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"outside")
+    (output_root / "take.mp4").symlink_to(outside)
+    monkeypatch.setattr(
+        sys.modules["folder_paths"],
+        "get_output_directory",
+        lambda: str(output_root),
+        raising=False,
+    )
+
+    with pytest.raises(HostOutputProbeError, match="escapes the output root"):
+        loaded_plugin.module._ComfyOutputProbeProvider().probe_output(
+            OutputDescriptor(filename="take.mp4")
+        )
 
 
 @pytest.mark.parametrize(
@@ -422,6 +794,14 @@ async def test_fake_comfy_lifecycle_reports_ready_then_stopped(
     assert control.app_kwargs is not None
     assert control.app_kwargs["public_api_prefix"] == "/directordeck"
     assert control.app_kwargs["comfy_tls_certfile"] is None
+    assert isinstance(
+        control.app_kwargs["host_output_probe"],
+        plugin._ComfyOutputProbeProvider,
+    )
+    assert (
+        control.app_kwargs["endpoint_runtime_instance_id"]
+        == plugin._COMFY_BOOT_RUNTIME_INSTANCE_ID
+    )
 
     control.release.set()
     thread.join(timeout=1)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import json
 import hashlib
 import logging
@@ -11,6 +12,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -34,19 +36,44 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 
 from .comfy import ComfyClient, ComfyClientProtocol, ComfyError, default_comfy_factory
+from .capabilities import (
+    CapabilityEvaluator,
+    CapabilityReason,
+    FeaturePreflightReport,
+    build_feature_catalog,
+    build_operational_readiness,
+    capture_host_capabilities,
+    feature_catalog_etag,
+    preflight_projected_v5_timeline,
+    quote_feature_catalog_etag,
+)
 from .compiler import (
     DraftNotRunnable,
     timeline_segment_take_fingerprint,
     unified_continuity_predecessors,
-    validate_runnable,
     validate_unified_runnable,
+)
+from .config_manager import (
+    get_directordeck_config,
+    get_lora_loader_policy,
+    initialize_directordeck_config,
 )
 from .database import (
     AssetTrashInUse,
     AssetTrashRestoreConflict,
     Database,
+    ExecutionEvidenceConflict,
+    RayRuntimeIntentConflict,
+    SettingsAuthorityConflict,
     TimelineRevisionConflict,
     TimelineRevisionExhausted,
+)
+from .execution.submission import LockedSubmissionPlanner
+from .host_artifacts import (
+    HostOutputProbeError,
+    HostOutputProbeProvider,
+    HostOutputProbeResult,
+    PermanentHostOutputProbeError,
 )
 from .instance_lock import DirectorInstanceLock
 from .public_url import public_api_url, set_public_api_prefix
@@ -64,24 +91,29 @@ from .media import (
     detect_shots_bytes,
 )
 from .media_setup import FFmpegInstallManager, ensure_media_tools_on_path, media_tools_status
+from .migration_api import (
+    HistoricalCreativeInputError,
+    HistoricalSaveAsProjectRequest,
+    ProjectImportCommitRequest,
+    ProjectImportCoordinator,
+    ProjectImportError,
+    ProjectImportPreflightRead,
+    ProjectImportPreflightRequest,
+    prepare_project_import,
+    resolve_historical_creative_input,
+)
+from .migrations import (
+    ProjectMigrationReceipt,
+    RuntimeSettingsSchemaMigrated,
+    TimelineSchemaMigrated,
+    migrate_timeline_v4_to_v5,
+)
 from .native_templates import (
     ModelFamily,
-    NativeCompileResult,
     NativeHistoricalTake,
     NativeTemplateError,
-    NativeWorkflowUnit,
-    bind_native_workflow_predecessor_output,
-    bind_raylight_runtime_epoch,
-    build_raylight_shutdown_unit,
-    compile_native_timeline,
-    raylight_runtime_descriptor,
     raylight_runtime_logical_gpu_indices,
-    raylight_workflow_logical_gpu_indices,
     resolve_execution_backend,
-    standard_lora_metadata_requests,
-    validate_native_capabilities,
-    validate_native_workflow_ready,
-    validate_native_workflow_unit_capabilities,
 )
 from .progress import (
     ComfyExecutionEvent,
@@ -90,8 +122,12 @@ from .progress import (
     ComfyReconcileHint,
     LivePreviewCache,
     NativeProgressManager,
+    child_execution_start_snapshot,
     child_execution_snapshot,
     child_progress_snapshot,
+    durable_preview_phase_watermark,
+    preview_phase_index_for_event,
+    preview_source_for_node,
     sampler_segment_for_node,
 )
 from .schemas import (
@@ -105,9 +141,9 @@ from .schemas import (
     AssetTrashRequest,
     AssetTrashRestoreRead,
     AssetTrashRestoreRequest,
-    CreateJobRequest,
     DetectShotsRequest,
     DetectShotsResponse,
+    FeaturePreflightRequest,
     GenerationMode,
     JobBulkCancelRead,
     JobBulkCancelRequest,
@@ -122,17 +158,22 @@ from .schemas import (
     JobRecoveryConfirmComfyRestartRequest,
     JobRead,
     JobStatus,
+    LoraFeatureParams,
     ModeDraft,
     ProjectCreateRequest,
     ProjectDeleteRead,
-    ProjectImportRequest,
     ProjectListRead,
-    ProjectRenameRequest,
     ProjectSummaryRead,
     RayLightRuntimeRecoveryConfirmRequest,
     RayLightRuntimeStatusRead,
     RuntimeSettings,
-    RuntimeSettingsAuthorityRead,
+    RuntimeSettingsAuthorityV1WriteRequest,
+    RuntimeSettingsAuthorityV2WriteRequest,
+    RuntimeSettingsAuthorityV3Read,
+    RuntimeSettingsAuthorityV3WriteRequest,
+    RuntimeSettingsMigrationNoticeListRead,
+    RuntimeSettingsV2,
+    RuntimeSettingsV3,
     StorageStatusRead,
     TimelineAuthorityRead,
     TimelineAuthorityWriteRequest,
@@ -142,15 +183,73 @@ from .schemas import (
     TimelineRevisionExhaustedRead,
     UnifiedFL2VASegment,
     UnifiedTimelineDraft,
+    UnifiedTimelineDraftV5,
     VideoMetadata,
-    mode_draft_to_timeline,
     timeline_segment_recipe,
     utc_now,
     validate_mode_draft,
     validate_timeline_draft,
+    validate_timeline_draft_v5,
 )
 from .storage import StorageController
-from .task_management import TaskManagementError, import_job_output_as_asset
+from .task_management import (
+    TaskManagementError,
+    attached_compiled_execution_plan,
+    attach_parent_output_authority,
+    authoritative_parent_outputs,
+    import_job_output_as_asset,
+    ordered_observed_artifacts,
+)
+from .workflow.execution import (
+    AssemblySourceArtifactRef,
+    CompiledExecutionPlan,
+    ContinuityLateBindingEvidence,
+    DocumentDigest,
+    EndpointIdentity,
+    ExactCancelConfirmedEvidence,
+    HistoryTerminalEvidence,
+    LockedSegmentUnit,
+    LockedSubmissionPlan,
+    LockedSubmissionUnit,
+    ObservedArtifactSpec,
+    ObservedAssemblyArtifactSpec,
+    OutputObservationReceipt,
+    OutputDescriptor,
+    PromptOwnership,
+    PreparedControlUnit,
+    PreparedSegmentUnit,
+    RuntimeEpochLateBindingEvidence,
+    compiled_execution_plan_digest,
+    sha256_document_digest,
+)
+from .workflow.compile_report import CompiledExecutionReportV2
+from .workflow.v5_compat import (
+    V5CreativeAuthorityError,
+    compile_v5_execution_plan,
+    project_v5_compile_authority,
+    project_v5_contextual_host_authority,
+    project_v5_runtime_currentness,
+)
+from .workflow.runtime_snapshot import (
+    JobRuntimeSnapshotV1,
+    build_job_runtime_snapshot,
+    validate_job_runtime_snapshot_creative_binding,
+)
+from .workflow.effective_features import (
+    migrate_timeline_feature_authority_to_v5,
+)
+from .workflow.contracts import (
+    HostCapabilityProvider,
+    HostCapabilitySnapshot,
+    OperationalReadiness,
+)
+from .workflow.node_contracts import (
+    CURRENT_NODE_CONTRACT_REGISTRY,
+    V4_NODE_CONTRACT_REGISTRY,
+)
+from .workflow.templates import CURRENT_TEMPLATE_BUNDLE
+from .workflow.v4_compiler import V4CapabilityEvaluationError
+from .workflow.v4_resolver import CreativeCompileInputError
 
 
 ComfyFactory = Callable[[str], ComfyClientProtocol]
@@ -169,6 +268,7 @@ _RECOVERY_OWNERSHIP_STAGES = {
     "restart_cancel_pending",
     "restart_cancel_unconfirmed",
     "restart_cancel_failed",
+    "restart_certificate_required",
 }
 _PROCESS_OWNERSHIP_STAGES = (
     _SUBMISSION_OWNERSHIP_STAGES | _RECOVERY_OWNERSHIP_STAGES
@@ -598,6 +698,410 @@ def _comfy(request: Request) -> ComfyClientProtocol:
     return request.app.state.comfy_factory(request.app.state.comfy_url)
 
 
+async def _host_capability_snapshot(request: Request) -> HostCapabilitySnapshot:
+    """Capture one immutable, provider-validated host observation.
+
+    The backend never imports ComfyUI internals.  Absence or failure of the
+    plugin-owned provider is a configuration/readiness failure. Director never
+    substitutes its compiler identities for observations of the live host.
+    """
+
+    provider: HostCapabilityProvider | None = (
+        request.app.state.host_capability_provider
+    )
+    if provider is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "host_capability_provider_unavailable",
+                "message": "Host capability observation is unavailable.",
+            },
+        )
+    try:
+        captured = await anyio.to_thread.run_sync(
+            capture_host_capabilities,
+            provider,
+        )
+        return captured.snapshot
+    except (OSError, RuntimeError, TypeError, ValidationError, ValueError) as exc:
+        logger.warning("Host capability capture failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "host_capability_snapshot_unavailable",
+                "message": "Host capability observation could not be validated.",
+            },
+        ) from exc
+
+
+def _snapshot_has_node_class(
+    snapshot: HostCapabilitySnapshot,
+    class_type: str,
+) -> bool:
+    """Return whether ComfyUI objectively exposes the required class_type."""
+
+    return class_type in snapshot.node_registry
+
+
+def _snapshot_supports_raylight_cleanup(
+    snapshot: HostCapabilitySnapshot,
+) -> bool:
+    """Return whether a persisted descriptor can queue a RayKill control."""
+
+    return _snapshot_has_node_class(snapshot, "DirectorDeckRayKill")
+
+
+def _snapshot_cuda_gpu_count(snapshot: HostCapabilitySnapshot) -> int:
+    """Return the dense logical namespace owned by RayLight's CUDA ledger."""
+
+    return sum(item.backend == "cuda" for item in snapshot.gpu_inventory)
+
+
+def _host_operational_readiness(
+    request: Request,
+    snapshot: HostCapabilitySnapshot,
+) -> OperationalReadiness:
+    """Read transient runtime facts without contacting or mutating ComfyUI."""
+
+    try:
+        state = _db(request).get_raylight_runtime_state()
+        if state is None:
+            return build_operational_readiness(
+                endpoint_online=True,
+                available_logical_gpu_count=_snapshot_cuda_gpu_count(snapshot),
+            )
+        current = state.get("current")
+        runtime_gpu_indices = (
+            raylight_runtime_logical_gpu_indices(current)
+            if isinstance(current, dict)
+            else ()
+        )
+        legacy_unknown = bool(state.get("legacy_unknown"))
+        ray_tainted = bool(state.get("tainted"))
+        cleanup_contract_available = _snapshot_supports_raylight_cleanup(snapshot)
+        blocking_reasons = (
+            ("ray_cleanup_unavailable",)
+            if isinstance(current, dict) and not cleanup_contract_available
+            else ()
+        )
+        return build_operational_readiness(
+            endpoint_online=True,
+            ray_recovery_required=legacy_unknown,
+            ray_tainted=ray_tainted,
+            # A full descriptor lets the Stage-4 locked planner place an exact
+            # RayKill barrier.  Taint without that evidence is not repairable.
+            ray_cleanup_available=(
+                ray_tainted
+                and isinstance(current, dict)
+                and cleanup_contract_available
+            ),
+            runtime_gpu_indices=runtime_gpu_indices,
+            available_logical_gpu_count=_snapshot_cuda_gpu_count(snapshot),
+            blocking_reason_codes=blocking_reasons,
+        )
+    except (KeyError, NativeTemplateError, TypeError, ValidationError, ValueError):
+        return build_operational_readiness(
+            endpoint_online=True,
+            ray_recovery_required=True,
+            ray_tainted=True,
+            ray_cleanup_available=False,
+            available_logical_gpu_count=_snapshot_cuda_gpu_count(snapshot),
+            blocking_reason_codes=("ray_runtime_state_invalid",),
+        )
+
+
+def _project_not_found_reason() -> CapabilityReason:
+    """Return one privacy-safe project-scope failure for every entrypoint."""
+
+    return CapabilityReason(
+        code="project_not_found",
+        feature_id=None,
+        segment_id=None,
+        unit_id=None,
+        backend=None,
+        rule="project_scope",
+        message="The selected project no longer exists.",
+        remediation="Reload the project list and select an existing project.",
+        safe_details={},
+    )
+
+
+def _project_not_found_http_error() -> HTTPException:
+    reason = _project_not_found_reason()
+    return HTTPException(
+        status_code=404,
+        detail={
+            "code": reason.code,
+            "message": reason.message,
+            "reasons": [reason.model_dump(mode="json")],
+        },
+    )
+
+
+def _feature_preflight_report_from_reason(
+    *,
+    snapshot: HostCapabilitySnapshot,
+    readiness: OperationalReadiness,
+    reason: CapabilityReason,
+) -> FeaturePreflightReport:
+    return FeaturePreflightReport(
+        template_bundle_version=CURRENT_TEMPLATE_BUNDLE.version,
+        host_capability_revision=snapshot.host_capability_revision(),
+        operational_readiness=readiness,
+        valid=False,
+        errors=(reason,),
+        effective_by_segment={},
+    )
+
+
+def _host_context_observation_reason() -> CapabilityReason:
+    """Return one safe failure contract for every host-context entrypoint."""
+
+    return CapabilityReason(
+        code="host_context_unavailable",
+        feature_id=None,
+        segment_id=None,
+        unit_id=None,
+        backend=None,
+        rule="host_context_observation",
+        message="The current ComfyUI model or runtime context could not be observed.",
+        remediation="Check the embedded ComfyUI connection and run preflight again.",
+        safe_details={},
+    )
+
+
+def _host_context_observation_http_error() -> HTTPException:
+    reason = _host_context_observation_reason()
+    return HTTPException(
+        status_code=502,
+        detail={
+            "code": reason.code,
+            "message": reason.message,
+            "reasons": [reason.model_dump(mode="json")],
+        },
+    )
+
+
+def _creative_input_reason(error: BaseException) -> CapabilityReason:
+    """Project resolver/legacy validation failures into one safe wire shape."""
+
+    candidate: BaseException | None = error
+    if not isinstance(candidate, CreativeCompileInputError):
+        candidate = error.__cause__
+    if isinstance(candidate, CreativeCompileInputError):
+        return CapabilityReason(
+            code=candidate.code,
+            feature_id=candidate.feature_id,
+            segment_id=candidate.segment_id,
+            unit_id=None,
+            backend=candidate.backend,
+            rule=candidate.rule,
+            message=candidate.public_message,
+            remediation=candidate.remediation,
+            safe_details=candidate.safe_details,
+        )
+    rendered = str(error)
+    if isinstance(error, NativeTemplateError) and re.fullmatch(
+        r"segment compiles to \d+ frames; native H3 template limit is 512",
+        rendered,
+    ):
+        return CapabilityReason(
+            code="segment_frame_limit_exceeded",
+            feature_id=None,
+            segment_id=None,
+            unit_id=None,
+            backend=None,
+            rule="native_h3_frame_limit",
+            message="A selected segment exceeds the 512-frame MiniMax H3 limit.",
+            remediation=(
+                "Split the segment into shorter segments, then run preflight again."
+            ),
+            safe_details={"max_frames": 512},
+        )
+    if isinstance(error, DraftNotRunnable):
+        if rendered.startswith(
+            "Ref2VA segments need source_video or independent reference media: "
+        ):
+            return CapabilityReason(
+                code="ref2va_input_required",
+                feature_id=None,
+                segment_id=None,
+                unit_id=None,
+                backend=None,
+                rule="ref2va_conditioning_input",
+                message=(
+                    "Ref2VA segments need a source video or independent reference media."
+                ),
+                remediation=(
+                    "Add a source video or at least one reference image, video, "
+                    "or audio, then run preflight again."
+                ),
+                safe_details={},
+            )
+        historical_failure: tuple[str, str, str] | None = None
+        for suffix, code, message in (
+            (
+                "已有历史成片记录无效，无法用于接续",
+                "historical_take_invalid",
+                "The selected historical take has invalid execution evidence.",
+            ),
+            (
+                "有输出规格匹配的历史成功成片，但不含生成音频接续所需的音轨",
+                "historical_take_audio_required",
+                "The selected historical take does not contain the required audio track.",
+            ),
+            (
+                "存在历史成功成片，但分辨率、帧率或可见帧数与当前分段不一致",
+                "historical_take_geometry_mismatch",
+                "The selected historical take does not match the current segment geometry.",
+            ),
+            (
+                "只有旧任务输出定位记录，实际媒体规格与音轨信息不可用；请重新生成前驱",
+                "historical_take_observation_unavailable",
+                "The selected legacy take has no verified media observation.",
+            ),
+            (
+                "没有可用的历史成功成片",
+                "historical_take_required",
+                "No compatible historical take is available for continuity.",
+            ),
+        ):
+            if rendered.endswith(suffix):
+                historical_failure = (code, message, suffix)
+                break
+        if historical_failure is not None:
+            code, message, _ = historical_failure
+            return CapabilityReason(
+                code=code,
+                feature_id="continuity",
+                segment_id=None,
+                unit_id=None,
+                backend=None,
+                rule="historical_take_compatibility",
+                message=message,
+                remediation=(
+                    "Regenerate the predecessor with the current settings or disable "
+                    "continuity, then run preflight again."
+                ),
+                safe_details={},
+            )
+        if (
+            rendered.startswith("segment_ids must name enabled timeline segments")
+            or rendered == "at least one enabled timeline segment is required"
+        ):
+            return CapabilityReason(
+                code="segment_selection_invalid",
+                feature_id=None,
+                segment_id=None,
+                unit_id=None,
+                backend=None,
+                rule="segment_selection",
+                message="The requested segment selection is empty, disabled, or stale.",
+                remediation="Select only enabled segments from the current project and run preflight again.",
+                safe_details={},
+            )
+    if (
+        isinstance(error, ValueError)
+        and ": asset id '" in rendered
+        and rendered.endswith("' is not registered")
+    ):
+        return CapabilityReason(
+            code="asset_unavailable",
+            feature_id=None,
+            segment_id=None,
+            unit_id=None,
+            backend=None,
+            rule="asset_registry",
+            message=(
+                "A selected segment references an asset that is no longer available."
+            ),
+            remediation=(
+                "Reload the asset library and replace or remove the missing asset, "
+                "then run preflight again."
+            ),
+            safe_details={},
+        )
+    return CapabilityReason(
+        code="creative_configuration_invalid",
+        feature_id=None,
+        segment_id=None,
+        unit_id=None,
+        backend=None,
+        rule="timeline_validation",
+        message="The selected timeline is not runnable.",
+        remediation="Correct the timeline, assets, or segment selection and run preflight again.",
+        safe_details={},
+    )
+
+
+def _capability_reasons_http_error(
+    reasons: tuple[CapabilityReason, ...],
+) -> HTTPException:
+    if not reasons:
+        reasons = (
+            CapabilityReason(
+                code="capability_unavailable",
+                feature_id=None,
+                segment_id=None,
+                unit_id=None,
+                backend=None,
+                rule="capability_evaluation",
+                message="The selected feature is unavailable.",
+                remediation="Run preflight again after checking the current host capabilities.",
+                safe_details={},
+            ),
+        )
+    first = reasons[0]
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": first.code,
+            "message": first.message,
+            "reasons": [reason.model_dump(mode="json") for reason in reasons],
+        },
+    )
+
+
+def _creative_input_http_error(
+    reason: CapabilityReason,
+    *additional_reasons: CapabilityReason,
+) -> HTTPException:
+    return _capability_reasons_http_error((reason, *additional_reasons))
+
+
+def _v5_creative_authority_reason(
+    exc: V5CreativeAuthorityError,
+) -> CapabilityReason:
+    return CapabilityReason(
+        code=exc.code,
+        feature_id=exc.feature_id,
+        segment_id=exc.segment_id,
+        unit_id=None,
+        backend=None,
+        rule="v5_creative_authority",
+        message=str(exc),
+        remediation=(
+            "Complete or correct the project-owned model and feature "
+            "configuration, then run preflight again."
+        ),
+        safe_details=exc.safe_details,
+    )
+
+
+def _capability_compile_http_error(
+    error: V4CapabilityEvaluationError,
+    *additional_reasons: CapabilityReason,
+) -> HTTPException:
+    reasons = tuple(
+        reason
+        for reason in getattr(error.evaluation, "reasons", ())
+        if isinstance(reason, CapabilityReason)
+    )
+    return _capability_reasons_http_error(
+        (*reasons, *additional_reasons),
+    )
+
+
 def _runtime_authority_changed() -> HTTPException:
     return HTTPException(
         status_code=409,
@@ -608,9 +1112,19 @@ def _runtime_authority_changed() -> HTTPException:
     )
 
 
+def _execution_plan_invariant_http_error() -> HTTPException:
+    return HTTPException(
+        status_code=500,
+        detail={
+            "code": "execution_plan_invariant_failed",
+            "message": "The compiled execution evidence is internally inconsistent.",
+        },
+    )
+
+
 def _runtime_authority_snapshot(
     request: Request,
-) -> tuple[RuntimeSettings, str]:
+) -> tuple[RuntimeSettingsV3, str]:
     settings, authority = _db(request).get_settings_authority()
     expected = request.headers.get("X-Director-Runtime-Authority")
     # These endpoints form one App-owned authority batch. A request without a
@@ -667,6 +1181,187 @@ def _timeline_revision_exhausted(exc: TimelineRevisionExhausted) -> HTTPExceptio
     return HTTPException(status_code=409, detail=detail.model_dump(mode="json"))
 
 
+def _legacy_generation_api_retired() -> HTTPException:
+    """Versioned tombstone for the six pre-timeline write APIs.
+
+    Reads remain available for historical display and offline migration, but a
+    v5 server must never manufacture a new creative snapshot by combining an
+    old mode draft with live runtime settings.
+    """
+
+    return HTTPException(
+        status_code=410,
+        detail={
+            "code": "legacy_generation_api_retired",
+            "message": (
+                "Legacy six-mode generation writes are retired; refresh the "
+                "client and submit a v5 timeline snapshot."
+            ),
+            "required_schema": 5,
+        },
+    )
+
+
+def _project_import_http_error(exc: ProjectImportError) -> HTTPException:
+    detail: dict[str, Any] = {
+        "code": exc.code,
+        "message": exc.message,
+    }
+    if exc.details:
+        detail["details"] = exc.details
+    return HTTPException(status_code=exc.status_code, detail=detail)
+
+
+def _historical_creative_http_error(
+    exc: HistoricalCreativeInputError,
+) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
+def _runtime_settings_schema_migrated() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "runtime_settings_schema_migrated",
+            "message": (
+                "Runtime settings migrated to schema 3; refresh before saving."
+            ),
+            "current_schema": 3,
+        },
+    )
+
+
+def _settings_authority_conflict() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "runtime_settings_authority_conflict",
+            "message": (
+                "Runtime settings changed on the server; fetch the current "
+                "authority before retrying."
+            ),
+        },
+    )
+
+
+def _new_disallowed_lora_loader_mapping(
+    current: RuntimeSettingsV3,
+    candidate: RuntimeSettingsV3,
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """Reject new invalid mappings while keeping old records recoverable."""
+
+    current_by_filename = {
+        record.lora_filename: record for record in current.lora_loader_overrides
+    }
+    for record in candidate.lora_loader_overrides:
+        policy = get_lora_loader_policy(record.lora_filename)
+        if record.adapter_id in policy.loader_ids:
+            continue
+        previous = current_by_filename.get(record.lora_filename)
+        if previous is not None and previous == record:
+            continue
+        return record.lora_filename, record.adapter_id, policy.loader_ids
+    return None
+
+
+def _lora_loader_mapping_not_allowed(
+    issue: tuple[str, str, tuple[str, ...]],
+) -> HTTPException:
+    lora_filename, adapter_id, allowed_loader_ids = issue
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": "lora_loader_not_allowed_for_file",
+            "message": "The selected LoRA loader is not allowed for this LoRA file.",
+            "lora_filename": lora_filename,
+            "adapter_id": adapter_id,
+            "allowed_loader_ids": list(allowed_loader_ids),
+        },
+    )
+
+
+def _timeline_schema_migrated(
+    database: Database, project_id: str
+) -> HTTPException:
+    receipt = database.get_latest_project_migration_receipt(
+        project_id,
+        from_schema=4,
+        to_schema=5,
+    )
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "timeline_schema_migrated",
+            "message": "Timeline schema migrated to v5; refresh before saving.",
+            "project_id": project_id,
+            "current_schema": 5,
+            "migration_id": (
+                receipt.migration_id if receipt is not None else None
+            ),
+        },
+    )
+
+
+def _timeline_authority_required(project_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "timeline_authority_required",
+            "message": "Timeline writes require an expected server revision.",
+            "project_id": project_id,
+        },
+    )
+
+
+def _project_rename_api_retired(project_id: str) -> HTTPException:
+    """Retire title writes that bypass timeline history, WAL, and CAS."""
+
+    return HTTPException(
+        status_code=410,
+        detail={
+            "code": "project_rename_api_retired",
+            "message": (
+                "Project titles are part of timeline creative authority; "
+                "update document.title through timeline authority CAS."
+            ),
+            "required_endpoint": (
+                f"/api/projects/{project_id}/timeline/authority"
+            ),
+            "required_schema": 5,
+        },
+    )
+
+
+def _project_import_preflight_required() -> HTTPException:
+    return HTTPException(
+        status_code=410,
+        detail={
+            "code": "project_import_preflight_required",
+            "message": (
+                "Direct project import is retired; use import preflight and "
+                "commit with the returned short-lived token."
+            ),
+        },
+    )
+
+
+def _parse_v5_timeline_authority_write(
+    database: Database,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> TimelineAuthorityWriteRequest:
+    document = body.get("document")
+    if isinstance(document, Mapping) and document.get("version") == 4:
+        raise _timeline_schema_migrated(database, project_id)
+    try:
+        return TimelineAuthorityWriteRequest.model_validate(body)
+    except ValidationError as exc:
+        raise _validation_error(exc) from exc
+
+
 def _normalize_shot_detection(value: Any, *, total_frames: int) -> DetectShotsResponse:
     """Validate the Director response and make the two timeline bounds explicit."""
 
@@ -702,6 +1397,48 @@ def _normalize_shot_detection(value: Any, *, total_frames: int) -> DetectShotsRe
     )
 
 
+def _child_output_node_mapping(child: dict[str, Any]) -> dict[str, str]:
+    evidence = child.get("execution_evidence")
+    if isinstance(evidence, dict) and "exact_prompt_snapshot" in evidence:
+        snapshot = evidence["exact_prompt_snapshot"]
+        expected = (
+            snapshot.expected_output_spec
+            if hasattr(snapshot, "expected_output_spec")
+            else snapshot.get("expected_output_spec")
+            if isinstance(snapshot, dict)
+            else None
+        )
+        if expected is None:
+            return {}
+        segment_id = (
+            expected.segment_id
+            if hasattr(expected, "segment_id")
+            else expected.get("segment_id")
+            if isinstance(expected, dict)
+            else None
+        )
+        node_id = (
+            expected.node_id
+            if hasattr(expected, "node_id")
+            else expected.get("node_id")
+            if isinstance(expected, dict)
+            else None
+        )
+        if (
+            isinstance(segment_id, str)
+            and segment_id in child.get("segment_ids", [])
+            and isinstance(node_id, str)
+        ):
+            return {node_id: segment_id}
+        return {}
+    declared_segments = {str(item) for item in child.get("segment_ids", [])}
+    return {
+        str(node_id): str(segment_id)
+        for segment_id, node_id in (child.get("output_nodes") or {}).items()
+        if str(segment_id) in declared_segments
+    }
+
+
 def _segment_output_candidates(
     job: dict[str, Any],
 ) -> dict[str, list[tuple[dict[str, Any], dict[str, str]]]]:
@@ -714,12 +1451,34 @@ def _segment_output_candidates(
 
     candidates: dict[str, list[tuple[dict[str, Any], dict[str, str]]]] = {}
     for child in job.get("children", []):
-        declared_segments = {str(item) for item in child.get("segment_ids", [])}
-        node_to_segment = {
-            str(node_id): str(segment_id)
-            for segment_id, node_id in (child.get("output_nodes") or {}).items()
-            if str(segment_id) in declared_segments
-        }
+        evidence = child.get("execution_evidence")
+        if isinstance(evidence, dict):
+            snapshot = evidence.get("exact_prompt_snapshot")
+            expected = (
+                snapshot.expected_output_spec
+                if hasattr(snapshot, "expected_output_spec")
+                else None
+            )
+            artifact = child.get("observed_artifact")
+            if (
+                expected is None
+                or not isinstance(artifact, ObservedArtifactSpec)
+                or child.get("status") != "succeeded"
+                or artifact.child_id != str(child.get("id") or "")
+                or artifact.segment_id != expected.segment_id
+                or expected.segment_id not in child.get("segment_ids", [])
+            ):
+                # A typed child can never fall back to mutable legacy columns.
+                continue
+            output = {
+                "node_id": expected.node_id,
+                **artifact.output_descriptor.model_dump(mode="json"),
+            }
+            candidates.setdefault(expected.segment_id, []).append(
+                (child, output)
+            )
+            continue
+        node_to_segment = _child_output_node_mapping(child)
         for output in child.get("outputs", []):
             segment_id = node_to_segment.get(str(output.get("node_id") or ""))
             if segment_id is None:
@@ -764,13 +1523,58 @@ def _segment_results(
     return results
 
 
-def _job_timeline_snapshot(job: dict[str, Any]) -> UnifiedTimelineDraft | None:
+def _job_legacy_creative_projection(
+    job: dict[str, Any],
+) -> tuple[UnifiedTimelineDraft, RuntimeSettings | None] | None:
+    """Project either historical schema into the frozen display contract."""
+
     snapshot = job.get("config_snapshot")
     if not isinstance(snapshot, dict):
         return None
+    raw_timeline = snapshot.get("timeline")
+    if not isinstance(raw_timeline, Mapping):
+        return None
     try:
-        return UnifiedTimelineDraft.model_validate(snapshot.get("timeline"))
-    except (TypeError, ValidationError, ValueError):
+        if raw_timeline.get("version") == 5:
+            timeline_v5 = UnifiedTimelineDraftV5.model_validate(raw_timeline)
+            legacy_document = timeline_v5.model_dump(
+                mode="json",
+                exclude={"model_stack", "features"},
+            )
+            legacy_document["version"] = 4
+            return UnifiedTimelineDraft.model_validate(legacy_document), None
+        timeline_v4 = UnifiedTimelineDraft.model_validate(raw_timeline)
+        try:
+            settings_v1 = RuntimeSettings.model_validate(
+                job.get("settings_snapshot")
+            )
+        except (TypeError, ValidationError, ValueError):
+            settings_v1 = None
+        return timeline_v4, settings_v1
+    except (
+        TypeError,
+        ValidationError,
+        ValueError,
+    ):
+        return None
+
+
+def _job_timeline_snapshot(job: dict[str, Any]) -> UnifiedTimelineDraft | None:
+    projection = _job_legacy_creative_projection(job)
+    if projection is None:
+        return None
+    return projection[0]
+
+
+def _job_v5_creative_snapshot(
+    job: Mapping[str, Any],
+) -> UnifiedTimelineDraftV5 | None:
+    try:
+        return resolve_historical_creative_input(
+            job,
+            migrate_v4_to_v5=migrate_timeline_v4_to_v5,
+        )
+    except (HistoricalCreativeInputError, ProjectImportError):
         return None
 
 
@@ -780,12 +1584,151 @@ def _snapshot_filename(value: str) -> str:
     return re.split(r"[\\/]", value)[-1]
 
 
+def _v5_generation_lora(
+    draft: UnifiedTimelineDraftV5,
+    family: ModelFamily,
+) -> tuple[str | None, float]:
+    selection = draft.features.project.get("lora")
+    if selection is None or not selection.enabled:
+        return None, 1.0
+    params = LoraFeatureParams.model_validate(selection.params)
+    family_selection = params.by_family[family]
+    if not family_selection.enabled or family_selection.filename is None:
+        return None, family_selection.strength
+    return _snapshot_filename(family_selection.filename), family_selection.strength
+
+
+def _v5_generation_runtime_details(
+    job: Mapping[str, Any],
+    draft: UnifiedTimelineDraftV5,
+    families: list[ModelFamily],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Read bounded and historical full runtime snapshots without live state."""
+
+    config_snapshot = job.get("config_snapshot")
+    raw_segment_ids = (
+        config_snapshot.get("segment_ids")
+        if isinstance(config_snapshot, Mapping)
+        else None
+    )
+    if raw_segment_ids is not None and not (
+        isinstance(raw_segment_ids, list)
+        and all(isinstance(item, str) for item in raw_segment_ids)
+    ):
+        return None
+    segment_ids = raw_segment_ids if isinstance(raw_segment_ids, list) else None
+    raw_runtime = job.get("settings_snapshot")
+    if not isinstance(raw_runtime, Mapping):
+        return None
+
+    family_runtime: dict[str, tuple[str, str, Any | None]] = {}
+    shared_devices: dict[str, str | None] = {}
+    if "snapshot_schema_version" in raw_runtime:
+        try:
+            bounded = JobRuntimeSnapshotV1.model_validate(raw_runtime)
+            validate_job_runtime_snapshot_creative_binding(
+                bounded,
+                draft,
+                segment_ids,
+            )
+        except (TypeError, ValidationError, ValueError):
+            return None
+        for family, placement in bounded.family_map().items():
+            family_runtime[family] = (
+                placement.backend,
+                placement.device,
+                placement.raylight_profile,
+            )
+        runtime = bounded.runtime_projection
+        shared_devices = {
+            "clip": runtime.clip_device,
+            "video_vae": runtime.video_vae_device,
+            "audio_vae": runtime.audio_vae_device,
+        }
+    else:
+        schema_version = raw_runtime.get("schema_version")
+        try:
+            if schema_version == 3:
+                historical = RuntimeSettingsV3.model_validate(raw_runtime)
+            elif schema_version == 2:
+                historical = RuntimeSettingsV2.model_validate(raw_runtime)
+            else:
+                return None
+        except (TypeError, ValidationError, ValueError):
+            return None
+        for family in families:
+            placement = getattr(historical.placement, family)
+            backend = (
+                "raylight"
+                if len(placement.raylight.gpu_select) >= 2
+                else "standard"
+            )
+            family_runtime[family] = (
+                backend,
+                placement.device,
+                placement.raylight if backend == "raylight" else None,
+            )
+        shared_devices = {
+            "clip": historical.placement.clip_device,
+            "video_vae": historical.placement.video_vae_device,
+            "audio_vae": historical.placement.audio_vae_device,
+        }
+
+    if set(family_runtime) != set(families):
+        return None
+    models: list[dict[str, Any]] = []
+    for family in families:
+        model_filename = getattr(draft.model_stack, family).filename
+        if model_filename is None:
+            return None
+        backend, device, raylight = family_runtime[family]
+        lora_name, lora_strength = _v5_generation_lora(draft, family)
+        models.append(
+            {
+                "family": family,
+                "filename": _snapshot_filename(model_filename),
+                "device": device,
+                "lora_name": lora_name,
+                "lora_strength": lora_strength,
+                "backends": [backend],
+                "logical_gpu_indices": (
+                    list(raylight.gpu_select) if raylight is not None else []
+                ),
+                "ulysses_degree": (
+                    raylight.ulysses_degree if raylight is not None else None
+                ),
+                "ring_degree": (
+                    raylight.ring_degree if raylight is not None else None
+                ),
+            }
+        )
+
+    shared_models: list[dict[str, Any]] = []
+    for role in ("clip", "video_vae", "audio_vae"):
+        filename = getattr(draft.model_stack, role).filename
+        device = shared_devices[role]
+        # The bounded snapshot intentionally omits an unused audio VAE route.
+        if role == "audio_vae" and device is None:
+            continue
+        if filename is None or device is None:
+            return None
+        shared_models.append(
+            {
+                "role": role,
+                "filename": _snapshot_filename(filename),
+                "device": device,
+            }
+        )
+    return models, shared_models
+
+
 def _job_generation_details(
     job: dict[str, Any], children: list[dict[str, Any]]
 ) -> JobGenerationDetailsRead | None:
-    timeline = _job_timeline_snapshot(job)
-    if timeline is None:
+    projection = _job_legacy_creative_projection(job)
+    if projection is None:
         return None
+    timeline, settings = projection
 
     snapshot = job.get("config_snapshot")
     raw_segment_ids = (
@@ -828,11 +1771,23 @@ def _job_generation_details(
     models: list[dict[str, Any]] = []
     shared_models: list[dict[str, Any]] = []
     runtime_snapshot_available = False
-    try:
-        settings = RuntimeSettings.model_validate(job.get("settings_snapshot"))
-    except (TypeError, ValidationError, ValueError):
-        settings = None
-    if settings is not None:
+    captured_v5 = None
+    raw_timeline = snapshot.get("timeline") if isinstance(snapshot, Mapping) else None
+    if isinstance(raw_timeline, Mapping) and raw_timeline.get("version") == 5:
+        try:
+            captured_v5 = UnifiedTimelineDraftV5.model_validate(raw_timeline)
+        except (TypeError, ValidationError, ValueError):
+            captured_v5 = None
+    if captured_v5 is not None:
+        v5_runtime = _v5_generation_runtime_details(
+            job,
+            captured_v5,
+            families,
+        )
+        if v5_runtime is not None:
+            models, shared_models = v5_runtime
+            runtime_snapshot_available = True
+    elif settings is not None:
         runtime_snapshot_available = True
         for family in families:
             binding = getattr(settings.models, family)
@@ -1015,16 +1970,51 @@ def _job_error_summary(job: dict[str, Any]) -> str | None:
     return None
 
 
+def _child_public_outputs(child: dict[str, Any]) -> list[str]:
+    """Project typed child media only from immutable expected/observed facts."""
+
+    evidence = child.get("execution_evidence")
+    if isinstance(evidence, dict):
+        snapshot = evidence.get("exact_prompt_snapshot")
+        expected = (
+            snapshot.expected_output_spec
+            if hasattr(snapshot, "expected_output_spec")
+            else None
+        )
+        artifact = child.get("observed_artifact")
+        if (
+            expected is None
+            or not isinstance(artifact, ObservedArtifactSpec)
+            or child.get("status") != "succeeded"
+            or artifact.child_id != str(child.get("id") or "")
+            or artifact.segment_id != expected.segment_id
+            or expected.segment_id not in child.get("segment_ids", [])
+        ):
+            # Merely having mutable compatibility outputs can never make an
+            # incomplete or corrupt typed evidence chain public.
+            return []
+        return [
+            _output_file_location(
+                {
+                    "node_id": expected.node_id,
+                    **artifact.output_descriptor.model_dump(mode="json"),
+                }
+            )
+        ]
+    return [_output_file_location(output) for output in child.get("outputs", [])]
+
+
 def _job_read(
     job: dict[str, Any], *, live_preview_available: bool = False,
     current_snapshot: bool = False,
     current_project: bool = False,
 ) -> JobRead:
+    parent_outputs = authoritative_parent_outputs(job)
     outputs = [
         public_api_url(f"/api/jobs/{job['id']}/outputs/{index}")
-        for index, _ in enumerate(job["outputs"])
+        for index, _ in enumerate(parent_outputs)
     ]
-    output_files = [_output_file_location(output) for output in job["outputs"]]
+    output_files = [_output_file_location(output) for output in parent_outputs]
     segment_results = _segment_results(job, current_snapshot=current_snapshot)
     visible_output_files = set(output_files)
     visible_output_files.update(result["output_file"] for result in segment_results)
@@ -1068,10 +2058,7 @@ def _job_read(
                     "progress": child["progress"],
                     "stage": child["stage"],
                     "prompt_id": child["prompt_id"],
-                    "outputs": [
-                        _output_file_location(output)
-                        for output in child["outputs"]
-                    ],
+                    "outputs": _child_public_outputs(child),
                     "error": child["error"],
                 }
                 for child in job.get("children", [])
@@ -1085,6 +2072,105 @@ def _job_read(
     )
 
 
+def _child_with_execution_evidence(
+    database: Database,
+    child: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        evidence = database.get_job_child_execution_evidence(str(child["id"]))
+    except (ExecutionEvidenceConflict, RuntimeError, ValidationError, ValueError):
+        # Preserve the fact that this is a typed child so every downstream
+        # projection fails closed instead of reinterpreting mutable legacy
+        # columns after immutable evidence corruption.
+        enriched = dict(child)
+        enriched["execution_evidence"] = {"invalid": True}
+        enriched["observed_artifact"] = None
+        return enriched
+    if evidence is None:
+        try:
+            has_typed_marker = database.has_job_child_execution_marker(
+                str(child["id"])
+            )
+        except RuntimeError:
+            has_typed_marker = True
+        if has_typed_marker:
+            enriched = dict(child)
+            enriched["execution_evidence"] = {"invalid": True}
+            enriched["observed_artifact"] = None
+            return enriched
+        return child
+    enriched = dict(child)
+    enriched["execution_evidence"] = evidence
+    try:
+        enriched["observed_artifact"] = database.get_observed_artifact(
+            str(child["id"])
+        )
+    except (ExecutionEvidenceConflict, RuntimeError, ValidationError, ValueError):
+        enriched["observed_artifact"] = None
+    return enriched
+
+
+def _job_with_parent_output_authority(
+    database: Database,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach the typed parent-output facts used by every public consumer."""
+
+    enriched = dict(job)
+    raw_children = enriched.get("children")
+    if not isinstance(raw_children, list):
+        raw_children = database.list_job_children(str(enriched["id"]))
+    children = [
+        child
+        if isinstance(child, dict) and "execution_evidence" in child
+        else _child_with_execution_evidence(database, child)
+        for child in raw_children
+        if isinstance(child, dict)
+    ]
+    enriched["children"] = children
+    try:
+        typed = database.has_job_execution_marker(str(enriched["id"]))
+    except RuntimeError:
+        typed = True
+    typed = typed or any(
+        isinstance(child.get("execution_evidence"), dict) for child in children
+    )
+    try:
+        plan = database.get_job_execution_plan(str(enriched["id"]))
+    except (ExecutionEvidenceConflict, RuntimeError, ValidationError, ValueError):
+        plan = None
+        typed = True
+    else:
+        typed = typed or plan is not None
+
+    assembly = None
+    config_snapshot = enriched.get("config_snapshot")
+    timeline = (
+        config_snapshot.get("timeline")
+        if isinstance(config_snapshot, dict)
+        else None
+    )
+    needs_assembly = (
+        plan is not None
+        and len(plan.segment_units) > 1
+        and isinstance(timeline, dict)
+        and timeline.get("export_mode") == "all"
+        and _is_full_timeline_selection(config_snapshot)
+    )
+    if needs_assembly:
+        try:
+            assembly = database.get_observed_assembly_artifact(str(enriched["id"]))
+        except (ExecutionEvidenceConflict, RuntimeError, ValidationError, ValueError):
+            typed = True
+            assembly = None
+    return attach_parent_output_authority(
+        enriched,
+        typed=typed,
+        compiled_plan=plan,
+        observed_assembly=assembly,
+    )
+
+
 def _live_preview_for_job(request: Request, job: dict[str, Any]):
     """Return a cache hit only while its exact native child sampler is live."""
 
@@ -1095,7 +2181,10 @@ def _live_preview_for_job(request: Request, job: dict[str, Any]):
     preview = cache.get(str(job["id"]))
     if preview is None:
         return None
-    child = _db(request).get_job_child(preview.child_id)
+    database = _db(request)
+    child = database.get_job_child(preview.child_id)
+    if child is not None:
+        child = _child_with_execution_evidence(database, child)
     if (
         child is None
         or child["job_id"] != str(job["id"])
@@ -1120,7 +2209,7 @@ _UNSET_CURRENT_TIMELINE = _UnsetCurrentTimeline()
 def _job_read_context_for_project(
     request: Request,
     project_id: str | None,
-) -> tuple[UnifiedTimelineDraft | None, RuntimeSettings]:
+) -> tuple[str, UnifiedTimelineDraftV5 | None, RuntimeSettingsV3]:
     """Resolve one request's active-project comparison authority exactly once."""
 
     database = _db(request)
@@ -1132,7 +2221,93 @@ def _job_read_context_for_project(
         # project was deleted. The mutation remains valid, but currentness must
         # fail closed rather than silently comparing against the default.
         current_timeline = None
-    return current_timeline, database.get_settings()
+    return active_project_id, current_timeline, database.get_settings()
+
+
+def _current_v5_effective_execution_digest(
+    request: Request,
+    *,
+    draft: UnifiedTimelineDraftV5,
+    settings: RuntimeSettingsV3,
+    segment_ids: list[str] | None,
+    project_id: str,
+    job_id: str,
+    runtime_projection: Any,
+    cache: dict[str, Any] | None,
+) -> tuple[DocumentDigest, JobRuntimeSnapshotV1]:
+    """Purely re-resolve the execution identity used by currentness.
+
+    Host availability belongs to preflight and is intentionally absent from
+    ``effective_execution_digest``.  This proof therefore uses the current
+    static template/NodeContract registries and the current project-scoped
+    historical-take ledger, but performs no ComfyUI or provider I/O. Exact
+    mapping-only LoRA resolution is pure and belongs to this same proof.
+    """
+
+    projection = project_v5_compile_authority(draft, settings, segment_ids)
+    historical_takes = _resolve_historical_continuity_takes(
+        _db(request),
+        projection.draft,
+        segment_ids=segment_ids,
+        project_id=project_id,
+    )
+    cache_key = sha256_document_digest(
+        {
+            "project_id": project_id,
+            "timeline": draft.model_dump(mode="json"),
+            "segment_ids": segment_ids,
+            "runtime_projection": asdict(runtime_projection),
+            # Memoize by the already-resolved, job-reachable adapter evidence.
+            # Enumerating the settings override table here would make a
+            # RayLight-only currentness read depend on Standard host knowledge,
+            # even though RayLight resolution deliberately never reads it.
+            "resolved_lora_adapters": [
+                {
+                    "family": item.family,
+                    "adapter": item.resolution.adapter.model_dump(mode="json"),
+                    "binding": (
+                        item.resolution.binding.model_dump(mode="json")
+                        if item.resolution.binding is not None
+                        else None
+                    ),
+                    "options": dict(item.resolution.options),
+                }
+                for item in projection.resolved_lora_adapters
+            ],
+            "historical_takes": [
+                {
+                    "target_segment_id": target_segment_id,
+                    "take_id": take.id,
+                    "source_segment_id": take.segment_id,
+                    "output": dict(take.output),
+                }
+                for target_segment_id, take in sorted(historical_takes.items())
+            ],
+        }
+    ).value
+    if cache is not None and cache_key in cache:
+        cached = cache[cache_key]
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and isinstance(cached[0], DocumentDigest)
+            and isinstance(cached[1], JobRuntimeSnapshotV1)
+        ):
+            return cached
+    plan = compile_v5_execution_plan(
+        draft,
+        settings,
+        job_id,
+        segment_ids,
+        historical_takes=historical_takes,
+    )
+    evidence = (
+        plan.effective_execution_digest,
+        build_job_runtime_snapshot(draft, segment_ids, settings, plan),
+    )
+    if cache is not None:
+        cache[cache_key] = evidence
+    return evidence
 
 
 def _job_read_for_request(
@@ -1140,46 +2315,120 @@ def _job_read_for_request(
     job: dict[str, Any],
     *,
     current_timeline: (
-        UnifiedTimelineDraft | None | _UnsetCurrentTimeline
+        UnifiedTimelineDraftV5 | None | _UnsetCurrentTimeline
     ) = _UNSET_CURRENT_TIMELINE,
-    current_settings: RuntimeSettings | None = None,
+    current_settings: RuntimeSettingsV3 | None = None,
+    current_project_id: str | None = None,
+    current_execution_digest_cache: dict[str, Any] | None = None,
 ) -> JobRead:
     """Annotate one job with strict currentness flags.
 
     ``current_project`` deliberately compares only the typed timeline (scoped
     by the caller to the active project's timeline); ``current_snapshot`` adds
-    the stricter runtime-settings equality for the main monitor. Loose project
-    membership is expressed by the separate ``project_id`` field.
+    equality of the execution-relevant runtime projection and a freshly
+    resolved effective-execution digest. Loose project membership is expressed
+    by the separate ``project_id`` field.
     """
+
+    job = _job_with_parent_output_authority(_db(request), job)
 
     current_snapshot = False
     current_project = False
-    snapshot_timeline = _job_timeline_snapshot(job)
+    snapshot_timeline = _job_v5_creative_snapshot(job)
     if snapshot_timeline is not None:
         if isinstance(current_timeline, _UnsetCurrentTimeline):
+            current_project_id = _db(request).LEGACY_DEFAULT_PROJECT_ID
             current_timeline = _db(request).get_timeline()
+        elif current_project_id is None:
+            current_project_id = str(
+                job.get("project_id")
+                or _db(request).LEGACY_DEFAULT_PROJECT_ID
+            )
         if current_timeline is not None:
             current_project = (
                 snapshot_timeline.model_dump(mode="json")
                 == current_timeline.model_dump(mode="json")
             )
-    if job.get("mode") == "timeline" and snapshot_timeline is not None:
+    raw_job_snapshot = job.get("config_snapshot")
+    raw_job_timeline = (
+        raw_job_snapshot.get("timeline")
+        if isinstance(raw_job_snapshot, Mapping)
+        else None
+    )
+    # ``_job_v5_creative_snapshot`` may produce a read-only v5 projection for
+    # a historical v4 job.  That keeps old jobs inspectable, but it must never
+    # upgrade their take currentness implicitly: only an originally captured
+    # v5 authority has the runtime-projection contract below.
+    has_captured_v5_authority = (
+        isinstance(raw_job_timeline, Mapping)
+        and raw_job_timeline.get("version") == 5
+    )
+    if (
+        job.get("mode") == "timeline"
+        and snapshot_timeline is not None
+        and has_captured_v5_authority
+    ):
         try:
-            snapshot_settings = RuntimeSettings.model_validate(
+            snapshot_runtime = JobRuntimeSnapshotV1.model_validate(
                 job.get("settings_snapshot")
             )
             if current_settings is None:
                 current_settings = _db(request).get_settings()
+            if "segment_ids" not in raw_job_snapshot:
+                raise ValueError("captured segment selection is missing")
+            raw_segment_ids = raw_job_snapshot.get("segment_ids")
+            segment_ids = (
+                raw_segment_ids if isinstance(raw_segment_ids, list) else None
+            )
+            if raw_segment_ids is not None and segment_ids is None:
+                raise ValueError("invalid captured segment selection")
+            if current_timeline is None:
+                raise ValueError("current project timeline is unavailable")
+            current_runtime = project_v5_runtime_currentness(
+                current_timeline,
+                segment_ids,
+                current_settings,
+            )
         except (TypeError, ValidationError, ValueError):
             # Historical or partially migrated jobs remain inspectable, but
             # can never be described as an exact current snapshot.
             pass
         else:
-            current_snapshot = (
-                current_project
-                and snapshot_settings.model_dump(mode="json")
-                == current_settings.model_dump(mode="json")
-            )
+            try:
+                stored_plan = attached_compiled_execution_plan(job)
+                if stored_plan is None or current_project_id is None:
+                    raise ValueError("job has no typed execution plan")
+                (
+                    current_digest,
+                    current_runtime_snapshot,
+                ) = _current_v5_effective_execution_digest(
+                    request,
+                    draft=current_timeline,
+                    settings=current_settings,
+                    segment_ids=segment_ids,
+                    project_id=current_project_id,
+                    job_id=str(job.get("id") or "currentness"),
+                    runtime_projection=current_runtime,
+                    cache=current_execution_digest_cache,
+                )
+                current_snapshot = (
+                    snapshot_runtime.has_same_execution_identity(
+                        current_runtime_snapshot
+                    )
+                    and current_digest
+                    == stored_plan.effective_execution_digest
+                )
+            except (
+                DraftNotRunnable,
+                NativeTemplateError,
+                TypeError,
+                V5CreativeAuthorityError,
+                ValidationError,
+                ValueError,
+            ):
+                # Missing current historical takes or any graph/adapter
+                # identity drift is not evidence of currentness.
+                current_snapshot = False
     return _job_read(
         job,
         live_preview_available=_live_preview_for_job(request, job) is not None,
@@ -1196,7 +2445,7 @@ def _job_read_for_project_scope(
 ) -> JobRead:
     """Project one job against the caller's explicit active-project scope."""
 
-    current_timeline, current_settings = _job_read_context_for_project(
+    active_project_id, current_timeline, current_settings = _job_read_context_for_project(
         request,
         project_id,
     )
@@ -1205,6 +2454,7 @@ def _job_read_for_project_scope(
         job,
         current_timeline=current_timeline,
         current_settings=current_settings,
+        current_project_id=active_project_id,
     )
 
 
@@ -1260,6 +2510,192 @@ def _collect_output_files(value: Any, *, node_id: str = "") -> list[dict[str, st
             seen.add(identity)
             deduplicated.append(item)
     return deduplicated
+
+
+def _trusted_history_output_descriptor(
+    history_entry: Mapping[str, Any],
+    *,
+    node_id: str,
+) -> OutputDescriptor:
+    """Extract exactly one safe persistent descriptor from the expected node."""
+
+    outputs = history_entry.get("outputs")
+    if not isinstance(outputs, Mapping) or node_id not in outputs:
+        raise ExecutionEvidenceConflict(
+            "successful history is missing the expected output node"
+        )
+    candidates: list[OutputDescriptor] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            if "filename" in value:
+                if value.get("type") != "output":
+                    raise ExecutionEvidenceConflict(
+                        "expected output node returned a non-persistent descriptor"
+                    )
+                try:
+                    candidates.append(OutputDescriptor.model_validate(value))
+                except ValidationError as exc:
+                    raise ExecutionEvidenceConflict(
+                        "expected output node returned an unsafe descriptor"
+                    ) from exc
+                return
+            for nested in value.values():
+                visit(nested)
+            return
+        if isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(outputs[node_id])
+    if len(candidates) != 1:
+        raise ExecutionEvidenceConflict(
+            "successful history must contain exactly one expected take descriptor"
+        )
+    return candidates[0]
+
+
+async def _observe_output_receipt(
+    request: Request,
+    child: dict[str, Any],
+    receipt: OutputObservationReceipt,
+) -> dict[str, Any]:
+    """Finish the path-free host probe and atomic observed-artifact publish."""
+
+    database = _db(request)
+    existing = database.get_observed_artifact(str(child["id"]))
+    if existing is not None:
+        latest = database.get_job_child(str(child["id"]))
+        if latest is None:
+            raise KeyError(child["id"])
+        return latest
+    provider: HostOutputProbeProvider | None = request.app.state.host_output_probe
+    if provider is None:
+        return child
+    try:
+        raw_probe = await anyio.to_thread.run_sync(
+            provider.probe_output,
+            receipt.output_descriptor,
+        )
+        probe = HostOutputProbeResult.model_validate(raw_probe)
+    except PermanentHostOutputProbeError:
+        # A structurally unsafe descriptor, unsupported media type, or path
+        # escape cannot heal on a later reconciliation.  Preserve successful
+        # history ownership but close local artifact verification explicitly
+        # instead of leaving the child in an infinite retry loop.
+        return database.fail_output_observation(
+            str(child["id"]),
+            error="host output cannot be observed safely",
+            updated_at=datetime.now(timezone.utc),
+        )
+    except HostOutputProbeError:
+        # The immutable receipt is the retry authority.  A missing media tool,
+        # temporarily unavailable file, or bounded probe timeout must not
+        # discard exact terminal history or trigger a resubmission.
+        latest = database.get_job_child(str(child["id"]))
+        return latest if latest is not None else child
+    except ValidationError:
+        return database.fail_output_observation(
+            str(child["id"]),
+            error="host output probe returned invalid metadata",
+            updated_at=datetime.now(timezone.utc),
+        )
+    artifact = ObservedArtifactSpec(
+        segment_id=receipt.segment_id,
+        child_id=receipt.child_id,
+        output_descriptor=receipt.output_descriptor,
+        width=probe.width,
+        height=probe.height,
+        fps=probe.fps,
+        frame_count=probe.frame_count,
+        duration_seconds=probe.duration_seconds,
+        has_audio=probe.has_audio,
+        media_probe_version=probe.media_probe_version,
+        content_hash=None,
+    )
+    return database.finalize_observed_artifact(
+        str(child["id"]),
+        artifact=artifact,
+        updated_at=datetime.now(timezone.utc),
+    )[0]
+
+
+async def _record_and_observe_typed_success(
+    request: Request,
+    child: dict[str, Any],
+    history_entry: Mapping[str, Any],
+    ownership: PromptOwnership,
+) -> dict[str, Any]:
+    """Bridge exact successful history to an ObservedArtifactSpec."""
+
+    database = _db(request)
+    evidence = database.get_job_child_execution_evidence(str(child["id"]))
+    if evidence is None:
+        raise ExecutionEvidenceConflict(
+            "typed prompt ownership has no exact execution evidence"
+        )
+    snapshot = evidence["exact_prompt_snapshot"]
+    expected = snapshot.expected_output_spec
+    if snapshot.unit_kind != "segment" or expected is None:
+        raise ExecutionEvidenceConflict(
+            "only segment prompts can publish observed artifacts"
+        )
+    observed_at = datetime.now(timezone.utc)
+    history_evidence = HistoryTerminalEvidence(
+        prompt_id=ownership.effective_prompt_id,
+        terminal_status="succeeded",
+        history_digest=sha256_document_digest(history_entry),
+        observed_at=observed_at,
+    )
+    try:
+        descriptor = _trusted_history_output_descriptor(
+            history_entry,
+            node_id=expected.node_id,
+        )
+    except ExecutionEvidenceConflict as exc:
+        failed = database.fail_successful_history_artifact(
+            str(child["id"]),
+            expected_revision=ownership.ownership_revision,
+            evidence=history_evidence,
+            error=str(exc),
+            updated_at=observed_at,
+        )
+        if failed is not None:
+            return failed[0]
+        latest = database.get_job_child(str(child["id"]))
+        if latest is None:
+            raise KeyError(child["id"])
+        return latest
+    receipt = OutputObservationReceipt(
+        child_id=str(child["id"]),
+        segment_id=expected.segment_id,
+        node_id=expected.node_id,
+        output_descriptor=descriptor,
+        exact_prompt_snapshot_digest=sha256_document_digest(
+            snapshot.model_dump(mode="json")
+        ),
+        expected_output_spec_digest=sha256_document_digest(
+            expected.model_dump(mode="json")
+        ),
+        history_evidence=history_evidence,
+    )
+    recorded = database.record_output_observation_receipt(
+        str(child["id"]),
+        expected_revision=ownership.ownership_revision,
+        receipt=receipt,
+        updated_at=observed_at,
+    )
+    if recorded is None:
+        latest = database.get_job_child(str(child["id"]))
+        durable_receipt = database.get_output_observation_receipt(
+            str(child["id"])
+        )
+        if latest is None:
+            raise KeyError(child["id"])
+        if durable_receipt is None:
+            return latest
+        return await _observe_output_receipt(request, latest, durable_receipt)
+    return await _observe_output_receipt(request, recorded[0], recorded[2])
 
 
 def _history_error(entry: dict[str, Any]) -> str | None:
@@ -1568,6 +3004,10 @@ async def _sync_timeline_child(
 
     if child["status"] in _TERMINAL_STATUSES or not child.get("prompt_id"):
         return child
+    database = _db(request)
+    pending_receipt = database.get_output_observation_receipt(str(child["id"]))
+    if pending_receipt is not None:
+        return await _observe_output_receipt(request, child, pending_receipt)
     # While POST /prompt is in flight, the submission coroutine is the only
     # owner allowed to bind this caller-assigned prompt id. Queue/history may
     # already expose the side effect before the HTTP response returns; letting
@@ -1579,8 +3019,6 @@ async def _sync_timeline_child(
         and child.get("stage") in _PROCESS_OWNERSHIP_STAGES
     ):
         return child
-    database = _db(request)
-
     def commit(**updates: Any) -> dict[str, Any]:
         updated = database.update_job_child_if_snapshot(
             child["id"],
@@ -1595,6 +3033,49 @@ async def _sync_timeline_child(
             raise KeyError(child["id"])
         return latest
 
+    def commit_history_terminal(
+        *,
+        status: str,
+        stage: str,
+        outputs: list[dict[str, Any]],
+        error: str | None,
+    ) -> dict[str, Any]:
+        ownership = _typed_prompt_ownership_for_child(database, child)
+        if ownership is None:
+            return commit(
+                status=status,
+                progress=1.0,
+                stage=stage,
+                outputs=outputs,
+                error=error,
+                completed_at=utc_now(),
+            )
+        if ownership.effective_prompt_id != str(child["prompt_id"]):
+            raise ExecutionEvidenceConflict(
+                "history prompt id does not match durable ownership"
+            )
+        observed_at = datetime.now(timezone.utc)
+        confirmed = database.confirm_prompt_terminal(
+            str(child["id"]),
+            expected_revision=ownership.ownership_revision,
+            evidence=HistoryTerminalEvidence(
+                prompt_id=ownership.effective_prompt_id,
+                terminal_status=status,
+                history_digest=sha256_document_digest(history_entry),
+                observed_at=observed_at,
+            ),
+            outputs=outputs,
+            stage=stage,
+            error=error,
+            updated_at=observed_at,
+        )
+        if confirmed is not None:
+            return confirmed[0]
+        latest = database.get_job_child(str(child["id"]))
+        if latest is None:
+            raise KeyError(child["id"])
+        return latest
+
     if isinstance(history_entry, dict):
         status_block = (
             history_entry.get("status")
@@ -1604,35 +3085,47 @@ async def _sync_timeline_child(
         status_value = str(status_block.get("status_str") or "").lower()
         error = _history_error(history_entry)
         interrupted = _history_has_event(history_entry, "execution_interrupted")
-        if child.get("backend") == "raylight":
-            history_state = _raylight_recovery_history_state(history_entry)
-            if history_state == "invalid":
-                raise ComfyError(
-                    "RayLight history status is contradictory; refusing to certify the runtime tail"
-                )
-            failed = history_state == "terminal" and status_value in {
-                "error",
-                "failed",
-            }
-            succeeded = history_state == "terminal" and status_value == "success"
-        else:
-            failed = status_value in {"error", "failed"} or bool(error)
-            succeeded = status_value == "success" or (
-                bool(status_block.get("completed")) and not failed
+        history_state = _raylight_recovery_history_state(history_entry)
+        if history_state == "invalid":
+            raise ComfyError(
+                "ComfyUI history status is contradictory; refusing to certify prompt ownership"
             )
+        failed = history_state == "terminal" and status_value in {
+            "error",
+            "failed",
+        }
+        succeeded = history_state == "terminal" and status_value == "success"
         if interrupted:
-            return commit(
+            return commit_history_terminal(
                 status="cancelled",
-                progress=1.0,
                 stage=("cancelled" if parent_cancelling else "ComfyUI 端已中断"),
                 outputs=[],
                 error=None,
-                completed_at=utc_now(),
             )
         if failed or succeeded:
-            return commit(
+            if succeeded:
+                ownership = _typed_prompt_ownership_for_child(database, child)
+                if ownership is not None:
+                    execution_evidence = (
+                        database.get_job_child_execution_evidence(
+                            str(child["id"])
+                        )
+                    )
+                    if (
+                        execution_evidence is not None
+                        and execution_evidence[
+                            "exact_prompt_snapshot"
+                        ].unit_kind
+                        == "segment"
+                    ):
+                        return await _record_and_observe_typed_success(
+                            request,
+                            child,
+                            history_entry,
+                            ownership,
+                        )
+            return commit_history_terminal(
                 status="failed" if failed else "succeeded",
-                progress=1.0,
                 stage="failed" if failed else "completed",
                 outputs=(
                     []
@@ -1640,7 +3133,6 @@ async def _sync_timeline_child(
                     else _collect_output_files(history_entry.get("outputs") or {})
                 ),
                 error=error if failed else None,
-                completed_at=utc_now(),
             )
     if running:
         # A standard websocket event may already have persisted exact
@@ -1671,6 +3163,22 @@ async def _sync_timeline_child(
             ),
         )
     if confirmed_absent and child.get("stage") not in _PROCESS_OWNERSHIP_STAGES:
+        ownership = _typed_prompt_ownership_for_child(database, child)
+        if ownership is not None:
+            if ownership.state not in {
+                "cleanup_confirmed",
+                "terminal_confirmed",
+                "unconfirmed",
+            }:
+                database.compare_and_set_prompt_ownership(
+                    str(child["id"]),
+                    expected_revision=ownership.ownership_revision,
+                    state="unconfirmed",
+                    updated_at=datetime.now(timezone.utc),
+                )
+            # One exact absence is not release evidence for Stage-4 jobs.
+            latest = database.get_job_child(str(child["id"]))
+            return latest or child
         was_running = child["status"] == "running" or child.get("started_at") is not None
         return commit(
             status=("failed" if was_running and not parent_cancelling else "cancelled"),
@@ -1847,10 +3355,36 @@ def _ordered_timeline_outputs(job: dict[str, Any], children: list[dict[str, Any]
     output_by_segment: dict[str, dict[str, str]] = {}
     unknown_nodes: list[str] = []
     for child in children:
-        node_to_segment = {
-            str(node_id): str(segment_id)
-            for segment_id, node_id in child["output_nodes"].items()
-        }
+        evidence = child.get("execution_evidence")
+        if isinstance(evidence, dict):
+            snapshot = evidence.get("exact_prompt_snapshot")
+            expected = (
+                snapshot.expected_output_spec
+                if hasattr(snapshot, "expected_output_spec")
+                else None
+            )
+            artifact = child.get("observed_artifact")
+            if (
+                expected is None
+                or not isinstance(artifact, ObservedArtifactSpec)
+                or artifact.child_id != str(child["id"])
+                or artifact.segment_id != expected.segment_id
+            ):
+                # Typed results are complete only when the immutable expected
+                # output and the actual media observation agree.  The mutable
+                # child output projection is never recovery authority.
+                continue
+            if expected.segment_id in output_by_segment:
+                raise ValueError(
+                    "native workflow returned duplicate output for segment "
+                    f"'{expected.segment_id}'"
+                )
+            output_by_segment[expected.segment_id] = {
+                "node_id": expected.node_id,
+                **artifact.output_descriptor.model_dump(mode="json"),
+            }
+            continue
+        node_to_segment = _child_output_node_mapping(child)
         for output in child["outputs"]:
             segment_id = node_to_segment.get(str(output.get("node_id") or ""))
             if segment_id is None:
@@ -1901,26 +3435,18 @@ def _is_full_timeline_selection(snapshot: dict[str, Any]) -> bool:
     return bool(enabled_ids) and {str(item) for item in segment_ids} == enabled_ids
 
 
-async def _assemble_timeline_output(
+async def _assemble_output_descriptors(
     request: Request,
     job: dict[str, Any],
-    segment_outputs: list[dict[str, str]],
-) -> dict[str, str]:
-    """Download exact child takes, assemble them, then register one Comfy output."""
-
+    outputs: tuple[OutputDescriptor, ...],
+) -> tuple[OutputDescriptor, VideoMetadata, str]:
     client = _comfy(request)
     segment_bytes: list[bytes] = []
-    for output in segment_outputs:
-        response = await client.view(
-            {
-                "filename": output["filename"],
-                "subfolder": output.get("subfolder", ""),
-                "type": output.get("type", "output"),
-            }
-        )
+    for output in outputs:
+        response = await client.view(output.model_dump(mode="json"))
         if not response.content:
             raise MediaToolError(
-                f"generated segment '{output['filename']}' is empty"
+                f"generated segment '{output.filename}' is empty"
             )
         segment_bytes.append(response.content)
     timeline = job["config_snapshot"]["timeline"]
@@ -1940,12 +3466,53 @@ async def _assemble_timeline_output(
         "video/mp4",
         "directordeck/timelines",
     )
-    return {
-        "node_id": "assembly",
-        "filename": str(uploaded["name"]),
-        "subfolder": str(uploaded.get("subfolder") or ""),
-        "type": str(uploaded.get("type") or "output"),
-    }
+    descriptor = OutputDescriptor(
+        filename=str(uploaded["name"]),
+        subfolder=str(uploaded.get("subfolder") or ""),
+        type=str(uploaded.get("type") or "output"),
+    )
+    return (
+        descriptor,
+        proxy.metadata,
+        f"sha256:{hashlib.sha256(proxy.content).hexdigest()}",
+    )
+
+
+async def _assemble_timeline_output(
+    request: Request,
+    job: dict[str, Any],
+    segment_artifacts: tuple[ObservedArtifactSpec, ...],
+) -> tuple[OutputDescriptor, VideoMetadata, str]:
+    """Assemble only ordered, host-observed child artifacts."""
+
+    return await _assemble_output_descriptors(
+        request,
+        job,
+        tuple(artifact.output_descriptor for artifact in segment_artifacts),
+    )
+
+
+async def _assemble_legacy_timeline_output(
+    request: Request,
+    job: dict[str, Any],
+    outputs: list[dict[str, str]],
+) -> tuple[OutputDescriptor, VideoMetadata, str]:
+    """Keep pre-typed in-flight jobs recoverable without upgrading authority."""
+
+    return await _assemble_output_descriptors(
+        request,
+        job,
+        tuple(
+            OutputDescriptor.model_validate(
+                {
+                    "filename": output.get("filename"),
+                    "subfolder": output.get("subfolder", ""),
+                    "type": output.get("type", "output"),
+                }
+            )
+            for output in outputs
+        ),
+    )
 
 
 async def _sync_timeline_job_once(
@@ -2206,9 +3773,53 @@ async def _sync_timeline_job_once(
         elif durable_all_terminal and all(
             status == "succeeded" for status in segment_statuses
         ):
+            execution_plan: CompiledExecutionPlan | None = None
+            ordered_artifacts: tuple[ObservedArtifactSpec, ...] = ()
             try:
-                ordered_outputs = _ordered_timeline_outputs(job, children)
-            except ValueError as exc:
+                enriched_children = [
+                    _child_with_execution_evidence(database, child)
+                    for child in children
+                ]
+                execution_plan = database.get_job_execution_plan(str(job["id"]))
+                if execution_plan is None:
+                    if any(
+                        isinstance(child.get("execution_evidence"), dict)
+                        for child in enriched_children
+                    ):
+                        raise TaskManagementError(
+                            "任务的 typed 执行计划缺失或损坏",
+                            status_code=409,
+                        )
+                    ordered_outputs = _ordered_timeline_outputs(
+                        job,
+                        enriched_children,
+                    )
+                else:
+                    authority_job = attach_parent_output_authority(
+                        {**job, "children": enriched_children},
+                        typed=True,
+                        compiled_plan=execution_plan,
+                        observed_assembly=None,
+                    )
+                    ordered_artifacts = ordered_observed_artifacts(authority_job)
+                    ordered_outputs = [
+                        {
+                            "node_id": unit.expected_output_spec.node_id,
+                            **artifact.output_descriptor.model_dump(mode="json"),
+                        }
+                        for unit, artifact in zip(
+                            execution_plan.segment_units,
+                            ordered_artifacts,
+                            strict=True,
+                        )
+                    ]
+            except (
+                ExecutionEvidenceConflict,
+                RuntimeError,
+                TaskManagementError,
+                ValidationError,
+                ValueError,
+            ) as exc:
                 updates.update(
                     status="failed",
                     progress=1.0,
@@ -2274,8 +3885,67 @@ async def _sync_timeline_job_once(
                             latest["children"] = database.list_job_children(job["id"])
                             return latest
                         try:
-                            assembled = await _assemble_timeline_output(
-                                request, claimed, ordered_outputs
+                            if execution_plan is not None:
+                                descriptor, metadata, content_hash = (
+                                    await _assemble_timeline_output(
+                                        request,
+                                        claimed,
+                                        ordered_artifacts,
+                                    )
+                                )
+                                assembly = ObservedAssemblyArtifactSpec(
+                                    job_id=str(job["id"]),
+                                    source_compiled_plan_digest=(
+                                        compiled_execution_plan_digest(
+                                            execution_plan
+                                        )
+                                    ),
+                                    source_artifacts=tuple(
+                                        AssemblySourceArtifactRef(
+                                            segment_id=artifact.segment_id,
+                                            child_id=artifact.child_id,
+                                            observed_artifact_digest=(
+                                                sha256_document_digest(
+                                                    artifact.model_dump(mode="json")
+                                                )
+                                            ),
+                                        )
+                                        for artifact in ordered_artifacts
+                                    ),
+                                    output_descriptor=descriptor,
+                                    width=metadata.width,
+                                    height=metadata.height,
+                                    fps=metadata.native_fps,
+                                    frame_count=metadata.frame_count,
+                                    duration_seconds=metadata.duration,
+                                    has_audio=metadata.has_audio,
+                                    media_probe_version=metadata.probe_method,
+                                    content_hash=content_hash,
+                                )
+                                committed = (
+                                    database.finalize_observed_assembly_artifact(
+                                        str(job["id"]),
+                                        expected_updated_at=str(
+                                            claimed["updated_at"]
+                                        ),
+                                        artifact=assembly,
+                                        updated_at=datetime.now(timezone.utc),
+                                    )
+                                )
+                                if committed is None:
+                                    committed = database.get_job(str(job["id"]))
+                                    if committed is None:
+                                        raise KeyError(job["id"])
+                                committed["children"] = (
+                                    database.list_job_children(str(job["id"]))
+                                )
+                                return committed
+                            descriptor, _metadata, _content_hash = (
+                                await _assemble_legacy_timeline_output(
+                                    request,
+                                    claimed,
+                                    ordered_outputs,
+                                )
                             )
                         except asyncio.CancelledError:
                             # A disconnected HTTP client or server shutdown can
@@ -2293,7 +3963,15 @@ async def _sync_timeline_job_once(
                                 completed_at=None,
                             )
                             raise
-                        except (MediaToolError, ComfyError, httpx.HTTPError, ValueError) as exc:
+                        except (
+                            ComfyError,
+                            ExecutionEvidenceConflict,
+                            MediaToolError,
+                            TaskManagementError,
+                            ValidationError,
+                            ValueError,
+                            httpx.HTTPError,
+                        ) as exc:
                             terminal_updates = dict(
                                 status="failed",
                                 progress=1.0,
@@ -2323,7 +4001,12 @@ async def _sync_timeline_job_once(
                                 status="succeeded",
                                 progress=1.0,
                                 stage="completed",
-                                outputs=[assembled],
+                                outputs=[
+                                    {
+                                        "node_id": "assembly",
+                                        **descriptor.model_dump(mode="json"),
+                                    }
+                                ],
                                 error=None,
                                 completed_at=utc_now(),
                             )
@@ -2712,6 +4395,151 @@ async def _quiesce_cancelled_submission_dispatcher(
     return result
 
 
+def _typed_prompt_ownership_for_child(
+    database: Database,
+    child: dict[str, Any],
+) -> PromptOwnership | None:
+    """Return the immutable prompt authority for a Stage-4 child.
+
+    A typed ownership row without its immutable exact snapshot, or a mutable
+    child projection that no longer names the effective prompt, is corruption.
+    Cancellation/recovery must fail closed instead of silently falling back to
+    the legacy lifecycle fields in either case.
+    """
+
+    child_id = str(child["id"])
+    ownership = database.get_prompt_ownership(child_id)
+    evidence = database.get_job_child_execution_evidence(child_id)
+    if ownership is None and evidence is None:
+        markerless_legacy_control = (
+            child.get("status") in _TERMINAL_STATUSES
+            and not child.get("segment_ids")
+            and not child.get("prompt_snapshot")
+        )
+        # A typed parent pre-creates every child before any prompt is claimed.
+        # Such an unsubmitted child legitimately has neither exact evidence nor
+        # ownership.  A mutable prompt id, however, proves that submission was
+        # projected at some point; if every immutable child marker has vanished
+        # we must not reinterpret that submitted typed child as legacy.  The
+        # sole migration exception is an already-terminal pre-Stage-4 RayKill
+        # row: those controls had no segment and stored an empty prompt snapshot.
+        # They are safe to ignore during idempotent cancellation; any later
+        # segment continuation independently requires the complete typed control
+        # certificate and therefore still fails closed.
+        if (
+            child.get("prompt_id")
+            and not markerless_legacy_control
+            and database.has_job_child_execution_marker(child_id)
+        ):
+            raise ExecutionEvidenceConflict(
+                f"child {child_id} lost its exact prompt ownership evidence"
+            )
+        return None
+    if ownership is None or evidence is None:
+        raise ExecutionEvidenceConflict(
+            f"child {child_id} has incomplete exact prompt ownership evidence"
+        )
+    if str(child.get("prompt_id") or "") != ownership.effective_prompt_id:
+        raise ExecutionEvidenceConflict(
+            f"child {child_id} prompt id differs from durable ownership"
+        )
+    return ownership
+
+
+def _claim_typed_prompt_cancel(
+    database: Database,
+    child: dict[str, Any],
+) -> PromptOwnership | None:
+    """Monotonically claim cancellation while tolerating a receipt race."""
+
+    ownership = _typed_prompt_ownership_for_child(database, child)
+    if ownership is None:
+        return None
+    for _ in range(8):
+        if ownership.state in {
+            "cancel_pending",
+            "cleanup_confirmed",
+            "terminal_confirmed",
+        }:
+            return ownership
+        claimed = database.compare_and_set_prompt_ownership(
+            str(child["id"]),
+            expected_revision=ownership.ownership_revision,
+            state="cancel_pending",
+            updated_at=datetime.now(timezone.utc),
+        )
+        if claimed is not None:
+            return claimed
+        latest = database.get_prompt_ownership(str(child["id"]))
+        if latest is None:
+            raise ExecutionEvidenceConflict(
+                f"prompt ownership for child {child['id']} disappeared"
+            )
+        ownership = latest
+    raise ExecutionEvidenceConflict(
+        f"prompt ownership for child {child['id']} did not converge"
+    )
+
+
+def _mark_typed_prompt_unconfirmed(
+    database: Database,
+    child_id: str,
+    ownership: PromptOwnership | None,
+) -> PromptOwnership | None:
+    """Persist ambiguity without ever clearing an ownership record."""
+
+    if ownership is None or ownership.state in {
+        "cleanup_confirmed",
+        "terminal_confirmed",
+    }:
+        return ownership
+    if ownership.state == "unconfirmed":
+        return ownership
+    changed = database.compare_and_set_prompt_ownership(
+        child_id,
+        expected_revision=ownership.ownership_revision,
+        state="unconfirmed",
+        updated_at=datetime.now(timezone.utc),
+    )
+    return changed or database.get_prompt_ownership(child_id)
+
+
+def _confirm_typed_exact_cancel(
+    database: Database,
+    child_id: str,
+    ownership: PromptOwnership,
+    *,
+    stage: str,
+) -> dict[str, Any] | None:
+    """Atomically settle ownership, child lifecycle, and a matching Ray tail."""
+
+    if ownership.state == "terminal_confirmed":
+        return database.get_job_child(child_id)
+    if ownership.state == "cleanup_confirmed":
+        return database.get_job_child(child_id)
+    confirmed_at = datetime.now(timezone.utc)
+    released = database.confirm_prompt_cleanup(
+        child_id,
+        expected_revision=ownership.ownership_revision,
+        evidence=ExactCancelConfirmedEvidence(
+            prompt_id=ownership.effective_prompt_id,
+            confirmation_id=f"director-exact-cancel:{ownership.effective_prompt_id}",
+            confirmed_at=confirmed_at,
+        ),
+        stage=stage,
+        updated_at=confirmed_at,
+    )
+    if released is not None:
+        return released[0]
+    latest_ownership = database.get_prompt_ownership(child_id)
+    if latest_ownership is not None and latest_ownership.state in {
+        "cleanup_confirmed",
+        "terminal_confirmed",
+    }:
+        return database.get_job_child(child_id)
+    return None
+
+
 async def _cancel_timeline_job(
     request: Request,
     job: dict[str, Any],
@@ -2726,6 +4554,81 @@ async def _cancel_timeline_job(
     """
 
     database = _db(request)
+    current_endpoint = request.app.state.endpoint_identity
+    for endpoint_child in database.list_job_children(job["id"]):
+        endpoint_ownership = _typed_prompt_ownership_for_child(
+            database, endpoint_child
+        )
+        if endpoint_child["status"] in _TERMINAL_STATUSES:
+            if endpoint_ownership is not None and endpoint_ownership.state not in {
+                "cleanup_confirmed",
+                "terminal_confirmed",
+            }:
+                raise ExecutionEvidenceConflict(
+                    f"terminal child {endpoint_child['id']} retains prompt ownership"
+                )
+            continue
+        if not endpoint_child.get("prompt_id"):
+            continue
+        if endpoint_ownership is None:
+            continue
+        exact_evidence = database.get_job_child_execution_evidence(
+            str(endpoint_child["id"])
+        )
+        if exact_evidence is None:  # Guarded by the typed helper above.
+            raise ExecutionEvidenceConflict(
+                f"child {endpoint_child['id']} lost its exact prompt evidence"
+            )
+        frozen_endpoint = exact_evidence[
+            "exact_prompt_snapshot"
+        ].endpoint_identity
+        if frozen_endpoint.endpoint_key != current_endpoint.endpoint_key:
+            raise HTTPException(
+                status_code=409,
+                detail="job prompt belongs to a different ComfyUI endpoint",
+            )
+        if (
+            frozen_endpoint.runtime_instance_id
+            != current_endpoint.runtime_instance_id
+        ):
+            _mark_typed_prompt_unconfirmed(
+                database,
+                str(endpoint_child["id"]),
+                endpoint_ownership,
+            )
+            await _cas_active_child_update(
+                database,
+                endpoint_child,
+                status="cancelling",
+                stage="restart_certificate_required",
+                error=(
+                    "ComfyUI runtime instance changed; explicit restart "
+                    "confirmation is required"
+                ),
+                completed_at=None,
+            )
+            latest = database.get_job(job["id"])
+            if latest is not None and latest["status"] not in _TERMINAL_STATUSES:
+                database.update_job_if_snapshot(
+                    latest["id"],
+                    expected_status=latest["status"],
+                    expected_stage=latest.get("stage"),
+                    expected_updated_at=latest["updated_at"],
+                    status="cancelling",
+                    stage="restart_certificate_required",
+                    error=(
+                        "ComfyUI runtime instance changed; confirm restart "
+                        "before retrying"
+                    ),
+                    completed_at=None,
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "ComfyUI runtime instance changed; explicit restart "
+                    "confirmation is required"
+                ),
+            )
     # First reconcile an upstream prompt that has already reached history.
     # Cancellation must not overwrite a real success merely because the
     # browser's last polled parent snapshot was still queued/running.
@@ -2764,8 +4667,17 @@ async def _cancel_timeline_job(
     client = _comfy(request)
     dispatch_errors: list[str] = []
     recovery_error_prefixes: set[str] = set()
+    restart_certificate_required = False
     for child in database.list_job_children(job["id"]):
+        ownership = _typed_prompt_ownership_for_child(database, child)
         if child["status"] in _TERMINAL_STATUSES:
+            if ownership is not None and ownership.state not in {
+                "cleanup_confirmed",
+                "terminal_confirmed",
+            }:
+                raise ExecutionEvidenceConflict(
+                    f"terminal child {child['id']} retains prompt ownership"
+                )
             continue
         if not child.get("prompt_id"):
             await _cas_active_child_update(
@@ -2777,13 +4689,74 @@ async def _cancel_timeline_job(
                 completed_at=utc_now(),
             )
             continue
+        if ownership is not None and ownership.state in {
+            "cleanup_confirmed",
+            "terminal_confirmed",
+        }:
+            continue
+        if ownership is not None:
+            exact_evidence = database.get_job_child_execution_evidence(
+                str(child["id"])
+            )
+            if exact_evidence is None:  # Guarded by the typed helper above.
+                raise ExecutionEvidenceConflict(
+                    f"child {child['id']} lost its exact prompt evidence"
+                )
+            frozen_endpoint = exact_evidence[
+                "exact_prompt_snapshot"
+            ].endpoint_identity
+            current_endpoint = request.app.state.endpoint_identity
+            if frozen_endpoint.endpoint_key != current_endpoint.endpoint_key:
+                raise HTTPException(
+                    status_code=409,
+                    detail="job prompt belongs to a different ComfyUI endpoint",
+                )
+            if (
+                frozen_endpoint.runtime_instance_id
+                != current_endpoint.runtime_instance_id
+            ):
+                ownership = _mark_typed_prompt_unconfirmed(
+                    database, str(child["id"]), ownership
+                )
+                await _cas_active_child_update(
+                    database,
+                    child,
+                    status="cancelling",
+                    stage="restart_certificate_required",
+                    error=(
+                        "ComfyUI runtime instance changed; explicit restart "
+                        "confirmation is required"
+                    ),
+                    completed_at=None,
+                )
+                restart_certificate_required = True
+                continue
+        live_submission_owned = child.get("stage") in _SUBMISSION_OWNERSHIP_STAGES
+        if live_submission_owned:
+            # The caller-assigned id is only provisional until the in-flight
+            # POST returns its authenticated receipt.  Persist the user's
+            # parent/child cancellation intent, but let the dispatcher that
+            # owns that HTTP request bind the actual id before performing the
+            # exact directed cancel.  Cancelling the provisional id here can
+            # otherwise make the parent terminal while an incompatible server
+            # is about to reveal a different actual id.
+            while child["status"] not in _TERMINAL_STATUSES:
+                child, claimed = await _cas_active_child_update(
+                    database,
+                    child,
+                    status="cancelling",
+                    stage="cancelling_during_submit",
+                    completed_at=None,
+                )
+                if claimed:
+                    break
+            continue
+        ownership = _claim_typed_prompt_cancel(database, child)
         # The restart worker and a user retry can list the same child before
         # either awaits ComfyUI. Claim the exact row version; if the other path
         # won, reload and never turn its terminal result back into cancelling.
         while child["status"] not in _TERMINAL_STATUSES:
-            live_submission_owned = (
-                child.get("stage") in _SUBMISSION_OWNERSHIP_STAGES
-            )
+            live_submission_owned = False
             recovery_owned = child.get("stage") in _RECOVERY_OWNERSHIP_STAGES
             recovery_prefix = (
                 "restart"
@@ -2806,13 +4779,20 @@ async def _cancel_timeline_job(
                 break
         if child["status"] in _TERMINAL_STATUSES:
             continue
-        prompt_id = str(child["prompt_id"])
+        prompt_id = (
+            ownership.effective_prompt_id
+            if ownership is not None
+            else str(child["prompt_id"])
+        )
         try:
             dispatched = await client.cancel(prompt_id)
         except (ComfyError, httpx.HTTPError) as exc:
             dispatch_errors.append(f"{child['id']}: {exc}")
             if recovery_owned:
                 recovery_error_prefixes.add(recovery_prefix)
+            ownership = _mark_typed_prompt_unconfirmed(
+                database, str(child["id"]), ownership
+            )
             await _cas_active_child_update(
                 database,
                 child,
@@ -2826,7 +4806,14 @@ async def _cancel_timeline_job(
                 error=str(exc),
             )
             continue
-        if dispatched and not live_submission_owned:
+        if dispatched and ownership is not None:
+            _confirm_typed_exact_cancel(
+                database,
+                str(child["id"]),
+                ownership,
+                stage="cancelled",
+            )
+        elif dispatched and not live_submission_owned:
             # A successful directed cancellation is safe to persist against a
             # newer nonterminal cancellation marker, but only while it still
             # names the exact prompt we cancelled.
@@ -2846,6 +4833,34 @@ async def _cancel_timeline_job(
                 )
                 if committed:
                     break
+        elif not dispatched:
+            _mark_typed_prompt_unconfirmed(
+                database, str(child["id"]), ownership
+            )
+    if restart_certificate_required:
+        latest = database.get_job(job["id"])
+        if latest is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if latest["status"] not in _TERMINAL_STATUSES:
+            database.update_job_if_snapshot(
+                latest["id"],
+                expected_status=latest["status"],
+                expected_stage=latest.get("stage"),
+                expected_updated_at=latest["updated_at"],
+                status="cancelling",
+                stage="restart_certificate_required",
+                error=(
+                    "ComfyUI runtime instance changed; confirm restart before retrying"
+                ),
+                completed_at=None,
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "ComfyUI runtime instance changed; explicit restart confirmation "
+                "is required"
+            ),
+        )
     if dispatch_errors:
         latest = database.get_job(job["id"])
         if latest is None:
@@ -3016,15 +5031,17 @@ def _raylight_runtime_status(
                 recovery_token=None,
             )
         current = runtime.get("current")
+        legacy_unknown = bool(runtime.get("legacy_unknown"))
         recorded = (
             raylight_runtime_logical_gpu_indices(current)
             if isinstance(current, dict)
             else ()
         )
         invalid = tuple(index for index in recorded if index >= len(visible))
+        recovery_required = bool(invalid) or legacy_unknown
         return RayLightRuntimeStatusRead(
             active=isinstance(current, dict),
-            recovery_required=bool(invalid),
+            recovery_required=recovery_required,
             epoch=int(runtime["epoch"]),
             runtime_gpu_indexes=list(recorded),
             available_gpu_indexes=list(visible),
@@ -3032,7 +5049,7 @@ def _raylight_runtime_status(
             tainted=bool(runtime.get("tainted")),
             recovery_token=(
                 _raylight_runtime_recovery_token(runtime, visible)
-                if invalid
+                if recovery_required
                 else None
             ),
         )
@@ -3046,12 +5063,19 @@ def _raylight_runtime_recovery_detail(
     status: RayLightRuntimeStatusRead,
 ) -> dict[str, Any]:
     invalid = ", ".join(str(index) for index in status.invalid_gpu_indexes)
-    return {
-        "code": "raylight_runtime_restart_confirmation_required",
-        "message": (
+    if status.invalid_gpu_indexes:
+        message = (
             "旧 RayLight 运行状态引用了当前不可见的 ComfyUI 逻辑 GPU "
             f"{invalid}；请在系统设置中确认 ComfyUI 已重启并恢复 RayLight"
-        ),
+        )
+    else:
+        message = (
+            "检测到无法验证 ownership 的旧版 RayLight 运行状态；请先确认 "
+            "ComfyUI 已完整重启并清空旧任务，再恢复 RayLight"
+        )
+    return {
+        "code": "raylight_runtime_restart_confirmation_required",
+        "message": message,
         "runtime_gpu_indexes": status.runtime_gpu_indexes,
         "available_gpu_indexes": status.available_gpu_indexes,
         "invalid_gpu_indexes": status.invalid_gpu_indexes,
@@ -3060,107 +5084,22 @@ def _raylight_runtime_recovery_detail(
     }
 
 
-async def _preflight_timeline(
+async def _preflight_execution_plan(
     client: ComfyClientProtocol,
-    settings: RuntimeSettings,
-    compiled: NativeCompileResult,
+    plan: CompiledExecutionPlan,
     database: Database,
 ) -> None:
-    """Verify exactly the server-selected native templates and model inventory."""
+    """Verify transient Ray-ledger facts after exact static evaluation.
 
-    capabilities = await client.capabilities()
-    raylight_contract_issues = (
-        (capabilities.get("execution_backends") or {})
-        .get("raylight", {})
-        .get("contract_issues", [])
-    )
-    if (
-        "RayInitializerAdvanced" in compiled.node_policy["allowed_nodes"]
-        and raylight_contract_issues
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "raylight_contract_mismatch",
-                "message": (
-                    "installed RayLight is not the Director-compatible build: "
-                    + "; ".join(str(item) for item in raylight_contract_issues)
-                ),
-                "issues": list(raylight_contract_issues),
-            },
-        )
-    try:
-        validate_native_capabilities(
-            compiled,
-            set(capabilities.get("available_nodes") or []),
-            {
-                str(name): str(source)
-                for name, source in (
-                    capabilities.get("node_provenance") or {}
-                ).items()
-            }
-            if isinstance(capabilities.get("node_provenance"), dict)
-            else None,
-        )
-    except NativeTemplateError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": str(exc),
-                "nodes": sorted(
-                    set(compiled.node_policy["allowed_nodes"])
-                    - set(capabilities.get("available_nodes") or [])
-                ),
-            },
-        ) from exc
-    inventory = await client.models()
-    expected: dict[str, str] = {
-        "clip": settings.models.clip.filename,
-        "video_vae": settings.models.video_vae.filename,
-        "audio_vae": settings.models.audio_vae.filename,
-    }
-    placements = {
-        settings.models.clip.device,
-        settings.models.video_vae.device,
-        settings.models.audio_vae.device,
-    }
-    for family in compiled.families:
-        if family not in {"fl2va", "ref2va"}:
-            raise HTTPException(status_code=422, detail=f"unknown model family: {family}")
-        binding = getattr(settings.models, family)
-        expected[family] = binding.filename
-        placements.add(binding.device)
-        if binding.lora_name is not None:
-            assert binding.lora_name is not None
-            expected[f"loras:{family}"] = binding.lora_name
-        backend = next(
-            unit.backend for unit in compiled.workflows if unit.family == family
-        )
-        if backend == "raylight":
-            placements.update(f"gpu:{index}" for index in binding.raylight.gpu_select)
-    absent: list[str] = []
-    for role, filename in expected.items():
-        inventory_role = "loras" if role.startswith("loras:") else role
-        if filename not in inventory.get(inventory_role, []):
-            absent.append(f"{role}:{filename}")
-    if absent:
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "configured model files are unavailable", "models": absent},
-        )
+    Node/media/package contracts and placements are owned by the immutable
+    host snapshot plus ``CapabilityEvaluator``. Exact selected model resources
+    are checked by ``_contextual_host_errors``. This final read only guards the
+    durable Ray ledger immediately before endpoint serialization and never
+    calls the legacy, side-effecting capability transport.
+    """
+
+    del plan  # the immutable plan was already evaluated before this boundary
     stats = await client.system_stats()
-    available_devices = _device_names(stats)
-    invalid_devices = sorted(
-        device for device in placements if device not in available_devices
-    )
-    if invalid_devices:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "configured logical GPU is unavailable",
-                "devices": invalid_devices,
-            },
-        )
     try:
         runtime_status = _raylight_runtime_status(database, stats)
     except NativeTemplateError as exc:
@@ -3179,55 +5118,33 @@ async def _preflight_timeline(
 
 
 async def _preflight_raylight_transition(
+    request: Request,
     client: ComfyClientProtocol,
-    unit: NativeWorkflowUnit,
+    unit: PreparedControlUnit,
     database: Database,
 ) -> None:
-    """Verify the server-owned RayKill barrier before it enters ComfyUI."""
+    """Recapture required RayLight class_types before queueing the control."""
 
-    capabilities = await client.capabilities()
-    raylight_contract_issues = (
-        (capabilities.get("execution_backends") or {})
-        .get("raylight", {})
-        .get("contract_issues", [])
+    snapshot = await _host_capability_snapshot(request)
+    required = {
+        str(node.get("class_type") or "")
+        for node in unit.prompt_base.values()
+    }
+    invalid_contracts = sorted(
+        class_type
+        for class_type in required
+        if not class_type
+        or not _snapshot_has_node_class(snapshot, class_type)
     )
-    if raylight_contract_issues:
+    if invalid_contracts:
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "raylight_contract_mismatch",
-                "message": (
-                    "installed RayLight is not the Director-compatible build: "
-                    + "; ".join(str(item) for item in raylight_contract_issues)
-                ),
-                "issues": list(raylight_contract_issues),
+                "code": "raylight_control_capability_unavailable",
+                "message": "A required RayLight control node is unavailable.",
+                "nodes": invalid_contracts,
             },
         )
-    available = set(capabilities.get("available_nodes") or [])
-    provenance = (
-        {
-            str(name): str(source)
-            for name, source in capabilities["node_provenance"].items()
-        }
-        if isinstance(capabilities.get("node_provenance"), dict)
-        else None
-    )
-    try:
-        validate_native_workflow_unit_capabilities(
-            unit, available, node_provenance=provenance
-        )
-    except NativeTemplateError as exc:
-        required = {
-            str(node.get("class_type") or "")
-            for node in unit.prompt.values()
-        }
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": str(exc),
-                "nodes": sorted(required - available),
-            },
-        ) from exc
     stats = await client.system_stats()
     try:
         runtime_status = _raylight_runtime_status(database, stats)
@@ -3240,7 +5157,7 @@ async def _preflight_raylight_transition(
             },
         ) from exc
     visible = tuple(runtime_status.available_gpu_indexes)
-    recorded = raylight_workflow_logical_gpu_indices(unit)
+    recorded = tuple(runtime_status.runtime_gpu_indexes)
     invalid = [index for index in recorded if index >= len(visible)]
     if invalid:
         status = (
@@ -3314,22 +5231,74 @@ async def _await_raylight_transition(
                 if database is not None and child_id is not None:
                     child = database.get_job_child(child_id)
                     if child is not None and child["status"] not in _TERMINAL_STATUSES:
-                        database.update_job_child_if_snapshot(
-                            child_id,
-                            expected_status=child["status"],
-                            expected_updated_at=child["updated_at"],
-                            status="failed",
-                            progress=1.0,
-                            stage="RayLight 安全切换失败",
-                            outputs=[],
-                            error=error or "RayLight safe-switch barrier failed",
-                            completed_at=utc_now(),
+                        ownership = _typed_prompt_ownership_for_child(
+                            database, child
                         )
+                        if ownership is None:
+                            database.update_job_child_if_snapshot(
+                                child_id,
+                                expected_status=child["status"],
+                                expected_updated_at=child["updated_at"],
+                                status="failed",
+                                progress=1.0,
+                                stage="RayLight 安全切换失败",
+                                outputs=[],
+                                error=(
+                                    error
+                                    or "RayLight safe-switch barrier failed"
+                                ),
+                                completed_at=utc_now(),
+                            )
+                        else:
+                            observed_at = datetime.now(timezone.utc)
+                            database.confirm_prompt_terminal(
+                                child_id,
+                                expected_revision=(
+                                    ownership.ownership_revision
+                                ),
+                                evidence=HistoryTerminalEvidence(
+                                    prompt_id=ownership.effective_prompt_id,
+                                    terminal_status="failed",
+                                    history_digest=sha256_document_digest(entry),
+                                    observed_at=observed_at,
+                                ),
+                                outputs=[],
+                                stage="RayLight 安全切换失败",
+                                error=(
+                                    error
+                                    or "RayLight safe-switch barrier failed"
+                                ),
+                                updated_at=observed_at,
+                            )
                 raise ComfyError(
                     "RayLight safe-switch barrier failed; Standard workflow was not submitted"
                     + (f": {error}" if error else "")
                 )
             if succeeded:
+                if database is not None and child_id is not None:
+                    child = database.get_job_child(child_id)
+                    if child is not None and child["status"] not in _TERMINAL_STATUSES:
+                        ownership = _typed_prompt_ownership_for_child(
+                            database, child
+                        )
+                        if ownership is not None:
+                            observed_at = datetime.now(timezone.utc)
+                            database.confirm_prompt_terminal(
+                                child_id,
+                                expected_revision=(
+                                    ownership.ownership_revision
+                                ),
+                                evidence=HistoryTerminalEvidence(
+                                    prompt_id=ownership.effective_prompt_id,
+                                    terminal_status="succeeded",
+                                    history_digest=sha256_document_digest(entry),
+                                    observed_at=observed_at,
+                                ),
+                                outputs=[],
+                                stage="RayLight 已安全释放",
+                                error=None,
+                                updated_at=observed_at,
+                            )
                 return True
         elif not exact_absent:
             raise ComfyError(
@@ -3369,6 +5338,7 @@ async def _await_timeline_generation(
     child_id: str,
     prompt_id: str,
     *,
+    request: Request,
     stop_on_parent_cancel: bool = True,
     dispatch_job_id: str | None = None,
     running_stage: str = "sampling",
@@ -3393,6 +5363,17 @@ async def _await_timeline_generation(
             raise KeyError(child_id)
         if child["status"] in _TERMINAL_STATUSES:
             return child
+        pending_receipt = database.get_output_observation_receipt(child_id)
+        if pending_receipt is not None:
+            child = await _observe_output_receipt(
+                request,
+                child,
+                pending_receipt,
+            )
+            if child["status"] in _TERMINAL_STATUSES:
+                return child
+            await asyncio.sleep(_RAYLIGHT_GENERATION_POLL_SECONDS)
+            continue
         if dispatch_job_id is not None and dispatch_job_id != job_id:
             dispatch_parent = database.get_job(dispatch_job_id)
             if dispatch_parent is None:
@@ -3416,32 +5397,34 @@ async def _await_timeline_generation(
             status_value = str(status.get("status_str") or "").lower()
             error = _history_error(entry)
             interrupted = _history_has_event(entry, "execution_interrupted")
-            if child.get("backend") == "raylight":
-                history_state = _raylight_recovery_history_state(entry)
-                if history_state == "invalid":
-                    raise ComfyError(
-                        f"{error_context} history status is contradictory; "
-                        "successor was not submitted"
-                    )
-                failed = history_state == "terminal" and status_value in {
-                    "error",
-                    "failed",
-                }
-                succeeded = (
-                    history_state == "terminal" and status_value == "success"
+            # Exact terminal history has one classifier for every backend.
+            # Accepting a bare ``success`` string or an unrelated completed
+            # flag here would let a contradictory Standard entry publish an
+            # ObservedArtifactSpec and unlock dependent submissions even
+            # though the normal reconciliation path correctly rejects it.
+            history_state = _raylight_recovery_history_state(entry)
+            if history_state == "invalid":
+                raise ComfyError(
+                    f"{error_context} history status is contradictory; "
+                    "successor was not submitted"
                 )
-            else:
-                failed = status_value in {"error", "failed"} or bool(error)
-                succeeded = status_value == "success" or (
-                    bool(status.get("completed"))
-                    and not failed
-                    and not interrupted
-                )
+            failed = history_state == "terminal" and status_value in {
+                "error",
+                "failed",
+            }
+            succeeded = (
+                history_state == "terminal" and status_value == "success"
+            )
             if interrupted or failed or succeeded:
+                terminal_status = (
+                    "cancelled"
+                    if interrupted
+                    else "failed"
+                    if failed
+                    else "succeeded"
+                )
                 updates = {
-                    "status": (
-                        "cancelled" if interrupted else "failed" if failed else "succeeded"
-                    ),
+                    "status": terminal_status,
                     "progress": 1.0,
                     "stage": (
                         "ComfyUI 端已中断"
@@ -3458,6 +5441,54 @@ async def _await_timeline_generation(
                     "error": error if failed else None,
                     "completed_at": utc_now(),
                 }
+                ownership = _typed_prompt_ownership_for_child(database, child)
+                if ownership is not None:
+                    execution_evidence = (
+                        database.get_job_child_execution_evidence(child_id)
+                    )
+                    if (
+                        terminal_status == "succeeded"
+                        and execution_evidence is not None
+                        and execution_evidence[
+                            "exact_prompt_snapshot"
+                        ].unit_kind
+                        == "segment"
+                    ):
+                        observed = await _record_and_observe_typed_success(
+                            request,
+                            child,
+                            entry,
+                            ownership,
+                        )
+                        if observed["status"] in _TERMINAL_STATUSES:
+                            return observed
+                        # Exact successful history is already frozen in the
+                        # output receipt.  A temporarily unavailable host
+                        # probe remains retryable and must keep this endpoint
+                        # gate closed; returning a verifying child would make
+                        # the continuity dispatcher permanently fail every
+                        # descendant and would misclassify a Ray success as a
+                        # runtime failure.
+                        await asyncio.sleep(_RAYLIGHT_GENERATION_POLL_SECONDS)
+                        continue
+                    observed_at = datetime.now(timezone.utc)
+                    confirmed = database.confirm_prompt_terminal(
+                        child_id,
+                        expected_revision=ownership.ownership_revision,
+                        evidence=HistoryTerminalEvidence(
+                            prompt_id=ownership.effective_prompt_id,
+                            terminal_status=terminal_status,
+                            history_digest=sha256_document_digest(entry),
+                            observed_at=observed_at,
+                        ),
+                        outputs=updates["outputs"],
+                        stage=str(updates["stage"]),
+                        error=updates["error"],
+                        updated_at=observed_at,
+                    )
+                    if confirmed is not None:
+                        return confirmed[0]
+                    continue
                 committed = database.update_job_child_if_snapshot(
                     child_id,
                     expected_status=child["status"],
@@ -3499,6 +5530,14 @@ async def _await_timeline_generation(
         if visible:
             absent_observations = 0
         elif exact_absent:
+            ownership = _typed_prompt_ownership_for_child(database, child)
+            if ownership is not None:
+                _mark_typed_prompt_unconfirmed(
+                    database, child_id, ownership
+                )
+                absent_observations = 0
+                await asyncio.sleep(_RAYLIGHT_GENERATION_POLL_SECONDS)
+                continue
             if child.get("stage") in _PROCESS_OWNERSHIP_STAGES:
                 # An ambiguous/lost submit response can precede a delayed
                 # Comfy queue.put. Only the recovery owner may close it by
@@ -3556,6 +5595,7 @@ async def _await_raylight_generation(
     child_id: str,
     prompt_id: str,
     *,
+    request: Request,
     stop_on_parent_cancel: bool = True,
     dispatch_job_id: str | None = None,
     terminal_events: PromptTerminalEvents | None = None,
@@ -3568,6 +5608,7 @@ async def _await_raylight_generation(
         job_id,
         child_id,
         prompt_id,
+        request=request,
         stop_on_parent_cancel=stop_on_parent_cancel,
         dispatch_job_id=dispatch_job_id,
         running_stage="RayLight 采样中",
@@ -3723,10 +5764,19 @@ def _endpoint_recovery_blockers(
         if str(parent["id"]) == dispatch_job_id:
             continue
         for child in database.list_job_children(str(parent["id"])):
+            ownership = _typed_prompt_ownership_for_child(database, child)
+            typed_unreleased = (
+                ownership is not None
+                and ownership.state
+                not in {"cleanup_confirmed", "terminal_confirmed"}
+            )
             if (
-                child["status"] not in _TERMINAL_STATUSES
-                and child.get("prompt_id")
-                and child.get("stage") in _RECOVERY_OWNERSHIP_STAGES
+                typed_unreleased
+                or (
+                    child["status"] not in _TERMINAL_STATUSES
+                    and child.get("prompt_id")
+                    and child.get("stage") in _RECOVERY_OWNERSHIP_STAGES
+                )
             ):
                 blockers.append(child)
     return blockers
@@ -3828,6 +5878,27 @@ async def _cleanup_failed_timeline_submission(
     uncertain: list[str] = []
     for child_id, prompt_id in targets.items():
         child = database.get_job_child(child_id)
+        ownership = (
+            _typed_prompt_ownership_for_child(database, child)
+            if child is not None
+            else None
+        )
+        if ownership is not None and ownership.state in {
+            "cleanup_confirmed",
+            "terminal_confirmed",
+        }:
+            continue
+        if ownership is not None and ownership.state != "cancel_pending":
+            claimed_ownership = database.compare_and_set_prompt_ownership(
+                child_id,
+                expected_revision=ownership.ownership_revision,
+                state="cancel_pending",
+                updated_at=datetime.now(timezone.utc),
+            )
+            if claimed_ownership is None:
+                uncertain.append(f"{child_id}: ownership changed before cancel")
+                continue
+            ownership = claimed_ownership
         if child is not None and child["status"] not in _TERMINAL_STATUSES:
             before_cleanup_claim = getattr(
                 request.app.state, "before_cleanup_cancel_claim", None
@@ -3855,6 +5926,13 @@ async def _cleanup_failed_timeline_submission(
             confirmed = await client.cancel(prompt_id)
         except Exception as cancel_exc:
             uncertain.append(f"{child_id}: {cancel_exc}")
+            if ownership is not None:
+                database.compare_and_set_prompt_ownership(
+                    child_id,
+                    expected_revision=ownership.ownership_revision,
+                    state="unconfirmed",
+                    updated_at=datetime.now(timezone.utc),
+                )
             child = database.get_job_child(child_id)
             if child is not None and child["status"] == "cancelling":
                 database.update_job_child_if_snapshot(
@@ -3868,6 +5946,13 @@ async def _cleanup_failed_timeline_submission(
             continue
         if not confirmed:
             uncertain.append(f"{child_id}: cancellation was not confirmed")
+            if ownership is not None:
+                database.compare_and_set_prompt_ownership(
+                    child_id,
+                    expected_revision=ownership.ownership_revision,
+                    state="unconfirmed",
+                    updated_at=datetime.now(timezone.utc),
+                )
             child = database.get_job_child(child_id)
             if child is not None and child["status"] == "cancelling":
                 database.update_job_child_if_snapshot(
@@ -3877,6 +5962,26 @@ async def _cleanup_failed_timeline_submission(
                     stage="submission_cancel_unconfirmed",
                     error=str(error),
                     completed_at=None,
+                )
+            continue
+        if ownership is not None:
+            confirmed_at = datetime.now(timezone.utc)
+            released = database.confirm_prompt_cleanup(
+                child_id,
+                expected_revision=ownership.ownership_revision,
+                evidence=ExactCancelConfirmedEvidence(
+                    prompt_id=ownership.effective_prompt_id,
+                    confirmation_id=(
+                        f"director-exact-cancel:{ownership.effective_prompt_id}"
+                    ),
+                    confirmed_at=confirmed_at,
+                ),
+                stage="cancelled_after_submission_failure",
+                updated_at=confirmed_at,
+            )
+            if released is None:
+                uncertain.append(
+                    f"{child_id}: ownership changed before cancel confirmation"
                 )
             continue
         child = database.get_job_child(child_id)
@@ -3956,6 +6061,59 @@ async def _cleanup_failed_timeline_submission(
     )
 
 
+def _mark_timeline_submission_interrupted(
+    database: Database,
+    job_id: str,
+) -> None:
+    """Persist a finite recovery owner after any unexpected submit exit."""
+
+    current = database.get_job(job_id)
+    if current is None or current["status"] in _TERMINAL_STATUSES:
+        return
+    has_bound_prompt = False
+    for child in database.list_job_children(job_id):
+        if child["status"] in _TERMINAL_STATUSES:
+            continue
+        if child.get("prompt_id"):
+            has_bound_prompt = True
+            database.update_job_child_if_snapshot(
+                child["id"],
+                expected_status=child["status"],
+                expected_updated_at=child["updated_at"],
+                status="cancelling",
+                stage="submission_interrupted",
+                completed_at=None,
+            )
+        else:
+            database.update_job_child_if_snapshot(
+                child["id"],
+                expected_status=child["status"],
+                expected_updated_at=child["updated_at"],
+                status="cancelled",
+                progress=1.0,
+                stage="not_submitted",
+                completed_at=utc_now(),
+            )
+    latest = database.get_job(job_id)
+    if latest is None or latest["status"] in _TERMINAL_STATUSES:
+        return
+    database.update_job_if_snapshot(
+        job_id,
+        expected_status=latest["status"],
+        expected_stage=latest.get("stage"),
+        expected_updated_at=latest["updated_at"],
+        status="cancelling" if has_bound_prompt else "cancelled",
+        progress=1.0 if not has_bound_prompt else current["progress"],
+        stage=(
+            "submission_interrupted"
+            if has_bound_prompt
+            else "submission_cancelled"
+        ),
+        error="native segment submission was interrupted",
+        completed_at=None if has_bound_prompt else utc_now(),
+    )
+
+
 def _bind_actual_prompt_id_from_submit_error(
     database: Database,
     error: Exception,
@@ -3977,7 +6135,6 @@ def _bind_actual_prompt_id_from_submit_error(
         return set()
     if (
         not actual
-        or actual == requested
         or actual != actual.strip()
         or len(actual) > 512
         or any(
@@ -3986,14 +6143,97 @@ def _bind_actual_prompt_id_from_submit_error(
         )
     ):
         return set()
-    candidates = [
-        child_id
-        for child_id, durable_prompt_id in possibly_submitted.items()
-        if durable_prompt_id == requested
-    ]
+    candidates: list[str] = []
+    for child_id, durable_prompt_id in possibly_submitted.items():
+        candidate_child = database.get_job_child(child_id)
+        candidate_ownership = (
+            _typed_prompt_ownership_for_child(database, candidate_child)
+            if candidate_child is not None
+            else None
+        )
+        if candidate_ownership is not None:
+            if (
+                candidate_ownership.requested_prompt_id == requested
+                and candidate_ownership.effective_prompt_id
+                in {requested, actual}
+            ):
+                candidates.append(child_id)
+        elif durable_prompt_id == requested:
+            candidates.append(child_id)
     if len(candidates) != 1:
         return set()
     child_id = candidates[0]
+    ownership_child = database.get_job_child(child_id)
+    ownership = (
+        _typed_prompt_ownership_for_child(database, ownership_child)
+        if ownership_child is not None
+        else None
+    )
+    cleanup_response = error.detail.get("cleanup_response")
+    cleanup_confirmed = (
+        isinstance(cleanup_response, dict)
+        and set(cleanup_response) == {"cancelled"}
+        and cleanup_response.get("cancelled") is True
+    )
+    if (
+        ownership is not None
+        and ownership.requested_prompt_id == requested
+    ):
+        if actual == requested:
+            # A receipt hook may fail before it advances ownership even when
+            # ComfyUI honored the caller-assigned id.  Preserve the inline
+            # cleanup acknowledgement instead of issuing a second cancel;
+            # when cleanup was not confirmed, the normal outer path retains
+            # and targets the already-durable requested id.
+            if cleanup_confirmed:
+                confirmed_at = datetime.now(timezone.utc)
+                released = database.confirm_prompt_cleanup(
+                    child_id,
+                    expected_revision=ownership.ownership_revision,
+                    updated_at=confirmed_at,
+                    evidence=ExactCancelConfirmedEvidence(
+                        prompt_id=actual,
+                        confirmation_id=f"comfy-atomic-cancel:{actual}",
+                        confirmed_at=confirmed_at,
+                    ),
+                    stage="cancelled_after_submission_failure",
+                )
+                if released is not None:
+                    return {child_id}
+            return set()
+        if ownership.effective_prompt_id == requested:
+            rebound = database.record_prompt_submission_receipt(
+                child_id,
+                expected_revision=ownership.ownership_revision,
+                actual_prompt_id=actual,
+                state="owned_actual_id",
+                updated_at=datetime.now(timezone.utc),
+            )
+            if rebound is None:
+                return set()
+            ownership = rebound
+        elif ownership.effective_prompt_id != actual:
+            return set()
+        possibly_submitted[child_id] = actual
+        if cleanup_confirmed:
+            confirmed_at = datetime.now(timezone.utc)
+            released = database.confirm_prompt_cleanup(
+                child_id,
+                expected_revision=ownership.ownership_revision,
+                updated_at=confirmed_at,
+                evidence=ExactCancelConfirmedEvidence(
+                    prompt_id=actual,
+                    confirmation_id=f"comfy-atomic-cancel:{actual}",
+                    confirmed_at=confirmed_at,
+                ),
+                stage="cancelled_after_submission_failure",
+            )
+            if released is not None:
+                return {child_id}
+        return set()
+
+    # Legacy submissions have no typed ownership row. Preserve the old
+    # best-effort projection until their historical lifecycle is exhausted.
     try:
         rebound = database.replace_job_child_prompt_id_if_current(
             child_id,
@@ -4004,12 +6244,7 @@ def _bind_actual_prompt_id_from_submit_error(
         return set()
     if rebound is not None:
         possibly_submitted[child_id] = actual
-        cleanup_response = error.detail.get("cleanup_response")
-        if (
-            isinstance(cleanup_response, dict)
-            and set(cleanup_response) == {"cancelled"}
-            and cleanup_response.get("cancelled") is True
-        ):
+        if cleanup_confirmed:
             return {child_id}
     return set()
 
@@ -4038,26 +6273,48 @@ def _resolve_historical_continuity_takes(
         fingerprint = timeline_segment_take_fingerprint(draft, predecessor)
         require_audio = segment.audio_mode == "generate"
         try:
-            take = database.find_latest_segment_take(
+            take = database.find_latest_observed_segment_take(
                 predecessor.id,
                 fingerprint,
                 require_audio=require_audio,
                 project_id=project_id,
             )
-        except (NativeTemplateError, TypeError, ValueError) as exc:
+            has_exact_observed = (
+                take is None
+                and database.has_observed_segment_take(
+                    predecessor.id,
+                    content_fingerprint=fingerprint,
+                    project_id=project_id,
+                )
+            )
+            has_any_observed = (
+                take is None
+                and not has_exact_observed
+                and database.has_observed_segment_take(
+                    predecessor.id,
+                    project_id=project_id,
+                )
+            )
+        except (
+            ExecutionEvidenceConflict,
+            NativeTemplateError,
+            TypeError,
+            ValueError,
+        ) as exc:
             raise DraftNotRunnable(
                 f"片段 '{segment.id}' 的直接前驱 '{predecessor.id}' "
                 "已有历史成片记录无效，无法用于接续"
             ) from exc
         if take is None:
-            if require_audio and database.has_segment_take(
-                predecessor.id,
-                content_fingerprint=fingerprint,
-                project_id=project_id,
-            ):
+            if require_audio and has_exact_observed:
                 raise DraftNotRunnable(
                     f"片段 '{segment.id}' 的直接前驱 '{predecessor.id}' "
                     "有输出规格匹配的历史成功成片，但不含生成音频接续所需的音轨"
+                )
+            if has_exact_observed or has_any_observed:
+                raise DraftNotRunnable(
+                    f"片段 '{segment.id}' 的直接前驱 '{predecessor.id}' "
+                    "存在历史成功成片，但分辨率、帧率或可见帧数与当前分段不一致"
                 )
             if database.has_segment_take(
                 predecessor.id,
@@ -4065,7 +6322,7 @@ def _resolve_historical_continuity_takes(
             ):
                 raise DraftNotRunnable(
                     f"片段 '{segment.id}' 的直接前驱 '{predecessor.id}' "
-                    "存在历史成功成片，但分辨率、帧率或可见帧数与当前分段不一致"
+                    "只有旧任务输出定位记录，实际媒体规格与音轨信息不可用；请重新生成前驱"
                 )
             raise DraftNotRunnable(
                 f"片段 '{segment.id}' 的直接前驱 '{predecessor.id}' "
@@ -4082,7 +6339,7 @@ def _resolve_historical_continuity_takes(
 def _project_summary(project: dict[str, Any]) -> ProjectSummaryRead:
     """Project a project row into its public summary without leaking the document."""
 
-    timeline = validate_timeline_draft(project["document"])
+    timeline = validate_timeline_draft_v5(project["document"])
     return ProjectSummaryRead(
         id=project["id"],
         title=project["title"],
@@ -4092,24 +6349,218 @@ def _project_summary(project: dict[str, Any]) -> ProjectSummaryRead:
     )
 
 
-async def _standard_lora_metadata_for_timeline(
-    client: ComfyClientProtocol,
+def _contextual_host_reason(
+    *,
+    code: str,
+    rule: str,
+    message: str,
+    remediation: str,
+    safe_details: dict[str, Any] | None = None,
+) -> CapabilityReason:
+    return CapabilityReason(
+        code=code,
+        feature_id=None,
+        segment_id=None,
+        unit_id=None,
+        backend=None,
+        rule=rule,
+        message=message,
+        remediation=remediation,
+        safe_details=safe_details or {},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextualHostRequirements:
+    """Exact non-node host resources used by the selected v4 routes."""
+
+    model_bindings: tuple[tuple[str, str, str], ...]
+    standard_placements: tuple[str, ...]
+
+
+_MODEL_INVENTORY_CATEGORIES = (
+    "fl2va",
+    "ref2va",
+    "clip",
+    "video_vae",
+    "audio_vae",
+    "loras",
+)
+
+
+def _validated_model_inventory(value: object) -> dict[str, frozenset[str]]:
+    """Normalize ComfyUI model inventory without trusting its JSON shape."""
+
+    if not isinstance(value, Mapping):
+        raise ComfyError("invalid model inventory")
+    normalized: dict[str, frozenset[str]] = {}
+    for category in _MODEL_INVENTORY_CATEGORIES:
+        items = value.get(category)
+        if (
+            not isinstance(items, list)
+            or len(items) > 100_000
+            or any(
+                not isinstance(item, str) or not item or len(item) > 4_096
+                for item in items
+            )
+        ):
+            raise ComfyError("invalid model inventory")
+        normalized[category] = frozenset(items)
+    return normalized
+
+
+def _contextual_host_requirements(
     draft: UnifiedTimelineDraft,
     settings: RuntimeSettings,
     segment_ids: list[str] | None,
-) -> dict[ModelFamily, dict[str, str] | None]:
-    """Ask the owning ComfyUI endpoint about unknown auto Standard LoRAs."""
+) -> _ContextualHostRequirements:
+    """Resolve model files/devices without emitting a workflow graph.
 
-    requests = standard_lora_metadata_requests(
-        draft, settings, segment_ids=segment_ids
+    The projection mirrors the v4 shared-model and model-path interpreters.
+    In particular the audio VAE is reachable only for Ref2VA or generated
+    audio, and RayLight diffusion placement is evaluated by the capability
+    evaluator against its CUDA-only logical inventory.
+    """
+
+    selected_ids = (
+        set(segment_ids)
+        if segment_ids is not None
+        else {segment.id for segment in draft.segments if segment.enabled}
     )
-    if not requests:
-        return {}
-    families = list(requests)
-    values = await asyncio.gather(
-        *(client.lora_metadata(requests[family]) for family in families)
+    segments = tuple(
+        segment
+        for segment in draft.segments
+        if segment.enabled and segment.id in selected_ids
     )
-    return dict(zip(families, values, strict=True))
+    families = tuple(dict.fromkeys(segment.mode for segment in segments))
+    needs_audio_vae = any(
+        segment.mode == "ref2va" or segment.audio_mode == "generate"
+        for segment in segments
+    )
+
+    bindings: list[tuple[str, str, str]] = [
+        ("clip", "clip", settings.models.clip.filename),
+        ("video_vae", "video_vae", settings.models.video_vae.filename),
+    ]
+    placements = {
+        settings.models.clip.device,
+        settings.models.video_vae.device,
+    }
+    if needs_audio_vae:
+        bindings.append(
+            ("audio_vae", "audio_vae", settings.models.audio_vae.filename)
+        )
+        placements.add(settings.models.audio_vae.device)
+
+    for family in families:
+        binding = getattr(settings.models, family)
+        bindings.append((family, family, binding.filename))
+        if resolve_execution_backend(binding) == "standard":
+            placements.add(binding.device)
+        if binding.lora_name is not None:
+            bindings.append(("loras", f"loras:{family}", binding.lora_name))
+
+    return _ContextualHostRequirements(
+        model_bindings=tuple(bindings),
+        standard_placements=tuple(sorted(placements)),
+    )
+
+
+async def _contextual_host_errors(
+    client: ComfyClientProtocol,
+    *,
+    draft: UnifiedTimelineDraft,
+    settings: RuntimeSettings,
+    segment_ids: list[str] | None,
+    snapshot: HostCapabilitySnapshot,
+) -> tuple[CapabilityReason, ...]:
+    """Read-only exact model and Standard-placement checks for v4 routes."""
+
+    requirements = _contextual_host_requirements(draft, settings, segment_ids)
+    inventory = _validated_model_inventory(await client.models())
+
+    errors: list[CapabilityReason] = []
+    absent = sorted(
+        role
+        for category, role, filename in requirements.model_bindings
+        if filename
+        not in inventory.get(category, [])
+    )
+    if absent:
+        errors.append(
+            _contextual_host_reason(
+                code="model_binding_unavailable",
+                rule="host_model_inventory",
+                message="One or more selected model files are unavailable.",
+                remediation="Select files reported by the current ComfyUI host and run preflight again.",
+                safe_details={"bindings": absent},
+            )
+        )
+
+    available_devices = {"default", "cpu"} | {
+        f"gpu:{item.logical_index}" for item in snapshot.gpu_inventory
+    }
+    invalid_devices = sorted(
+        device
+        for device in requirements.standard_placements
+        if device not in available_devices
+    )
+    if invalid_devices:
+        errors.append(
+            _contextual_host_reason(
+                code="runtime_placement_unavailable",
+                rule="host_logical_gpu_inventory",
+                message="One or more selected runtime devices are unavailable.",
+                remediation="Select logical devices reported by the current ComfyUI host and run preflight again.",
+                safe_details={"devices": invalid_devices},
+            )
+        )
+
+    return tuple(errors)
+
+
+async def _project_import_capability_issues(
+    request: Request,
+    draft_v5: UnifiedTimelineDraftV5,
+) -> list[dict[str, Any]]:
+    """Observe current host compatibility without making import contingent on it."""
+
+    database = _db(request)
+    captured_settings = database.get_settings()
+    try:
+        projection = project_v5_compile_authority(
+            draft_v5,
+            captured_settings,
+        )
+    except V5CreativeAuthorityError as exc:
+        return [_v5_creative_authority_reason(exc).model_dump(mode="json")]
+    try:
+        snapshot = await _host_capability_snapshot(request)
+        readiness = _host_operational_readiness(request, snapshot)
+        client = _comfy(request)
+        contextual = await _contextual_host_errors(
+            client,
+            draft=projection.draft,
+            settings=projection.settings,
+            segment_ids=None,
+            snapshot=snapshot,
+        )
+        feature_report = preflight_projected_v5_timeline(
+            draft=projection.draft,
+            settings=projection.settings,
+            effective_features=projection.effective_features,
+            snapshot=snapshot,
+            readiness=readiness,
+            segment_ids=None,
+            historical_takes={},
+            resolved_lora_adapters=projection.lora_adapter_map(),
+        )
+    except (ComfyError, httpx.HTTPError, ValidationError, ValueError):
+        return [_host_context_observation_reason().model_dump(mode="json")]
+    return [
+        reason.model_dump(mode="json")
+        for reason in (*feature_report.errors, *contextual)
+    ]
 
 
 async def _compile_timeline_report(
@@ -4118,13 +6569,29 @@ async def _compile_timeline_report(
     *,
     project_id: str | None,
 ) -> TimelineCompileRead:
-    """Shared compile/preflight path for the legacy and project-scoped routes."""
+    """Compile and preflight through the same plan authority as submission."""
 
     database = _db(request)
-    settings = database.get_settings()
+    captured_settings = database.get_settings()
     owner_project_id = project_id or database.LEGACY_DEFAULT_PROJECT_ID
-    draft = body.config or database.get_project_timeline(owner_project_id)
+    if not database.project_exists(owner_project_id):
+        raise _project_not_found_http_error()
+    # ``config`` is required by the v5 request schema.  Project lookup above
+    # establishes ownership scope only; compilation never reloads its mutable
+    # document as a fallback.
     try:
+        draft_v5 = migrate_timeline_feature_authority_to_v5(body.config)
+    except (ValidationError, ValueError) as exc:
+        raise _creative_input_http_error(_creative_input_reason(exc)) from exc
+    contextual_errors: tuple[CapabilityReason, ...] = ()
+    try:
+        host_projection = project_v5_contextual_host_authority(
+            draft_v5,
+            captured_settings,
+            body.segment_ids,
+        )
+        draft = host_projection.draft
+        settings = host_projection.settings
         database.validate_timeline_assets(
             draft,
             segment_ids=body.segment_ids,
@@ -4137,74 +6604,197 @@ async def _compile_timeline_report(
             project_id=owner_project_id,
         )
         client = _comfy(request)
-        standard_lora_metadata = await _standard_lora_metadata_for_timeline(
+        host_capability_snapshot = await _host_capability_snapshot(request)
+        operational_readiness = _host_operational_readiness(
+            request,
+            host_capability_snapshot,
+        )
+        contextual_errors = await _contextual_host_errors(
             client,
-            draft,
-            settings,
+            draft=draft,
+            settings=settings,
+            segment_ids=body.segment_ids,
+            snapshot=host_capability_snapshot,
+        )
+        projection = project_v5_compile_authority(
+            draft_v5,
+            captured_settings,
             body.segment_ids,
         )
-        compiled = compile_native_timeline(
-            draft,
-            settings,
+        feature_report = preflight_projected_v5_timeline(
+            draft=draft,
+            settings=settings,
+            effective_features=projection.effective_features,
+            snapshot=host_capability_snapshot,
+            readiness=operational_readiness,
+            segment_ids=body.segment_ids,
+            historical_takes=historical_takes,
+            resolved_lora_adapters=projection.lora_adapter_map(),
+        )
+        blocking_reasons = (*feature_report.errors, *contextual_errors)
+        if blocking_reasons:
+            raise _capability_reasons_http_error(blocking_reasons)
+        execution_plan = compile_v5_execution_plan(
+            draft_v5,
+            captured_settings,
             f"preview-{uuid.uuid4()}",
             body.segment_ids,
             historical_takes=historical_takes,
-            standard_lora_metadata=standard_lora_metadata,
+            host_capability_snapshot=host_capability_snapshot,
+            operational_readiness=operational_readiness,
+            capability_evaluator=CapabilityEvaluator(
+                CURRENT_NODE_CONTRACT_REGISTRY
+            ),
         )
         # Compile reports are also the user's explicit preflight action.
-        # Run the same side-effect-free registry, provenance, model and
-        # logical-device checks used immediately before job submission;
-        # never present a locally compilable plan as runtime-ready when
-        # the selected ComfyUI endpoint cannot execute it.
-        await _preflight_timeline(
-            client, settings, compiled, database
+        # The response remains the stable browser projection stored inside the
+        # immutable plan, while all runtime checks consume that same plan.
+        await _preflight_execution_plan(
+            client, execution_plan, database
         )
-    except (NativeTemplateError, DraftNotRunnable, ValidationError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except (ComfyError, httpx.HTTPError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Cannot inspect LoRA metadata from ComfyUI: {exc}",
+    except V4CapabilityEvaluationError as exc:
+        raise _capability_compile_http_error(exc, *contextual_errors) from exc
+    except V5CreativeAuthorityError as exc:
+        raise _creative_input_http_error(
+            _v5_creative_authority_reason(exc),
+            *contextual_errors,
         ) from exc
+    except (NativeTemplateError, DraftNotRunnable, ValidationError, ValueError) as exc:
+        reason = _creative_input_reason(exc)
+        raise _creative_input_http_error(reason, *contextual_errors) from exc
+    except (ComfyError, httpx.HTTPError) as exc:
+        raise _host_context_observation_http_error() from exc
+    plan_document = execution_plan.model_dump(mode="json")
+    try:
+        report = CompiledExecutionReportV2.model_validate_json(
+            json.dumps(
+                plan_document["compile_report"],
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        )
+    except (KeyError, ValidationError):
+        logger.exception("compiled execution report failed its typed invariant")
+        raise _execution_plan_invariant_http_error() from None
+    host_revision = host_capability_snapshot.host_capability_revision()
+    if report.host_capability_revision != host_revision:
+        logger.error("compiled execution report host revision drifted")
+        raise _execution_plan_invariant_http_error()
+    resolutions_by_segment: dict[str, list[Any]] = {}
+    for resolution in report.feature_resolutions:
+        resolutions_by_segment.setdefault(resolution.segment_id, []).append(
+            resolution
+        )
+    effective_by_segment: dict[str, dict[str, Any]] = {}
+    for segment_id, preflight_segment in feature_report.effective_by_segment.items():
+        actual = resolutions_by_segment.get(segment_id, [])
+        expected = [
+            (
+                feature.id,
+                feature.version,
+                feature.state,
+                feature.adapter_fingerprint,
+                feature.capability.model_dump(mode="json"),
+            )
+            for feature in preflight_segment.features
+        ]
+        observed = [
+            (
+                feature.feature_id,
+                feature.version,
+                feature.resolution.state,
+                feature.adapter_fingerprint,
+                feature.capability.model_dump(mode="json"),
+            )
+            for feature in actual
+        ]
+        if (
+            not actual
+            or expected != observed
+            or any(
+                feature.unit_id != preflight_segment.unit_id
+                or feature.backend != preflight_segment.backend
+                or feature.family != preflight_segment.family
+                or feature.template_id != preflight_segment.template_id
+                for feature in actual
+            )
+        ):
+            logger.error(
+                "compiled feature evidence drifted from captured preflight",
+                extra={"segment_id": segment_id},
+            )
+            raise _execution_plan_invariant_http_error()
+        effective_by_segment[segment_id] = {
+            "unit_id": actual[0].unit_id,
+            "backend": actual[0].backend,
+            "family": actual[0].family,
+            "template_id": actual[0].template_id,
+            "features": [
+                {
+                    "id": feature.feature_id,
+                    "version": feature.version,
+                    "state": feature.resolution.state,
+                    "adapter_fingerprint": feature.adapter_fingerprint,
+                    "capability": feature.capability,
+                }
+                for feature in actual
+            ],
+        }
+    if set(resolutions_by_segment) != set(effective_by_segment):
+        logger.error("compiled feature evidence contains an unexpected segment")
+        raise _execution_plan_invariant_http_error()
     return TimelineCompileRead(
-        model_families=list(compiled.families),
-        plans=list(compiled.plans),
-        node_policy=compiled.node_policy,
+        template_bundle_version=execution_plan.template_bundle_version,
+        host_capability_revision=host_revision,
+        model_families=list(report.families),
+        plans=plan_document["compile_report"]["plans"],
+        node_policy=plan_document["node_policy"],
+        features={
+            "requested": draft_v5.features.model_dump(mode="json"),
+            "effective_by_segment": effective_by_segment,
+            "resolutions": [
+                {
+                    "segment_id": resolution.segment_id,
+                    "unit_id": resolution.unit_id,
+                    "feature_id": resolution.feature_id,
+                    "version": resolution.version,
+                    "backend": resolution.backend,
+                    "family": resolution.family,
+                    "template_id": resolution.template_id,
+                    "resolution": resolution.resolution,
+                    "adapter_fingerprint": resolution.adapter_fingerprint,
+                    "capability": resolution.capability,
+                }
+                for resolution in report.feature_resolutions
+            ],
+            "notices": list(report.notices),
+        },
+        effective_execution_digest=(
+            execution_plan.effective_execution_digest.model_dump(mode="json")
+        ),
     )
 
 
-def _native_continuity_graph(
-    workflows: tuple[NativeWorkflowUnit, ...],
-) -> tuple[
-    dict[str, NativeWorkflowUnit],
-    dict[str, tuple[str, ...]],
-]:
-    """Validate and index the server-owned one-segment dependency graph."""
+def _execution_continuity_graph(
+    plan: CompiledExecutionPlan,
+) -> dict[str, tuple[str, ...]]:
+    """Validate and index dependencies from the sole compiled-plan authority."""
 
-    units_by_segment: dict[str, NativeWorkflowUnit] = {}
-    for unit in workflows:
-        if len(unit.segment_ids) != 1:
-            raise NativeTemplateError(
-                f"native workflow '{unit.id}' must own exactly one segment"
-            )
-        segment_id = unit.segment_ids[0]
+    units_by_segment: dict[str, PreparedSegmentUnit] = {}
+    for unit in plan.segment_units:
+        segment_id = unit.owner_segment_id
         if segment_id in units_by_segment:
             raise NativeTemplateError(
-                f"native continuity segment '{segment_id}' has multiple workflows"
+                f"continuity segment '{segment_id}' has multiple prepared units"
             )
-        output_node_id = unit.output_nodes.get(segment_id)
-        output_node = (
-            unit.prompt.get(output_node_id)
-            if isinstance(output_node_id, str)
-            else None
-        )
-        if (
-            set(unit.output_nodes) != {segment_id}
-            or not isinstance(output_node, dict)
-            or output_node.get("class_type") != "SaveVideo"
-        ):
+        output = unit.expected_output_spec
+        output_node = unit.prompt_base.get(output.node_id)
+        if not isinstance(output_node, Mapping) or output_node.get(
+            "class_type"
+        ) != "SaveVideo":
             raise NativeTemplateError(
-                f"native workflow '{unit.id}' must declare its unique SaveVideo "
+                f"prepared unit '{unit.id}' must declare its unique SaveVideo "
                 f"output for segment '{segment_id}'"
             )
         units_by_segment[segment_id] = unit
@@ -4212,14 +6802,15 @@ def _native_continuity_graph(
     mutable_dependents: dict[str, list[str]] = {}
     predecessor_by_segment: dict[str, str] = {}
     for segment_id, unit in units_by_segment.items():
-        dependency = unit.continuity
+        dependency = unit.continuity_dependency
         if dependency is None:
             continue
-        predecessor_id = dependency.predecessor_segment_id
-        if dependency.source == "historical_take":
+        predecessor_id = str(dependency.get("predecessor_segment_id") or "")
+        source = dependency.get("source")
+        if source == "historical_take":
             if (
-                not dependency.resolved
-                or not dependency.historical_take_id
+                dependency.get("resolved") is not True
+                or not dependency.get("historical_take_id")
                 or predecessor_id in units_by_segment
             ):
                 raise NativeTemplateError(
@@ -4227,7 +6818,7 @@ def _native_continuity_graph(
                     "historical-take dependency"
                 )
             continue
-        if dependency.source != "same_run":
+        if source != "same_run":
             raise NativeTemplateError(
                 f"continuity segment '{segment_id}' has an unknown dependency source"
             )
@@ -4236,7 +6827,7 @@ def _native_continuity_graph(
                 f"continuity segment '{segment_id}' requires unselected predecessor "
                 f"'{predecessor_id}'"
             )
-        if dependency.resolved or dependency.historical_take_id is not None:
+        if dependency.get("resolved") or dependency.get("historical_take_id") is not None:
             raise NativeTemplateError(
                 f"continuity segment '{segment_id}' has an invalid same-run dependency"
             )
@@ -4261,16 +6852,39 @@ def _native_continuity_graph(
             seen.add(cursor)
             cursor = predecessor_by_segment[cursor]
 
-    return units_by_segment, {
+    return {
         predecessor_id: tuple(successor_ids)
         for predecessor_id, successor_ids in mutable_dependents.items()
     }
 
 
 def _continuity_output_descriptor(
-    child: dict[str, Any], predecessor_segment_id: str
+    database: Database,
+    child: dict[str, Any],
+    predecessor_segment_id: str,
 ) -> dict[str, str]:
     """Resolve exactly one persistent SaveVideo result for a predecessor."""
+
+    execution_evidence = database.get_job_child_execution_evidence(
+        str(child["id"])
+    )
+    if execution_evidence is not None:
+        expected = execution_evidence[
+            "exact_prompt_snapshot"
+        ].expected_output_spec
+        artifact = database.get_observed_artifact(str(child["id"]))
+        if (
+            expected is None
+            or expected.segment_id != predecessor_segment_id
+            or artifact is None
+            or artifact.segment_id != predecessor_segment_id
+            or artifact.child_id != str(child["id"])
+        ):
+            raise NativeTemplateError(
+                f"continuity predecessor '{predecessor_segment_id}' has no "
+                "trusted observed artifact"
+            )
+        return artifact.output_descriptor.model_dump(mode="json")
 
     output_nodes = child.get("output_nodes")
     output_node_id = (
@@ -4355,31 +6969,52 @@ async def _create_timeline_job_impl(
     job_id: str | None = None,
     accepted: asyncio.Event | None = None,
     accepted_release: asyncio.Event | None = None,
+    captured_settings_future: asyncio.Future[RuntimeSettingsV3] | None = None,
     project_id: str | None = None,
 ) -> JobRead:
     database = _db(request)
-    settings = database.get_settings()
+    captured_settings = database.get_settings()
+    if captured_settings_future is not None and not captured_settings_future.done():
+        captured_settings_future.set_result(captured_settings)
     client = _comfy(request)
     owner_project_id = project_id or database.LEGACY_DEFAULT_PROJECT_ID
 
     def project_job_read(snapshot: dict[str, Any]) -> JobRead:
-        # Resolve at the response boundary so a timeline edit made while a
-        # long submission is running is reflected in currentness immediately.
-        return _job_read_for_project_scope(
+        # The accepted response is derived from the two snapshots captured at
+        # request admission.  Reading a mutable live project/settings pair
+        # here would reintroduce split creative authority into job creation.
+        return _job_read_for_request(
             request,
             snapshot,
-            project_id=owner_project_id,
+            current_timeline=draft_v5,
+            current_settings=captured_settings,
         )
 
-    draft = body.config or database.get_project_timeline(owner_project_id)
+    if not database.project_exists(owner_project_id):
+        raise _project_not_found_http_error()
+    # The request is the immutable creative snapshot.  This scope check must
+    # not become a second document read or a live-settings creative fallback.
+    draft_v5 = body.config
     try:
+        host_projection = project_v5_contextual_host_authority(
+            draft_v5,
+            captured_settings,
+            body.segment_ids,
+        )
+        draft = host_projection.draft
+        settings = host_projection.settings
         database.validate_timeline_assets(
             draft,
             segment_ids=body.segment_ids,
         )
+    except V5CreativeAuthorityError as exc:
+        raise _creative_input_http_error(
+            _v5_creative_authority_reason(exc)
+        ) from exc
     except (ValidationError, ValueError) as exc:
-        raise _validation_error(exc) from exc
+        raise _creative_input_http_error(_creative_input_reason(exc)) from exc
     job_id = job_id or str(uuid.uuid4())
+    contextual_errors: tuple[CapabilityReason, ...] = ()
     try:
         validate_unified_runnable(draft, segment_ids=body.segment_ids)
         historical_takes = _resolve_historical_continuity_takes(
@@ -4388,34 +7023,85 @@ async def _create_timeline_job_impl(
             segment_ids=body.segment_ids,
             project_id=owner_project_id,
         )
-        standard_lora_metadata = await _standard_lora_metadata_for_timeline(
+        host_capability_snapshot = await _host_capability_snapshot(request)
+        operational_readiness = _host_operational_readiness(
+            request,
+            host_capability_snapshot,
+        )
+        contextual_errors = await _contextual_host_errors(
             client,
-            draft,
-            settings,
+            draft=draft,
+            settings=settings,
+            segment_ids=body.segment_ids,
+            snapshot=host_capability_snapshot,
+        )
+        projection = project_v5_compile_authority(
+            draft_v5,
+            captured_settings,
             body.segment_ids,
         )
-        # The browser never submits a workflow. This is the only compilation
-        # boundary and returns family/backend workflow units held server-side.
-        compiled = compile_native_timeline(
-            draft,
-            settings,
+        draft = projection.draft
+        settings = projection.settings
+        feature_report = preflight_projected_v5_timeline(
+            draft=draft,
+            settings=settings,
+            effective_features=projection.effective_features,
+            snapshot=host_capability_snapshot,
+            readiness=operational_readiness,
+            segment_ids=body.segment_ids,
+            historical_takes=historical_takes,
+            resolved_lora_adapters=projection.lora_adapter_map(),
+        )
+        blocking_reasons = (*feature_report.errors, *contextual_errors)
+        if blocking_reasons:
+            raise _capability_reasons_http_error(blocking_reasons)
+        # The browser never submits a workflow.  Production compilation
+        # exposes one authority only: immutable prepared segment units. Ray
+        # ledger readiness remains a separate plan-level concern and is
+        # recaptured by `_preflight_execution_plan` before any endpoint side
+        # effect rather than being copied onto every feature.
+        execution_plan = compile_v5_execution_plan(
+            draft_v5,
+            captured_settings,
             job_id,
             body.segment_ids,
             historical_takes=historical_takes,
-            standard_lora_metadata=standard_lora_metadata,
+            host_capability_snapshot=host_capability_snapshot,
+            operational_readiness=operational_readiness,
+            capability_evaluator=CapabilityEvaluator(
+                CURRENT_NODE_CONTRACT_REGISTRY
+            ),
         )
-        _, continuity_dependents = _native_continuity_graph(
-            compiled.workflows
-        )
-    except (NativeTemplateError, DraftNotRunnable, ValidationError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except (ComfyError, httpx.HTTPError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Cannot inspect LoRA metadata from ComfyUI: {exc}",
+        execution_plan_digest = compiled_execution_plan_digest(execution_plan)
+        continuity_dependents = _execution_continuity_graph(execution_plan)
+    except V4CapabilityEvaluationError as exc:
+        raise _capability_compile_http_error(exc, *contextual_errors) from exc
+    except V5CreativeAuthorityError as exc:
+        raise _creative_input_http_error(
+            _v5_creative_authority_reason(exc),
+            *contextual_errors,
         ) from exc
+    except (NativeTemplateError, DraftNotRunnable, ValidationError, ValueError) as exc:
+        reason = _creative_input_reason(exc)
+        raise _creative_input_http_error(reason, *contextual_errors) from exc
+    except (ComfyError, httpx.HTTPError) as exc:
+        raise _host_context_observation_http_error() from exc
+    try:
+        job_runtime_snapshot = build_job_runtime_snapshot(
+            draft_v5,
+            body.segment_ids,
+            captured_settings,
+            execution_plan,
+        )
+    except (TypeError, ValidationError, ValueError):
+        logger.exception("job runtime snapshot failed its typed invariant")
+        raise _execution_plan_invariant_http_error() from None
     database = _db(request)
     now = utc_now()
+    compile_report = execution_plan.model_dump(mode="json")["compile_report"]
+    compiled_manifest = compile_report.get("manifest")
+    if not isinstance(compiled_manifest, dict):
+        raise _execution_plan_invariant_http_error()
     database.create_job(
         {
             "id": job_id,
@@ -4432,23 +7118,24 @@ async def _create_timeline_job_impl(
             "outputs": [],
             "error": None,
             "config_snapshot": {
-                "timeline": draft.model_dump(mode="json"),
+                "timeline": draft_v5.model_dump(mode="json"),
                 "segment_ids": body.segment_ids,
             },
-            "settings_snapshot": settings.model_dump(mode="json"),
-            "prompt_snapshot": compiled.manifest,
+            "settings_snapshot": job_runtime_snapshot.model_dump(mode="json"),
+            "prompt_snapshot": compiled_manifest,
             "created_at": now,
             "updated_at": now,
             "started_at": None,
             "completed_at": None,
         }
     )
+    database.create_job_execution_plan(job_id, execution_plan)
     child_ids: dict[str, str] = {}
     child_ids_by_segment: dict[str, str] = {}
-    for index, unit in enumerate(compiled.workflows):
+    for index, unit in enumerate(execution_plan.segment_units):
         child_id = str(uuid.uuid4())
         child_ids[unit.id] = child_id
-        child_ids_by_segment[unit.segment_ids[0]] = child_id
+        child_ids_by_segment[unit.owner_segment_id] = child_id
         database.create_job_child(
             {
                 "id": child_id,
@@ -4459,15 +7146,17 @@ async def _create_timeline_job_impl(
                 "group_index": index * 2 + 1,
                 "family": unit.family,
                 "backend": unit.backend,
-                "segment_ids": list(unit.segment_ids),
-                "output_nodes": dict(unit.output_nodes),
+                "segment_ids": [unit.owner_segment_id],
+                "output_nodes": {
+                    unit.owner_segment_id: unit.expected_output_spec.node_id
+                },
                 "status": "preparing",
                 "progress": 0.0,
                 "stage": "preflight",
                 "prompt_id": None,
                 "outputs": [],
                 "error": None,
-                "prompt_snapshot": unit.prompt,
+                "prompt_snapshot": unit.model_dump(mode="json")["prompt_base"],
                 "created_at": now,
                 "updated_at": now,
                 "started_at": None,
@@ -4483,12 +7172,10 @@ async def _create_timeline_job_impl(
     endpoint_key: str | None = None
     submission_ticket: asyncio.Future[None] | None = None
     predecessor: asyncio.Future[None] | None = None
-    transition_unit_ids: set[str] = set()
-    ray_state_before_submit: dict[str, dict[str, Any]] = {}
     continuity_outputs: dict[str, dict[str, str]] = {}
     dependency_failed_segments: set[str] = set()
     try:
-        await _preflight_timeline(client, settings, compiled, database)
+        await _preflight_execution_plan(client, execution_plan, database)
         gate = database.update_job_if_status(
             job_id, "preparing", stage="submitting"
         )
@@ -4575,7 +7262,7 @@ async def _create_timeline_job_impl(
             client, database, runtime_state
         )
         if runtime_state.get("legacy_unknown") and any(
-            unit.backend == "standard" for unit in compiled.workflows
+            unit.backend == "standard" for unit in execution_plan.segment_units
         ):
             raise HTTPException(
                 status_code=409,
@@ -4585,15 +7272,12 @@ async def _create_timeline_job_impl(
                     "任务以显式重建运行池，再提交 Standard 任务。"
                 ),
             )
-        epoch = int(runtime_state["epoch"])
-        current_descriptor = runtime_state.get("current")
-        current_tainted = bool(runtime_state.get("tainted"))
         tail_prompt_id = runtime_state.get("tail_prompt_id")
         tail_action = runtime_state.get("tail_action")
         if (
             isinstance(tail_prompt_id, str)
             and tail_action == "ray_unit"
-            and current_tainted
+            and bool(runtime_state.get("tainted"))
         ):
             # A process restart can leave a durable Ray prompt executing after
             # its submission coroutine disappeared. Never append behind that
@@ -4610,6 +7294,7 @@ async def _create_timeline_job_impl(
                     str(tail_child["job_id"]),
                     str(tail_child["id"]),
                     tail_prompt_id,
+                    request=request,
                     stop_on_parent_cancel=False,
                     dispatch_job_id=job_id,
                     terminal_events=request.app.state.prompt_terminal_events,
@@ -4622,9 +7307,7 @@ async def _create_timeline_job_impl(
                         _raylight_child_has_terminal_history_certificate(terminal)
                     ),
                 )
-                current_tainted = not succeeded
             else:
-                current_tainted = True
                 runtime_state = dict(runtime_state, tainted=True)
                 database.put_raylight_runtime_state(runtime_state)
         elif isinstance(tail_prompt_id, str) and tail_action == "shutdown":
@@ -4653,64 +7336,92 @@ async def _create_timeline_job_impl(
                 tail_child = database.get_job_child(str(tail_child["id"]))
                 if tail_child is None:
                     raise KeyError(tail_prompt_id)
-            if tail_child is not None and tail_child["status"] != "succeeded":
-                current_tainted = True
-            else:
+            if tail_child is None or tail_child["status"] == "succeeded":
                 await _await_raylight_transition(client, tail_prompt_id)
                 database.settle_raylight_runtime_prompt(
                     tail_prompt_id,
                     succeeded=True,
                     terminal_history_certified=True,
                 )
-                current_descriptor = None
-                current_tainted = False
 
-        planned_units: list[NativeWorkflowUnit] = []
-        compiled_positions = {
-            unit.id: index for index, unit in enumerate(compiled.workflows)
-        }
-        barrier_serial = 0
+        planned_units: list[LockedSubmissionUnit] = []
+        transition_unit_ids: set[str] = set()
+        submission_planner = LockedSubmissionPlanner(
+            request.app.state.endpoint_identity
+        )
+
+        def planned_continuity_manifest(
+            unit: LockedSubmissionUnit,
+        ) -> dict[str, Any] | None:
+            if not isinstance(unit, LockedSegmentUnit):
+                return None
+            dependency = unit.continuity_dependency
+            if dependency is None:
+                return None
+            pointer = str(dependency.get("input_pointer") or "")
+            pointer_parts = pointer.removeprefix("/").split("/")
+            if len(pointer_parts) != 3 or pointer_parts[1:] != ["inputs", "file"]:
+                raise NativeTemplateError(
+                    f"workflow '{unit.id}' has an invalid continuity pointer"
+                )
+            return {
+                "predecessor_segment_id": dependency.get(
+                    "predecessor_segment_id"
+                ),
+                "overlap_frames": dependency.get("overlap_frames"),
+                "load_video_node_id": pointer_parts[0],
+                "source": dependency.get("source"),
+                "historical_take_id": dependency.get("historical_take_id"),
+                "resolved": dependency.get("resolved"),
+            }
 
         def persist_planned_manifest() -> None:
-            planned_manifest = dict(compiled.manifest)
+            planned_manifest = dict(compiled_manifest)
             planned_manifest["submission_order"] = [
                 unit.id for unit in planned_units
             ]
-            planned_manifest["runtime_epoch"] = epoch
+            current_ray_ledger = database.get_raylight_runtime_state()
+            planned_manifest["runtime_epoch"] = (
+                int(current_ray_ledger["epoch"])
+                if current_ray_ledger is not None
+                else 0
+            )
             planned_manifest["runtime_transitions"] = [
                 unit.id for unit in planned_units
-                if unit.id in transition_unit_ids
+                if isinstance(unit, PreparedControlUnit)
             ]
             planned_manifest["units"] = [
                 {
                     "id": unit.id,
                     "family": unit.family,
                     "backend": unit.backend,
-                    "segment_ids": list(unit.segment_ids),
-                    "output_nodes": dict(unit.output_nodes),
-                    "continuity": (
-                        {
-                            "predecessor_segment_id": (
-                                unit.continuity.predecessor_segment_id
-                            ),
-                            "overlap_frames": unit.continuity.overlap_frames,
-                            "load_video_node_id": (
-                                unit.continuity.load_video_node_id
-                            ),
-                            "source": unit.continuity.source,
-                            "historical_take_id": (
-                                unit.continuity.historical_take_id
-                            ),
-                            "resolved": unit.continuity.resolved,
-                        }
-                        if unit.continuity is not None
-                        else None
+                    "segment_ids": (
+                        [unit.owner_segment_id]
+                        if isinstance(unit, LockedSegmentUnit)
+                        else []
                     ),
+                    "output_nodes": (
+                        {
+                            unit.owner_segment_id: (
+                                unit.expected_output_spec.node_id
+                            )
+                        }
+                        if isinstance(unit, LockedSegmentUnit)
+                        else {}
+                    ),
+                    "continuity": planned_continuity_manifest(unit),
                     "runtime_namespace": (
-                        None
-                        if unit.id in transition_unit_ids
-                        else descriptor["runtime_namespace"]
-                        if (descriptor := raylight_runtime_descriptor(unit)) is not None
+                        next(
+                            (
+                                unit.late_bound_values[evidence.input_pointer]
+                                for evidence in unit.late_binding_evidence
+                                if isinstance(
+                                    evidence, RuntimeEpochLateBindingEvidence
+                                )
+                            ),
+                            None,
+                        )
+                        if isinstance(unit, LockedSegmentUnit)
                         else None
                     ),
                 }
@@ -4718,21 +7429,67 @@ async def _create_timeline_job_impl(
             ]
             database.update_job(job_id, prompt_snapshot=planned_manifest)
 
+        def continuity_evidence_for(
+            prepared: PreparedSegmentUnit,
+        ) -> tuple[ContinuityLateBindingEvidence, ...]:
+            """Read output authority only; the planner materializes the graph."""
+
+            dependency = prepared.continuity_dependency
+            if dependency is not None:
+                predecessor_id = str(
+                    dependency.get("predecessor_segment_id") or ""
+                )
+                source = dependency.get("source")
+                if source == "same_run":
+                    raw_output = continuity_outputs.get(
+                        predecessor_id
+                    )
+                else:
+                    historical = historical_takes.get(
+                        prepared.owner_segment_id
+                    )
+                    raw_output = (
+                        historical.output if historical is not None else None
+                    )
+                if not isinstance(raw_output, Mapping):
+                    raise NativeTemplateError(
+                        f"workflow '{prepared.id}' has no continuity output evidence"
+                    )
+                output = OutputDescriptor.model_validate(
+                    {
+                        "filename": raw_output.get("filename"),
+                        "subfolder": raw_output.get("subfolder") or "",
+                        "type": raw_output.get("type") or "output",
+                    }
+                )
+                return (
+                    ContinuityLateBindingEvidence(
+                        input_pointer=str(dependency.get("input_pointer") or ""),
+                        predecessor_segment_id=predecessor_id,
+                        dependency_source=source,
+                        historical_take_id=dependency.get("historical_take_id"),
+                        output=output,
+                    ),
+                )
+            return ()
+
         def dynamically_planned_units():
             """Yield only the next safe unit; resume after its terminal gate."""
 
-            nonlocal barrier_serial, current_descriptor, current_tainted, epoch
-            for original_unit in compiled.workflows:
-                segment_id = original_unit.segment_ids[0]
+            for ordinal, prepared in enumerate(execution_plan.segment_units):
+                segment_id = prepared.owner_segment_id
                 if segment_id in dependency_failed_segments:
                     continue
-                dependency = original_unit.continuity
+                dependency = prepared.continuity_dependency
                 if (
                     dependency is not None
-                    and dependency.source == "same_run"
+                    and dependency.get("source") == "same_run"
                 ):
+                    predecessor_id = str(
+                        dependency.get("predecessor_segment_id") or ""
+                    )
                     predecessor_output = continuity_outputs.get(
-                        dependency.predecessor_segment_id
+                        predecessor_id
                     )
                     if predecessor_output is None:
                         newly_failed = _fail_continuity_descendants(
@@ -4740,153 +7497,60 @@ async def _create_timeline_job_impl(
                             job_id=job_id,
                             child_ids_by_segment=child_ids_by_segment,
                             dependents=continuity_dependents,
-                            predecessor_segment_id=(
-                                dependency.predecessor_segment_id
-                            ),
+                            predecessor_segment_id=predecessor_id,
                             reason="predecessor did not produce a certified output",
                         )
                         dependency_failed_segments.update(newly_failed)
                         continue
-                    try:
-                        original_unit = bind_native_workflow_predecessor_output(
-                            original_unit, predecessor_output
-                        )
-                    except NativeTemplateError as exc:
-                        newly_failed = _fail_continuity_descendants(
-                            database,
-                            job_id=job_id,
-                            child_ids_by_segment=child_ids_by_segment,
-                            dependents=continuity_dependents,
-                            predecessor_segment_id=(
-                                dependency.predecessor_segment_id
-                            ),
-                            reason=str(exc),
-                        )
-                        dependency_failed_segments.update(newly_failed)
-                        continue
                 elif dependency is not None and (
-                    dependency.source != "historical_take"
-                    or not dependency.resolved
-                    or not dependency.historical_take_id
+                    dependency.get("source") != "historical_take"
+                    or dependency.get("resolved") is not True
+                    or not dependency.get("historical_take_id")
                 ):
                     raise NativeTemplateError(
                         f"continuity segment '{segment_id}' has an unresolved "
                         "historical take"
                     )
-                target_descriptor = raylight_runtime_descriptor(original_unit)
-                target_key = (
-                    str(target_descriptor["runtime_key"])
-                    if target_descriptor is not None
-                    else None
+                wave = submission_planner.build_wave(
+                    execution_plan,
+                    source_unit_ordinal=ordinal,
+                    segment_child_id=child_ids[prepared.id],
+                    continuity_evidence=continuity_evidence_for(prepared),
+                    ray_ledger_before=database.get_raylight_runtime_state(),
+                    source_compiled_plan_digest=execution_plan_digest,
                 )
-                current_key = (
-                    str(current_descriptor.get("runtime_key") or "")
-                    if isinstance(current_descriptor, dict)
-                    else None
-                )
-                incompatible = current_descriptor is not None and (
-                    current_tainted
-                    or original_unit.backend == "standard"
-                    or current_key != target_key
-                )
-                if incompatible:
-                    barrier_serial += 1
-                    transition_unit = build_raylight_shutdown_unit(
-                        current_descriptor,
-                        unit_id=(
-                            f"switch-{compiled_positions[original_unit.id]:03d}-"
-                            f"{barrier_serial}-{job_id}"
-                        ),
-                    )
+                segment_plan = wave
+                if len(wave.units) == 2:
+                    transition_unit = wave.units[0]
+                    assert isinstance(transition_unit, PreparedControlUnit)
                     transition_unit_ids.add(transition_unit.id)
-                    child_id = str(uuid.uuid4())
-                    child_ids[transition_unit.id] = child_id
-                    transition_now = utc_now()
-                    database.create_job_child(
-                        {
-                            "id": child_id,
-                            "job_id": job_id,
-                            "group_index": compiled_positions[original_unit.id] * 2,
-                            "family": transition_unit.family,
-                            "backend": transition_unit.backend,
-                            "segment_ids": [],
-                            "output_nodes": {},
-                            "status": "preparing",
-                            "progress": 0.0,
-                            "stage": "RayLight 安全切换",
-                            "prompt_id": None,
-                            "outputs": [],
-                            "error": None,
-                            "prompt_snapshot": transition_unit.prompt,
-                            "created_at": transition_now,
-                            "updated_at": transition_now,
-                            "started_at": None,
-                            "completed_at": None,
-                        }
-                    )
-                    parent_after_create = database.get_job(job_id)
-                    if (
-                        parent_after_create is None
-                        or parent_after_create["status"] != "preparing"
-                    ):
-                        database.update_job_child_if_status(
-                            child_id,
-                            "preparing",
-                            status="cancelled",
-                            progress=1.0,
-                            stage="not_submitted",
-                            error=None,
-                            completed_at=utc_now(),
-                        )
-                        return
-                    ray_state_before_submit[transition_unit.id] = {
-                        "version": 2,
-                        "epoch": epoch,
-                        "current": current_descriptor,
-                        "tail_prompt_id": child_id,
-                        "tail_action": "shutdown",
-                        "tainted": True,
-                    }
                     planned_units.append(transition_unit)
                     persist_planned_manifest()
-                    yield transition_unit
+                    yield transition_unit, wave
                     # The generator resumes only after the outer loop has
                     # positively certified RayKill history.
-                    current_descriptor = None
-                    current_tainted = False
-                if original_unit.backend == "raylight":
-                    if current_descriptor is None:
-                        epoch += 1
-                    bound_unit = bind_raylight_runtime_epoch(original_unit, epoch)
-                    validate_native_workflow_ready(bound_unit)
-                    current_descriptor = raylight_runtime_descriptor(bound_unit)
-                    if current_descriptor is None:
-                        raise NativeTemplateError(
-                            f"RayLight unit '{original_unit.id}' has no runtime descriptor"
-                        )
-                    ray_state_before_submit[bound_unit.id] = {
-                        "version": 2,
-                        "epoch": epoch,
-                        "current": current_descriptor,
-                        "tail_prompt_id": child_ids[bound_unit.id],
-                        "tail_action": "ray_unit",
-                        "tainted": True,
-                    }
-                    planned_units.append(bound_unit)
-                    persist_planned_manifest()
-                    yield bound_unit
-                else:
-                    validate_native_workflow_ready(original_unit)
-                    planned_units.append(original_unit)
-                    persist_planned_manifest()
-                    yield original_unit
+                    segment_plan = submission_planner.segment_continuation(
+                        wave,
+                        ray_ledger_before=(
+                            database.get_raylight_runtime_state()
+                        ),
+                    )
+                segment_unit = segment_plan.units[0]
+                assert isinstance(segment_unit, LockedSegmentUnit)
+                planned_units.append(segment_unit)
+                persist_planned_manifest()
+                yield segment_unit, segment_plan
 
         workflows_to_submit = dynamically_planned_units()
         # ComfyUI's normal queue serializes these one-segment prompts. Stable
         # loader ids/inputs permit endpoint-local cache reuse without putting
         # 128 independent sampling/decode branches in one failure domain.
-        for unit in workflows_to_submit:
-            segment_id = unit.segment_ids[0] if unit.segment_ids else None
+        for unit, locked_plan in workflows_to_submit:
+            segment_id = (
+                unit.owner_segment_id
+                if isinstance(unit, LockedSegmentUnit)
+                else None
+            )
             if (
                 segment_id is not None
                 and segment_id in dependency_failed_segments
@@ -4894,7 +7558,7 @@ async def _create_timeline_job_impl(
                 continue
             if unit.id in transition_unit_ids:
                 await _preflight_raylight_transition(
-                    client, unit, database
+                    request, client, unit, database
                 )
             current = database.get_job(job_id)
             if current is None:
@@ -4910,27 +7574,26 @@ async def _create_timeline_job_impl(
                 return project_job_read(
                     await _cancel_timeline_job(request, current)
                 )
-            child_id = child_ids[unit.id]
-            planned_ray_state = ray_state_before_submit.get(unit.id)
-            validate_native_workflow_ready(unit)
-            if planned_ray_state is not None:
-                database.put_raylight_runtime_state(
-                    planned_ray_state
-                )
+            child_id = unit.child_id
+            locked_unit = unit
             before_claim = getattr(
                 request.app.state, "before_submission_claim", None
             )
             if before_claim is not None:
                 await before_claim(job_id, child_id)
-            claimed_child = database.claim_job_child_submission(
-                job_id,
-                child_id,
-                prompt_id=child_id,
-                # Replace the compile-time base namespace with the exact
-                # persistent epoch that was chosen under the endpoint lock.
-                prompt_snapshot=unit.prompt,
+            exact_snapshot = submission_planner.exact_snapshot(
+                locked_plan,
+                locked_unit,
             )
-            if claimed_child is None:
+            try:
+                claimed_child, initial_ownership = (
+                    database.persist_job_child_submission_intent(
+                        job_id,
+                        locked_plan=locked_plan,
+                        exact_snapshot=exact_snapshot,
+                    )
+                )
+            except (ExecutionEvidenceConflict, RayRuntimeIntentConflict):
                 latest_parent = database.get_job(job_id)
                 if latest_parent is None:
                     raise HTTPException(
@@ -4954,9 +7617,53 @@ async def _create_timeline_job_impl(
                     status_code=409,
                     detail="job child changed state before submission",
                 )
-            possibly_submitted[child_id] = child_id
+
+            possibly_submitted[child_id] = initial_ownership.effective_prompt_id
+            after_submission_intent = getattr(
+                request.app.state, "after_submission_intent", None
+            )
+            if after_submission_intent is not None:
+                # Crash-window test seam: intent/exact snapshot/ownership are
+                # durable, while no network side effect has started yet.
+                await after_submission_intent(job_id, child_id, exact_snapshot)
+
+            def persist_submit_receipt(
+                requested_prompt_id: str | None,
+                actual_prompt_id: str,
+            ) -> None:
+                if requested_prompt_id != locked_unit.requested_prompt_id:
+                    raise ExecutionEvidenceConflict(
+                        "ComfyUI receipt does not match the locked requested id"
+                    )
+                receipt = database.record_prompt_submission_receipt(
+                    child_id,
+                    expected_revision=initial_ownership.ownership_revision,
+                    actual_prompt_id=actual_prompt_id,
+                    state=(
+                        "owned_requested_id"
+                        if actual_prompt_id == requested_prompt_id
+                        else "owned_actual_id"
+                    ),
+                    updated_at=datetime.now(timezone.utc),
+                )
+                if receipt is None:
+                    raise ExecutionEvidenceConflict(
+                        "prompt ownership changed before receipt persistence"
+                    )
+                possibly_submitted[child_id] = receipt.effective_prompt_id
+
+            exact_prompt_document = exact_snapshot.model_dump(mode="json")[
+                "exact_prompt"
+            ]
+            if not isinstance(exact_prompt_document, dict):
+                raise ExecutionEvidenceConflict(
+                    "exact prompt snapshot did not materialize a JSON object"
+                )
             submitted = await client.submit(
-                unit.prompt, settings.client_id, prompt_id=child_id
+                exact_prompt_document,
+                settings.client_id,
+                prompt_id=locked_unit.requested_prompt_id,
+                on_receipt=persist_submit_receipt,
             )
             prompt_id = str(submitted["prompt_id"])
             submitted_children.append((child_id, prompt_id))
@@ -5045,7 +7752,7 @@ async def _create_timeline_job_impl(
                         stage="cancelling_after_submit",
                         prompt_id=(
                             prompt_id
-                            if len(compiled.workflows) == 1
+                            if len(execution_plan.segment_units) == 1
                             and not transition_unit_ids
                             else None
                         ),
@@ -5057,9 +7764,30 @@ async def _create_timeline_job_impl(
                             status_code=404,
                             detail="job disappeared after submission",
                         )
+                latest_child = database.get_job_child(child_id)
+                if latest_child is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="job child disappeared after submission",
+                    )
+                cancel_ownership = _claim_typed_prompt_cancel(
+                    database, latest_child
+                )
+                if cancel_ownership is not None and cancel_ownership.state in {
+                    "cleanup_confirmed",
+                    "terminal_confirmed",
+                }:
+                    submission_lock.release()
+                    lock_acquired = False
+                    return project_job_read(
+                        await _sync_timeline_job(request, latest_parent)
+                    )
                 try:
                     dispatched = await client.cancel(prompt_id)
                 except (ComfyError, httpx.HTTPError) as exc:
+                    _mark_typed_prompt_unconfirmed(
+                        database, child_id, cancel_ownership
+                    )
                     latest_child = database.get_job_child(child_id)
                     latest_parent = database.get_job(job_id)
                     if latest_child is None or latest_parent is None:
@@ -5104,27 +7832,38 @@ async def _create_timeline_job_impl(
                         status_code=404, detail="job disappeared after submission"
                     )
                 if not dispatched:
+                    _mark_typed_prompt_unconfirmed(
+                        database, child_id, cancel_ownership
+                    )
                     reconciled = await _sync_timeline_job(request, latest_parent)
                     if reconciled["status"] in {"succeeded", "failed"}:
                         submission_lock.release()
                         lock_acquired = False
                         return project_job_read(reconciled)
                 else:
-                    latest_child = database.get_job_child(child_id)
-                    if (
-                        latest_child is not None
-                        and latest_child["status"] not in _TERMINAL_STATUSES
-                    ):
-                        database.update_job_child_if_snapshot(
+                    if cancel_ownership is not None:
+                        _confirm_typed_exact_cancel(
+                            database,
                             child_id,
-                            expected_status=latest_child["status"],
-                            expected_updated_at=latest_child["updated_at"],
-                            status="cancelled",
-                            progress=1.0,
+                            cancel_ownership,
                             stage="cancelled",
-                            error=None,
-                            completed_at=utc_now(),
                         )
+                    else:
+                        latest_child = database.get_job_child(child_id)
+                        if (
+                            latest_child is not None
+                            and latest_child["status"] not in _TERMINAL_STATUSES
+                        ):
+                            database.update_job_child_if_snapshot(
+                                child_id,
+                                expected_status=latest_child["status"],
+                                expected_updated_at=latest_child["updated_at"],
+                                status="cancelled",
+                                progress=1.0,
+                                stage="cancelled",
+                                error=None,
+                                completed_at=utc_now(),
+                            )
                 cancelled_parent = database.get_job(job_id)
                 if cancelled_parent is None:
                     raise HTTPException(
@@ -5135,7 +7874,7 @@ async def _create_timeline_job_impl(
                 return project_job_read(
                     await _sync_timeline_job(request, cancelled_parent)
                 )
-            if unit.id in transition_unit_ids:
+            if isinstance(unit, PreparedControlUnit):
                 # Queue order alone is insufficient: ComfyUI continues with
                 # later prompts after a failed output node. Require positive
                 # history evidence from RayKill before submitting Standard.
@@ -5178,7 +7917,7 @@ async def _create_timeline_job_impl(
                     succeeded=True,
                     terminal_history_certified=True,
                 )
-            elif planned_ray_state is not None:
+            elif isinstance(unit, LockedSegmentUnit) and unit.backend == "raylight":
                 # Ray actors are mutable and failures are not covered by a
                 # method-level finally in the installed sampler. Do not even
                 # enqueue the next Director Ray generation until exact history
@@ -5191,6 +7930,7 @@ async def _create_timeline_job_impl(
                     job_id,
                     child_id,
                     prompt_id,
+                    request=request,
                     terminal_events=request.app.state.prompt_terminal_events,
                 )
                 succeeded = terminal["status"] == "succeeded"
@@ -5201,7 +7941,6 @@ async def _create_timeline_job_impl(
                         _raylight_child_has_terminal_history_certificate(terminal)
                     ),
                 )
-                current_tainted = not succeeded
                 latest_parent = database.get_job(job_id)
                 if latest_parent is None:
                     raise HTTPException(
@@ -5227,6 +7966,7 @@ async def _create_timeline_job_impl(
                         job_id,
                         child_id,
                         prompt_id,
+                        request=request,
                         running_stage="sampling",
                         error_context="continuity predecessor generation",
                         terminal_events=request.app.state.prompt_terminal_events,
@@ -5247,7 +7987,9 @@ async def _create_timeline_job_impl(
                     try:
                         continuity_outputs[segment_id] = (
                             _continuity_output_descriptor(
-                                terminal_child, segment_id
+                                database,
+                                terminal_child,
+                                segment_id,
                             )
                         )
                     except NativeTemplateError as exc:
@@ -5281,6 +8023,37 @@ async def _create_timeline_job_impl(
         if lock_acquired and submission_lock is not None:
             submission_lock.release()
             lock_acquired = False
+        latest_after_http_error = database.get_job(job_id)
+        cleanup_already_owned = (
+            latest_after_http_error is not None
+            and latest_after_http_error["status"] == "cancelling"
+            and latest_after_http_error.get("stage") == "cancel_failed"
+        )
+        if possibly_submitted and not cleanup_already_owned:
+            # HTTPException is not limited to the initial read-only preflight:
+            # a later unit can fail its dependency/claim gate after an earlier
+            # unit already owns a real ComfyUI prompt.  That state must use the
+            # same exact-id cleanup protocol as a transport failure.  Marking
+            # it locally failed would orphan the upstream prompt and erase the
+            # only recovery owner while releasing the endpoint lock.
+            try:
+                await _cleanup_failed_timeline_submission(
+                    request,
+                    job_id=job_id,
+                    client=client,
+                    error=exc,
+                    possibly_submitted=possibly_submitted,
+                )
+            except BaseException:
+                _mark_timeline_submission_interrupted(database, job_id)
+                raise
+            raise
+        if cleanup_already_owned:
+            # The late-submit cancellation branch already attempted the exact
+            # prompt id and persisted an unconfirmed recovery owner before it
+            # raised this HTTPException.  A second cleanup pass would overwrite
+            # the more precise ``cancel_failed`` state.
+            raise
         failed_parent = database.update_job_if_status(
             job_id,
             "preparing",
@@ -5311,20 +8084,27 @@ async def _create_timeline_job_impl(
         # the current durable requested id, so outer cleanup and restart
         # recovery target the actual upstream side effect if inline cleanup was
         # false or raised.
-        inline_cancelled = _bind_actual_prompt_id_from_submit_error(
-            database, exc, possibly_submitted
-        )
-        if lock_acquired and submission_lock is not None:
-            submission_lock.release()
-            lock_acquired = False
-        await _cleanup_failed_timeline_submission(
-            request,
-            job_id=job_id,
-            client=client,
-            error=exc,
-            possibly_submitted=possibly_submitted,
-            inline_cancelled=inline_cancelled,
-        )
+        try:
+            inline_cancelled = _bind_actual_prompt_id_from_submit_error(
+                database, exc, possibly_submitted
+            )
+            if lock_acquired and submission_lock is not None:
+                submission_lock.release()
+                lock_acquired = False
+            await _cleanup_failed_timeline_submission(
+                request,
+                job_id=job_id,
+                client=client,
+                error=exc,
+                possibly_submitted=possibly_submitted,
+                inline_cancelled=inline_cancelled,
+            )
+        except BaseException:
+            if lock_acquired and submission_lock is not None:
+                submission_lock.release()
+                lock_acquired = False
+            _mark_timeline_submission_interrupted(database, job_id)
+            raise
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except asyncio.CancelledError:
         if lock_acquired and submission_lock is not None:
@@ -5336,6 +8116,7 @@ async def _create_timeline_job_impl(
             return project_job_read(current)
         raise
     except BaseException:
+        logger.exception("timeline submission interrupted unexpectedly")
         # A graceful server shutdown can cancel the shielded submission task.
         # Persist a finite recovery state before releasing the endpoint lock;
         # caller-assigned prompt ids make every possibly accepted side effect
@@ -5343,49 +8124,7 @@ async def _create_timeline_job_impl(
         if lock_acquired and submission_lock is not None:
             submission_lock.release()
             lock_acquired = False
-        current = database.get_job(job_id)
-        if current is not None and current["status"] not in _TERMINAL_STATUSES:
-            has_bound_prompt = False
-            for child in database.list_job_children(job_id):
-                if child["status"] in _TERMINAL_STATUSES:
-                    continue
-                if child.get("prompt_id"):
-                    has_bound_prompt = True
-                    database.update_job_child_if_snapshot(
-                        child["id"],
-                        expected_status=child["status"],
-                        expected_updated_at=child["updated_at"],
-                        status="cancelling",
-                        stage="submission_interrupted",
-                        completed_at=None,
-                    )
-                else:
-                    database.update_job_child_if_snapshot(
-                        child["id"],
-                        expected_status=child["status"],
-                        expected_updated_at=child["updated_at"],
-                        status="cancelled",
-                        progress=1.0,
-                        stage="not_submitted",
-                        completed_at=utc_now(),
-                    )
-            latest = database.get_job(job_id)
-            if latest is not None and latest["status"] not in _TERMINAL_STATUSES:
-                database.update_job_if_snapshot(
-                    job_id,
-                    expected_status=latest["status"],
-                    expected_stage=latest.get("stage"),
-                    expected_updated_at=latest["updated_at"],
-                    status="cancelling" if has_bound_prompt else "cancelled",
-                    progress=1.0 if not has_bound_prompt else current["progress"],
-                    stage=(
-                        "submission_interrupted"
-                        if has_bound_prompt
-                        else "submission_cancelled"
-                    ),
-                    error="native segment submission was interrupted",
-                    completed_at=None if has_bound_prompt else utc_now(),
-                )
+        _mark_timeline_submission_interrupted(database, job_id)
         raise
     finally:
         if submission_ticket is not None:
@@ -5479,8 +8218,23 @@ async def _create_timeline_job(
     runs. A hard process exit is reconciled by lifespan startup recovery.
     """
 
+    try:
+        body = body.model_copy(
+            update={
+                "config": migrate_timeline_feature_authority_to_v5(
+                    body.config
+                )
+            },
+            deep=True,
+        )
+    except (ValidationError, ValueError) as exc:
+        raise _creative_input_http_error(_creative_input_reason(exc)) from exc
+
     accepted = asyncio.Event()
     accepted_release = asyncio.Event()
+    captured_settings_future: asyncio.Future[RuntimeSettingsV3] = (
+        asyncio.get_running_loop().create_future()
+    )
     job_id = str(uuid.uuid4())
     task = asyncio.create_task(
         _create_timeline_job_impl(
@@ -5490,6 +8244,7 @@ async def _create_timeline_job(
             job_id=job_id,
             accepted=accepted,
             accepted_release=accepted_release,
+            captured_settings_future=captured_settings_future,
             project_id=project_id,
         ),
         name="timeline-submit",
@@ -5508,7 +8263,13 @@ async def _create_timeline_job(
         if not done.cancelled():
             # Retrieve a detached task exception after client disconnect; a
             # normal awaiting caller still observes the same stored exception.
-            done.exception()
+            error = done.exception()
+            if error is not None and accepted.is_set():
+                logger.error(
+                    "detached timeline submission failed for job %s",
+                    job_id,
+                    exc_info=error,
+                )
 
     task.add_done_callback(consume)
     accepted_wait = asyncio.create_task(accepted.wait())
@@ -5523,10 +8284,11 @@ async def _create_timeline_job(
         if job is None:
             return await asyncio.shield(task)
         job["children"] = _db(request).list_job_children(job_id)
-        return _job_read_for_project_scope(
+        return _job_read_for_request(
             request,
             job,
-            project_id=project_id,
+            current_timeline=body.config,
+            current_settings=await asyncio.shield(captured_settings_future),
         )
     finally:
         accepted_release.set()
@@ -5598,7 +8360,15 @@ async def _recover_interrupted_submission(
     dispatch_errors: list[str] = []
     has_unconfirmed = False
     for child in database.list_job_children(job["id"]):
+        ownership = _typed_prompt_ownership_for_child(database, child)
         if child["status"] in _TERMINAL_STATUSES:
+            if ownership is not None and ownership.state not in {
+                "cleanup_confirmed",
+                "terminal_confirmed",
+            }:
+                raise ExecutionEvidenceConflict(
+                    f"terminal child {child['id']} retains prompt ownership"
+                )
             continue
         prompt_id = child.get("prompt_id")
         if not prompt_id:
@@ -5612,6 +8382,48 @@ async def _recover_interrupted_submission(
                 completed_at=utc_now(),
             )
             continue
+        if ownership is not None and ownership.state in {
+            "cleanup_confirmed",
+            "terminal_confirmed",
+        }:
+            continue
+        if ownership is not None:
+            exact_evidence = database.get_job_child_execution_evidence(
+                str(child["id"])
+            )
+            if exact_evidence is None:  # Guarded by the typed helper above.
+                raise ExecutionEvidenceConflict(
+                    f"child {child['id']} lost its exact prompt evidence"
+                )
+            frozen_endpoint = exact_evidence[
+                "exact_prompt_snapshot"
+            ].endpoint_identity
+            current_endpoint = request.app.state.endpoint_identity
+            if frozen_endpoint.endpoint_key != current_endpoint.endpoint_key:
+                raise ExecutionEvidenceConflict(
+                    "recovery endpoint does not match the exact prompt endpoint"
+                )
+            if (
+                frozen_endpoint.runtime_instance_id
+                != current_endpoint.runtime_instance_id
+            ):
+                ownership = _mark_typed_prompt_unconfirmed(
+                    database, str(child["id"]), ownership
+                )
+                await _cas_active_child_update(
+                    database,
+                    child,
+                    status="cancelling",
+                    stage="restart_certificate_required",
+                    error=(
+                        "ComfyUI runtime instance changed; explicit restart "
+                        "confirmation is required"
+                    ),
+                    completed_at=None,
+                )
+                has_unconfirmed = True
+                continue
+        ownership = _claim_typed_prompt_cancel(database, child)
         # Reassert ownership in case a previous bounded pass recorded a
         # transient failure.  This closes the race with the normal reconciler
         # before the exact directed cancellation is retried.
@@ -5628,13 +8440,20 @@ async def _recover_interrupted_submission(
                 break
         if child["status"] in _TERMINAL_STATUSES:
             continue
-        prompt_id = str(child["prompt_id"])
+        prompt_id = (
+            ownership.effective_prompt_id
+            if ownership is not None
+            else str(child["prompt_id"])
+        )
         try:
             dispatched = await client.cancel(prompt_id)
         except asyncio.CancelledError:
             raise
         except (ComfyError, httpx.HTTPError) as exc:
             dispatch_errors.append(f"{child['id']}: {exc}")
+            ownership = _mark_typed_prompt_unconfirmed(
+                database, str(child["id"]), ownership
+            )
             await _cas_active_child_update(
                 database,
                 child,
@@ -5645,6 +8464,16 @@ async def _recover_interrupted_submission(
             )
             continue
         if dispatched:
+            if ownership is not None:
+                released = _confirm_typed_exact_cancel(
+                    database,
+                    str(child["id"]),
+                    ownership,
+                    stage="cancelled_after_restart",
+                )
+                if released is None:
+                    has_unconfirmed = True
+                continue
             confirmation = child
             while (
                 confirmation["status"] not in _TERMINAL_STATUSES
@@ -5662,6 +8491,9 @@ async def _recover_interrupted_submission(
                 if committed:
                     break
         else:
+            ownership = _mark_typed_prompt_unconfirmed(
+                database, str(child["id"]), ownership
+            )
             unconfirmed, _ = await _cas_active_child_update(
                 database,
                 child,
@@ -5752,7 +8584,14 @@ async def _run_interrupted_submission_recovery(request: Request) -> None:
                     await _recover_interrupted_submission(request, snapshot)
                 except asyncio.CancelledError:
                     raise
-                except (ComfyError, httpx.HTTPError, HTTPException, KeyError, ValidationError):
+                except (
+                    ComfyError,
+                    ExecutionEvidenceConflict,
+                    httpx.HTTPError,
+                    HTTPException,
+                    KeyError,
+                    ValidationError,
+                ):
                     latest = database.get_job(str(snapshot["id"]))
                     if latest is not None and latest["status"] not in _TERMINAL_STATUSES:
                         database.update_job_if_status(
@@ -5773,9 +8612,12 @@ def create_app(
     database_path: str | Path,
     comfy_url: str,
     comfy_factory: ComfyFactory | None = None,
+    host_capability_provider: HostCapabilityProvider | None = None,
+    host_output_probe: HostOutputProbeProvider | None = None,
     comfy_tls_certfile: str | Path | None = None,
     public_api_prefix: str = "",
     raylight_requirements_path: str | Path | None = None,
+    endpoint_runtime_instance_id: str | None = None,
 ) -> FastAPI:
     set_public_api_prefix(public_api_prefix)
     comfy_url = comfy_url.rstrip("/")
@@ -5814,14 +8656,30 @@ def create_app(
         _comfy_origin: str, event: ComfyProgressEvent | ComfyExecutionEvent
     ) -> None:
         for child in database.find_job_children_by_prompt_id(event.prompt_id):
+            child = _child_with_execution_evidence(database, child)
             parent_status = database.get_job_status(child["job_id"])
             if parent_status is None or parent_status in _TERMINAL_STATUSES:
                 continue
+            phase_index = preview_phase_index_for_event(child, event)
+            if (
+                phase_index is not None
+                and child.get("status") in {"preparing", "queued", "running"}
+            ):
+                # Node/progress events are phase-start evidence even when their
+                # numeric snapshot loses a later monotonic database race.
+                live_preview_cache.advance_phase(
+                    job_id=str(child["job_id"]),
+                    child_id=str(child["id"]),
+                    prompt_id=event.prompt_id,
+                    phase_index=phase_index,
+                )
             snapshot = (
                 child_progress_snapshot(child, event)
                 if isinstance(event, ComfyProgressEvent)
                 else child_execution_snapshot(child, event)
             )
+            if snapshot is None and isinstance(event, ComfyExecutionEvent):
+                snapshot = child_execution_start_snapshot(child, event)
             if snapshot is None:
                 continue
             try:
@@ -5845,26 +8703,38 @@ def create_app(
         _comfy_origin: str, event: ComfyPreviewEvent
     ) -> None:
         for child in database.find_job_children_by_prompt_id(event.prompt_id):
+            child = _child_with_execution_evidence(database, child)
             parent_job_id = str(child["job_id"])
             parent_status = database.get_job_status(parent_job_id)
             if parent_status is None or parent_status in _TERMINAL_STATUSES:
                 continue
-            segment_id = sampler_segment_for_node(child, event.node_id)
-            if segment_id is None:
+            preview_source = preview_source_for_node(child, event.node_id)
+            if preview_source is None:
                 continue
+            segment_id = preview_source.segment_id
             # Re-read both rows at the final cache boundary. DELETE cascades
             # child rows; the cache tombstone closes the inverse ordering where
             # deletion wins immediately before this put.
             latest_parent_status = database.get_job_status(parent_job_id)
             latest_child = database.get_job_child(child["id"])
+            if latest_child is not None:
+                latest_child = _child_with_execution_evidence(
+                    database, latest_child
+                )
             if (
                 latest_parent_status is None
                 or latest_parent_status in _TERMINAL_STATUSES
                 or latest_child is None
                 or latest_child["status"] not in {"queued", "running"}
                 or latest_child.get("prompt_id") != event.prompt_id
-                or sampler_segment_for_node(latest_child, event.node_id)
-                != segment_id
+            ):
+                continue
+            latest_preview_source = preview_source_for_node(
+                latest_child, event.node_id
+            )
+            if (
+                latest_preview_source is None
+                or latest_preview_source.segment_id != segment_id
             ):
                 continue
             live_preview_cache.put(
@@ -5872,6 +8742,10 @@ def create_app(
                 child_id=child["id"],
                 segment_id=segment_id,
                 event=event,
+                source=latest_preview_source,
+                minimum_phase_index=durable_preview_phase_watermark(
+                    latest_child
+                ),
             )
 
     async def wake_native_reconcile(
@@ -5919,6 +8793,10 @@ def create_app(
         )
         try:
             reconcile_wake_event.clear()
+            # Product-owned support configuration is parsed exactly once per
+            # DirectorDeck process. All later consumers read its immutable
+            # in-memory snapshot rather than reopening the JSON file.
+            initialize_directordeck_config()
             database.initialize()
             database.recover_interrupted_assemblies()
             # Startup is intentionally local-only.  The previous process
@@ -5931,11 +8809,36 @@ def create_app(
             progress_manager.ensure(app.state.comfy_url, settings.client_id)
             for snapshot in database.list_active_job_settings():
                 try:
-                    active_settings = RuntimeSettings.model_validate(snapshot)
+                    if (
+                        isinstance(snapshot, Mapping)
+                        and snapshot.get("snapshot_schema_version") == 1
+                    ):
+                        bounded_snapshot = JobRuntimeSnapshotV1.model_validate(
+                            snapshot
+                        )
+                        # Older bounded V1 rows did not capture control-plane
+                        # routing. They remain readable, but startup must not
+                        # guess their original client from mutable settings.
+                        if bounded_snapshot.control_evidence is None:
+                            continue
+                        active_client_id = (
+                            bounded_snapshot.control_evidence.progress_client_id
+                        )
+                    else:
+                        active_settings = (
+                            RuntimeSettingsV3.model_validate(snapshot)
+                            if isinstance(snapshot, Mapping)
+                            and snapshot.get("schema_version") == 3
+                            else RuntimeSettingsV2.model_validate(snapshot)
+                            if isinstance(snapshot, Mapping)
+                            and snapshot.get("schema_version") == 2
+                            else RuntimeSettings.model_validate(snapshot)
+                        )
+                        active_client_id = active_settings.client_id
                 except ValidationError:
                     continue
                 progress_manager.ensure(
-                    app.state.comfy_url, active_settings.client_id
+                    app.state.comfy_url, active_client_id
                 )
             reconciler_task = asyncio.create_task(
                 _run_timeline_reconciler(recovery_request),
@@ -5994,16 +8897,26 @@ def create_app(
     app.state.instance_lock = instance_lock
     app.state.storage = storage
     app.state.comfy_url = comfy_url
+    app.state.endpoint_identity = EndpointIdentity(
+        schema_version=1,
+        endpoint_key=_EMBEDDED_ENDPOINT_KEY,
+        runtime_instance_id=(
+            endpoint_runtime_instance_id or str(uuid.uuid4())
+        ),
+    )
     app.state.comfy_factory = comfy_factory or (
         partial(ComfyClient, verify=comfy_tls_context)
         if comfy_tls_context is not None
         else default_comfy_factory
     )
+    app.state.host_capability_provider = host_capability_provider
+    app.state.host_output_probe = host_output_probe
     app.state.comfy_tls_context = comfy_tls_context
     app.state.progress_manager = progress_manager
     app.state.live_preview_cache = live_preview_cache
     app.state.raylight_install_manager = RayLightInstallManager()
     app.state.ffmpeg_install_manager = FFmpegInstallManager()
+    app.state.project_import_coordinator = ProjectImportCoordinator()
     # The plugin always passes its bundled requirements file; an absent path
     # only means RayLight installation is unavailable for this build.
     app.state.raylight_requirements_path = (
@@ -6052,26 +8965,256 @@ def create_app(
             active_database_path=str(storage.active_database_path)
         )
 
-    @app.get("/api/settings", response_model=RuntimeSettings)
-    async def get_settings(request: Request) -> RuntimeSettings:
+    @app.get("/api/settings", response_model=RuntimeSettingsV3)
+    async def get_settings(request: Request) -> RuntimeSettingsV3:
         return _db(request).get_settings()
 
     @app.get(
         "/api/settings/authority",
-        response_model=RuntimeSettingsAuthorityRead,
+        response_model=RuntimeSettingsAuthorityV3Read,
     )
     async def get_settings_authority(
         request: Request,
-    ) -> RuntimeSettingsAuthorityRead:
+    ) -> RuntimeSettingsAuthorityV3Read:
         settings, authority = _db(request).get_settings_authority()
-        return RuntimeSettingsAuthorityRead(
+        return RuntimeSettingsAuthorityV3Read(
             settings=settings,
             authority_token=authority,
         )
 
-    @app.put("/api/settings", response_model=RuntimeSettings)
-    async def put_settings(request: Request, settings: RuntimeSettings) -> RuntimeSettings:
-        return _db(request).put_settings(settings)
+    @app.get(
+        "/api/settings/migration-notices",
+        response_model=RuntimeSettingsMigrationNoticeListRead,
+    )
+    async def get_runtime_settings_migration_notices(
+        request: Request,
+    ) -> RuntimeSettingsMigrationNoticeListRead:
+        return RuntimeSettingsMigrationNoticeListRead(
+            notices=_db(request).list_runtime_settings_migration_notices()
+        )
+
+    @app.put("/api/settings")
+    async def put_legacy_settings(
+        request: Request, body: dict[str, Any]
+    ) -> Any:
+        # No non-CAS v3 write exists.  Keeping this route as a structured
+        # tombstone also lets stale RuntimeSettingsV1 tabs recover their WAL
+        # instead of receiving an ambiguous validation error.
+        del request, body
+        raise _runtime_settings_schema_migrated()
+
+    @app.put(
+        "/api/settings/authority",
+        response_model=RuntimeSettingsAuthorityV3Read,
+    )
+    async def put_settings_authority(
+        request: Request,
+        body: (
+            RuntimeSettingsAuthorityV1WriteRequest
+            | RuntimeSettingsAuthorityV2WriteRequest
+            | RuntimeSettingsAuthorityV3WriteRequest
+        ),
+    ) -> RuntimeSettingsAuthorityV3Read:
+        if body.schema_version != 3:
+            raise _runtime_settings_schema_migrated()
+        database = _db(request)
+        current, current_authority = database.get_settings_authority()
+        if current_authority != body.expected_authority_token:
+            raise _settings_authority_conflict()
+        issue = _new_disallowed_lora_loader_mapping(current, body.document)
+        if issue is not None:
+            raise _lora_loader_mapping_not_allowed(issue)
+        try:
+            settings, authority = database.put_settings_v3_authority(
+                body.document,
+                expected_authority_token=body.expected_authority_token,
+                schema_version=body.schema_version,
+            )
+        except RuntimeSettingsSchemaMigrated:
+            raise _runtime_settings_schema_migrated() from None
+        except SettingsAuthorityConflict:
+            raise _settings_authority_conflict() from None
+        return RuntimeSettingsAuthorityV3Read(
+            settings=settings,
+            authority_token=authority,
+        )
+
+    @app.get("/api/features/catalog")
+    async def get_feature_catalog(request: Request) -> Response:
+        snapshot = await _host_capability_snapshot(request)
+        catalog = build_feature_catalog(
+            snapshot,
+            template_bundle=CURRENT_TEMPLATE_BUNDLE,
+        )
+        etag = quote_feature_catalog_etag(
+            feature_catalog_etag(
+                template_bundle_version=catalog.template_bundle_version,
+                host_capability_revision=catalog.host_capability_revision,
+            )
+        )
+        if_none_match = request.headers.get("if-none-match")
+        candidates = (
+            {item.strip() for item in if_none_match.split(",")}
+            if if_none_match
+            else set()
+        )
+        if "*" in candidates or etag in candidates:
+            return Response(status_code=304, headers={"ETag": etag})
+        return Response(
+            content=catalog.model_dump_json(),
+            media_type="application/json",
+            headers={"ETag": etag},
+        )
+
+    @app.get("/api/config")
+    async def get_product_config() -> Response:
+        """Return the immutable product configuration loaded at startup."""
+
+        return Response(
+            content=get_directordeck_config().model_dump_json(),
+            media_type="application/json",
+        )
+
+    @app.post(
+        "/api/features/preflight",
+        response_model=FeaturePreflightReport,
+    )
+    async def preflight_features(
+        request: Request,
+        body: FeaturePreflightRequest,
+    ) -> FeaturePreflightReport:
+        # This route is deliberately advisory and read-only.  Submission and
+        # explicit compile recapture and reevaluate all capability evidence.
+        snapshot = await _host_capability_snapshot(request)
+        readiness = _host_operational_readiness(request, snapshot)
+        database = _db(request)
+        project_id = body.project_id or database.LEGACY_DEFAULT_PROJECT_ID
+        if not database.project_exists(project_id):
+            return _feature_preflight_report_from_reason(
+                snapshot=snapshot,
+                readiness=readiness,
+                reason=_project_not_found_reason(),
+            )
+        try:
+            draft_v5 = migrate_timeline_feature_authority_to_v5(
+                body.config or database.get_project_timeline(project_id)
+            )
+        except KeyError:
+            # The project may have been deleted between the scope check and read.
+            return _feature_preflight_report_from_reason(
+                snapshot=snapshot,
+                readiness=readiness,
+                reason=_project_not_found_reason(),
+            )
+        except (ValidationError, ValueError) as exc:
+            return _feature_preflight_report_from_reason(
+                snapshot=snapshot,
+                readiness=readiness,
+                reason=_creative_input_reason(exc),
+            )
+        captured_settings = database.get_settings()
+        try:
+            host_projection = project_v5_contextual_host_authority(
+                draft_v5,
+                captured_settings,
+                body.segment_ids,
+            )
+            draft = host_projection.draft
+            settings = host_projection.settings
+            database.validate_timeline_assets(
+                draft,
+                segment_ids=body.segment_ids,
+            )
+            validate_unified_runnable(draft, segment_ids=body.segment_ids)
+            historical_takes = _resolve_historical_continuity_takes(
+                database,
+                draft,
+                segment_ids=body.segment_ids,
+                project_id=project_id,
+            )
+        except V5CreativeAuthorityError as exc:
+            return _feature_preflight_report_from_reason(
+                snapshot=snapshot,
+                readiness=readiness,
+                reason=_v5_creative_authority_reason(exc),
+            )
+        except (DraftNotRunnable, NativeTemplateError, ValidationError, ValueError) as exc:
+            reason = _creative_input_reason(exc)
+            return _feature_preflight_report_from_reason(
+                snapshot=snapshot,
+                readiness=readiness,
+                reason=reason,
+            )
+        try:
+            client = _comfy(request)
+            contextual_errors = await _contextual_host_errors(
+                client,
+                draft=draft,
+                settings=settings,
+                segment_ids=body.segment_ids,
+                snapshot=snapshot,
+            )
+        except (ComfyError, httpx.HTTPError):
+            return _feature_preflight_report_from_reason(
+                snapshot=snapshot,
+                readiness=readiness,
+                reason=_host_context_observation_reason(),
+            )
+        try:
+            projection = project_v5_compile_authority(
+                draft_v5,
+                captured_settings,
+                body.segment_ids,
+            )
+            draft = projection.draft
+            settings = projection.settings
+        except V5CreativeAuthorityError as exc:
+            return FeaturePreflightReport(
+                template_bundle_version=CURRENT_TEMPLATE_BUNDLE.version,
+                host_capability_revision=snapshot.host_capability_revision(),
+                operational_readiness=readiness,
+                valid=False,
+                errors=(
+                    _v5_creative_authority_reason(exc),
+                    *contextual_errors,
+                ),
+                effective_by_segment={},
+            )
+        try:
+            feature_report = preflight_projected_v5_timeline(
+                draft=draft,
+                settings=settings,
+                effective_features=projection.effective_features,
+                snapshot=snapshot,
+                readiness=readiness,
+                segment_ids=body.segment_ids,
+                historical_takes=historical_takes,
+                resolved_lora_adapters=projection.lora_adapter_map(),
+            )
+        except (
+            NativeTemplateError,
+            DraftNotRunnable,
+            ValidationError,
+            ValueError,
+        ) as exc:
+            reason = _creative_input_reason(exc)
+            return FeaturePreflightReport(
+                template_bundle_version=CURRENT_TEMPLATE_BUNDLE.version,
+                host_capability_revision=snapshot.host_capability_revision(),
+                operational_readiness=readiness,
+                valid=False,
+                errors=(reason, *contextual_errors),
+                effective_by_segment={},
+            )
+        errors = (*feature_report.errors, *contextual_errors)
+        return FeaturePreflightReport(
+            template_bundle_version=feature_report.template_bundle_version,
+            host_capability_revision=feature_report.host_capability_revision,
+            operational_readiness=feature_report.operational_readiness,
+            valid=not errors,
+            errors=errors,
+            effective_by_segment=dict(feature_report.effective_by_segment),
+        )
 
     @app.get("/api/capabilities")
     async def get_capabilities(request: Request) -> dict[str, Any]:
@@ -6327,9 +9470,10 @@ def create_app(
                     status_code=409,
                     detail="RayLight runtime state no longer exists",
                 )
+            legacy_unknown = bool(runtime_state.get("legacy_unknown"))
             tail_prompt_id = runtime_state.get("tail_prompt_id")
             tail_action = runtime_state.get("tail_action")
-            if (
+            if not legacy_unknown and (
                 not isinstance(tail_prompt_id, str)
                 or not tail_prompt_id
                 or tail_action not in {"ray_unit", "shutdown"}
@@ -6346,7 +9490,10 @@ def create_app(
             # Director persisted when it originally reconciled this same tail;
             # otherwise require a fresh exact history result now. The durable
             # certificate is covered by the UI token and final full-state CAS.
-            if not _raylight_runtime_has_terminal_certificate(runtime_state):
+            if (
+                not legacy_unknown
+                and not _raylight_runtime_has_terminal_certificate(runtime_state)
+            ):
                 try:
                     history = await client.history(tail_prompt_id)
                 except (ComfyError, httpx.HTTPError) as exc:
@@ -6463,30 +9610,28 @@ def create_app(
         return _db(request).get_draft(mode)
 
     @app.put("/api/drafts/{mode}")
-    async def put_draft(request: Request, mode: GenerationMode, body: dict[str, Any]) -> Any:
-        database = _db(request)
-        try:
-            draft = validate_mode_draft(mode, body)
-            return database.validate_and_put_draft(
-                mode,
-                draft,
-            )
-        except (ValidationError, ValueError) as exc:
-            raise _validation_error(exc) from exc
+    async def put_draft(
+        request: Request, mode: GenerationMode, body: dict[str, Any]
+    ) -> Any:
+        # The models and read endpoint intentionally remain for historical
+        # display/migration.  Accepting writes would recreate a second
+        # creative authority after the v5 cut-over.
+        del request, mode, body
+        raise _legacy_generation_api_retired()
 
-    @app.get("/api/timeline", response_model=UnifiedTimelineDraft)
-    async def get_timeline(request: Request) -> UnifiedTimelineDraft:
+    @app.get("/api/timeline", response_model=UnifiedTimelineDraftV5)
+    async def get_timeline(request: Request) -> UnifiedTimelineDraftV5:
         return _db(request).get_timeline()
 
-    @app.put("/api/timeline", response_model=UnifiedTimelineDraft)
+    @app.put("/api/timeline")
     async def put_timeline(
-        request: Request, body: UnifiedTimelineDraft
-    ) -> UnifiedTimelineDraft:
+        request: Request, body: dict[str, Any]
+    ) -> Any:
         database = _db(request)
-        try:
-            return database.validate_and_put_timeline(body)
-        except (ValidationError, ValueError) as exc:
-            raise _validation_error(exc) from exc
+        project_id = database.LEGACY_DEFAULT_PROJECT_ID
+        if body.get("version") == 4:
+            raise _timeline_schema_migrated(database, project_id)
+        raise _timeline_authority_required(project_id)
 
     @app.get("/api/timeline/authority", response_model=TimelineAuthorityRead)
     async def get_timeline_authority(request: Request) -> TimelineAuthorityRead:
@@ -6496,14 +9641,23 @@ def create_app(
     @app.put("/api/timeline/authority", response_model=TimelineAuthorityRead)
     async def put_timeline_authority(
         request: Request,
-        body: TimelineAuthorityWriteRequest,
+        body: dict[str, Any],
     ) -> TimelineAuthorityRead:
         database = _db(request)
+        parsed = _parse_v5_timeline_authority_write(
+            database,
+            database.LEGACY_DEFAULT_PROJECT_ID,
+            body,
+        )
         try:
             document, revision = database.validate_and_put_timeline_authority(
-                body.document,
-                expected_revision=body.expected_revision,
+                parsed.document,
+                expected_revision=parsed.expected_revision,
             )
+        except TimelineSchemaMigrated:
+            raise _timeline_schema_migrated(
+                database, database.LEGACY_DEFAULT_PROJECT_ID
+            ) from None
         except TimelineRevisionConflict as exc:
             raise _timeline_revision_conflict(exc) from None
         except TimelineRevisionExhausted as exc:
@@ -6535,15 +9689,127 @@ def create_app(
     async def create_project(
         request: Request, body: ProjectCreateRequest
     ) -> ProjectSummaryRead:
-        project = _db(request).create_project(body.title)
+        project = _db(request).create_project(
+            body.title,
+            initial_model_stack=body.initial_model_stack,
+        )
         return _project_summary(project)
 
-    @app.post("/api/projects/import", response_model=ProjectSummaryRead)
-    async def import_project(
-        request: Request, body: ProjectImportRequest
+    @app.post("/api/projects/import")
+    async def import_project_legacy(
+        request: Request, body: dict[str, Any]
+    ) -> Any:
+        del request, body
+        raise _project_import_preflight_required()
+
+    @app.post(
+        "/api/projects/import/preflight",
+        response_model=ProjectImportPreflightRead,
+    )
+    async def preflight_project_import(
+        request: Request,
+        body: ProjectImportPreflightRequest,
+    ) -> ProjectImportPreflightRead:
+        try:
+            digest, proposed, missing_context, missing_models = (
+                prepare_project_import(
+                    body,
+                    migrate_v4_to_v5=migrate_timeline_v4_to_v5,
+                )
+            )
+        except ProjectImportError as exc:
+            raise _project_import_http_error(exc) from exc
+        if proposed is None:
+            return ProjectImportPreflightRead(
+                status="needs_input",
+                input_digest=digest,
+                missing_context=missing_context,
+                missing_model_bindings=missing_models,
+            )
+        try:
+            _db(request).validate_timeline_assets(proposed)
+        except (ValidationError, ValueError) as exc:
+            reason = _creative_input_reason(exc)
+            return ProjectImportPreflightRead(
+                status="needs_input",
+                input_digest=digest,
+                proposed_document=proposed,
+                missing_context=["assets"],
+                missing_model_bindings=missing_models,
+                capability_issues=[reason.model_dump(mode="json")],
+            )
+        try:
+            capability_issues = await _project_import_capability_issues(
+                request,
+                proposed,
+            )
+            return request.app.state.project_import_coordinator.issue(
+                title=body.title,
+                input_digest=digest,
+                proposed_document=proposed,
+                missing_model_bindings=missing_models,
+                capability_issues=capability_issues,
+            )
+        except ProjectImportError as exc:
+            raise _project_import_http_error(exc) from exc
+
+    @app.post(
+        "/api/projects/import/commit",
+        response_model=ProjectSummaryRead,
+    )
+    async def commit_project_import(
+        request: Request,
+        body: ProjectImportCommitRequest,
     ) -> ProjectSummaryRead:
-        project = _db(request).import_project(body.title, body.document)
+        try:
+            title, proposed = (
+                request.app.state.project_import_coordinator.consume(body)
+            )
+            database = _db(request)
+            # ``import_project`` revalidates assets and inserts under one
+            # BEGIN IMMEDIATE transaction, closing the preflight/delete race.
+            project = database.import_project(title, proposed)
+        except ProjectImportError as exc:
+            raise _project_import_http_error(exc) from exc
+        except (ValidationError, ValueError) as exc:
+            raise _creative_input_http_error(_creative_input_reason(exc)) from exc
         return _project_summary(project)
+
+    @app.get(
+        "/api/projects/{project_id}/migration-receipts/latest",
+        response_model=ProjectMigrationReceipt,
+    )
+    async def get_latest_project_migration_receipt(
+        request: Request,
+        project_id: str,
+        from_schema: Annotated[int, Query(alias="from", ge=1)] = 4,
+        to_schema: Annotated[int, Query(alias="to", ge=2)] = 5,
+    ) -> ProjectMigrationReceipt:
+        receipt = _db(request).get_latest_project_migration_receipt(
+            project_id,
+            from_schema=from_schema,
+            to_schema=to_schema,
+        )
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="migration receipt not found")
+        return receipt
+
+    @app.get(
+        "/api/projects/{project_id}/migration-receipts/{migration_id}",
+        response_model=ProjectMigrationReceipt,
+    )
+    async def get_project_migration_receipt(
+        request: Request,
+        project_id: str,
+        migration_id: str,
+    ) -> ProjectMigrationReceipt:
+        receipt = _db(request).get_project_migration_receipt(
+            project_id,
+            migration_id,
+        )
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="migration receipt not found")
+        return receipt
 
     @app.get("/api/projects/{project_id}", response_model=ProjectSummaryRead)
     async def get_project(request: Request, project_id: str) -> ProjectSummaryRead:
@@ -6552,17 +9818,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="project not found")
         return _project_summary(project)
 
-    @app.patch("/api/projects/{project_id}", response_model=ProjectSummaryRead)
-    async def rename_project(
-        request: Request, project_id: str, body: ProjectRenameRequest
-    ) -> ProjectSummaryRead:
-        try:
-            project = _db(request).rename_project(project_id, body.title)
-        except KeyError:
-            raise HTTPException(status_code=404, detail="project not found") from None
-        except ValueError as exc:
-            raise _validation_error(exc) from exc
-        return _project_summary(project)
+    @app.patch("/api/projects/{project_id}")
+    async def rename_project(project_id: str) -> None:
+        raise _project_rename_api_retired(project_id)
 
     @app.delete("/api/projects/{project_id}", response_model=ProjectDeleteRead)
     async def delete_project(
@@ -6588,33 +9846,26 @@ def create_app(
 
     @app.get(
         "/api/projects/{project_id}/timeline",
-        response_model=UnifiedTimelineDraft,
+        response_model=UnifiedTimelineDraftV5,
     )
     async def get_project_timeline(
         request: Request, project_id: str
-    ) -> UnifiedTimelineDraft:
+    ) -> UnifiedTimelineDraftV5:
         try:
             return _db(request).get_project_timeline(project_id)
         except KeyError:
             raise HTTPException(status_code=404, detail="project not found") from None
 
-    @app.put(
-        "/api/projects/{project_id}/timeline",
-        response_model=UnifiedTimelineDraft,
-    )
+    @app.put("/api/projects/{project_id}/timeline")
     async def put_project_timeline(
-        request: Request, project_id: str, body: UnifiedTimelineDraft
-    ) -> UnifiedTimelineDraft:
+        request: Request, project_id: str, body: dict[str, Any]
+    ) -> Any:
         database = _db(request)
-        try:
-            return database.validate_and_put_project_timeline(
-                project_id,
-                body,
-            )
-        except KeyError:
+        if database.get_project(project_id) is None:
             raise HTTPException(status_code=404, detail="project not found") from None
-        except (ValidationError, ValueError) as exc:
-            raise _validation_error(exc) from exc
+        if body.get("version") == 4:
+            raise _timeline_schema_migrated(database, project_id)
+        raise _timeline_authority_required(project_id)
 
     @app.get(
         "/api/projects/{project_id}/timeline/authority",
@@ -6638,19 +9889,28 @@ def create_app(
     async def put_project_timeline_authority(
         request: Request,
         project_id: str,
-        body: TimelineAuthorityWriteRequest,
+        body: dict[str, Any],
     ) -> TimelineAuthorityRead:
         database = _db(request)
+        if database.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        parsed = _parse_v5_timeline_authority_write(
+            database,
+            project_id,
+            body,
+        )
         try:
             document, revision = (
                 database.validate_and_put_project_timeline_authority(
                     project_id,
-                    body.document,
-                    expected_revision=body.expected_revision,
+                    parsed.document,
+                    expected_revision=parsed.expected_revision,
                 )
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="project not found") from None
+        except TimelineSchemaMigrated:
+            raise _timeline_schema_migrated(database, project_id) from None
         except TimelineRevisionConflict as exc:
             raise _timeline_revision_conflict(exc) from None
         except TimelineRevisionExhausted as exc:
@@ -6677,8 +9937,6 @@ def create_app(
     async def create_project_job(
         request: Request, project_id: str, body: TimelineJobRequest
     ) -> JobRead:
-        if _db(request).get_project(project_id) is None:
-            raise HTTPException(status_code=404, detail="project not found")
         return await _create_timeline_job(request, body, project_id=project_id)
 
     @app.get("/api/assets", response_model=AssetListRead)
@@ -7062,37 +10320,18 @@ def create_app(
 
     @app.post("/api/jobs", response_model=JobRead)
     async def create_job(
-        request: Request, body: CreateJobRequest | TimelineJobRequest
+        request: Request, body: dict[str, Any]
     ) -> JobRead:
         # Generic job creation accepts the new unified contract as well as the
         # legacy six-mode body.  The explicit /api/timeline/jobs route remains
         # the clearest client API, while this keeps automation on /api/jobs.
-        if isinstance(body, TimelineJobRequest):
-            return await _create_timeline_job(request, body)
-        database = _db(request)
+        if "mode" in body:
+            raise _legacy_generation_api_retired()
         try:
-            draft = (
-                validate_mode_draft(body.mode, body.config)
-                if body.config is not None
-                else database.get_draft(body.mode)
-            )
-            # Preserve the declared six-recipe semantics at the legacy API
-            # boundary. Converting an unfinished I2V/FL2V/R2V/V2V draft into
-            # the v2 family shape first could otherwise make missing media
-            # derive a different runnable recipe (for example I2V -> T2V).
-            validate_runnable(draft)
-            database.validate_draft_assets(draft)
-        except (DraftNotRunnable, ValidationError, ValueError) as exc:
+            timeline_request = TimelineJobRequest.model_validate(body)
+        except ValidationError as exc:
             raise _validation_error(exc) from exc
-        # Legacy clients retain their request/response mode, but the hidden
-        # execution path is the same native timeline compiler and child-job
-        # orchestrator. No endpoint can submit a Director workflow anymore.
-        timeline = mode_draft_to_timeline(draft, title=f"旧版 {body.mode} 任务")
-        return await _create_timeline_job(
-            request,
-            TimelineJobRequest(config=timeline),
-            parent_mode=body.mode,
-        )
+        return await _create_timeline_job(request, timeline_request)
 
     @app.get("/api/tasks/events")
     async def task_events(request: Request) -> StreamingResponse:
@@ -7181,10 +10420,11 @@ def create_app(
             # queue/history I/O and persists the next observable snapshot.
             snapshot["children"] = children_by_job[str(snapshot["id"])]
             jobs.append(snapshot)
-        current_timeline, current_settings = _job_read_context_for_project(
+        active_project_id, current_timeline, current_settings = _job_read_context_for_project(
             request,
             project_id,
         )
+        execution_digest_cache: dict[str, Any] = {}
         return JobListRead(
             jobs=[
                 _job_read_for_request(
@@ -7192,6 +10432,8 @@ def create_app(
                     job,
                     current_timeline=current_timeline,
                     current_settings=current_settings,
+                    current_project_id=active_project_id,
+                    current_execution_digest_cache=execution_digest_cache,
                 )
                 for job in jobs
             ],
@@ -7213,6 +10455,7 @@ def create_app(
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         job["children"] = database.list_job_children(job_id)
+        job = _job_with_parent_output_authority(database, job)
         return _job_read_for_project_scope(
             request,
             job,
@@ -7307,17 +10550,22 @@ def create_app(
     async def get_job_project(
         request: Request, job_id: str
     ) -> JobProjectSnapshotRead:
-        """Return only the typed source project, never runtime or workflow data."""
+        """Return a v5 creative view resolved only from immutable job evidence."""
 
         job = _db(request).get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        project = _job_timeline_snapshot(job)
-        if project is None:
-            raise HTTPException(
-                status_code=409,
-                detail="this historical task has no compatible project snapshot",
+        try:
+            project = resolve_historical_creative_input(
+                job,
+                migrate_v4_to_v5=migrate_timeline_v4_to_v5,
             )
+        except (HistoricalCreativeInputError, ProjectImportError) as exc:
+            if isinstance(exc, ProjectImportError):
+                historical = HistoricalCreativeInputError(exc.code, exc.message)
+            else:
+                historical = exc
+            raise _historical_creative_http_error(historical) from exc
         snapshot = job.get("config_snapshot")
         raw_segment_ids = (
             snapshot.get("segment_ids") if isinstance(snapshot, dict) else None
@@ -7332,6 +10580,41 @@ def create_app(
             project=project,
             segment_ids=segment_ids,
         )
+
+    @app.post(
+        "/api/jobs/{job_id}/save-as-project",
+        response_model=ProjectSummaryRead,
+    )
+    async def save_historical_job_as_project(
+        request: Request,
+        job_id: str,
+        body: HistoricalSaveAsProjectRequest,
+    ) -> ProjectSummaryRead:
+        """Create a fresh project scope without copying any historical ledger."""
+
+        database = _db(request)
+        job = database.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        try:
+            project = resolve_historical_creative_input(
+                job,
+                migrate_v4_to_v5=migrate_timeline_v4_to_v5,
+            )
+            if body.title.strip():
+                project = project.model_copy(
+                    update={"title": body.title.strip()}
+                )
+            saved = database.import_project(body.title, project)
+        except (HistoricalCreativeInputError, ProjectImportError) as exc:
+            if isinstance(exc, ProjectImportError):
+                historical = HistoricalCreativeInputError(exc.code, exc.message)
+            else:
+                historical = exc
+            raise _historical_creative_http_error(historical) from exc
+        except (ValidationError, ValueError) as exc:
+            raise _creative_input_http_error(_creative_input_reason(exc)) from exc
+        return _project_summary(saved)
 
     @app.post(
         "/api/jobs/{job_id}/import-output",
@@ -7355,6 +10638,7 @@ def create_app(
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         job["children"] = database.list_job_children(job_id)
+        job = _job_with_parent_output_authority(database, job)
         try:
             asset = await import_job_output_as_asset(
                 registry=database,
@@ -7370,6 +10654,98 @@ def create_app(
         except (ComfyError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return JobOutputImportRead(asset=asset)
+
+    @app.post("/api/jobs/{job_id}/retry", response_model=JobRead)
+    async def retry_job(request: Request, job_id: str) -> JobRead:
+        """Create a fresh job from historical creative config only.
+
+        No compiled, exact-prompt, child, prompt-id, or runtime ledger state is
+        copied.  The normal creation path therefore performs current schema
+        validation, model inspection, capability preflight, compilation, and
+        creates an entirely new execution-evidence lineage.
+        """
+
+        database = _db(request)
+        source = database.get_job(job_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        dispatcher = request.app.state.submission_jobs.get(job_id)
+        if dispatcher is not None and not dispatcher.done():
+            raise HTTPException(
+                status_code=409,
+                detail="job submission still owns prompt side effects",
+            )
+
+        children = database.list_job_children(job_id)
+        unreleased: list[str] = []
+        for child in children:
+            try:
+                ownership = _typed_prompt_ownership_for_child(database, child)
+            except ExecutionEvidenceConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if ownership is not None:
+                if ownership.state not in {
+                    "cleanup_confirmed",
+                    "terminal_confirmed",
+                }:
+                    unreleased.append(str(child["id"]))
+            elif (
+                source["status"] not in _TERMINAL_STATUSES
+                and child.get("prompt_id")
+            ):
+                # Legacy jobs have no structured ownership evidence.  Their
+                # active prompt projection remains the conservative gate.
+                unreleased.append(str(child["id"]))
+        if unreleased:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "job still owns one or more ComfyUI prompts: "
+                    + ", ".join(unreleased)
+                ),
+            )
+
+        # Retry is a new write and therefore must start from the strict v5
+        # creative view. Historical v4 jobs are upgraded only through their
+        # own immutable settings snapshot by the historical resolver; the
+        # display-only v4 projection is never submitted back to the v5 API.
+        timeline = _job_v5_creative_snapshot(source)
+        if timeline is None:
+            raise HTTPException(
+                status_code=409,
+                detail="historical job config cannot migrate to the current schema",
+            )
+        config_snapshot = source.get("config_snapshot")
+        raw_segment_ids = (
+            config_snapshot.get("segment_ids")
+            if isinstance(config_snapshot, dict)
+            else None
+        )
+        try:
+            segment_ids = (
+                [str(value) for value in raw_segment_ids]
+                if isinstance(raw_segment_ids, list)
+                else None
+            )
+            retry_body = TimelineJobRequest(
+                config=timeline,
+                segment_ids=segment_ids,
+            )
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="historical job selection cannot migrate to the current schema",
+            ) from exc
+        return await _create_timeline_job(
+            request,
+            retry_body,
+            parent_mode=str(source["mode"]),
+            project_id=(
+                str(source["project_id"])
+                if source.get("project_id") is not None
+                else None
+            ),
+        )
 
     @app.delete("/api/jobs/{job_id}", response_model=JobDeleteRead)
     async def delete_job(request: Request, job_id: str) -> JobDeleteRead:
@@ -7400,6 +10776,14 @@ def create_app(
             deleted = database.delete_job_if_status(job_id, job["status"])
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="job not found") from exc
+        except ExecutionEvidenceConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "job still owns unresolved ComfyUI prompt evidence; "
+                    "complete cancellation or recovery before deleting it"
+                ),
+            ) from exc
         if not deleted:
             raise HTTPException(
                 status_code=409,
@@ -7458,10 +10842,13 @@ def create_app(
                 ),
             )
         try:
-            settled = _db(request).confirm_comfy_restart_recovery(job_id)
+            settled = _db(request).confirm_comfy_restart_recovery(
+                job_id,
+                current_endpoint_identity=request.app.state.endpoint_identity,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="job not found") from exc
-        except ValueError as exc:
+        except (ExecutionEvidenceConflict, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         request.app.state.live_preview_cache.discard(job_id)
         settled["children"] = _db(request).list_job_children(job_id)
@@ -7475,8 +10862,9 @@ def create_app(
         request: Request,
         job_id: str,
         *,
-        current_timeline: UnifiedTimelineDraft | None,
-        current_settings: RuntimeSettings,
+        current_project_id: str,
+        current_timeline: UnifiedTimelineDraftV5 | None,
+        current_settings: RuntimeSettingsV3,
     ) -> JobRead:
         def read_job(snapshot: dict[str, Any]) -> JobRead:
             return _job_read_for_request(
@@ -7484,6 +10872,7 @@ def create_app(
                 snapshot,
                 current_timeline=current_timeline,
                 current_settings=current_settings,
+                current_project_id=current_project_id,
             )
 
         database = _db(request)
@@ -7606,16 +10995,20 @@ def create_app(
         job_id: str,
         project_id: Annotated[str | None, Query(max_length=128)] = None,
     ) -> JobRead:
-        current_timeline, current_settings = _job_read_context_for_project(
+        active_project_id, current_timeline, current_settings = _job_read_context_for_project(
             request,
             project_id,
         )
-        return await _cancel_job_with_read_context(
-            request,
-            job_id,
-            current_timeline=current_timeline,
-            current_settings=current_settings,
-        )
+        try:
+            return await _cancel_job_with_read_context(
+                request,
+                job_id,
+                current_project_id=active_project_id,
+                current_timeline=current_timeline,
+                current_settings=current_settings,
+            )
+        except ExecutionEvidenceConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/jobs/cancel", response_model=JobBulkCancelRead)
     async def cancel_jobs(
@@ -7637,20 +11030,24 @@ def create_app(
                 status_code=404,
                 detail="job not found: " + ", ".join(missing),
             )
-        current_timeline, current_settings = _job_read_context_for_project(
+        active_project_id, current_timeline, current_settings = _job_read_context_for_project(
             request,
             project_id,
         )
         results: list[JobRead] = []
         for job_id in body.job_ids:
-            results.append(
-                await _cancel_job_with_read_context(
-                    request,
-                    job_id,
-                    current_timeline=current_timeline,
-                    current_settings=current_settings,
+            try:
+                results.append(
+                    await _cancel_job_with_read_context(
+                        request,
+                        job_id,
+                        current_project_id=active_project_id,
+                        current_timeline=current_timeline,
+                        current_settings=current_settings,
+                    )
                 )
-            )
+            except ExecutionEvidenceConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JobBulkCancelRead(
             jobs=results,
             requested_count=len(body.job_ids),
@@ -7693,7 +11090,10 @@ def create_app(
             raise HTTPException(status_code=404, detail="job not found")
         # Segment takes are durable child-row outputs. Do not trigger queue,
         # history, or whole-timeline assembly merely to proxy an existing take.
-        job["children"] = database.list_job_children(job_id)
+        job["children"] = [
+            _child_with_execution_evidence(database, child)
+            for child in database.list_job_children(job_id)
+        ]
         matches = _segment_output_candidates(job).get(segment_id, [])
         if not matches:
             raise HTTPException(status_code=404, detail="segment output not found")
@@ -7727,9 +11127,12 @@ def create_app(
         job = database.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        if index >= len(job["outputs"]):
+        job["children"] = database.list_job_children(job_id)
+        job = _job_with_parent_output_authority(database, job)
+        outputs = authoritative_parent_outputs(job)
+        if index >= len(outputs):
             raise HTTPException(status_code=404, detail="job output not found")
-        output = job["outputs"][index]
+        output = outputs[index]
         try:
             return await _proxy_comfy_media(
                 _comfy(request),

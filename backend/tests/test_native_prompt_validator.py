@@ -54,7 +54,7 @@ def _nodes(
             }
 
     return SimpleNamespace(
-        NODE_CLASS_MAPPINGS={"RayInitializerAdvanced": Initializer}
+        NODE_CLASS_MAPPINGS={"DirectorDeckRayInitializerAdvanced": Initializer}
     )
 
 
@@ -83,7 +83,7 @@ def test_compiled_raylight_contract_requires_explicit_ck() -> None:
                     backend="raylight",
                     prompt={
                         "1": {
-                            "class_type": "RayInitializerAdvanced",
+                            "class_type": "DirectorDeckRayInitializerAdvanced",
                             "inputs": {"XFuser_attention": value},
                         }
                     },
@@ -96,3 +96,23 @@ def test_compiled_raylight_contract_requires_explicit_ck() -> None:
     ) == []
     failures = _validate_compiled_raylight_attention([result("TORCH_FLASH")])
     assert any("must be explicitly COMFY_KITCHEN_INT8" in failure for failure in failures)
+
+
+def test_validator_raylight_fixture_explicitly_enables_multi_gpu() -> None:
+    settings = _VALIDATOR._raylight_settings()
+
+    assert settings.multi_gpu_enabled is True
+    assert settings.models.fl2va.raylight.gpu_select == [0, 1]
+    assert settings.models.ref2va.raylight.gpu_select == [0, 1]
+
+
+def test_validator_standard_lora_fixtures_use_visible_exact_overrides() -> None:
+    for loader in ("model_only", "bypass_model_only"):
+        settings = _VALIDATOR._standard_lora_settings(loader)
+        binding = settings.models.fl2va
+        override = binding.standard_lora_loader_override
+
+        assert override is not None
+        assert override.loader == loader
+        assert override.lora_name == binding.lora_name
+        assert override.model_filename == binding.filename

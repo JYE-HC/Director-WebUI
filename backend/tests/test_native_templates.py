@@ -5,7 +5,6 @@ from copy import deepcopy
 import pytest
 from pydantic import ValidationError
 
-import directordeck.native_templates as native_templates_module
 from directordeck.native_templates import (
     EXPECTED_NATIVE_NODE_MODULES,
     NativeCompileResult,
@@ -20,8 +19,19 @@ from directordeck.native_templates import (
     raylight_workflow_logical_gpu_indices,
     validate_native_capabilities,
     validate_native_workflow_ready,
+    validate_native_workflow_runtime_effects,
 )
-from directordeck.schemas import RuntimeSettings, UnifiedTimelineDraft, default_settings
+from directordeck.schemas import (
+    LoraLoaderOverrideRecord,
+    RuntimeSettings,
+    UnifiedTimelineDraft,
+    default_settings,
+)
+from directordeck.workflow.lora_factory import (
+    LoraLoaderBindingKey,
+    ResolvedLoraAdapter,
+    resolve_standard_lora_adapter,
+)
 
 
 def _asset(kind: str, name: str, *, slot: int | None = None) -> dict:
@@ -126,6 +136,34 @@ def _settings(
             "cpu_offload": False,
         }
     return RuntimeSettings.model_validate(value)
+
+
+def _resolved_standard_lora(
+    settings: RuntimeSettings,
+    family: str,
+    *,
+    adapter_id: str | None = None,
+) -> dict[str, ResolvedLoraAdapter]:
+    binding = getattr(settings.models, family)
+    assert binding.lora_name is not None
+    exact_binding = LoraLoaderBindingKey(
+        family=family,
+        model_filename=binding.filename,
+        lora_filename=binding.lora_name,
+    )
+    overrides = (
+        ()
+        if adapter_id is None
+        else (
+            LoraLoaderOverrideRecord(
+                family=family,
+                model_filename=exact_binding.model_filename,
+                lora_filename=exact_binding.lora_filename,
+                adapter_id=adapter_id,
+            ),
+        )
+    )
+    return {family: resolve_standard_lora_adapter(exact_binding, overrides)}
 
 
 def _continuity_draft(
@@ -243,12 +281,12 @@ def test_raylight_substitutes_only_model_and_sampler_path(mode: str) -> None:
     types = _types(unit.prompt)
     assert unit.backend == "raylight"
     assert {
-        "RayInitializerAdvanced",
-        "RayUNETLoader",
-        "RayMiniMaxH3SigmaShift",
-        "RayBasicGuider",
-        "RayBasicScheduler",
-        "XFuserSamplerCustomAdvanced",
+        "DirectorDeckRayInitializerAdvanced",
+        "DirectorDeckRayUNETLoader",
+        "DirectorDeckRayMiniMaxH3SigmaShift",
+        "DirectorDeckRayBasicGuider",
+        "DirectorDeckRayBasicScheduler",
+        "DirectorDeckRayXFuserSamplerCustomAdvanced",
     } <= types
     assert {
         "UNETLoader",
@@ -263,7 +301,7 @@ def test_raylight_substitutes_only_model_and_sampler_path(mode: str) -> None:
     assert {"VAEDecode", "VAEDecodeAudio", "CreateVideo", "SaveVideo"} <= types
     initializer = next(
         node for node in unit.prompt.values()
-        if node["class_type"] == "RayInitializerAdvanced"
+        if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
     )["inputs"]
     assert initializer["GPU"] == 2
     assert initializer["GPU_SELECT"] == "0,1"
@@ -279,8 +317,8 @@ def test_raylight_substitutes_only_model_and_sampler_path(mode: str) -> None:
     [
         ("t2v", "fl2va", "standard", "BasicScheduler"),
         ("r2v", "ref2va", "standard", "BasicScheduler"),
-        ("t2v", "fl2va", "raylight", "RayBasicScheduler"),
-        ("r2v", "ref2va", "raylight", "RayBasicScheduler"),
+        ("t2v", "fl2va", "raylight", "DirectorDeckRayBasicScheduler"),
+        ("r2v", "ref2va", "raylight", "DirectorDeckRayBasicScheduler"),
     ],
 )
 def test_beta_scheduler_reaches_native_standard_and_raylight_prompts(
@@ -323,7 +361,7 @@ def test_keyed_raylight_policy_keeps_compatible_workflows_resident() -> None:
         node["inputs"]
         for unit in result.workflows
         for node in unit.prompt.values()
-        if node["class_type"] == "RayInitializerAdvanced"
+        if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
     ]
     assert len(initializers) == 2
     assert all(
@@ -355,7 +393,7 @@ def test_shared_endpoint_default_releases_raylight_worker_model() -> None:
     initializer = next(
         node["inputs"]
         for node in result.workflows[0].prompt.values()
-        if node["class_type"] == "RayInitializerAdvanced"
+        if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
     )
 
     assert initializer["clear_vram_after_sampling"] is True
@@ -402,26 +440,54 @@ def test_raylight_epoch_changes_initializer_and_shutdown_barrier_is_forced() -> 
         first_descriptor, unit_id="switch-test"
     )
     assert _types(barrier.prompt) == {
-        "RayInitializerAdvanced",
-        "RayUNETLoader",
-        "RayKill",
+        "DirectorDeckRayInitializerAdvanced",
+        "DirectorDeckRayUNETLoader",
+        "DirectorDeckRayKill",
     }
     barrier_initializer = next(
         node["inputs"]
         for node in barrier.prompt.values()
-        if node["class_type"] == "RayInitializerAdvanced"
+        if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
     )
     assert barrier_initializer["driver_cleanup_policy"] == "ray_devices"
     loader_id = next(
         node_id for node_id, node in barrier.prompt.items()
-        if node["class_type"] == "RayUNETLoader"
+        if node["class_type"] == "DirectorDeckRayUNETLoader"
     )
     kill = next(
         node for node in barrier.prompt.values()
-        if node["class_type"] == "RayKill"
+        if node["class_type"] == "DirectorDeckRayKill"
     )
     assert kill["inputs"]["ray_actors"] == [loader_id, 0]
     assert kill["inputs"]["kill_mode"] == "Kill Entire Cluster"
+
+
+def test_unbound_raylight_unit_is_not_submission_ready() -> None:
+    unit = compile_native_timeline(
+        _draft("t2v"), _settings(fl_backend="raylight"), "job-unbound-epoch"
+    ).workflows[0]
+
+    with pytest.raises(NativeTemplateError, match="exact bound runtime epoch evidence"):
+        validate_native_workflow_ready(unit)
+
+    validate_native_workflow_ready(bind_raylight_runtime_epoch(unit, 1))
+
+
+def test_raylight_ready_rejects_namespace_changed_after_exact_binding() -> None:
+    unit = compile_native_timeline(
+        _draft("t2v"), _settings(fl_backend="raylight"), "job-tampered-epoch"
+    ).workflows[0]
+    bound = bind_raylight_runtime_epoch(unit, 1)
+    tampered = deepcopy(bound)
+    initializer = next(
+        node
+        for node in tampered.prompt.values()
+        if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
+    )
+    initializer["inputs"]["ray_cluster_namespace"] = "evil-e1"
+
+    with pytest.raises(NativeTemplateError, match="exact bound runtime epoch evidence"):
+        validate_native_workflow_ready(tampered)
 
 
 def test_raylight_runtime_gpu_identity_is_strict_and_lossless() -> None:
@@ -478,7 +544,7 @@ def test_raylight_runtime_key_includes_driver_cleanup_policy() -> None:
     legacy_initializer = next(
         node
         for node in legacy_unit.prompt.values()
-        if node["class_type"] == "RayInitializerAdvanced"
+        if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
     )
     legacy_initializer["inputs"]["driver_cleanup_policy"] = "legacy_all"
 
@@ -495,7 +561,6 @@ def test_raylight_runtime_key_includes_driver_cleanup_policy() -> None:
 
 
 def test_raylight_attention_changes_namespace_and_runtime_identity_and_barrier_replays_old_value(
-    monkeypatch,
 ) -> None:
     settings = _settings(fl_backend="raylight")
     ck_unit = compile_native_timeline(
@@ -504,15 +569,19 @@ def test_raylight_attention_changes_namespace_and_runtime_identity_and_barrier_r
     ck_descriptor = raylight_runtime_descriptor(ck_unit)
     assert ck_descriptor is not None
 
-    with monkeypatch.context() as context:
-        context.setattr(
-            native_templates_module,
-            "_RAYLIGHT_XFUSER_ATTENTION",
-            "TORCH_FLASH",
-        )
-        legacy_unit = compile_native_timeline(
-            _draft("t2v"), settings, "job-attention-torch-flash"
-        ).workflows[0]
+    # Simulate a persisted pre-strict runtime descriptor.  New segment
+    # compilation must never create TORCH_FLASH, but an upgrade still needs to
+    # replay the old loader chain far enough to submit its DirectorDeckRayKill barrier.
+    legacy_unit = deepcopy(ck_unit)
+    legacy_initializer = next(
+        node
+        for node in legacy_unit.prompt.values()
+        if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
+    )
+    legacy_initializer["inputs"].update(
+        XFuser_attention="TORCH_FLASH",
+        ray_cluster_namespace="director-legacy-torch-flash-e1",
+    )
     legacy_descriptor = raylight_runtime_descriptor(legacy_unit)
     assert legacy_descriptor is not None
 
@@ -529,7 +598,7 @@ def test_raylight_attention_changes_namespace_and_runtime_identity_and_barrier_r
     barrier_initializer = next(
         node
         for node in barrier.prompt.values()
-        if node["class_type"] == "RayInitializerAdvanced"
+        if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
     )
     assert barrier_initializer["inputs"]["XFuser_attention"] == "TORCH_FLASH"
 
@@ -549,18 +618,18 @@ def test_raylight_shutdown_barrier_preserves_optional_lora_loader_chain() -> Non
 
     barrier = build_raylight_shutdown_unit(descriptor, unit_id="switch-lora")
     assert _types(barrier.prompt) == {
-        "RayInitializerAdvanced",
-        "RayLoraLoader",
-        "RayUNETLoader",
-        "RayKill",
+        "DirectorDeckRayInitializerAdvanced",
+        "DirectorDeckRayLoraLoader",
+        "DirectorDeckRayUNETLoader",
+        "DirectorDeckRayKill",
     }
     loader = next(
         node for node in barrier.prompt.values()
-        if node["class_type"] == "RayUNETLoader"
+        if node["class_type"] == "DirectorDeckRayUNETLoader"
     )
     lora_id = next(
         node_id for node_id, node in barrier.prompt.items()
-        if node["class_type"] == "RayLoraLoader"
+        if node["class_type"] == "DirectorDeckRayLoraLoader"
     )
     assert loader["inputs"]["lora"] == [lora_id, 0]
 
@@ -805,9 +874,9 @@ def test_capability_preflight_reports_missing_fixed_node() -> None:
         "job-capability",
     )
     available = set(result.node_policy["allowed_nodes"])
-    available.remove("RayUNETLoader")
+    available.remove("DirectorDeckRayUNETLoader")
 
-    with pytest.raises(NativeTemplateError, match="RayUNETLoader"):
+    with pytest.raises(NativeTemplateError, match="DirectorDeckRayUNETLoader"):
         validate_native_capabilities(result, available)
 
 
@@ -854,7 +923,7 @@ def test_gpu_pool_is_the_only_backend_route_and_hidden_lora_flags_are_ignored() 
     automatic_lora = compile_native_timeline(
         _draft("t2v"), unsupported_lora_option, "job-ray-lora-low-vram"
     )
-    assert "RayLoraLoader" in _types(automatic_lora.workflows[0].prompt)
+    assert "DirectorDeckRayLoraLoader" in _types(automatic_lora.workflows[0].prompt)
 
 
 def test_auto_backend_and_explicit_standard_device_are_fail_closed() -> None:
@@ -889,8 +958,8 @@ def test_auto_backend_and_explicit_standard_device_are_fail_closed() -> None:
     assert raylight.workflows[0].backend == "raylight"
 
     available = set(raylight.node_policy["allowed_nodes"])
-    available.remove("RayUNETLoader")
-    with pytest.raises(NativeTemplateError, match="RayUNETLoader"):
+    available.remove("DirectorDeckRayUNETLoader")
+    with pytest.raises(NativeTemplateError, match="DirectorDeckRayUNETLoader"):
         validate_native_capabilities(raylight, available)
 
 
@@ -913,7 +982,7 @@ def test_raylight_pool_requires_multi_gpu_enabled() -> None:
     assert enabled.workflows[0].backend == "raylight"
 
 
-def test_runtime_capability_check_rejects_same_name_custom_node_override() -> None:
+def test_runtime_capability_check_does_not_pin_host_owned_node_module() -> None:
     result = compile_native_timeline(_draft("t2v"), _settings(), "job-provenance")
     provenance = {
         node: EXPECTED_NATIVE_NODE_MODULES[node]
@@ -924,10 +993,24 @@ def test_runtime_capability_check_rejects_same_name_custom_node_override() -> No
     )
 
     provenance["UNETLoader"] = "custom_nodes.lookalike"
-    with pytest.raises(NativeTemplateError, match="UNETLoader.*comfy-core"):
-        validate_native_capabilities(
-            result, set(result.node_policy["allowed_nodes"]), provenance
-        )
+    validate_native_capabilities(
+        result, set(result.node_policy["allowed_nodes"]), provenance
+    )
+
+
+def test_runtime_capability_check_does_not_authorize_raylight_by_provenance() -> None:
+    result = compile_native_timeline(
+        _draft("t2v"), _settings(fl_backend="raylight"), "job-ray-provenance"
+    )
+    provenance = {
+        node: EXPECTED_NATIVE_NODE_MODULES[node]
+        for node in result.node_policy["provenance"]
+    }
+    provenance["DirectorDeckRayUNETLoader"] = "custom_nodes.lookalike"
+
+    validate_native_capabilities(
+        result, set(result.node_policy["allowed_nodes"]), provenance
+    )
 
 
 def test_raylight_namespace_is_stable_per_topology_not_per_job() -> None:
@@ -940,7 +1023,7 @@ def test_raylight_namespace_is_stable_per_topology_not_per_job() -> None:
         initializer = next(
             node
             for node in unit.prompt.values()
-            if node["class_type"] == "RayInitializerAdvanced"
+            if node["class_type"] == "DirectorDeckRayInitializerAdvanced"
         )
         return initializer["inputs"]["ray_cluster_namespace"]
 
@@ -975,6 +1058,7 @@ def test_continuity_builds_unresolved_predecessor_graph_and_binds_output() -> No
     assert successor.continuity.predecessor_segment_id == "segment-1"
     assert successor.continuity.overlap_frames == 22
     assert successor.continuity.resolved is False
+    validate_native_workflow_runtime_effects(successor)
     with pytest.raises(NativeTemplateError, match="waiting for predecessor"):
         validate_native_workflow_ready(successor)
 
@@ -1079,6 +1163,30 @@ def test_raylight_epoch_binding_preserves_resolved_continuity_metadata() -> None
 
     assert epoch_bound.continuity == bound.continuity
     validate_native_workflow_ready(epoch_bound)
+
+
+def test_continuity_ready_rejects_file_changed_after_exact_binding() -> None:
+    successor = compile_native_timeline(
+        _continuity_draft("t2v", "t2v"),
+        _settings(),
+        "job-tampered-continuity",
+    ).workflows[1]
+    bound = bind_native_workflow_predecessor_output(
+        successor,
+        {
+            "filename": "good.mp4",
+            "subfolder": "directordeck",
+            "type": "output",
+        },
+    )
+    assert bound.continuity is not None
+    tampered = deepcopy(bound)
+    tampered.prompt[tampered.continuity.load_video_node_id]["inputs"]["file"] = (
+        "evil.mp4 [output]"
+    )
+
+    with pytest.raises(NativeTemplateError, match="exact bound output evidence"):
+        validate_native_workflow_ready(tampered)
 
 
 @pytest.mark.parametrize(
@@ -1303,10 +1411,16 @@ def test_native_v1_ignores_obsolete_cfg_and_rejects_settings_it_cannot_honor() -
         lora_loader="dedicated",
         lora_low_vram=True,
     )
+    standard_settings = RuntimeSettings.model_validate(settings_value)
     automatic_standard_lora = compile_native_timeline(
         _draft("t2v"),
-        RuntimeSettings.model_validate(settings_value),
+        standard_settings,
         "job-low-vram-generic",
+        resolved_lora_adapters=_resolved_standard_lora(
+            standard_settings,
+            "fl2va",
+            adapter_id="model_only",
+        ),
     )
     assert "LoraLoaderModelOnly" in _types(
         automatic_standard_lora.workflows[0].prompt
@@ -1323,18 +1437,26 @@ def test_native_v1_ignores_obsolete_cfg_and_rejects_settings_it_cannot_honor() -
         RuntimeSettings.model_validate(settings_value),
         "job-ray-explicit-loader",
     )
-    assert "RayLoraLoader" in _types(automatic_ray_lora.workflows[0].prompt)
+    assert "DirectorDeckRayLoraLoader" in _types(automatic_ray_lora.workflows[0].prompt)
 
 
-def test_standard_ref2va_official_lora_uses_core_model_only_loader() -> None:
+def test_standard_ref2va_lora_uses_exact_user_mapped_adapter() -> None:
     value = _settings().model_dump(mode="json")
     value["models"]["ref2va"].update(
         lora_name="minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
         lora_strength=0.75,
     )
 
+    settings = RuntimeSettings.model_validate(value)
     result = compile_native_timeline(
-        _draft("r2v"), RuntimeSettings.model_validate(value), "job-ref2v-lora"
+        _draft("r2v"),
+        settings,
+        "job-ref2v-lora",
+        resolved_lora_adapters=_resolved_standard_lora(
+            settings,
+            "ref2va",
+            adapter_id="model_only",
+        ),
     )
 
     prompt = result.workflows[0].prompt
@@ -1344,44 +1466,29 @@ def test_standard_ref2va_official_lora_uses_core_model_only_loader() -> None:
     )
     assert lora["inputs"]["lora_name"] == value["models"]["ref2va"]["lora_name"]
     assert lora["inputs"]["strength_model"] == 0.75
-    assert "RayLoraLoader" not in _types(prompt)
-    assert result.manifest["lora_resolution"]["ref2va"]["source"] == "audited_profile"
+    assert "DirectorDeckRayLoraLoader" not in _types(prompt)
+    assert result.manifest["lora_resolution"]["ref2va"]["source"] == (
+        "user_override"
+    )
 
 
-def test_unknown_standard_lora_uses_remote_generic_metadata_or_scoped_override() -> None:
+def test_unknown_standard_lora_uses_configured_factory_fallback() -> None:
     value = _settings().model_dump(mode="json")
     value["models"]["fl2va"]["lora_name"] = "renamed_generic.safetensors"
     settings = RuntimeSettings.model_validate(value)
 
-    inferred = compile_native_timeline(
+    compiled = compile_native_timeline(
         _draft("t2v"),
         settings,
-        "job-metadata-lora",
-        standard_lora_metadata={
-            "fl2va": {
-                "target_format": "ComfyUI generic LoRA",
-                "source_format": "Diffusers PEFT LoRA",
-            }
-        },
+        "job-fallback-lora",
+        resolved_lora_adapters=_resolved_standard_lora(settings, "fl2va"),
     )
-    assert "LoraLoaderModelOnly" in _types(inferred.workflows[0].prompt)
-    assert inferred.manifest["lora_resolution"]["fl2va"]["source"] == "metadata"
-
-    with pytest.raises(NativeTemplateError, match="choose a Standard LoRA loader"):
-        compile_native_timeline(_draft("t2v"), settings, "job-unknown-lora")
-
-    value["models"]["fl2va"]["standard_lora_loader_override"] = {
-        "loader": "bypass_model_only",
-        "lora_name": "renamed_generic.safetensors",
-        "model_filename": value["models"]["fl2va"]["filename"],
-    }
-    explicit = compile_native_timeline(
-        _draft("t2v"),
-        RuntimeSettings.model_validate(value),
-        "job-explicit-lora",
+    assert "LoraLoaderModelOnly" in _types(
+        compiled.workflows[0].prompt
     )
-    assert "LoraLoaderBypassModelOnly" in _types(explicit.workflows[0].prompt)
-    assert explicit.manifest["lora_resolution"]["fl2va"]["source"] == "manual"
+    assert compiled.manifest["lora_resolution"]["fl2va"]["source"] == (
+        "factory_default"
+    )
 
 
 def test_native_video_conditioning_requires_a_24fps_server_proxy() -> None:

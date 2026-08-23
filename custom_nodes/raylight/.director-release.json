@@ -1,5 +1,7 @@
 {
   "name": "raylight",
+  "python_package": "directordeck_raylight",
+  "version": "1.8.0+director.1",
   "director_release": "0.1.0-rc1",
   "upstream_commit": "4085a37b62d7504cf7746f50c9d59e4fd1495b2b",
   "modified_for_director": true

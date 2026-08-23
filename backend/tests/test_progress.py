@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import struct
+from dataclasses import replace
 
 import pytest
 
@@ -14,12 +15,17 @@ from directordeck.progress import (
     ComfyReconcileHint,
     LivePreviewCache,
     NativeProgressManager,
+    ResolvedPreviewSource,
+    child_execution_start_snapshot,
     child_execution_snapshot,
     child_progress_snapshot,
+    durable_preview_phase_watermark,
     parse_execution_message,
     parse_preview_message,
     parse_progress_message,
     parse_reconcile_message,
+    preview_phase_index_for_event,
+    preview_source_for_node,
     sampler_segment_for_node,
     websocket_url,
 )
@@ -46,6 +52,112 @@ def preview_message(
         + metadata
         + content
     )
+
+
+def persisted_specs_child(*, nested: bool = False) -> dict:
+    progress_spec = {
+        "version": 1,
+        "phases": [
+            {
+                "id": "prepare",
+                "label": "准备模型",
+                "node_id": "load",
+                "kind": "milestone",
+                "weight": 0.1,
+            },
+            {
+                "id": "sample_early",
+                "label": "第一次采样",
+                "node_id": "sample-a",
+                "kind": "fractional",
+                "weight": 0.3,
+            },
+            {
+                "id": "upscale",
+                "label": "超分放大",
+                "node_id": "upscale",
+                "kind": "milestone",
+                "weight": 0.2,
+            },
+            {
+                "id": "sample_late",
+                "label": "第二次采样",
+                "node_id": "sample-b",
+                "kind": "fractional",
+                "weight": 0.3,
+            },
+            {
+                "id": "persist",
+                "label": "写入成片",
+                "node_id": "save",
+                "kind": "milestone",
+                "weight": 0.1,
+            },
+        ],
+    }
+    preview_spec = {
+        "version": 1,
+        "sources": [
+            {
+                "node_id": "sample-a",
+                "phase_id": "sample_early",
+                "publish": True,
+                "priority": 10,
+                "supersedes": [],
+            },
+            {
+                "node_id": "upscale",
+                "phase_id": "upscale",
+                "publish": False,
+                "priority": 50,
+                "supersedes": [],
+            },
+            {
+                "node_id": "sample-b",
+                "phase_id": "sample_late",
+                "publish": True,
+                "priority": 20,
+                "supersedes": ["sample-a"],
+            },
+            {
+                "node_id": "save",
+                "phase_id": "persist",
+                "publish": True,
+                "priority": 30,
+                "supersedes": [],
+            },
+        ],
+    }
+    snapshot = {
+        "owner_segment_id": "shot-a",
+        "expected_output_spec": {"segment_id": "shot-a"},
+        "exact_prompt": {
+            "load": {"class_type": "UNETLoader", "inputs": {}},
+            "sample-a": {"class_type": "SamplerCustomAdvanced", "inputs": {}},
+            "upscale": {"class_type": "UpscaleModel", "inputs": {}},
+            "sample-b": {"class_type": "SamplerCustomAdvanced", "inputs": {}},
+            "save": {"class_type": "SaveVideo", "inputs": {}},
+            "legacy-sampler": {
+                "class_type": "SamplerCustomAdvanced",
+                "inputs": {},
+            },
+        },
+        "progress_spec": progress_spec,
+        "preview_spec": preview_spec,
+    }
+    child = {
+        "segment_ids": ["shot-a"],
+        "group_index": 3,
+        "progress": 0.0,
+        # A valid Stage-4 snapshot must prevent these legacy class guesses from
+        # becoming a second, conflicting authority.
+        "prompt_snapshot": snapshot["exact_prompt"],
+    }
+    if nested:
+        child["execution_evidence"] = {"exact_prompt_snapshot": snapshot}
+    else:
+        child["exact_prompt_snapshot"] = snapshot
+    return child
 
 
 def test_websocket_url_preserves_reverse_proxy_prefix() -> None:
@@ -370,7 +482,7 @@ def test_generic_progress_state_counter_is_not_presented_as_sampler_steps() -> N
     child = {
         "segment_ids": ["shot-a"],
         "prompt_snapshot": {
-            "16": {"class_type": "XFuserSamplerCustomAdvanced", "inputs": {}},
+            "16": {"class_type": "DirectorDeckRayXFuserSamplerCustomAdvanced", "inputs": {}},
         },
     }
     aggregate = parse_progress_message(
@@ -386,6 +498,198 @@ def test_generic_progress_state_counter_is_not_presented_as_sampler_steps() -> N
             prompt_id="p-ray", node_id="16", value=1.0, maximum=1.0
         ),
     ) is not None
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_persisted_progress_spec_maps_ordered_weighted_phases_monotonically(
+    nested: bool,
+) -> None:
+    child = persisted_specs_child(nested=nested)
+
+    prepare = child_execution_snapshot(
+        child,
+        ComfyExecutionEvent(prompt_id="p-stage4", node_id="load"),
+    )
+    assert prepare is not None
+    assert prepare.progress == pytest.approx(0.1)
+    assert prepare.stage == "准备模型"
+
+    child["progress"] = prepare.progress
+    early = child_progress_snapshot(
+        child,
+        ComfyProgressEvent(
+            prompt_id="p-stage4",
+            node_id="sample-a",
+            value=50.0,
+            maximum=100.0,
+        ),
+    )
+    assert early is not None
+    assert early.progress == pytest.approx(0.25)
+    assert early.stage == "第一次采样 · 50/100"
+
+    child["progress"] = early.progress
+    upscale = child_execution_snapshot(
+        child,
+        ComfyExecutionEvent(prompt_id="p-stage4", node_id="upscale"),
+    )
+    assert upscale is not None
+    assert upscale.progress == pytest.approx(0.6)
+    assert upscale.stage == "超分放大"
+
+    child["progress"] = upscale.progress
+    late = child_progress_snapshot(
+        child,
+        ComfyProgressEvent(
+            prompt_id="p-stage4",
+            node_id="sample-b",
+            value=50.0,
+            maximum=100.0,
+        ),
+    )
+    assert late is not None
+    assert late.progress == pytest.approx(0.75)
+    assert late.stage == "第二次采样 · 50/100"
+
+    child["progress"] = late.progress
+    assert child_progress_snapshot(
+        child,
+        ComfyProgressEvent(
+            prompt_id="p-stage4",
+            node_id="sample-a",
+            value=100.0,
+            maximum=100.0,
+        ),
+    ) is None
+    assert child_progress_snapshot(
+        child,
+        ComfyProgressEvent(
+            prompt_id="p-stage4",
+            node_id="legacy-sampler",
+            value=100.0,
+            maximum=100.0,
+        ),
+    ) is None
+    assert child_execution_snapshot(
+        child,
+        ComfyExecutionEvent(prompt_id="p-stage4", node_id="legacy-sampler"),
+    ) is None
+
+    persisted = child_execution_snapshot(
+        child,
+        ComfyExecutionEvent(prompt_id="p-stage4", node_id="save"),
+    )
+    assert persisted is not None
+    assert persisted.progress == pytest.approx(1.0)
+    assert persisted.stage == "写入成片"
+
+
+def test_persisted_stage_only_phase_updates_label_without_inventing_progress() -> None:
+    child = persisted_specs_child()
+    child["exact_prompt_snapshot"]["progress_spec"]["phases"].insert(
+        0,
+        {
+            "id": "inspect",
+            "label": "读取并编码输入",
+            "node_id": "legacy-sampler",
+            "kind": "stage",
+            "weight": 0.0,
+        },
+    )
+
+    snapshot = child_execution_snapshot(
+        child,
+        ComfyExecutionEvent(
+            prompt_id="p-stage4",
+            node_id="legacy-sampler",
+        ),
+    )
+
+    assert snapshot is not None
+    assert snapshot.progress == 0.0
+    assert snapshot.stage == "读取并编码输入"
+
+
+def test_persisted_missing_or_invalid_progress_spec_never_uses_legacy_fallback() -> None:
+    child = persisted_specs_child()
+    snapshot = child["exact_prompt_snapshot"]
+    snapshot["progress_spec"] = None
+    event = ComfyProgressEvent(
+        prompt_id="p-stage4",
+        node_id="sample-a",
+        value=5.0,
+        maximum=20.0,
+    )
+    assert child_progress_snapshot(child, event) is None
+    assert child_execution_snapshot(
+        child,
+        ComfyExecutionEvent(prompt_id="p-stage4", node_id="sample-a"),
+    ) is None
+
+    snapshot["progress_spec"] = {
+        "version": 1,
+        "phases": [
+            {
+                "id": "broken",
+                "label": "Broken",
+                "node_id": "sample-a",
+                "kind": "fractional",
+                "weight": 0.5,
+            }
+        ],
+    }
+    assert child_progress_snapshot(child, event) is None
+
+
+def test_invalid_execution_evidence_marker_disables_progress_and_preview_fallback() -> None:
+    child = persisted_specs_child()
+    snapshot = child.pop("exact_prompt_snapshot")
+    child["execution_evidence"] = {"invalid": True}
+    # These mutable fields would fully authorize the old fallback if the
+    # typed marker were mistaken for evidence absence.
+    child["prompt_snapshot"] = snapshot["exact_prompt"]
+    child["output_nodes"] = {"shot-a": "save"}
+
+    assert child_progress_snapshot(
+        child,
+        ComfyProgressEvent(
+            prompt_id="p-stage4",
+            node_id="legacy-sampler",
+            value=50.0,
+            maximum=100.0,
+        ),
+    ) is None
+    assert child_execution_snapshot(
+        child,
+        ComfyExecutionEvent(
+            prompt_id="p-stage4",
+            node_id="legacy-sampler",
+        ),
+    ) is None
+    assert preview_source_for_node(child, "legacy-sampler") is None
+
+
+def test_exact_unlisted_node_can_start_lifecycle_without_progress_fallback() -> None:
+    child = persisted_specs_child()
+    child.update(status="preparing", stage="submitting", progress=0.0)
+    event = ComfyExecutionEvent(
+        prompt_id="p-stage4", node_id="legacy-sampler"
+    )
+
+    # The node is in the immutable exact prompt but intentionally absent from
+    # ProgressSpec. It proves execution began without inheriting the legacy
+    # sampler's numeric landmark or label.
+    assert child_execution_snapshot(child, event) is None
+    started = child_execution_start_snapshot(child, event)
+    assert started is not None
+    assert started.progress == 0.0
+    assert started.stage == "开始执行"
+
+    unknown = ComfyExecutionEvent(prompt_id="p-stage4", node_id="missing")
+    assert child_execution_start_snapshot(child, unknown) is None
+
+    child["exact_prompt_snapshot"]["progress_spec"] = None
+    assert child_execution_start_snapshot(child, event) is None
 
 
 def test_child_progress_maps_sampler_to_segment_and_step() -> None:
@@ -415,9 +719,9 @@ def test_execution_stage_covers_raylight_load_condition_decode_and_save() -> Non
         "segment_ids": ["shot-a"],
         "output_nodes": {"shot-a": "8"},
         "prompt_snapshot": {
-            "1": {"class_type": "RayInitializerAdvanced", "inputs": {}},
+            "1": {"class_type": "DirectorDeckRayInitializerAdvanced", "inputs": {}},
             "2": {
-                "class_type": "RayUNETLoader",
+                "class_type": "DirectorDeckRayUNETLoader",
                 "inputs": {"ray_actors_init": ["1", 0]},
             },
             "3": {
@@ -425,7 +729,7 @@ def test_execution_stage_covers_raylight_load_condition_decode_and_save() -> Non
                 "inputs": {},
             },
             "4": {
-                "class_type": "XFuserSamplerCustomAdvanced",
+                "class_type": "DirectorDeckRayXFuserSamplerCustomAdvanced",
                 "inputs": {"guider": ["2", 0], "latent_image": ["3", 1]},
             },
             "5": {
@@ -511,12 +815,275 @@ def test_sampler_node_maps_one_to_one_to_stable_segment_id() -> None:
         "segment_ids": ["shot-a", "shot-b"],
         "prompt_snapshot": {
             "8": {"class_type": "SamplerCustomAdvanced", "inputs": {}},
-            "16": {"class_type": "XFuserSamplerCustomAdvanced", "inputs": {}},
+            "16": {"class_type": "DirectorDeckRayXFuserSamplerCustomAdvanced", "inputs": {}},
         },
     }
     assert sampler_segment_for_node(child, "8") == "shot-a"
     assert sampler_segment_for_node(child, "16") == "shot-b"
     assert sampler_segment_for_node(child, "missing") is None
+
+
+def test_persisted_preview_spec_filters_sources_and_rejects_late_old_phase() -> None:
+    child = persisted_specs_child()
+    early = preview_source_for_node(child, "sample-a")
+    late = preview_source_for_node(child, "sample-b")
+    highest = preview_source_for_node(child, "save")
+
+    assert isinstance(early, ResolvedPreviewSource)
+    assert isinstance(late, ResolvedPreviewSource)
+    assert isinstance(highest, ResolvedPreviewSource)
+    assert early.persisted and (early.phase_index, early.priority) == (1, 10)
+    assert (late.phase_index, late.priority) == (3, 20)
+    assert late.supersedes == ("sample-a",)
+    assert (highest.phase_index, highest.priority) == (4, 30)
+    assert preview_source_for_node(child, "upscale") is None
+    assert preview_source_for_node(child, "legacy-sampler") is None
+    assert sampler_segment_for_node(child, "sample-a") == "shot-a"
+    assert sampler_segment_for_node(child, "upscale") is None
+
+    cache = LivePreviewCache(max_total_bytes=MAX_PREVIEW_MESSAGE_BYTES)
+
+    def event(node_id: str, content: bytes) -> ComfyPreviewEvent:
+        return ComfyPreviewEvent(
+            prompt_id="p-stage4",
+            node_id=node_id,
+            mime_type="image/png",
+            content=content,
+        )
+
+    assert cache.put(
+        job_id="job-stage4",
+        child_id="child-stage4",
+        segment_id="shot-a",
+        event=event("sample-a", b"early"),
+        source=early,
+    )
+    # A non-publishing intermediate phase is still a phase-start watermark.
+    # Its execution must close the preceding sampler before the next sampler
+    # has emitted a frame.
+    assert cache.advance_phase(
+        job_id="job-stage4",
+        child_id="child-stage4",
+        prompt_id="p-stage4",
+        phase_index=2,
+    )
+    assert not cache.put(
+        job_id="job-stage4",
+        child_id="child-stage4",
+        segment_id="shot-a",
+        event=event("sample-a", b"delayed-before-next-preview"),
+        source=early,
+    )
+    assert cache.get("job-stage4").content == b"early"  # type: ignore[union-attr]
+    assert cache.put(
+        job_id="job-stage4",
+        child_id="child-stage4",
+        segment_id="shot-a",
+        event=event("sample-b", b"late"),
+        source=late,
+    )
+    assert not cache.put(
+        job_id="job-stage4",
+        child_id="child-stage4",
+        segment_id="shot-a",
+        event=event("sample-a", b"delayed-old"),
+        source=early,
+    )
+    assert cache.get("job-stage4").content == b"late"  # type: ignore[union-attr]
+
+    # A higher-priority source need not duplicate every transitive supersedes
+    # edge. Once selected, the lower-priority late frame cannot overwrite it.
+    assert cache.put(
+        job_id="job-stage4",
+        child_id="child-stage4",
+        segment_id="shot-a",
+        event=event("save", b"highest"),
+        source=highest,
+    )
+    assert not cache.put(
+        job_id="job-stage4",
+        child_id="child-stage4",
+        segment_id="shot-a",
+        event=event("sample-b", b"delayed-late"),
+        source=late,
+    )
+    stored = cache.get("job-stage4")
+    assert stored is not None
+    assert stored.node_id == "save"
+    assert stored.content == b"highest"
+    assert stored.source_phase_id == "persist"
+    assert stored.source_phase_index == 4
+    assert stored.source_priority == 30
+
+
+def test_phase_watermark_recovers_scopes_and_remains_bounded() -> None:
+    child = persisted_specs_child()
+    early = preview_source_for_node(child, "sample-a")
+    late = preview_source_for_node(child, "sample-b")
+    assert isinstance(early, ResolvedPreviewSource)
+    assert isinstance(late, ResolvedPreviewSource)
+
+    assert preview_phase_index_for_event(
+        child,
+        ComfyExecutionEvent(prompt_id="p-stage4", node_id="upscale"),
+    ) == 2
+    assert preview_phase_index_for_event(
+        child,
+        ComfyProgressEvent(
+            prompt_id="p-stage4",
+            node_id="sample-b",
+            value=1.0,
+            maximum=10.0,
+        ),
+    ) == 3
+    assert preview_phase_index_for_event(
+        child,
+        ComfyExecutionEvent(prompt_id="p-stage4", node_id="legacy-sampler"),
+    ) is None
+
+    # At the exact 0.6 boundary the durable projection conservatively treats
+    # sample_late as started. A fresh process-local cache therefore cannot
+    # visibly rewind to sample_early after a restart.
+    child["progress"] = 0.6
+    recovered = durable_preview_phase_watermark(child)
+    assert recovered == 3
+    cache = LivePreviewCache(max_phase_watermarks=2)
+
+    def event(prompt_id: str, node_id: str, content: bytes) -> ComfyPreviewEvent:
+        return ComfyPreviewEvent(
+            prompt_id=prompt_id,
+            node_id=node_id,
+            mime_type="image/png",
+            content=content,
+        )
+
+    assert not cache.put(
+        job_id="job-recovered",
+        child_id="child-old",
+        segment_id="shot-a",
+        event=event("p-stage4", early.node_id, b"late-after-restart"),
+        source=early,
+        minimum_phase_index=recovered,
+    )
+    assert cache.get("job-recovered") is None
+    assert cache.put(
+        job_id="job-recovered",
+        child_id="child-old",
+        segment_id="shot-a",
+        event=event("p-stage4", late.node_id, b"current"),
+        source=late,
+        minimum_phase_index=recovered,
+    )
+
+    # Phase order is authoritative even if a later source has a numerically
+    # lower priority and omits an explicit supersedes edge.
+    phase_order_cache = LivePreviewCache()
+    assert phase_order_cache.put(
+        job_id="job-phase-order",
+        child_id="child-phase-order",
+        segment_id="shot-a",
+        event=event("p-order", early.node_id, b"early"),
+        source=early,
+    )
+    assert phase_order_cache.put(
+        job_id="job-phase-order",
+        child_id="child-phase-order",
+        segment_id="shot-a",
+        event=event("p-order", late.node_id, b"later-low-priority"),
+        source=replace(late, priority=-10, supersedes=()),
+    )
+
+    # Watermarks are monotonic and scoped to an exact child/prompt pair. A
+    # later child can begin at its own first phase under the same parent.
+    assert not cache.advance_phase(
+        job_id="job-recovered",
+        child_id="child-old",
+        prompt_id="p-stage4",
+        phase_index=1,
+    )
+    assert cache.advance_phase(
+        job_id="job-recovered",
+        child_id="child-next",
+        prompt_id="p-next",
+        phase_index=0,
+    )
+    assert cache.put(
+        job_id="job-recovered",
+        child_id="child-next",
+        segment_id="shot-a",
+        event=event("p-next", early.node_id, b"next-child"),
+        source=early,
+    )
+    assert cache.get("job-recovered").content == b"next-child"  # type: ignore[union-attr]
+    assert cache.phase_watermark_count == 2
+    assert cache.advance_phase(
+        job_id="job-third",
+        child_id="child-third",
+        prompt_id="p-third",
+        phase_index=0,
+    )
+    assert cache.phase_watermark_count == 2
+
+    cache.discard("job-recovered")
+    assert cache.phase_watermark_count == 1
+    assert not cache.advance_phase(
+        job_id="job-recovered",
+        child_id="child-next",
+        prompt_id="p-next",
+        phase_index=1,
+    )
+    cache.clear()
+    assert cache.phase_watermark_count == 0
+
+
+def test_legacy_and_malformed_typed_rows_do_not_enter_phase_watermark_policy() -> None:
+    legacy = {
+        "segment_ids": ["shot-a"],
+        "prompt_snapshot": {
+            "sampler": {"class_type": "SamplerCustomAdvanced", "inputs": {}},
+        },
+    }
+    legacy_event = ComfyExecutionEvent(prompt_id="legacy-prompt", node_id="sampler")
+    assert preview_phase_index_for_event(legacy, legacy_event) is None
+    assert durable_preview_phase_watermark(legacy) is None
+
+    source = preview_source_for_node(legacy, "sampler")
+    assert isinstance(source, ResolvedPreviewSource)
+    assert source.persisted is False and source.phase_index is None
+    cache = LivePreviewCache()
+    first = ComfyPreviewEvent(
+        prompt_id="legacy-prompt",
+        node_id="sampler",
+        mime_type="image/png",
+        content=b"first",
+    )
+    refreshed = ComfyPreviewEvent(
+        prompt_id="legacy-prompt",
+        node_id="sampler",
+        mime_type="image/png",
+        content=b"refreshed",
+    )
+    assert cache.put(
+        job_id="legacy-job",
+        child_id="legacy-child",
+        segment_id="shot-a",
+        event=first,
+        source=source,
+    )
+    assert cache.put(
+        job_id="legacy-job",
+        child_id="legacy-child",
+        segment_id="shot-a",
+        event=refreshed,
+        source=source,
+    )
+    assert cache.get("legacy-job").content == b"refreshed"  # type: ignore[union-attr]
+
+    malformed = persisted_specs_child()
+    malformed["exact_prompt_snapshot"]["progress_spec"] = {"broken": True}
+    assert preview_phase_index_for_event(malformed, legacy_event) is None
+    assert durable_preview_phase_watermark(malformed) is None
+    assert preview_source_for_node(malformed, "sample-a") is None
 
 
 def test_live_preview_cache_expires_evicts_and_tombstones_deleted_job() -> None:

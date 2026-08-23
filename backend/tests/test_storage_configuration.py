@@ -22,8 +22,11 @@ def _director_database(path: Path, *, title: str | None = None) -> Database:
     database = Database(path)
     database.initialize()
     if title is not None:
-        timeline = database.get_timeline().model_copy(update={"title": title})
-        database.put_timeline(timeline)
+        timeline, revision = database.get_timeline_authority()
+        database.validate_and_put_timeline_authority(
+            timeline.model_copy(update={"title": title}),
+            expected_revision=revision,
+        )
     return database
 
 

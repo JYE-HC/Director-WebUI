@@ -41,8 +41,10 @@ export interface AssetReference {
   filename?: string | null;
   path?: string | null;
   preview_url?: string | null;
-  /** Present only for video assets and populated by the server-side probe. */
-  metadata?: VideoMetadata;
+  /** Immutable upload identity when known; legacy assets may predate hashing. */
+  content_hash?: string | null;
+  /** Video probe data; the complete v5 wire uses null for image/audio assets. */
+  metadata?: VideoMetadata | null;
 }
 
 /** A reference asset whose zero-based slot remains stable after deletions. */

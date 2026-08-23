@@ -13,6 +13,9 @@ Director-specific changes include:
 - cleanup limited to the selected Ray GPU pool;
 - worker model retention and bounded host-RAM LRU caching;
 - stable Ray actor lifecycle and shutdown behavior used by Director;
+- private `directordeck_raylight` Python package and Ray-worker namespace, so
+  an external user-installed `raylight` package can coexist without being read
+  or replaced by DirectorDeck;
 - normal logs omit the full CUDA visibility mask, which can contain GPU/MIG UUIDs.
 
 Files changed from upstream carry a `Modified for Director Web` header. New

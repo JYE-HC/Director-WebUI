@@ -4,25 +4,19 @@
   "license": "GPL-3.0-only",
   "director_source_commit": "6622bae10e6031368860a3dc266776d9a4dff430",
   "comfyui": {
-    "minimum_compatible_commit": "8f37cf8c833a8f2d3c62e2adbccebfd165623481",
-    "tested_commit": "8f37cf8c833a8f2d3c62e2adbccebfd165623481"
+    "recommended_minimum_version": "0.33.0",
+    "enforcement": "warning_only"
   },
   "custom_nodes": [
     {
       "name": "raylight",
+      "packaged_path": "nodes/DirectorDeck-RayLight",
+      "python_package": "directordeck_raylight",
       "upstream": "https://github.com/komikndr/raylight",
       "upstream_commit": "4085a37b62d7504cf7746f50c9d59e4fd1495b2b",
-      "version": "1.8.0-director.1",
+      "version": "1.8.0+director.1",
       "license": "Apache-2.0",
-      "tree_sha256": "c0866d40234a9fb81e8fb6fa603664031b8961538737333a758f960c90ceb004"
-    },
-    {
-      "name": "ComfyUI-MiniMax-H3-Turbo",
-      "upstream": "https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo",
-      "upstream_commit": "55fee864dd7b2976b1c4ce3c3d5f7968f181409f",
-      "version": "1.2.3",
-      "license": "Apache-2.0",
-      "tree_sha256": "7346ff110c1a421f71171eceba88b6b9a2672cfe09bb5ef3f571e315aac6854f"
+      "tree_sha256": "56b2bd01279de8ce0d09aec2f51319366fdb9e5808edc1eb30840aae1936a04a"
     }
   ]
 }

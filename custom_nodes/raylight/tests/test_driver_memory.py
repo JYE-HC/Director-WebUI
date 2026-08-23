@@ -21,7 +21,7 @@ def _load_driver_memory():
     try:
         spec = importlib.util.spec_from_file_location(
             "_raylight_driver_memory_under_test",
-            ROOT / "src/raylight/driver_memory.py",
+            ROOT / "src/directordeck_raylight/driver_memory.py",
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -251,12 +251,12 @@ def _method(class_node, name):
 
 def test_all_nine_samplers_use_the_shared_pre_and_post_cleanup_helpers():
     sampler_classes = {
-        ROOT / "src/raylight/nodes.py": (
+        ROOT / "src/directordeck_raylight/nodes.py": (
             "XFuserKSamplerAdvanced",
             "UnifiedParallelSampler",
             "DPKSamplerAdvanced",
         ),
-        ROOT / "src/raylight/comfy_extra_dist/nodes_custom_sampler.py": (
+        ROOT / "src/directordeck_raylight/comfy_extra_dist/nodes_custom_sampler.py": (
             "XFuserSamplerCustomAdvanced",
             "XFuserSamplerCustom",
             "UnifiedParallelSamplerCustomAdvanced",
@@ -276,7 +276,7 @@ def test_all_nine_samplers_use_the_shared_pre_and_post_cleanup_helpers():
 
 
 def test_initializer_contract_is_optional_legacy_default_and_metadata_is_captured():
-    nodes_path = ROOT / "src/raylight/nodes.py"
+    nodes_path = ROOT / "src/directordeck_raylight/nodes.py"
     source = nodes_path.read_text()
     classes = _classes(nodes_path)
     spawn_actor = _method(classes["RayInitializer"], "spawn_actor")
@@ -297,7 +297,7 @@ def test_initializer_contract_is_optional_legacy_default_and_metadata_is_capture
 
 
 def test_explicit_clean_vram_node_keeps_legacy_global_behavior():
-    classes = _classes(ROOT / "src/raylight/nodes.py")
+    classes = _classes(ROOT / "src/directordeck_raylight/nodes.py")
     calls = _method_calls(_method(classes["RayCleanVRAMUsed"], "clean_vram"))
     assert calls.count("unload_all_models") == 1
     assert calls.count("soft_empty_cache") == 1

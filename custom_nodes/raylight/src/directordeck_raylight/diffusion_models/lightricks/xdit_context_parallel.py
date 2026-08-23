@@ -1,0 +1,226 @@
+import torch
+from xfuser.core.distributed import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
+import directordeck_raylight.distributed_modules.attention as xfuser_attn
+import comfy
+from comfy.ldm.lightricks.model import apply_rotary_emb
+from ..utils import pad_to_world_size
+
+attn_type = xfuser_attn.get_attn_type()
+sync_ulysses = xfuser_attn.get_sync_ulysses()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+
+
+# A better solution is just to type.MethodType the x, context, and pe construction,
+def pad_group_to_world_size(group, dim):
+    """
+    group: Tensor | list[Tensor] | tuple[Tensor]
+    Returns: padded_group, orig_sizes
+    """
+
+    if torch.is_tensor(group):
+        orig = group.size(dim)
+        group, _ = pad_to_world_size(group, dim=dim)
+        return group, orig
+
+    elif isinstance(group, (list, tuple)):
+        padded = []
+        origs = []
+        for g in group:
+            o = g.size(dim)
+            g, _ = pad_to_world_size(g, dim=dim)
+            padded.append(g)
+            origs.append(o)
+        return type(group)(padded), origs
+
+    else:
+        return group, None
+
+
+def pad_and_split_pe(pe, dim, sp_world_size, sp_rank):
+    if torch.is_tensor(pe):
+        pe, _ = pad_to_world_size(pe, dim=dim)
+        return torch.chunk(pe, sp_world_size, dim=dim)[sp_rank]
+    if isinstance(pe, tuple) and len(pe) == 2 and torch.is_tensor(pe[0]) and isinstance(pe[1], bool):
+        return (pad_and_split_pe(pe[0], dim, sp_world_size, sp_rank), pe[1])
+    if isinstance(pe, (list, tuple)):
+        return type(pe)(pad_and_split_pe(item, dim, sp_world_size, sp_rank) for item in pe)
+    return pe
+
+
+def sp_chunk_group(group, sp_world_size, sp_rank, dim):
+    if torch.is_tensor(group):
+        return torch.chunk(group, sp_world_size, dim=dim)[sp_rank]
+
+    elif isinstance(group, (list, tuple)):
+        return type(group)(torch.chunk(g, sp_world_size, dim=dim)[sp_rank] for g in group)
+    else:
+        return group
+
+
+def sp_gather_group(group, orig_sizes, dim):
+    if torch.is_tensor(group):
+        g = get_sp_group().all_gather(group.contiguous(), dim=dim)
+        return g.narrow(dim, 0, orig_sizes)
+
+    elif isinstance(group, (list, tuple)):
+        out = []
+        for g, o in zip(group, orig_sizes):
+            g = get_sp_group().all_gather(g.contiguous(), dim=dim)
+            g = g.narrow(dim, 0, o)
+            out.append(g)
+        return type(group)(out)
+
+    else:
+        return group
+
+
+def process_usp_timestep(timestep, sp_rank, sp_world_size):
+    if isinstance(timestep, (list, tuple)):
+        return type(timestep)(
+            process_usp_timestep(item, sp_rank, sp_world_size) for item in timestep
+        )
+
+    if torch.is_tensor(timestep) and timestep.ndim >= 3:
+        orig_len = timestep.size(1)
+        if orig_len == 0:
+            return timestep
+
+        padded_len = ((orig_len + sp_world_size - 1) // sp_world_size) * sp_world_size
+        chunk_size = padded_len // sp_world_size
+        start = sp_rank * chunk_size
+        end = start + chunk_size
+
+        if start >= orig_len:
+            return timestep[:, -1:, :].expand(-1, chunk_size, -1).clone()
+        if end <= orig_len:
+            return timestep[:, start:end, :].clone()
+
+        real_part = timestep[:, start:, :]
+        padding = timestep[:, -1:, :].expand(-1, end - orig_len, -1)
+        return torch.cat([real_part, padding], dim=1)
+
+    if hasattr(timestep, "num_frames") and hasattr(timestep, "patches_per_frame"):
+        total_len = timestep.num_frames * timestep.patches_per_frame
+        if total_len == 0:
+            return timestep.data[:, :0, :]
+
+        padded_len = ((total_len + sp_world_size - 1) // sp_world_size) * sp_world_size
+        chunk_size = padded_len // sp_world_size
+        start = sp_rank * chunk_size
+        end = start + chunk_size
+
+        indices = torch.arange(start, end, device=timestep.data.device)
+        valid_indices = torch.clamp(indices, max=total_len - 1)
+        frame_indices = valid_indices // timestep.patches_per_frame
+        return timestep.data[:, frame_indices, :]
+
+    return timestep
+
+
+def usp_dit_forward(
+    self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, *args, **kwargs
+):
+    """
+    Internal forward pass for LTX models.
+
+    Args:
+        x: Input tensor
+        timestep: Timestep tensor
+        context: Context tensor (e.g., text embeddings)
+        attention_mask: Attention mask tensor
+        frame_rate: Frame rate for temporal processing
+        transformer_options: Additional options for transformer blocks
+        keyframe_idxs: Keyframe indices for temporal processing
+        **kwargs: Additional keyword arguments
+
+    Returns:
+        Processed output tensor
+    """
+    sp_world_size = get_sequence_parallel_world_size()
+    sp_rank = get_sequence_parallel_rank()
+    if isinstance(x, list):
+        input_dtype = x[0].dtype
+        batch_size = x[0].shape[0]
+    else:
+        input_dtype = x.dtype
+        batch_size = x.shape[0]
+    # Process input
+    merged_args = {**transformer_options, **kwargs}
+    x, pixel_coords, additional_args = self._process_input(x, keyframe_idxs, denoise_mask, **merged_args)
+    merged_args.update(additional_args)
+
+    # Prepare timestep and context
+    timestep_prep = self._prepare_timestep(timestep, batch_size, input_dtype, **merged_args)
+    if not isinstance(timestep_prep, (list, tuple)):
+        raise TypeError(f"Unexpected _prepare_timestep return type: {type(timestep_prep)!r}")
+
+    if len(timestep_prep) == 3:
+        timestep, embedded_timestep, prompt_timestep = timestep_prep
+        if prompt_timestep is not None:
+            merged_args["prompt_timestep"] = prompt_timestep
+    elif len(timestep_prep) == 2:
+        timestep, embedded_timestep = timestep_prep
+    else:
+        raise ValueError(f"Unexpected _prepare_timestep return length: {len(timestep_prep)}")
+
+    context, attention_mask = self._prepare_context(context, batch_size, x, attention_mask)
+
+    # Prepare attention mask and positional embeddings
+    attention_mask = self._prepare_attention_mask(attention_mask, input_dtype)
+    pe = self._prepare_positional_embeddings(pixel_coords, frame_rate, input_dtype)
+    # ===================== SP SPLIT ====================== #
+    x, x_orig = pad_group_to_world_size(x, dim=1)
+    context, _ = pad_group_to_world_size(context, dim=1)
+    pe = pad_and_split_pe(pe, dim=1, sp_world_size=sp_world_size, sp_rank=sp_rank)
+
+    x = sp_chunk_group(x, sp_world_size, sp_rank, dim=1)
+    context = sp_chunk_group(context, sp_world_size, sp_rank, dim=1)
+    timestep = process_usp_timestep(timestep, sp_rank, sp_world_size)
+    if "prompt_timestep" in merged_args:
+        merged_args["prompt_timestep"] = process_usp_timestep(merged_args["prompt_timestep"], sp_rank, sp_world_size)
+
+    # Process transformer blocks
+    x = self._process_transformer_blocks(x, context, attention_mask, timestep, pe, transformer_options=transformer_options, **merged_args)
+
+    # ===================== SP GATHER ===================== #
+    x = sp_gather_group(x, x_orig, dim=1)
+
+    # Process output
+    x = self._process_output(x, embedded_timestep, keyframe_idxs, **merged_args)
+    return x
+
+
+def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}, *args, **kwargs):
+    q = self.to_q(x)
+    context = x if context is None else context
+    k = self.to_k(context)
+    v = self.to_v(context)
+
+    q = self.q_norm(q)
+    k = self.k_norm(k)
+
+    if pe is not None:
+        q = apply_rotary_emb(q, pe)
+        k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
+
+    out = xfuser_optimized_attention(
+        q,
+        k,
+        v,
+        self.heads,
+        attn_precision=self.attn_precision,
+    )
+
+    if self.to_gate_logits is not None:
+        gate_logits = self.to_gate_logits(x)
+        b, t, _ = out.shape
+        out = out.view(b, t, self.heads, self.dim_head)
+        gates = 2.0 * torch.sigmoid(gate_logits)
+        out = out * gates.unsqueeze(-1)
+        out = out.view(b, t, self.heads * self.dim_head)
+
+    return self.to_out(out)

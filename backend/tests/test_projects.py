@@ -9,7 +9,7 @@ from directordeck.schemas import (
     default_timeline_draft,
 )
 
-from .conftest import asset
+from .conftest import asset, save_timeline_document
 
 
 async def test_project_list_create_rename_delete(client) -> None:
@@ -31,12 +31,18 @@ async def test_project_list_create_rename_delete(client) -> None:
     timeline = (await client.get(f"/api/projects/{created['id']}/timeline")).json()
     assert timeline["segments"][0]["id"] != "timeline-segment-1"
 
-    renamed = await client.patch(
-        f"/api/projects/{created['id']}", json={"title": "改名后"}
+    timeline["title"] = "改名后"
+    renamed = await save_timeline_document(
+        client,
+        timeline,
+        project_id=created["id"],
     )
     assert renamed.status_code == 200
     assert renamed.json()["title"] == "改名后"
-    # Rename keeps the list title and the document title in sync.
+    # CAS timeline writes keep the list title and document title in sync.
+    summary = await client.get(f"/api/projects/{created['id']}")
+    assert summary.status_code == 200
+    assert summary.json()["title"] == "改名后"
     timeline = (await client.get(f"/api/projects/{created['id']}/timeline")).json()
     assert timeline["title"] == "改名后"
 
@@ -51,11 +57,17 @@ async def test_project_list_create_rename_delete(client) -> None:
 
 async def test_project_timeline_roundtrip_isolated_from_default(client) -> None:
     created = (await client.post("/api/projects", json={"title": "独立项目"})).json()
-    document = default_timeline_draft().model_dump(mode="json")
+    document = (
+        await client.get(f"/api/projects/{created['id']}/timeline")
+    ).json()
     document["title"] = "独立项目"
     document["segments"][0]["prompt"] = "独立项目的第一段"
 
-    put = await client.put(f"/api/projects/{created['id']}/timeline", json=document)
+    put = await save_timeline_document(
+        client,
+        document,
+        project_id=created["id"],
+    )
     assert put.status_code == 200
 
     default_timeline = (await client.get("/api/timeline")).json()
@@ -76,13 +88,18 @@ async def test_cascade_delete_unbinds_across_all_projects(client) -> None:
 
     default_document = default_timeline_draft().model_dump(mode="json")
     default_document["segments"][0]["first_image"] = first
-    await client.put("/api/timeline", json=default_document)
+    await save_timeline_document(client, default_document)
 
     created = (await client.post("/api/projects", json={"title": "级联测试"})).json()
     second_document = default_timeline_draft().model_dump(mode="json")
     second_document["title"] = "级联测试"
     second_document["segments"][0]["first_image"] = first
-    await client.put(f"/api/projects/{created['id']}/timeline", json=second_document)
+    await save_timeline_document(
+        client,
+        second_document,
+        project_id=created["id"],
+        legacy_settings=default_settings().model_dump(mode="json"),
+    )
 
     response = await client.delete(f"/api/assets/{first['id']}?cascade=true")
     assert response.status_code == 200
@@ -105,8 +122,14 @@ async def test_segment_take_lookup_scoped_by_project(client) -> None:
 
     document = default_timeline_draft().model_dump(mode="json")
     document["segments"][0]["id"] = "shared-segment"
-    await client.put(f"/api/projects/{created_a['id']}/timeline", json=document)
-    await client.put(f"/api/projects/{created_b['id']}/timeline", json=document)
+    for project_id in (created_a["id"], created_b["id"]):
+        saved = await save_timeline_document(
+            client,
+            document,
+            project_id=project_id,
+            legacy_settings=default_settings().model_dump(mode="json"),
+        )
+        assert saved.status_code == 200, saved.text
 
     timeline = UnifiedTimelineDraft.model_validate(document)
     fingerprint = timeline_segment_take_fingerprint(timeline, timeline.segments[0])
@@ -174,15 +197,27 @@ async def test_segment_take_lookup_scoped_by_project(client) -> None:
 
 
 async def test_import_project_preserves_document_verbatim(client) -> None:
-    document = default_timeline_draft().model_dump(mode="json")
+    document = (await client.get("/api/timeline")).json()
     document["title"] = "历史来源"
     document["segments"][0]["id"] = "historical-segment"
     document["segments"][0]["prompt"] = "从历史任务恢复"
 
-    imported = (await client.post(
-        "/api/projects/import",
+    preflight = await client.post(
+        "/api/projects/import/preflight",
         json={"title": "历史来源", "document": document},
-    )).json()
+    )
+    assert preflight.status_code == 200, preflight.text
+    proposal = preflight.json()
+    assert proposal["status"] == "ready"
+    committed = await client.post(
+        "/api/projects/import/commit",
+        json={
+            "commit_token": proposal["commit_token"],
+            "input_digest": proposal["input_digest"],
+        },
+    )
+    assert committed.status_code == 200, committed.text
+    imported = committed.json()
     assert imported["title"] == "历史来源"
     assert imported["segment_count"] == 1
 

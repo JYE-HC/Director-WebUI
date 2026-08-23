@@ -37,6 +37,18 @@ def test_runtime_settings_have_no_comfy_url_field() -> None:
         )
 
 
+def test_endpoint_identity_is_boot_scoped_and_injectable(tmp_path: Path) -> None:
+    runtime_id = "comfy-boot-runtime-1"
+    app = create_app(
+        database_path=tmp_path / "directordeck.sqlite3",
+        comfy_url="http://127.0.0.1:8188",
+        endpoint_runtime_instance_id=runtime_id,
+    )
+
+    assert app.state.endpoint_identity.endpoint_key == "embedded"
+    assert app.state.endpoint_identity.runtime_instance_id == runtime_id
+
+
 def test_embedded_tls_certificate_is_shared_by_http_and_websocket_clients(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -211,7 +223,7 @@ async def test_connection_test_reports_transport_failure(
     assert tested.json() == {"ok": False, "message": "连接被拒绝"}
 
 
-async def test_settings_put_response_matches_authoritative_get(
+async def test_settings_cas_response_matches_authoritative_get(
     tmp_path: Path,
 ) -> None:
     app = create_app(
@@ -223,9 +235,17 @@ async def test_settings_put_response_matches_authoritative_get(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=True),
         base_url="http://testserver",
     ) as client:
+        authority = await client.get("/api/settings/authority")
+        assert authority.status_code == 200, authority.text
         put = await client.put(
-            "/api/settings",
-            json=default_settings().model_dump(mode="json"),
+            "/api/settings/authority",
+            json={
+                "document": authority.json()["settings"],
+                "expected_authority_token": authority.json()[
+                    "authority_token"
+                ],
+                "schema_version": 3,
+            },
         )
         assert put.status_code == 200, put.text
         get = await client.get("/api/settings")
@@ -234,4 +254,4 @@ async def test_settings_put_response_matches_authoritative_get(
     # The browser compares its PUT draft with the authoritative GET
     # byte-for-byte; any silent server-side rewrite becomes an infinite
     # latest-wins retry loop.
-    assert put.content == get.content
+    assert put.json()["settings"] == get.json()

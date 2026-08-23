@@ -4,14 +4,38 @@ import asyncio
 import sqlite3
 import uuid
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 import directordeck.app as director_app_module
-from directordeck.compiler import timeline_segment_take_fingerprint
+import pytest
+from directordeck.compiler import align_h3_frames, timeline_segment_take_fingerprint
 from directordeck.database import Database
-from directordeck.schemas import UnifiedTimelineDraft, default_settings, default_timeline_draft
+from directordeck.schemas import (
+    UnifiedTimelineDraft,
+    default_settings,
+    default_timeline_draft,
+)
+from directordeck.workflow.execution import (
+    HistoryTerminalEvidence,
+    ObservedArtifactSpec,
+    OutputDescriptor,
+    OutputObservationReceipt,
+    sha256_document_digest,
+)
 
-from .conftest import asset, wait_for_submission_tasks
+from .conftest import (
+    adapt_legacy_workflow_requests,
+    asset,
+    legacy_settings_document,
+    save_legacy_settings_document,
+    wait_for_submission_tasks,
+)
+
+
+@pytest.fixture(autouse=True)
+def _stage6_v5_request_adapter(client, monkeypatch) -> None:
+    adapt_legacy_workflow_requests(client, monkeypatch)
 
 
 def _segment(identity: str, *, prompt: str | None = None) -> dict:
@@ -66,6 +90,8 @@ def _seed_successful_take(
     filename: str | None = None,
     completed_at: str = "2026-08-13T12:00:00+00:00",
     duplicate_output: bool = False,
+    observed: bool = True,
+    retain_source_job: bool = False,
 ) -> tuple[str, str]:
     job_id = str(uuid.uuid4())
     child_id = str(uuid.uuid4())
@@ -78,6 +104,7 @@ def _seed_successful_take(
             "progress": 1.0,
             "stage": "completed",
             "prompt_id": None,
+            "project_id": database.LEGACY_DEFAULT_PROJECT_ID,
             "outputs": [],
             "error": None,
             "config_snapshot": {
@@ -124,6 +151,92 @@ def _seed_successful_take(
             "completed_at": completed_at,
         }
     )
+    if observed and not duplicate_output:
+        descriptor = OutputDescriptor(
+            filename=str(output["filename"]),
+            subfolder=str(output["subfolder"]),
+            type="output",
+        )
+        frame_count = align_h3_frames(
+            source_segment.duration_seconds, timeline.render.fps
+        )
+        artifact = ObservedArtifactSpec(
+            segment_id=segment_id,
+            child_id=child_id,
+            output_descriptor=descriptor,
+            width=timeline.render.width,
+            height=timeline.render.height,
+            fps=timeline.render.fps,
+            frame_count=frame_count,
+            duration_seconds=frame_count / timeline.render.fps,
+            has_audio=source_segment.audio_mode != "mute",
+            media_probe_version="historical-test-ffprobe-v1",
+            content_hash=None,
+        )
+        history_evidence = HistoryTerminalEvidence(
+            prompt_id=child_id,
+            terminal_status="succeeded",
+            history_digest=sha256_document_digest(
+                {"prompt_id": child_id, "output": output}
+            ),
+            observed_at=datetime.fromisoformat(completed_at),
+        )
+        receipt = OutputObservationReceipt(
+            child_id=child_id,
+            segment_id=segment_id,
+            node_id="save",
+            output_descriptor=descriptor,
+            exact_prompt_snapshot_digest=sha256_document_digest(
+                {"fixture": "historical-exact-prompt"}
+            ),
+            expected_output_spec_digest=sha256_document_digest(
+                {"fixture": "historical-expected-output"}
+            ),
+            history_evidence=history_evidence,
+        )
+        receipt_json = database._contract_json(receipt)
+        receipt_digest = database._execution_document_digest(receipt)
+        artifact_json = database._contract_json(artifact)
+        with database.connect() as connection:
+            database._ensure_execution_evidence_schema(connection)
+            database._ensure_artifact_observation_schema(connection)
+            take = connection.execute(
+                "SELECT id FROM segment_takes WHERE source_child_id = ?",
+                (child_id,),
+            ).fetchone()
+            assert take is not None
+            connection.execute(
+                "INSERT INTO job_child_output_receipts("
+                "child_id, schema_version, receipt, receipt_digest, created_at) "
+                "VALUES(?, 1, ?, ?, ?)",
+                (child_id, receipt_json, receipt_digest, completed_at),
+            )
+            connection.execute(
+                "INSERT INTO segment_take_observed_artifacts("
+                "take_id, source_child_id, schema_version, observed_artifact, "
+                "observed_artifact_digest, receipt_digest, created_at) "
+                "VALUES(?, ?, 1, ?, ?, ?, ?)",
+                (
+                    take["id"],
+                    child_id,
+                    artifact_json,
+                    database._execution_document_digest(artifact),
+                    receipt_digest,
+                    completed_at,
+                ),
+            )
+    if not retain_source_job:
+        # This helper deliberately constructs an archival observed-take row
+        # without a live Stage-4 ExactPromptSnapshot/PromptOwnership chain.  It
+        # is fixture setup for the post-job-deletion reader, not a valid live
+        # typed job.  Remove the synthetic source directly; production delete
+        # semantics are covered with complete evidence in the Stage-4 deletion
+        # suite and must reject this intentionally partial live chain.
+        with database.connect() as connection:
+            deleted = connection.execute(
+                "DELETE FROM jobs WHERE id = ?", (job_id,)
+            )
+            assert deleted.rowcount == 1
     return job_id, child_id
 
 
@@ -224,7 +337,13 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
     database = Database(tmp_path / "takes.sqlite3")
     database.initialize()
     timeline = _timeline(_segment("root"), audio_mode="generate")
-    job_id, child_id = _seed_successful_take(database, timeline, "root")
+    job_id, child_id = _seed_successful_take(
+        database,
+        timeline,
+        "root",
+        observed=False,
+        retain_source_job=True,
+    )
     fingerprint = _take_fingerprint(timeline)
 
     take = database.find_latest_segment_take(
@@ -246,6 +365,7 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
         "root",
         filename="newer-root.mp4",
         completed_at="2026-08-13T13:00:00+00:00",
+        retain_source_job=True,
     )
     newest = database.find_latest_segment_take(
         "root", fingerprint,
@@ -259,6 +379,7 @@ def test_take_ledger_is_exact_audio_filtered_backfilled_and_not_job_cascaded(
         "root",
         filename="same-time-root.mp4",
         completed_at="2026-08-13T13:00:00+00:00",
+        retain_source_job=True,
     )
     with sqlite3.connect(database.path) as db:
         tied = db.execute(
@@ -349,13 +470,21 @@ async def test_compile_and_submit_reuse_server_resolved_historical_take_without_
     )
     # Runtime/model/LoRA/sampler/seed changes are not authored predecessor
     # content and must not invalidate its persisted take.
-    live_settings = database.get_settings()
-    live_settings.models.fl2va.filename = "generic_h3_diffusion.safetensors"
-    live_settings.models.fl2va.lora_name = (
-        "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
+    live_settings = await legacy_settings_document(client)
+    live_settings["models"]["fl2va"]["filename"] = (
+        "generic_h3_diffusion.safetensors"
     )
-    live_settings.models.fl2va.lora_strength = 0.75
-    database.put_settings(live_settings)
+    live_settings["models"]["fl2va"]["lora_name"] = (
+        "minimax_h3_turbo_v4_step600_ema.safetensors"
+    )
+    live_settings["models"]["fl2va"]["lora_strength"] = 0.75
+    live_settings["models"]["fl2va"]["standard_lora_loader_override"] = {
+        "loader": "dedicated",
+        "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
+        "model_filename": "generic_h3_diffusion.safetensors",
+    }
+    saved_settings = await save_legacy_settings_document(client, live_settings)
+    assert saved_settings.status_code == 200, saved_settings.text
     authored.sampling.fl2va.steps = 31
     authored.sampling.fl2va.seed = 9_876_543
 
@@ -403,6 +532,35 @@ async def test_compile_and_submit_reuse_server_resolved_historical_take_without_
         },
     )
     assert rejected.status_code == 422
+
+
+async def test_legacy_historical_take_reports_observation_unavailable(client) -> None:
+    database = client.director_app.state.database
+    root = _segment("legacy-root")
+    successor = _segment("legacy-successor")
+    _seed_successful_take(
+        database,
+        _timeline(root, audio_mode="generate"),
+        "legacy-root",
+        filename="legacy-root.mp4",
+        observed=False,
+    )
+
+    response = await client.post(
+        "/api/timeline/compile",
+        json={
+            "config": _timeline(
+                root, successor, audio_mode="generate", continuity=True
+            ).model_dump(mode="json"),
+            "segment_ids": ["legacy-successor"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["detail"]["code"]
+        == "historical_take_observation_unavailable"
+    )
 
 
 async def test_historical_take_survives_recipe_family_prompt_and_reference_changes(
@@ -476,7 +634,7 @@ async def test_historical_take_reports_missing_geometry_and_audio_incapable(clie
         },
     )
     assert audio_error.status_code == 422
-    assert "不含生成音频接续所需的音轨" in audio_error.text
+    assert audio_error.json()["detail"]["code"] == "historical_take_audio_required"
 
     muted = _timeline(root, successor, audio_mode="mute", continuity=True)
     assert (
@@ -504,7 +662,10 @@ async def test_historical_take_reports_missing_geometry_and_audio_incapable(clie
         json={"config": mismatched_document, "segment_ids": ["state-successor"]},
     )
     assert mismatch.status_code == 422
-    assert "分辨率、帧率或可见帧数" in mismatch.text
+    assert (
+        mismatch.json()["detail"]["code"]
+        == "historical_take_geometry_mismatch"
+    )
 
     missing_document = deepcopy(edited_document)
     missing_document["segments"][0]["id"] = "never-rendered-root"
@@ -513,7 +674,7 @@ async def test_historical_take_reports_missing_geometry_and_audio_incapable(clie
         json={"config": missing_document, "segment_ids": ["state-successor"]},
     )
     assert missing.status_code == 422
-    assert "没有可用的历史成功成片" in missing.text
+    assert missing.json()["detail"]["code"] == "historical_take_required"
 
 
 async def test_historical_then_same_run_chain_waits_only_for_new_middle_take(

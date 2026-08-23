@@ -1,12 +1,10 @@
 import sys
 import os
 
-# Comfy dynamic lib loader cause the module imported as a path instead of normal python path
-# e.g. /path/to/ComfyUI/custom_nodes/raylight.src.raylight.etc
-# this code will change it into :
-# raylight.wanvideo or raylight.flux
-# this is done since ray cluster needs libs to run in this case raylight.
-# ray.init(runtime_env={"py_modules":[raylight]})
+# ComfyUI loads custom-node entrypoints by filesystem path. Add this maintained
+# fork's ``src`` directory so it always imports under DirectorDeck's private
+# Python namespace. Never alias it to ``raylight``: a user's external RayLight
+# install may coexist in the same process and must not participate here.
 this_dir = os.path.dirname(os.path.realpath(__file__))
 src_dir = os.path.join(this_dir, "src")
 if src_dir not in sys.path:
@@ -16,32 +14,32 @@ comfy_dir = os.path.abspath(os.path.join(this_dir, "../../comfy"))
 if comfy_dir not in sys.path:
     sys.path.insert(0, comfy_dir)
 
-from raylight.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 # Extra nodes
-from raylight.comfy_extra_dist.nodes_torch_compile import NODE_CLASS_MAPPINGS as COMPILE_NODE_CLASS_MAPPINGS
-from raylight.comfy_extra_dist.nodes_torch_compile import NODE_DISPLAY_NAME_MAPPINGS as COMPILE_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_torch_compile import NODE_CLASS_MAPPINGS as COMPILE_NODE_CLASS_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_torch_compile import NODE_DISPLAY_NAME_MAPPINGS as COMPILE_DISPLAY_NAME_MAPPINGS
 
-from raylight.comfy_extra_dist.nodes_model_advanced import NODE_CLASS_MAPPINGS as MODEL_ADV_CLASS_MAPPINGS
-from raylight.comfy_extra_dist.nodes_model_advanced import NODE_DISPLAY_NAME_MAPPINGS as MODEL_ADV_DISPLAY_NAME_MAPPINGS
-from raylight.comfy_extra_dist.nodes_guidance import NODE_CLASS_MAPPINGS as GUIDANCE_NODE_CLASS_MAPPINGS
-from raylight.comfy_extra_dist.nodes_guidance import NODE_DISPLAY_NAME_MAPPINGS as GUIDANCE_DISPLAY_NAME_MAPPINGS
-from raylight.comfy_extra_dist.nodes_easycache import NODE_CLASS_MAPPINGS as EASY_CACHE_NODE_CLASS_MAPPINGS
-from raylight.comfy_extra_dist.nodes_easycache import NODE_DISPLAY_NAME_MAPPINGS as EASY_CACHE_DISPLAY_NAME_MAPPINGS
-from raylight.comfy_extra_dist.nodes_minimax_h3 import NODE_CLASS_MAPPINGS as MINIMAX_H3_NODE_CLASS_MAPPINGS
-from raylight.comfy_extra_dist.nodes_minimax_h3 import NODE_DISPLAY_NAME_MAPPINGS as MINIMAX_H3_DISPLAY_NAME_MAPPINGS
-from raylight.comfy_extra_dist.nodes_lt import NODE_CLASS_MAPPINGS as LT_NODE_CLASS_MAPPINGS
-from raylight.comfy_extra_dist.nodes_lt import NODE_DISPLAY_NAME_MAPPINGS as LT_NODE_DISPLAY_NAME_MAPPINGS
-from raylight.comfy_extra_dist.nodes_context_windows import NODE_CLASS_MAPPINGS as CONTEXT_WINDOWS_NODE_CLASS_MAPPINGS
-from raylight.comfy_extra_dist.nodes_context_windows import NODE_DISPLAY_NAME_MAPPINGS as CONTEXT_WINDOWS_NODE_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_model_advanced import NODE_CLASS_MAPPINGS as MODEL_ADV_CLASS_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_model_advanced import NODE_DISPLAY_NAME_MAPPINGS as MODEL_ADV_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_guidance import NODE_CLASS_MAPPINGS as GUIDANCE_NODE_CLASS_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_guidance import NODE_DISPLAY_NAME_MAPPINGS as GUIDANCE_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_easycache import NODE_CLASS_MAPPINGS as EASY_CACHE_NODE_CLASS_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_easycache import NODE_DISPLAY_NAME_MAPPINGS as EASY_CACHE_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_minimax_h3 import NODE_CLASS_MAPPINGS as MINIMAX_H3_NODE_CLASS_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_minimax_h3 import NODE_DISPLAY_NAME_MAPPINGS as MINIMAX_H3_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_lt import NODE_CLASS_MAPPINGS as LT_NODE_CLASS_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_lt import NODE_DISPLAY_NAME_MAPPINGS as LT_NODE_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_context_windows import NODE_CLASS_MAPPINGS as CONTEXT_WINDOWS_NODE_CLASS_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_context_windows import NODE_DISPLAY_NAME_MAPPINGS as CONTEXT_WINDOWS_NODE_DISPLAY_NAME_MAPPINGS
 
-from raylight.comfy_extra_dist.nodes_custom_sampler import NODE_CLASS_MAPPINGS as SAMPLER_CLASS_MAPPINGS
-from raylight.comfy_extra_dist.nodes_custom_sampler import NODE_DISPLAY_NAME_MAPPINGS as SAMPLER_DISPLAY_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_custom_sampler import NODE_CLASS_MAPPINGS as SAMPLER_CLASS_MAPPINGS
+from directordeck_raylight.comfy_extra_dist.nodes_custom_sampler import NODE_DISPLAY_NAME_MAPPINGS as SAMPLER_DISPLAY_MAPPINGS
 
 if os.getenv("debug_raylight") == "1":
     print("RAYLIGHT DEBUG MODE")
-    from raylight.nodes_debug import NODE_CLASS_MAPPINGS as DEBUG_NODE_CLASS_NAME_MAPPINGS
-    from raylight.nodes_debug import NODE_DISPLAY_NAME_MAPPINGS as DEBUG_NODE_DISPLAY_NAME_MAPPINGS
+    from directordeck_raylight.nodes_debug import NODE_CLASS_MAPPINGS as DEBUG_NODE_CLASS_NAME_MAPPINGS
+    from directordeck_raylight.nodes_debug import NODE_DISPLAY_NAME_MAPPINGS as DEBUG_NODE_DISPLAY_NAME_MAPPINGS
 
     NODE_CLASS_MAPPINGS.update(DEBUG_NODE_CLASS_NAME_MAPPINGS)
     NODE_DISPLAY_NAME_MAPPINGS.update(DEBUG_NODE_DISPLAY_NAME_MAPPINGS)
@@ -52,16 +50,16 @@ gguf_dir = os.path.abspath(gguf_dir)
 print(gguf_dir)
 
 if os.path.isdir(gguf_dir):
-    from raylight.expansion.comfyui_gguf.nodes import NODE_CLASS_MAPPINGS as GGUF_NODE_CLASS_MAPPINGS
-    from raylight.expansion.comfyui_gguf.nodes import NODE_DISPLAY_NAME_MAPPINGS as GGUF_NODE_DISPLAY_NAME_MAPPINGS
+    from directordeck_raylight.expansion.comfyui_gguf.nodes import NODE_CLASS_MAPPINGS as GGUF_NODE_CLASS_MAPPINGS
+    from directordeck_raylight.expansion.comfyui_gguf.nodes import NODE_DISPLAY_NAME_MAPPINGS as GGUF_NODE_DISPLAY_NAME_MAPPINGS
 
     NODE_CLASS_MAPPINGS.update(GGUF_NODE_CLASS_MAPPINGS)
     NODE_DISPLAY_NAME_MAPPINGS.update(GGUF_NODE_DISPLAY_NAME_MAPPINGS)
 else:
     print("City96 GGUF not found, GGUF ray loader disable")
 
-from raylight.expansion.comfyui_ltxv import NODE_CLASS_MAPPINGS as LTXV_EXP_NODE_CLASS_MAPPINGS
-from raylight.expansion.comfyui_ltxv import NODE_DISPLAY_NAME_MAPPINGS as LTXV_EXP_NODE_DISPLAY_NAME_MAPPINGS
+from directordeck_raylight.expansion.comfyui_ltxv import NODE_CLASS_MAPPINGS as LTXV_EXP_NODE_CLASS_MAPPINGS
+from directordeck_raylight.expansion.comfyui_ltxv import NODE_DISPLAY_NAME_MAPPINGS as LTXV_EXP_NODE_DISPLAY_NAME_MAPPINGS
 
 
 # CLASS

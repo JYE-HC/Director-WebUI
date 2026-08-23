@@ -1,0 +1,25 @@
+{
+  "fixture_schema": 1,
+  "name": "extensible_workflow_v0",
+  "purpose": "Read-only behavior baseline for stages 1 through 11",
+  "public_baseline_commit": "6b959d6f73435afe2a83acef6c62fe9d812200fa",
+  "timeline_schema": 4,
+  "native_prompt_case_count": 26,
+  "files": {
+    "native_prompt_goldens.json": {
+      "sha256": "2b552225f1a5839f88da217d9cbc7ba9539363fa869242e0db73da5ce52edbb4",
+      "size_bytes": 372946,
+      "format": "UTF-8 JSON with significant object order and trailing newline"
+    },
+    "current_v4.sqlite3.gz": {
+      "sha256": "dd9b964d58bd45e8ebf6d175fd32ff1e849656831cc11777a8726e37b2ff8105",
+      "size_bytes": 7822,
+      "format": "Deterministic gzip archive of a SQLite current-v4 database; decompress to a temporary directory before opening"
+    },
+    "current_v4_expected.json": {
+      "sha256": "e4e037d1d31c3924f27bed9c0d506e223179be2c20ea5aeaa2513d7c2037d737",
+      "size_bytes": 34766,
+      "format": "UTF-8 JSON semantic projection with trailing newline"
+    }
+  }
+}

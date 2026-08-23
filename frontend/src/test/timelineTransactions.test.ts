@@ -50,6 +50,17 @@ describe("timeline transaction policy", () => {
       fallbackId: "test-transaction-fallback",
     })).toMatchObject({ scope: "document", context: "structural" });
     expect(timelineTransactionPolicy(state, {
+      type: "feature/set-project",
+      featureId: "lora",
+      selection: state.project.features.project.lora,
+    })).toMatchObject({ scope: "document", label: "修改 LoRA" });
+    expect(timelineTransactionPolicy(state, {
+      type: "feature/set-segment",
+      segmentId: segment.id,
+      featureId: "opaque_extension",
+      selection: { enabled: true, params: {} },
+    })).toMatchObject({ scope: "document", label: "修改片段扩展配置" });
+    expect(timelineTransactionPolicy(state, {
       type: "playhead/set",
       seconds: 1,
     })).toMatchObject({

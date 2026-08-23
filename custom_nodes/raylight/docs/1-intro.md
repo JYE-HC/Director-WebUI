@@ -87,7 +87,7 @@ custom_nodes/raylight/
 │   ├── 3-usp.md                # USP documentation
 │   ├── 4-cfg.md                # CFG parallelism
 │   └── 5-expansion.md          # Expansion modules
-├── src/raylight/
+├── src/directordeck_raylight/
 │   ├── comfy_dist/
 │   │   ├── sd.py               # Model loading (FSDP, GGUF, lazy)
 │   │   ├── fsdp_utils.py       # FSDP utilities

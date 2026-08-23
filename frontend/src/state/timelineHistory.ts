@@ -887,6 +887,8 @@ const TIMELINE_PATCH_ROOT_FIELDS = new Set([
   "render",
   "sampling",
   "export_mode",
+  "model_stack",
+  "features",
   "segments",
 ]);
 
@@ -905,6 +907,12 @@ const TIMELINE_PATCH_FIELDS = new Set([
   "scheduler",
   "shift",
   "audio_shift",
+  "model_stack",
+  "features",
+  "template_bundle_version",
+  "project",
+  "by_segment",
+  "params",
   "id",
   "mode",
   "prompt",
@@ -1023,7 +1031,7 @@ function timelineHistoryEnvelopeHash(
 }
 
 function parseExactTimelineProject(value: unknown): TimelineProject | null {
-  if (!isPlainRecord(value) || value.version !== 4 || !isJsonSafeValue(value)) return null;
+  if (!isPlainRecord(value) || value.version !== 5 || !isJsonSafeValue(value)) return null;
   const normalized = normalizeTimelineProject(value);
   if (!normalized || !timelineValuesEqual(value, normalized)) return null;
   return cloneJsonValue(normalized);
@@ -1040,7 +1048,7 @@ function parseTimelinePatchPath(value: unknown): TimelinePatch["path"] | null {
   const path: Array<string | number> = [];
   for (const part of value) {
     if (typeof part === "string") {
-      if (!TIMELINE_PATCH_FIELDS.has(part)) return null;
+      if (part.length < 1 || part.length > 512 || ["__proto__", "prototype", "constructor"].includes(part)) return null;
       path.push(part);
     } else if (Number.isSafeInteger(part) && (part as number) >= 0 && (part as number) <= 128) {
       path.push(part as number);
@@ -1048,7 +1056,46 @@ function parseTimelinePatchPath(value: unknown): TimelinePatch["path"] | null {
       return null;
     }
   }
-  return path;
+  const root = path[0];
+  if (root === "model_stack") {
+    return path.length === 3 &&
+        typeof path[1] === "string" &&
+        ["fl2va", "ref2va", "clip", "video_vae", "audio_vae"].includes(path[1]) &&
+        path[2] === "filename"
+      ? path
+      : null;
+  }
+  if (root === "features") {
+    if (path.length === 2 && path[1] === "template_bundle_version") return path;
+    if (path[1] === "project") {
+      if (typeof path[2] !== "string" || !/^[A-Za-z][A-Za-z0-9._-]{0,127}$/.test(path[2])) return null;
+      if (path.length === 3) return path;
+      if (path[3] === "enabled" && path.length === 4) return path;
+      if (path[3] !== "params") return null;
+      return path.slice(4).every((part) =>
+        (typeof part === "string" && part.length <= 128) ||
+        (typeof part === "number" && part >= 0 && part <= 256))
+        ? path
+        : null;
+    }
+    if (path[1] === "by_segment") {
+      if (typeof path[2] !== "string" || path[2].length > 128) return null;
+      if (path.length === 3) return path;
+      if (typeof path[3] !== "string" || !/^[A-Za-z][A-Za-z0-9._-]{0,127}$/.test(path[3])) return null;
+      if (path.length === 4) return path;
+      if (path[4] === "enabled" && path.length === 5) return path;
+      if (path[4] !== "params") return null;
+      return path.slice(5).every((part) =>
+        (typeof part === "string" && part.length <= 128) ||
+        (typeof part === "number" && part >= 0 && part <= 256))
+        ? path
+        : null;
+    }
+    return null;
+  }
+  return path.every((part) => typeof part === "number" || TIMELINE_PATCH_FIELDS.has(part))
+    ? path
+    : null;
 }
 
 function parseTimelinePatch(value: unknown): TimelinePatch | null {

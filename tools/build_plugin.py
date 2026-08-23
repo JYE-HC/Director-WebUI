@@ -27,9 +27,33 @@ from plugin_package import PackageError, source_identity, write_provenance
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = PROJECT_ROOT / "build" / "DirectorDeck"
 
-IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", ".git")
+IGNORE_PATTERNS = (
+    "__pycache__",
+    "*.pyc",
+    ".pytest_cache",
+    ".git",
+    "_ray_runtime_env",
+)
+IGNORE = shutil.ignore_patterns(*IGNORE_PATTERNS)
 
-BUNDLED_NODE_PACKS = ("raylight", "ComfyUI-MiniMax-H3-Turbo")
+BUNDLED_NODE_PACKS = (
+    "DirectorDeck-Strict-Attention",
+    "DirectorDeck-Strict-H3",
+    "raylight",
+)
+BUNDLED_NODE_PACK_DESTINATIONS = {
+    "raylight": "DirectorDeck-RayLight",
+}
+BUNDLED_RAYLIGHT_PYTHON_PACKAGE = "directordeck_raylight"
+BUNDLED_RAYLIGHT_EXCLUDED_DIRECTORIES = (
+    "docs",
+    "example_workflows",
+    "tests",
+)
+BUNDLED_RAYLIGHT_IGNORE = shutil.ignore_patterns(
+    *IGNORE_PATTERNS,
+    *BUNDLED_RAYLIGHT_EXCLUDED_DIRECTORIES,
+)
 
 
 def _package_identity() -> tuple[str, str]:
@@ -68,7 +92,28 @@ def _copy_payload(destination: Path) -> None:
         pack_src = PROJECT_ROOT / "custom_nodes" / pack
         if not pack_src.is_dir():
             raise SystemExit(f"bundled node pack missing: {pack_src}")
-        shutil.copytree(pack_src, destination / "nodes" / pack, ignore=IGNORE)
+        if pack == "raylight":
+            private_package = (
+                pack_src / "src" / BUNDLED_RAYLIGHT_PYTHON_PACKAGE
+            )
+            if not private_package.is_dir():
+                raise SystemExit(
+                    "bundled RayLight private Python package missing: "
+                    f"{private_package}"
+                )
+            legacy_package = pack_src / "src" / "raylight"
+            if legacy_package.exists():
+                raise SystemExit(
+                    "bundled RayLight must not expose the external Python namespace: "
+                    f"{legacy_package}"
+                )
+        packaged_name = BUNDLED_NODE_PACK_DESTINATIONS.get(pack, pack)
+        pack_ignore = BUNDLED_RAYLIGHT_IGNORE if pack == "raylight" else IGNORE
+        shutil.copytree(
+            pack_src,
+            destination / "nodes" / packaged_name,
+            ignore=pack_ignore,
+        )
     raylight_requirements = (
         PROJECT_ROOT / "custom_nodes" / "raylight" / "requirements.txt"
     )

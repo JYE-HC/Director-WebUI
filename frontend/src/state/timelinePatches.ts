@@ -1,6 +1,7 @@
 import type { TimelineProject } from "../domain/timelineProject";
 
-export const TIMELINE_PATCH_SCHEMA_VERSION = 1;
+/** Schema 2 adds model_stack/features and never replays v4 pointers in place. */
+export const TIMELINE_PATCH_SCHEMA_VERSION = 2;
 
 export type TimelinePatchPathPart = string | number;
 export type TimelinePatchPath = readonly TimelinePatchPathPart[];

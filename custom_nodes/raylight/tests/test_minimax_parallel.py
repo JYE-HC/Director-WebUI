@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[3]
 CORE = ROOT / "comfy/ldm/minimax/model.py"
-RAYLIGHT = ROOT / "custom_nodes/raylight/src/raylight/diffusion_models/minimax/xdit_context_parallel.py"
+RAYLIGHT = ROOT / "custom_nodes/raylight/src/directordeck_raylight/diffusion_models/minimax/xdit_context_parallel.py"
 
 
 def _module_symbols(path):

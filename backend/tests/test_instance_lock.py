@@ -15,6 +15,8 @@ from directordeck.app import create_app
 from directordeck.instance_lock import DirectorInstanceLock, DirectorInstanceLockError
 from directordeck.schemas import default_settings
 
+from .conftest import save_database_legacy_settings
+
 
 def _silence_progress_manager(app) -> None:
     app.state.progress_manager.ensure = Mock()
@@ -243,7 +245,7 @@ async def test_second_lifespan_for_same_database_fails_before_database_or_comfy_
     database_path = tmp_path / "shared.sqlite3"
     first = create_app(database_path=database_path, comfy_url="http://comfy.test:8188")
     first.state.database.initialize()
-    first.state.database.put_settings(default_settings())
+    save_database_legacy_settings(first.state.database, default_settings())
     _silence_progress_manager(first)
 
     second = create_app(database_path=database_path, comfy_url="http://comfy.test:8188")

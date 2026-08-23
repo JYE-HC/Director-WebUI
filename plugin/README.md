@@ -20,6 +20,9 @@ git clone https://github.com/JYE-HC/DirectorDeck.git
 重启 ComfyUI 后，侧栏出现 **Director** 面板，点击“打开 Director”即可在新标签页进入导演台
 （页面托管于同源的 `/directordeck/`）。ComfyUI 地址自动指向本实例，无需配置。
 
+建议使用 ComfyUI 0.33.0 或更新版本。旧版本或无法解析的版本只会产生兼容性警告，
+不会阻止 DirectorDeck 启动；实际不兼容行为会在导入、提示词校验或执行时按原始错误报告。
+
 ## 安全边界
 
 DirectorDeck 面向本机单一可信用户或可信私网，没有内置登录、授权边界或 TLS 终止。
@@ -35,6 +38,18 @@ DirectorDeck 面向本机单一可信用户或可信私网，没有内置登录�
 ```bash
 /path/to/ComfyUI/.venv/bin/python -m pip install -r DirectorDeck/requirements-raylight.txt
 ```
+
+Director 多卡工作流只使用插件内置并维护的 `DirectorDeck-RayLight`，并通过
+`DirectorDeckRay*` 专属节点名注册；其本地代码和 Ray worker 统一使用私有
+`directordeck_raylight` Python 命名空间。外部 `custom_nodes/raylight` 即使存在也不会被
+Director 导入、跳过内置实现或选入 Director 的工作流。
+
+## Standard LoRA 加载节点
+
+DirectorDeck 不打包或维护第三方 Standard LoRA 加载节点。请先将所选加载节点安装到
+ComfyUI，再在 Director 的系统设置中为底模与 LoRA 建立精确映射。映射是用户权威：
+DirectorDeck 不按模块名、接口切片或实现指纹拒绝用户安装或修改过的加载节点；真实导入、
+提示词校验与执行错误由 ComfyUI/Director 原样报告。
 
 ## 媒体工具（ffmpeg）
 

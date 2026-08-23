@@ -15,8 +15,11 @@ ComfyUI 进程运行，前端页面由 ComfyUI 托管在 `/directordeck/`，数�
 - 后端从固定、版本化模板构造 API prompt，并在每次提交前重新预检。
 - 标准模板只使用 ComfyUI core 与官方 `comfy_extras` 节点；不使用
   `MiniMaxH3Director` 自定义节点，也不依赖其上传、探测、分镜或进度接口。
-- 自定义节点只允许两类明确例外：后端从受支持 H3 LoRA 文件名推导出的加载器，以及由
-  多卡 GPU 池自动启用的 RayLight 执行链。两类例外都有精确白名单，缺节点或配置不兼容时直接失败。
+- Standard LoRA 加载节点由用户安装并通过精确配置映射选择；该映射是用户权威，Director
+  不按模块名、接口切片或实现指纹拒绝外部或用户修改过的节点。真实导入、提示词校验和执行错误
+  在发生时按原始错误报告。多卡执行只使用 DirectorDeck 自带并维护的 RayLight 分支；该分支以
+  `DirectorDeckRay*` 专属节点名注册，并运行在私有 `directordeck_raylight` Python 命名空间；
+  外部 `custom_nodes/raylight` 不会被 Director 导入或选用。
 
 一次时间线提交产生一个父任务，并为每个所选分段建立一个独立原生 child prompt。各 prompt
 使用稳定的模型、CLIP、VAE loader 节点 ID/输入，让 ComfyUI 可以跨 prompt 复用缓存，同时把
@@ -42,8 +45,8 @@ ComfyUI 进程运行，前端页面由 ComfyUI 托管在 `/directordeck/`，数�
 - 派生出的 RayLight 缺节点、GPU 或拓扑错误时直接阻断，不会静默退回 Standard；RayLight 默认按
   完整 RayLight 配置 key 保留 worker 权重，同 key 复用，不兼容 key 或 Standard 会先安全释放旧池；
 - UNET、CLIP、Video VAE、Audio VAE 可配置 ComfyUI 逻辑设备；`gpu:N` 不是物理卡号；
-- LoRA 只选择文件和强度，加载器由后端自动确定：旧 H3 Turbo 使用专用节点，当前量化兼容版使用
-  旁路节点，当前 `comfyui_bf16` 版使用通用 model-only，RayLight 使用 `RayLoraLoader`；未知命名失败封闭；
+- LoRA 只选择文件和强度；Standard 加载器采用用户配置的精确映射，Director 不维护或鉴定其
+  第三方实现，RayLight 链使用随插件维护的 `DirectorDeckRayLoraLoader`。真实缺失、导入和执行错误按原始错误报告；
 - MiniMax H3 原生模板固定 24fps 并使用 `BasicGuider`；产品不提供没有实际作用的 CFG 或负面提示词；
 - FL2VA 与 Ref2VA 各自保存步数、Seed、采样器、调度器和 Video/Audio Shift。Seed 始终是浏览器可
   无损往返的 JavaScript safe integer；勾选随机时，前端在每次提交前重掷并把确切数值显示在灰显输入框，
@@ -81,7 +84,7 @@ Director 的跨段 AV latent handoff，也不是剪辑层 crossfade。前驱失�
 
 纯 Standard 任务不主动执行段间清显存，稳定 loader 输入有利于跨任务复用。RayLight 默认使用
 `keep_until_switch`：family、model、LoRA、GPU pool、topology 与会修改 worker 的 sigma shift 完全相同的后续分段和任务直接复用 CUDA
-权重；任一项变化时，Director 会在提交锁内先提交并等待 `RayKill` 安全屏障，再用递增 epoch
+权重；任一项变化时，Director 会在提交锁内先提交并等待 `DirectorDeckRayKill` 安全屏障，再用递增 epoch
 创建新池。切到 Standard 也先清旧 Ray 池，因此 FL2VA 与 Ref2VA 可以在同一组 GPU 上顺序运行，无需重启
 ComfyUI，也不依赖 OOM 自动卸载。Director 还固定发送 `driver_cleanup_policy=ray_devices`：采样前只释放
 `GPU_SELECT` 所列 Ray 逻辑卡上的 Comfy driver 模型，不会强制卸载放在非 Ray 卡上的 CLIP/VAE；这些非 Ray
@@ -148,8 +151,9 @@ Director 没有登录鉴权，随 ComfyUI 同源提供服务。不要把 ComfyUI
 
 单卡自动走 Standard 链，只使用 ComfyUI core 与官方 extras。两张及以上 GPU 时在“系统设置”
 开启多卡推理，并按提示在插件内安装 RayLight 依赖（`requirements-raylight.txt`）后重启
-ComfyUI。多卡仅支持 Linux。`ComfyUI-MiniMax-H3-Turbo` 只在选择旧版专用 Turbo LoRA 时使用；
-不要安装旧 `MiniMaxH3Director` 大节点，Director 不依赖并明确拒绝它。
+ComfyUI。多卡仅支持 Linux。Standard LoRA 的加载节点由用户在 ComfyUI 中自行安装并通过精确
+映射选择；DirectorDeck 不打包或维护第三方 LoRA 节点。Director 不依赖、也不会生成旧
+`MiniMaxH3Director` 大节点；它是否安装不会影响 DirectorDeck 使用。
 
 ## ffmpeg
 

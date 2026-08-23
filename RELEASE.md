@@ -12,23 +12,32 @@ removed; no migration path is provided for pre-plugin installs.
 
 | Component | Requirement |
 | --- | --- |
-| ComfyUI | v0.33.0 or newer; tested baseline `8f37cf8c833a8f2d3c62e2adbccebfd165623481` |
+| ComfyUI | v0.33.0 or newer recommended; older or unparseable versions emit a warning but do not block startup |
 | Platform | Linux; Windows portable ComfyUI is supported for single-GPU Standard inference |
 | Multi-GPU (RayLight) | Linux only; dependencies install on demand from the settings page |
 | Python | the host ComfyUI environment (3.12+ recommended) |
 
-The plugin package bundles the Director-maintained RayLight fork and the
-`ComfyUI-MiniMax-H3-Turbo` node. Standard inference without the legacy Turbo
-LoRA uses only ComfyUI core and official extras. The old `MiniMaxH3Director`
+The plugin package bundles the Director-maintained RayLight fork under
+`nodes/DirectorDeck-RayLight` and exposes only the eight `DirectorDeckRay*`
+node types used by Director workflows. Its Python code and Ray workers use the
+private `directordeck_raylight` package namespace. An external
+`custom_nodes/raylight` install may coexist, but Director never imports or
+selects it and never skips its bundled fork because of it. Standard
+LoRA loader nodes are installed separately by the user and selected through an
+exact loader mapping; DirectorDeck does not bundle or maintain third-party LoRA
+nodes. Director does not reject user-installed loaders by module label,
+interface slice or implementation fingerprint; genuine import, prompt-validation
+and execution errors are reported when they occur. The old `MiniMaxH3Director`
 custom node is neither bundled nor supported.
 
 ## Validation boundary
 
-`tools/validate_native_comfy_prompts.py` imports nodes in CPU mode and
-validates registry provenance and prompt structure; it does not load models,
-queue prompts or start a Ray cluster. A real release still needs one Standard
-GPU generation and one generation for every supported RayLight topology on
-the maintainer's hardware.
+`tools/validate_native_comfy_prompts.py` imports nodes in CPU mode and validates
+prompt structure and Director-owned packaged nodes; user-installed Standard
+LoRA loaders are not runtime-authorized by provenance or fingerprint. The check
+does not load models, queue prompts or start a Ray cluster. A real release still
+needs one Standard GPU generation and one generation for every supported
+RayLight topology on the maintainer's hardware.
 
 ## Release flow
 

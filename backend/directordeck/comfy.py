@@ -3,7 +3,7 @@ from __future__ import annotations
 import ssl
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +43,6 @@ class ComfyMediaStream:
 class ComfyClientProtocol(Protocol):
     async def capabilities(self) -> dict[str, Any]: ...
     async def models(self) -> dict[str, list[str]]: ...
-    async def lora_metadata(self, filename: str) -> dict[str, str] | None: ...
     async def system_stats(self) -> dict[str, Any]: ...
     async def upload(self, filename: str, content: bytes | Path, content_type: str, kind: AssetKind) -> dict[str, Any]: ...
     async def upload_output(
@@ -54,6 +53,8 @@ class ComfyClientProtocol(Protocol):
         prompt: dict[str, Any],
         client_id: str,
         prompt_id: str | None = None,
+        *,
+        on_receipt: Callable[[str | None, str], None] | None = None,
     ) -> dict[str, Any]: ...
     async def history(
         self, prompt_id: str | None = None, *, max_items: int | None = None
@@ -67,12 +68,11 @@ class ComfyClientProtocol(Protocol):
 
 
 class ComfyClient:
-    CONTINUITY_REQUIRED_NODE_MODULES = {
-        "MiniMaxH3AddGuide": "comfy_extras.nodes_minimax_h3",
-        "ImageFromBatch": "comfy_extras.nodes_images",
-        "TrimAudioDuration": "comfy_extras.nodes_audio",
-    }
-    CONTINUITY_REQUIRED_NODES = tuple(CONTINUITY_REQUIRED_NODE_MODULES)
+    CONTINUITY_REQUIRED_NODES = (
+        "MiniMaxH3AddGuide",
+        "ImageFromBatch",
+        "TrimAudioDuration",
+    )
     STANDARD_REQUIRED_NODES = (
         "UNETLoader",
         "CLIPLoader",
@@ -110,25 +110,25 @@ class ComfyClient:
         "Video Slice",
         "GetVideoComponents",
         "LoadAudio",
-        "RayInitializerAdvanced",
-        "RayUNETLoader",
-        "RayMiniMaxH3SigmaShift",
-        "RayBasicGuider",
-        "RayBasicScheduler",
+        "DirectorDeckRayInitializerAdvanced",
+        "DirectorDeckRayUNETLoader",
+        "DirectorDeckRayMiniMaxH3SigmaShift",
+        "DirectorDeckRayBasicGuider",
+        "DirectorDeckRayBasicScheduler",
         "KSamplerSelect",
-        "XFuserSamplerCustomAdvanced",
-        "RayKill",
+        "DirectorDeckRayXFuserSamplerCustomAdvanced",
+        "DirectorDeckRayKill",
         "VAEDecode",
         "VAEDecodeAudio",
         "CreateVideo",
         "SaveVideo",
     )
-    # RayLoraLoader is only emitted when the selected RayLight model binding
+    # DirectorDeckRayLoraLoader is only emitted when the selected RayLight model binding
     # actually carries a LoRA.  Keeping it outside the base backend contract
     # prevents a LoRA-free RayLight installation from being reported as
     # unavailable; exact compiled-graph preflight still fails closed whenever
     # a selected workflow does emit this conditional node.
-    RAYLIGHT_LORA_REQUIRED_NODES = ("RayLoraLoader",)
+    RAYLIGHT_LORA_REQUIRED_NODES = ("DirectorDeckRayLoraLoader",)
 
     @staticmethod
     def raylight_initializer_contract_issues(node_info: Any) -> list[str]:
@@ -140,14 +140,14 @@ class ComfyClient:
         """
 
         if not isinstance(node_info, dict):
-            return ["RayInitializerAdvanced object_info is missing"]
+            return ["DirectorDeckRayInitializerAdvanced object_info is missing"]
         inputs = node_info.get("input")
         if not isinstance(inputs, dict):
-            return ["RayInitializerAdvanced input schema is missing"]
+            return ["DirectorDeckRayInitializerAdvanced input schema is missing"]
         required = inputs.get("required")
         optional = inputs.get("optional")
         if not isinstance(required, dict) or not isinstance(optional, dict):
-            return ["RayInitializerAdvanced required/optional schema is missing"]
+            return ["DirectorDeckRayInitializerAdvanced required/optional schema is missing"]
 
         issues: list[str] = []
         attention = required.get("XFuser_attention")
@@ -291,18 +291,13 @@ class ComfyClient:
         ]
         raylight_contract_issues = (
             self.raylight_initializer_contract_issues(
-                nodes.get("RayInitializerAdvanced")
+                nodes.get("DirectorDeckRayInitializerAdvanced")
             )
-            if isinstance(nodes, dict) and "RayInitializerAdvanced" in nodes
+            if isinstance(nodes, dict) and "DirectorDeckRayInitializerAdvanced" in nodes
             else []
         )
         continuity_missing = [
             node for node in self.CONTINUITY_REQUIRED_NODES if node not in available
-        ]
-        continuity_invalid_provenance = [
-            node
-            for node, expected_module in self.CONTINUITY_REQUIRED_NODE_MODULES.items()
-            if node in available and node_provenance.get(node) != expected_module
         ]
         try:
             cancel_payload = cancel_probe.json()
@@ -332,7 +327,6 @@ class ComfyClient:
                 "continuity": (
                     not standard_missing
                     and not continuity_missing
-                    and not continuity_invalid_provenance
                 ),
             },
             "execution_backends": {
@@ -341,8 +335,10 @@ class ComfyClient:
                     "missing_nodes": standard_missing,
                 },
                 "raylight": {
-                    "available": not raylight_missing and not raylight_contract_issues,
+                    "available": not raylight_missing,
                     "missing_nodes": raylight_missing,
+                    # Advisory only: ComfyUI remains the authority that accepts
+                    # or rejects the live node interface at prompt execution.
                     "contract_issues": raylight_contract_issues,
                     "conditional_requirements": {
                         "lora": {
@@ -375,39 +371,6 @@ class ComfyClient:
             "audio_vae": [item for item in vae_list if "audio" in item.lower()],
             "loras": lora_list,
         }
-
-    async def lora_metadata(self, filename: str) -> dict[str, str] | None:
-        """Read one remote LoRA's safetensors metadata without loading it.
-
-        ComfyUI owns the model filesystem and may be on another host. Its
-        fixed-folder metadata route performs path validation and reads only the
-        bounded safetensors header. A 404 means the file has no inspectable
-        metadata contract; other failures remain upstream errors.
-        """
-
-        async with self._http() as client:
-            response = await client.get(
-                "/view_metadata/loras", params={"filename": filename}
-            )
-        if response.status_code == 404:
-            return None
-        value = await self._json(response)
-        if (
-            not isinstance(value, dict)
-            or len(value) > 256
-            or any(
-                not isinstance(key, str)
-                or not isinstance(item, str)
-                or len(key) > 256
-                or len(item) > 8192
-                for key, item in value.items()
-            )
-            or sum(len(key) + len(item) for key, item in value.items()) > 65_536
-        ):
-            raise ComfyError(
-                "ComfyUI /view_metadata/loras returned invalid metadata"
-            )
-        return dict(value)
 
     async def system_stats(self) -> dict[str, Any]:
         async with self._http() as client:
@@ -468,7 +431,14 @@ class ComfyClient:
         prompt: dict[str, Any],
         client_id: str,
         prompt_id: str | None = None,
+        *,
+        on_receipt: Callable[[str | None, str], None] | None = None,
     ) -> dict[str, Any]:
+        requested_prompt_id = self._strict_submit_prompt_id(
+            prompt_id,
+            label="requested",
+            allow_none=True,
+        )
         payload: dict[str, Any] = {
             "prompt": prompt,
             "client_id": client_id,
@@ -477,88 +447,150 @@ class ComfyClient:
             # nodes; clients cannot choose a decoder or submit extra_data.
             "extra_data": {"preview_method": "latent2rgb"},
         }
-        if prompt_id is not None:
-            payload["prompt_id"] = prompt_id
+        if requested_prompt_id is not None:
+            payload["prompt_id"] = requested_prompt_id
         async with self._http(timeout=60) as client:
             value = await self._json(
                 await client.post("/prompt", json=payload)
             )
             if not isinstance(value, dict) or not value.get("prompt_id"):
                 raise ComfyError("ComfyUI accepted no prompt id", detail=value)
-            if prompt_id is None or str(value["prompt_id"]) == prompt_id:
-                return value
-
-            actual_prompt_id = str(value["prompt_id"])
-            mismatch_detail: dict[str, Any] = {
-                "requested_prompt_id": prompt_id,
+            actual_prompt_id = self._strict_submit_prompt_id(
+                value["prompt_id"],
+                label="actual",
+                allow_none=False,
+            )
+            assert actual_prompt_id is not None
+            receipt_detail: dict[str, Any] = {
+                "requested_prompt_id": requested_prompt_id,
                 "actual_prompt_id": actual_prompt_id,
                 "submit_response": value,
             }
+            if on_receipt is not None:
+                try:
+                    # This hook is deliberately synchronous. It records the
+                    # server receipt before this coroutine can yield again to a
+                    # mismatch cleanup, cancellation, or another submitter.
+                    on_receipt(requested_prompt_id, actual_prompt_id)
+                except Exception as exc:
+                    receipt_detail["receipt_hook_error"] = type(exc).__name__
+                    await self._cancel_submit_receipt(
+                        client,
+                        actual_prompt_id,
+                        receipt_detail,
+                        failure_subject="ComfyUI submit receipt hook failed",
+                    )
+                    raise ComfyError(
+                        "ComfyUI submit receipt hook failed; the accepted job "
+                        "was atomically cancelled",
+                        detail=receipt_detail,
+                    ) from exc
+
+            if (
+                requested_prompt_id is None
+                or actual_prompt_id == requested_prompt_id
+            ):
+                return value
+
             # The incompatible server has already queued a different id. Keep
             # response validation and exact cleanup inside this live client
             # lifetime: calling the generic cancel fallback could add a queue
             # race or target anything other than the id ComfyUI actually
             # minted.
-            safe_actual_id = quote(actual_prompt_id, safe="")
-            try:
-                cleanup_response = await client.post(
-                    f"/api/jobs/{safe_actual_id}/cancel"
-                )
-            except httpx.HTTPError as exc:
-                mismatch_detail["cleanup_error"] = str(exc)
-                raise ComfyError(
-                    "ComfyUI returned a different prompt id; atomic cleanup "
-                    "failed and the unexpected job may still be queued or running",
-                    detail=mismatch_detail,
-                ) from exc
-
-            mismatch_detail["cleanup_status_code"] = cleanup_response.status_code
-            if cleanup_response.status_code == 404:
-                try:
-                    mismatch_detail["cleanup_response"] = cleanup_response.json()
-                except ValueError:
-                    mismatch_detail["cleanup_response"] = cleanup_response.text[:1000]
-                raise ComfyError(
-                    "ComfyUI returned a different prompt id but has no atomic "
-                    "cleanup endpoint; the unexpected job may still be queued "
-                    "or running",
-                    detail=mismatch_detail,
-                )
-
-            try:
-                cleanup_value = await self._json(cleanup_response)
-            except ComfyError as exc:
-                mismatch_detail["cleanup_error"] = str(exc)
-                mismatch_detail["cleanup_response"] = exc.detail
-                raise ComfyError(
-                    "ComfyUI returned a different prompt id; atomic cleanup "
-                    "errored and the unexpected job may still be queued or running",
-                    detail=mismatch_detail,
-                ) from exc
-
-            mismatch_detail["cleanup_response"] = cleanup_value
-            if (
-                not isinstance(cleanup_value, dict)
-                or set(cleanup_value) != {"cancelled"}
-                or not isinstance(cleanup_value.get("cancelled"), bool)
-            ):
-                raise ComfyError(
-                    "ComfyUI returned a different prompt id and an invalid "
-                    "atomic cleanup response; the unexpected job may still be "
-                    "queued or running",
-                    detail=mismatch_detail,
-                )
-            if cleanup_value["cancelled"] is not True:
-                raise ComfyError(
-                    "ComfyUI returned a different prompt id and atomic cleanup "
-                    "was not confirmed; the unexpected job may still be queued "
-                    "or running",
-                    detail=mismatch_detail,
-                )
+            await self._cancel_submit_receipt(
+                client,
+                actual_prompt_id,
+                receipt_detail,
+                failure_subject="ComfyUI returned a different prompt id",
+            )
             raise ComfyError(
                 "ComfyUI returned a different prompt id than requested; the "
                 "unexpected job was atomically cancelled",
-                detail=mismatch_detail,
+                detail=receipt_detail,
+            )
+
+    @staticmethod
+    def _strict_submit_prompt_id(
+        value: Any,
+        *,
+        label: str,
+        allow_none: bool,
+    ) -> str | None:
+        if value is None and allow_none:
+            return None
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 512
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in value
+            )
+        ):
+            raise ComfyError(f"ComfyUI {label} prompt id is invalid")
+        return value
+
+    async def _cancel_submit_receipt(
+        self,
+        client: httpx.AsyncClient,
+        actual_prompt_id: str,
+        detail: dict[str, Any],
+        *,
+        failure_subject: str,
+    ) -> None:
+        safe_actual_id = quote(actual_prompt_id, safe="")
+        try:
+            cleanup_response = await client.post(
+                f"/api/jobs/{safe_actual_id}/cancel"
+            )
+        except httpx.HTTPError as exc:
+            detail["cleanup_error"] = str(exc)
+            raise ComfyError(
+                f"{failure_subject}; atomic cleanup failed and the unexpected "
+                "job may still be queued or running",
+                detail=detail,
+            ) from exc
+
+        detail["cleanup_status_code"] = cleanup_response.status_code
+        if cleanup_response.status_code == 404:
+            try:
+                detail["cleanup_response"] = cleanup_response.json()
+            except ValueError:
+                detail["cleanup_response"] = cleanup_response.text[:1000]
+            raise ComfyError(
+                f"{failure_subject} but has no atomic cleanup endpoint; the "
+                "unexpected job may still be queued or running",
+                detail=detail,
+            )
+
+        try:
+            cleanup_value = await self._json(cleanup_response)
+        except ComfyError as exc:
+            detail["cleanup_error"] = str(exc)
+            detail["cleanup_response"] = exc.detail
+            raise ComfyError(
+                f"{failure_subject}; atomic cleanup errored and the unexpected "
+                "job may still be queued or running",
+                detail=detail,
+            ) from exc
+
+        detail["cleanup_response"] = cleanup_value
+        if (
+            not isinstance(cleanup_value, dict)
+            or set(cleanup_value) != {"cancelled"}
+            or not isinstance(cleanup_value.get("cancelled"), bool)
+        ):
+            raise ComfyError(
+                f"{failure_subject} and an invalid atomic cleanup response; the "
+                "unexpected job may still be queued or running",
+                detail=detail,
+            )
+        if cleanup_value["cancelled"] is not True:
+            raise ComfyError(
+                f"{failure_subject} and atomic cleanup was not confirmed; the "
+                "unexpected job may still be queued or running",
+                detail=detail,
             )
 
     async def history(

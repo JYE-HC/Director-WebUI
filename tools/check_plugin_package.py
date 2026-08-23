@@ -63,9 +63,21 @@ REQUIRED_PATHS = {
 REQUIRED_DIRECTORIES = {
     "backend/directordeck",
     "dist/assets",
-    "nodes/ComfyUI-MiniMax-H3-Turbo",
-    "nodes/raylight",
+    "nodes/DirectorDeck-Strict-Attention",
+    "nodes/DirectorDeck-Strict-H3",
+    "nodes/DirectorDeck-RayLight",
+    "nodes/DirectorDeck-RayLight/src/directordeck_raylight",
     "web",
+}
+FORBIDDEN_BUNDLED_NODE_DIRECTORIES = {
+    "nodes/ComfyUI-MiniMax-H3-Turbo",
+    "nodes/DirectorDeck-Strict-LoRA",
+    "nodes/raylight",
+    "nodes/DirectorDeck-RayLight/src/raylight",
+    "nodes/DirectorDeck-RayLight/src/_ray_runtime_env",
+    "nodes/DirectorDeck-RayLight/docs",
+    "nodes/DirectorDeck-RayLight/example_workflows",
+    "nodes/DirectorDeck-RayLight/tests",
 }
 FINAL_REPOSITORY_EXTRAS = {
     PUBLISHER_REQUIREMENTS,
@@ -189,8 +201,8 @@ def _validate_docs(package_root: Path) -> None:
         raise PackageError("SECURITY.md does not state the required trust and exposure boundary")
     if "GNU GENERAL PUBLIC LICENSE" not in license_text or "Version 3" not in license_text:
         raise PackageError("LICENSE is not the expected GPL v3 text")
-    if "RayLight" not in notices or "ComfyUI-MiniMax-H3-Turbo" not in notices:
-        raise PackageError("THIRD_PARTY_NOTICES.md is missing bundled-node notices")
+    if "RayLight" not in notices:
+        raise PackageError("THIRD_PARTY_NOTICES.md is missing the bundled RayLight notice")
 
 
 def _validate_privacy_and_paths(package_root: Path) -> None:
@@ -434,6 +446,9 @@ def check_package(
     for relative in sorted(REQUIRED_DIRECTORIES):
         if not (package_root / relative).is_dir():
             raise PackageError(f"required package directory is missing: {relative}")
+    for relative in sorted(FORBIDDEN_BUNDLED_NODE_DIRECTORIES):
+        if (package_root / relative).exists():
+            raise PackageError(f"non-isolated external node pack path must not be bundled: {relative}")
     _validate_privacy_and_paths(package_root)
     if final_repository:
         _validate_final_repository_policy(package_root)

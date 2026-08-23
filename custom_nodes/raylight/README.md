@@ -1,5 +1,12 @@
 # Raylight
 
+> [!IMPORTANT]
+> This is the DirectorDeck-maintained bundled fork, not an independently
+> installed upstream RayLight plugin. DirectorDeck imports it only as
+> `directordeck_raylight` and exposes only its eight supported
+> `DirectorDeckRay*` aliases. Raw upstream `Ray*` node names and examples below
+> are maintenance reference material, not DirectorDeck workflow APIs.
+
 Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser and FSDP to implement parallelism.
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
@@ -72,7 +79,8 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 ## Documentation
 
-For developers and advanced users, see the [docs](docs/) folder for detailed guides on USP, CFG, FSDP, and expansion modules.
+The Director source checkout keeps the `docs/` folder for fork maintenance;
+release packages intentionally omit upstream docs, tests, and example workflows.
 - Top most head is `dev`, pr merge into `dev` or any custom branch name e.g `komikndr:raylight/feat-something` <- `john_doe:raylight/feat-something`, DONT MERGE INTO MAIN
 - If commit message contain "Partial: " it meaant the code is finished, tested on single worker, but not yet being tested in parallel setup.
 

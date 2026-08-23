@@ -111,7 +111,7 @@ if hasattr(model_base, "Flux"):
 **Location**: `diffusion_models/wan/xdit_cfg_parallel.py`
 
 ```python
-from raylight.distributed_modules.cfg_utils import cfg_parallel_forward
+from directordeck_raylight.distributed_modules.cfg_utils import cfg_parallel_forward
 
 def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     """

@@ -34,8 +34,8 @@ LAYOUTS = {
         "layout_name": "TensorCoreFP8Layout",
         "format": "float8_e4m3fn",
         "patch_paths": {
-            "cpu": RAYLIGHT_SRC / "raylight" / "comfy_dist" / "kitchen_patches" / "fp8_eager.py",
-            "cuda": RAYLIGHT_SRC / "raylight" / "comfy_dist" / "kitchen_patches" / "fp8.py",
+            "cpu": RAYLIGHT_SRC / "directordeck_raylight" / "comfy_dist" / "kitchen_patches" / "fp8_eager.py",
+            "cuda": RAYLIGHT_SRC / "directordeck_raylight" / "comfy_dist" / "kitchen_patches" / "fp8.py",
         },
         "install_name": "install_fp8_patches",
         "restore_name": "restore_fp8_patches",
@@ -44,8 +44,8 @@ LAYOUTS = {
         "layout_name": "TensorCoreNVFP4Layout",
         "format": "nvfp4",
         "patch_paths": {
-            "cpu": RAYLIGHT_SRC / "raylight" / "comfy_dist" / "kitchen_patches" / "nvfp4_eager.py",
-            "cuda": RAYLIGHT_SRC / "raylight" / "comfy_dist" / "kitchen_patches" / "nvfp4.py",
+            "cpu": RAYLIGHT_SRC / "directordeck_raylight" / "comfy_dist" / "kitchen_patches" / "nvfp4_eager.py",
+            "cuda": RAYLIGHT_SRC / "directordeck_raylight" / "comfy_dist" / "kitchen_patches" / "nvfp4.py",
         },
         "install_name": "install_nvfp4_patches",
         "restore_name": "restore_nvfp4_patches",
@@ -64,7 +64,7 @@ def _load_module(name: str, file_path: Path):
     return module
 
 
-_fsdp_utils = _load_module("raylight_fsdp_utils_compare", RAYLIGHT_SRC / "raylight" / "comfy_dist" / "fsdp_utils.py")
+_fsdp_utils = _load_module("raylight_fsdp_utils_compare", RAYLIGHT_SRC / "directordeck_raylight" / "comfy_dist" / "fsdp_utils.py")
 fully_shard_bottom_up = _fsdp_utils.fully_shard_bottom_up
 load_from_full_model_state_dict = _fsdp_utils.load_from_full_model_state_dict
 

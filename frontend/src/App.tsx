@@ -3,12 +3,10 @@ import { ApiError, directorApi, taskEventsUrl } from "./api/client";
 import {
   EMPTY_CAPABILITIES,
   EMPTY_MODELS,
-  rayLightResidencyPolicyAfterBindingChange,
-  resolveExecutionBackend,
   sanitizeRuntimeSettings,
   type CapabilityReport,
-  type DiffusionModelBinding,
-  type DiffusionModelRole,
+  type FeatureCatalog,
+  type FeaturePreflightResponse,
   type GenerationTask,
   type GPUResource,
   type ModelInventory,
@@ -31,6 +29,7 @@ import { TaskDrawer } from "./components/TaskDrawer";
 import { AssetTrashPanel } from "./components/AssetTrashPanel";
 import { TimelineHistoryPanel } from "./components/TimelineHistoryPanel";
 import { TimelineGlobalSettings } from "./components/TimelineGlobalSettings";
+import { ProjectImportDialog } from "./components/ProjectImportDialog";
 import { WorkspaceAssetSidebar } from "./components/WorkspaceAssetSidebar";
 import { Spinner } from "./components/ui";
 import {
@@ -58,6 +57,7 @@ import {
   listLocalTimelineWalBranches,
   loadAssetLayoutPreference,
   loadLocalTimelineWal,
+  migrateLegacyTimelineProjectToV5,
   normalizeTimelineProject,
   orderAssetsByPreference,
   resolveLocalTimelineWal,
@@ -68,6 +68,7 @@ import {
   timelineSamplingFamily,
   timelineAssetUsages,
   timelineEditorReducer,
+  updateLoraFeatureFamily,
   validateTimelineProject,
   type LocalTimelineWal,
   type CorruptLocalTimelineWalBranchEvidence,
@@ -109,6 +110,7 @@ import {
 } from "./state/timelineCoordination";
 import {
   deleteTimelineHistoryJournal,
+  hasLegacyV4TimelineHistoryJournalEvidence,
   listTimelineHistoryJournalBranches,
   loadTimelineHistoryJournal,
   readTimelineHistoryJournalVersionToken,
@@ -118,6 +120,33 @@ import {
   type TimelinePersistenceAuthority,
   type TimelinePersistenceScope,
 } from "./state/timelinePersistence";
+import {
+  buildLegacyRuntimeSettingsRecoveryPlan,
+  clearLegacyRuntimeSettingsWalCandidate,
+  listLegacyRuntimeSettingsWalCandidates,
+  type LegacyRuntimeSettingsRecoveryChoice,
+  type LegacyRuntimeSettingsWalCandidate,
+} from "./state/runtimeSettingsV1Recovery";
+import {
+  discardRuntimeSettingsV2WalCandidate,
+  downloadRuntimeSettingsV2WalEvidence,
+  hasIndependentRuntimeSettingsV3PendingWal,
+  listRuntimeSettingsV2WalEvidence,
+  recoverRuntimeSettingsV2WalCandidate,
+  RUNTIME_SETTINGS_V3_WAL_STORAGE_KEY,
+  type RuntimeSettingsV2RecoveryChoice,
+  type RuntimeSettingsV2WalCandidate,
+  type RuntimeSettingsV2WalEvidence,
+} from "./state/runtimeSettingsV2Migration";
+import {
+  saveLoraLoaderOverrideWithCas,
+  type LoraLoaderOverrideEdit,
+} from "./state/loraLoaderOverrides";
+import {
+  clearLegacyTimelineWalCandidate,
+  legacyTimelineWalCandidates,
+  resolveLegacyTimelineWalWithReceipt,
+} from "./state/timelineV5Migration";
 
 const SIDEBAR_OPEN_KEY = "directordeck:sidebar-open";
 const SIDEBAR_WIDTH_KEY = "directordeck:sidebar-expanded-width";
@@ -127,11 +156,10 @@ const TIMELINE_HISTORY_PANEL_ID = "timeline-history-panel";
 const ASSET_TRASH_PANEL_ID = "asset-trash-panel";
 export const UNBOUND_RUNTIME_SETTINGS_PENDING_KEY = "directordeck:runtime-settings-pending";
 export const QUARANTINED_UNBOUND_RUNTIME_SETTINGS_PENDING_KEY = "directordeck:runtime-settings-pending-quarantine";
-export const RUNTIME_SETTINGS_PENDING_KEY = "directordeck:v2:runtime-settings-pending";
-export const QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY = "directordeck:v2:runtime-settings-pending-quarantine";
+export const RUNTIME_SETTINGS_PENDING_KEY = RUNTIME_SETTINGS_V3_WAL_STORAGE_KEY;
+export const QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY = "directordeck:v4:runtime-settings-pending-quarantine";
 const RUNTIME_SETTINGS_PENDING_FORMAT = "director-pending-runtime-settings";
-const LEGACY_RUNTIME_SETTINGS_PENDING_VERSION = 1;
-const RUNTIME_SETTINGS_PENDING_VERSION = 2;
+const RUNTIME_SETTINGS_PENDING_VERSION = 4;
 const RUNTIME_SETTINGS_AUTOSAVE_MS = 300;
 const RUNTIME_SETTINGS_RETRY_MS = 1500;
 const STORAGE_AUTHORITY_RETRY_MS = 1000;
@@ -450,7 +478,7 @@ function waitForRayLightRecoveryWindow(
   });
 }
 
-type RuntimeSettingsOperationOwner = "settings-page" | DiffusionModelRole | "resync";
+type RuntimeSettingsOperationOwner = "settings-page" | "lora-mapping" | "resync";
 
 let runtimeSettingsWalOwnerCache: string | null = null;
 let adoptedRuntimeSettingsWalRaw: string | null = null;
@@ -500,6 +528,30 @@ function nextRandomSeed(previous: number): number {
   return previous === Number.MAX_SAFE_INTEGER ? 0 : previous + 1;
 }
 
+function materializeRandomSeeds(
+  project: TimelineProject,
+  segmentIds: readonly string[],
+): { project: TimelineProject; rerolled: boolean } {
+  const concrete = structuredClone(project);
+  const selection = new Set(segmentIds);
+  const usedFamilies = new Set(
+    concrete.segments
+      .filter((segment) => segment.enabled && selection.has(segment.id))
+      .map((segment) => timelineSamplingFamily(segment.mode)),
+  );
+  let rerolled = false;
+  for (const family of usedFamilies) {
+    const sampling = concrete.sampling[family];
+    if (!sampling.random_seed) continue;
+    concrete.sampling[family] = {
+      ...sampling,
+      seed: nextRandomSeed(sampling.seed),
+    };
+    rerolled = true;
+  }
+  return { project: concrete, rerolled };
+}
+
 function initialSidebarWidth(): number {
   const viewportWidth = window.innerWidth;
   const { minimum } = sidebarWidthBounds(viewportWidth);
@@ -513,6 +565,14 @@ function initialSidebarWidth(): number {
 
 function sameRuntimeSettings(left: RuntimeSettings, right: RuntimeSettings): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameProjectCreativeBindings(
+  left: TimelineProject,
+  right: TimelineProject,
+): boolean {
+  return JSON.stringify({ model_stack: left.model_stack, features: left.features }) ===
+    JSON.stringify({ model_stack: right.model_stack, features: right.features });
 }
 
 function quarantineRuntimeSettingsEntry(sourceKey: string, quarantineKey: string): void {
@@ -616,13 +676,11 @@ function parseRuntimeSettingsWalEnvelope(raw: string): {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
     const envelope = parsed as Record<string, unknown>;
     const keys = Object.keys(envelope).sort().join("|");
-    const legacy = envelope.version === LEGACY_RUNTIME_SETTINGS_PENDING_VERSION &&
-      keys === "active_database_path|format|pending|settings|version|written_at_ms";
     const owned = envelope.version === RUNTIME_SETTINGS_PENDING_VERSION &&
       keys === "active_database_path|format|owner_id|pending|settings|version|written_at_ms" &&
       validRuntimeSettingsWalOwner(envelope.owner_id);
     if (
-      (!legacy && !owned) ||
+      !owned ||
       envelope.format !== RUNTIME_SETTINGS_PENDING_FORMAT ||
       envelope.pending !== true ||
       !validActiveDatabasePath(envelope.active_database_path) ||
@@ -650,7 +708,6 @@ function runtimeSettingsWalOwnedByCurrentTab(
 }
 
 function loadPendingRuntimeSettings(database: ActiveDatabaseIdentity): RuntimeSettings | null {
-  quarantineUnboundRuntimeSettings();
   if (!validActiveDatabaseIdentity(database)) return null;
   try {
     const raw = window.localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY);
@@ -672,7 +729,6 @@ function loadPendingRuntimeSettings(database: ActiveDatabaseIdentity): RuntimeSe
 }
 
 function savePendingRuntimeSettings(settings: RuntimeSettings, database: ActiveDatabaseIdentity): void {
-  quarantineUnboundRuntimeSettings();
   if (!validActiveDatabaseIdentity(database)) return;
   try {
     const owner = runtimeSettingsWalOwner();
@@ -703,13 +759,14 @@ function savePendingRuntimeSettings(settings: RuntimeSettings, database: ActiveD
 }
 
 function clearPendingRuntimeSettings(): void {
-  quarantineUnboundRuntimeSettings();
   try {
     const current = window.localStorage.getItem(RUNTIME_SETTINGS_PENDING_KEY);
     if (
       current !== null &&
       (current === latestRuntimeSettingsWalRaw || current === adoptedRuntimeSettingsWalRaw)
-    ) window.localStorage.removeItem(RUNTIME_SETTINGS_PENDING_KEY);
+    ) {
+      window.localStorage.removeItem(RUNTIME_SETTINGS_PENDING_KEY);
+    }
     latestRuntimeSettingsWalRaw = null;
     adoptedRuntimeSettingsWalRaw = null;
   }
@@ -724,56 +781,6 @@ function createInitialTimelineState() {
   state.selection_anchor_id = state.project.segments[0].id;
   state.asset_grid_size = layout.size;
   return state;
-}
-
-function runtimeTimelineValidation(
-  project: TimelineProject,
-  capabilities: CapabilityReport,
-  settings: RuntimeSettings,
-  segmentIds?: readonly string[],
-): string[] {
-  const errors: string[] = [];
-  const selection = segmentIds ? new Set(segmentIds) : null;
-  const selectedFamilies = new Set(
-    project.segments
-      .filter((segment) => segment.enabled && (!selection || selection.has(segment.id)))
-      .map((segment) => segment.mode),
-  );
-  const hasSelectedContinuity = project.segments.some((segment) =>
-    segment.enabled &&
-    segment.continuity.enabled &&
-    (!selection || selection.has(segment.id)),
-  );
-  const nativeTimeline = capabilities.native_timeline;
-  if (hasSelectedContinuity && (
-    nativeTimeline?.supported !== true ||
-    nativeTimeline.continuity !== true ||
-    [...selectedFamilies].some((family) => !nativeTimeline.modes.includes(family))
-  )) {
-    errors.push("当前原生分段子图不支持所选片段的段间接续；请关闭这些片段的连续性设置");
-  }
-  if (capabilities.connection === "online") {
-    if (capabilities.execution_backends) {
-      for (const family of selectedFamilies) {
-        const binding = settings.models[family];
-        const backend = resolveExecutionBackend(binding);
-        const status = capabilities.execution_backends[backend];
-        if (!status || !status.available) {
-          errors.push(`${family.toUpperCase()} 配置解析为 ${backend === "raylight" ? "RayLight" : "标准"}执行，但当前 ComfyUI 不可用${status?.missing_nodes.length ? `：缺少 ${status.missing_nodes.join("、")}` : ""}`);
-        } else if (
-          backend === "raylight" &&
-          binding.lora_name &&
-          status.conditional_requirements?.lora.available === false
-        ) {
-          const missing = status.conditional_requirements.lora.missing_nodes;
-          errors.push(`${family.toUpperCase()} 的 RayLight LoRA 配置不可用${missing.length ? `：缺少 ${missing.join("、")}` : ""}`);
-        }
-      }
-    } else {
-      errors.push("当前 ComfyUI 未报告 Standard / RayLight 执行后端能力，请刷新能力或升级后端");
-    }
-  }
-  return errors;
 }
 
 const ACTIVE_PROJECT_ID_STORAGE_KEY = "directordeck:v1:active-project-id";
@@ -835,6 +842,35 @@ function submitTimelineForProject(
     : directorApi.createProjectTask(projectId, payload);
 }
 
+export class FeatureCatalogDriftError extends Error {
+  constructor() {
+    super("功能目录或宿主能力在预检期间发生变化；已重新核对，请重试");
+    this.name = "FeatureCatalogDriftError";
+  }
+}
+
+export function requireSuccessfulFeaturePreflight(
+  result: FeaturePreflightResponse,
+  config: TimelineProject,
+  catalog: FeatureCatalog | null,
+): void {
+  if (
+    catalog === null ||
+    config.features.template_bundle_version !== catalog.template_bundle_version ||
+    result.template_bundle_version !== catalog.template_bundle_version ||
+    result.host_capability_revision !== catalog.host_capability_revision
+  ) throw new FeatureCatalogDriftError();
+  if (result.valid) return;
+  const failure = result.errors[0];
+  if (failure) {
+    throw new Error(`${failure.message}；${failure.remediation}`);
+  }
+  const readiness = result.operational_readiness.blocking_reason_codes;
+  throw new Error(readiness.length
+    ? `当前运行环境未就绪：${readiness.join("、")}`
+    : "当前功能配置未通过服务端能力预检");
+}
+
 export default function App() {
   const [state, dispatch] = useReducer(directorReducer, undefined, loadDirectorState);
   const [timeline, rawTimelineDispatch] = useReducer(
@@ -857,6 +893,11 @@ export default function App() {
   const [rayLightRecoveryPending, setRayLightRecoveryPending] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
   const [runtimeResourcesReady, setRuntimeResourcesReady] = useState(false);
+  const [featureCatalogStatus, setFeatureCatalogStatus] = useState<{
+    ready: boolean;
+    error: string | null;
+  }>({ ready: false, error: null });
+  const [featureCatalog, setFeatureCatalog] = useState<FeatureCatalog | null>(null);
   const [runtimeSettingsOperationOwner, setRuntimeSettingsOperationOwner] = useState<RuntimeSettingsOperationOwner | null>(null);
   const [runtimeSettingsSyncRequired, setRuntimeSettingsSyncRequired] = useState(false);
   const [runtimeSettingsDraft, setRuntimeSettingsDraft] = useState<RuntimeSettings>(() => state.settings);
@@ -864,6 +905,7 @@ export default function App() {
   const [runtimeSettingsPausedError, setRuntimeSettingsPausedError] = useState<string | null>(null);
   const runtimeSettingsDraftValidRef = useRef(true);
   const [timelineDirty, setTimelineDirty] = useState(false);
+  const [creativeAuthorityWritePending, setCreativeAuthorityWritePending] = useState(false);
   const [timelineHydrationStatus, setTimelineHydrationStatus] = useState<
     "loading" | "retrying" | "stale" | "ready"
   >("loading");
@@ -901,6 +943,17 @@ export default function App() {
   const [deletingTaskIds, setDeletingTaskIds] = useState<ReadonlySet<string>>(() => new Set());
   const [clearingTasks, setClearingTasks] = useState(false);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [legacyRuntimeRecoveryCandidates, setLegacyRuntimeRecoveryCandidates] = useState<
+    LegacyRuntimeSettingsWalCandidate[]
+  >([]);
+  const [legacyRuntimeRecoveryProjectId, setLegacyRuntimeRecoveryProjectId] = useState("");
+  const [legacyRuntimeRecoveryBusy, setLegacyRuntimeRecoveryBusy] = useState(false);
+  const [runtimeSettingsV2RecoveryEvidence, setRuntimeSettingsV2RecoveryEvidence] = useState<
+    RuntimeSettingsV2WalEvidence[]
+  >([]);
+  const [runtimeSettingsV2RecoveryBusy, setRuntimeSettingsV2RecoveryBusy] = useState(false);
+  const [runtimeSettingsV2RecoveryHasV3Conflict, setRuntimeSettingsV2RecoveryHasV3Conflict] =
+    useState(false);
   const [activeProjectId, setActiveProjectIdState] = useState<string>(loadActiveProjectId);
   const [projectSwitchHandoffPending, setProjectSwitchHandoffPending] = useState(false);
   const [projectDeletingId, setProjectDeletingId] = useState<string | null>(null);
@@ -917,6 +970,10 @@ export default function App() {
   const externalRuntimeAuthorityRetryTimer = useRef<number | null>(null);
   const runtimeResourcesReadyRef = useRef(false);
   const runtimeResourcesAuthorityTokenRef = useRef<string | null>(null);
+  const featureCatalogRef = useRef<FeatureCatalog | null>(null);
+  const featureCatalogEtagRef = useRef<string | null>(null);
+  const featureCatalogReadyRef = useRef(false);
+  const featureCatalogErrorRef = useRef<string | null>(null);
   const rayLightRuntimeStatusRef = useRef<RayLightRuntimeStatus | null>(null);
   const rayLightRecoveryOperationRef = useRef<Promise<void> | null>(null);
   const rayLightRecoveryControllerRef = useRef<AbortController | null>(null);
@@ -953,6 +1010,9 @@ export default function App() {
   const timelineServerProjectRef = useRef<TimelineProject | null>(null);
   const timelineBranchOwnerRef = useRef(INITIAL_TIMELINE_BRANCH_OWNER_ID);
   const activeTimelineWalRef = useRef<LocalTimelineWal | null>(null);
+  const activeLegacyTimelineWalCandidateRef = useRef<
+    ReturnType<typeof legacyTimelineWalCandidates>[number] | null
+  >(null);
   const timelineJournalGeneration = useRef(0);
   const timelineJournalChain = useRef<Promise<void>>(Promise.resolve());
   const timelineJournalTokens = useRef(new Map<string, TimelineHistoryJournalVersionToken>());
@@ -964,6 +1024,12 @@ export default function App() {
   const restoredSegmentSelectionKey = useRef<string | null>(null);
   const projectSwitchGeneration = useRef(0);
   const projectListGeneration = useRef(0);
+  // A successful create/import/save-as response is stronger evidence than an
+  // immediately-following list response: the latter can still be a storage
+  // snapshot captured before the commit became visible. Keep those summaries
+  // until a server list observes their membership so a soft refresh cannot
+  // hide the project or force the active editor back to default.
+  const locallyCommittedProjectsRef = useRef(new Map<string, ProjectSummary>());
   const projectDeleteIntent = useRef<string | null>(null);
   const timelinePersistedRevision = useRef(0);
   const timelineWriteGeneration = useRef(0);
@@ -1111,6 +1177,13 @@ export default function App() {
     // A list response captured before this local mutation must not restore the
     // old title (or make a later membership decision against that old list).
     projectListGeneration.current += 1;
+    const locallyCommitted = locallyCommittedProjectsRef.current.get(projectId);
+    if (locallyCommitted && locallyCommitted.title !== title) {
+      locallyCommittedProjectsRef.current.set(projectId, {
+        ...locallyCommitted,
+        title,
+      });
+    }
     setProjects((projects) => {
       let changed = false;
       const next = projects.map((project) => {
@@ -1120,6 +1193,28 @@ export default function App() {
       });
       return changed ? next : projects;
     });
+  }, []);
+
+  const publishLocallyCommittedProject = useCallback((project: ProjectSummary) => {
+    // Invalidate a list that started before this commit response. A later list
+    // is still reconciled below because cross-request visibility can lag.
+    projectListGeneration.current += 1;
+    locallyCommittedProjectsRef.current.set(project.id, project);
+    setProjects((current) => current.some((candidate) => candidate.id === project.id)
+      ? current.map((candidate) => candidate.id === project.id ? project : candidate)
+      : [...current, project]);
+  }, []);
+
+  const reconcileServerProjectList = useCallback((serverProjects: ProjectSummary[]) => {
+    const serverIds = new Set(serverProjects.map((project) => project.id));
+    for (const projectId of serverIds) {
+      locallyCommittedProjectsRef.current.delete(projectId);
+    }
+    const reconciled = [...serverProjects];
+    for (const project of locallyCommittedProjectsRef.current.values()) {
+      if (!serverIds.has(project.id)) reconciled.push(project);
+    }
+    return reconciled;
   }, []);
 
   const setRuntimeAuthorityRequired = useCallback((required: boolean) => {
@@ -1137,8 +1232,8 @@ export default function App() {
     setTimelineRevisionConflictState(conflict);
   }, []);
 
-  const restartTimelineHydrationForProject = useCallback((projectId: string) => {
-    if (projectId === activeProjectIdRef.current) return;
+  const restartTimelineHydrationForProject = useCallback((projectId: string, force = false) => {
+    if (!force && projectId === activeProjectIdRef.current) return;
 
     const previousProjectId = activeProjectIdRef.current;
     const database = activeDatabaseRef.current;
@@ -1182,6 +1277,7 @@ export default function App() {
     timelineServerRevision.current = null;
     timelineServerProjectRef.current = null;
     activeTimelineWalRef.current = null;
+    activeLegacyTimelineWalCandidateRef.current = null;
     timelineRevision.current = 0;
     timelinePersistedRevision.current = 0;
     timelineHadLocal.current = false;
@@ -1910,16 +2006,30 @@ export default function App() {
       initialAuthority = null;
     }
     const unavailable = () => Promise.reject(new Error("运行设置权威 token 不可用"));
-    const [capabilityResult, gpuResult, modelResult, rayLightRuntimeResult] = await Promise.allSettled(
+    const cachedCatalogEtag = featureCatalogRef.current
+      ? featureCatalogEtagRef.current ?? undefined
+      : undefined;
+    const [
+      capabilityResult,
+      gpuResult,
+      modelResult,
+      rayLightRuntimeResult,
+      featureCatalogResult,
+    ] = await Promise.allSettled([
       initialAuthority
-        ? [
-            directorApi.getCapabilities(signal, initialAuthority.token),
-            directorApi.getGpus(signal, initialAuthority.token),
-            directorApi.getModels(signal, initialAuthority.token),
-            directorApi.getRayLightRuntimeStatus(signal, initialAuthority.token),
-          ]
-        : [unavailable(), unavailable(), unavailable(), unavailable()],
-    );
+        ? directorApi.getCapabilities(signal, initialAuthority.token)
+        : unavailable(),
+      initialAuthority
+        ? directorApi.getGpus(signal, initialAuthority.token)
+        : unavailable(),
+      initialAuthority
+        ? directorApi.getModels(signal, initialAuthority.token)
+        : unavailable(),
+      initialAuthority
+        ? directorApi.getRayLightRuntimeStatus(signal, initialAuthority.token)
+        : unavailable(),
+      directorApi.getFeatureCatalog(cachedCatalogEtag, signal),
+    ]);
     // Read the authority again after all resources. The server also checks the
     // same token before and after every upstream call, so A -> B -> A cannot
     // bless a mixed/B snapshot merely because the URL returned to A.
@@ -1974,6 +2084,46 @@ export default function App() {
       return false;
     }
 
+    const featureCatalogSnapshot = featureCatalogResult.status === "fulfilled"
+      ? featureCatalogResult.value.status === "fresh"
+        ? {
+            catalog: featureCatalogResult.value.catalog,
+            etag: featureCatalogResult.value.etag,
+          }
+        : featureCatalogRef.current &&
+            featureCatalogEtagRef.current === featureCatalogResult.value.etag
+          ? {
+              catalog: featureCatalogRef.current,
+              etag: featureCatalogResult.value.etag,
+            }
+          : null
+      : null;
+    if (featureCatalogSnapshot) {
+      featureCatalogRef.current = featureCatalogSnapshot.catalog;
+      featureCatalogEtagRef.current = featureCatalogSnapshot.etag;
+      featureCatalogReadyRef.current = true;
+      featureCatalogErrorRef.current = null;
+      setFeatureCatalog(featureCatalogSnapshot.catalog);
+      setFeatureCatalogStatus({ ready: true, error: null });
+    } else {
+      const reason = featureCatalogResult.status === "rejected" &&
+        featureCatalogResult.reason instanceof Error
+        ? featureCatalogResult.reason.message
+        : "服务器未返回可复用的功能目录";
+      const message = `功能目录与宿主能力不可用：${reason}`;
+      featureCatalogReadyRef.current = false;
+      featureCatalogErrorRef.current = message;
+      setFeatureCatalog(null);
+      setFeatureCatalogStatus({ ready: false, error: message });
+      // A stale cached catalog remains available solely for a future 304
+      // revalidation. It must never keep execution unlocked after a provider
+      // or catalog request failure.
+      runtimeResourcesReadyRef.current = false;
+      runtimeResourcesAuthorityTokenRef.current = null;
+      setRuntimeResourcesReady(false);
+      setCompileReport(null);
+    }
+
     const visibleGpuSnapshot = gpuResult.status === "fulfilled"
       ? gpuResult.value.filter((gpu) => gpu.visible)
       : [];
@@ -1990,6 +2140,7 @@ export default function App() {
       gpuResult.status === "fulfilled" &&
       modelResult.status === "fulfilled" &&
       rayLightRuntimeResult.status === "fulfilled" &&
+      featureCatalogSnapshot !== null &&
       gpuSnapshotMatchesRuntime;
     if (complete) {
       setCapabilities(capabilityResult.value);
@@ -2033,15 +2184,14 @@ export default function App() {
   runtimeResourceRefreshRef.current = (preserveExisting) =>
     refreshRuntimeResources(preserveExisting);
 
-  const refreshAuthoritativeResourcesAfterConnectionTest = useCallback(() => {
-    // A successful probe re-confirms the single embedded host. App owns
-    // resource authority and refreshes all four inventories in one
-    // latest-wins generation; a partial failure preserves the previously
-    // confirmed snapshot.
-    setRuntimeAuthorityRequired(true);
+  const refreshAuthoritativeRuntimeResources = useCallback(() => {
+    // A successful probe or in-process host-tool install changes the single
+    // embedded host. App refreshes runtime inventories and the catalog in one
+    // latest-wins generation. A resource-only failure must not masquerade as
+    // a settings-authority change or duplicate the server evaluator gate.
     setCompileReport(null);
     void refreshRuntimeResources(runtimeResourcesReadyRef.current);
-  }, [refreshRuntimeResources, setRuntimeAuthorityRequired]);
+  }, [refreshRuntimeResources]);
 
   const refreshRuntime = useCallback(async (
     signal?: AbortSignal,
@@ -2188,9 +2338,13 @@ export default function App() {
       let writeError: unknown = null;
       if (normalized) {
         try {
+          const expectedAuthorityToken = authoritativeSettingsTokenRef.current;
+          if (!expectedAuthorityToken) {
+            throw new Error("运行设置权威 token 尚未就绪");
+          }
           // The response is deliberately ignored. Only the GET below may
-          // become browser authority after a whole-document PUT.
-          await directorApi.updateSettings(normalized);
+          // become browser authority after a whole-document CAS.
+          await directorApi.updateSettingsAuthority(normalized, expectedAuthorityToken);
         } catch (reason) {
           // A lost response is ambiguous: the server may still have committed.
           // Continue into the authoritative GET instead of restoring old state.
@@ -2390,6 +2544,203 @@ export default function App() {
     return Promise.resolve(normalized);
   }, [setRuntimeAuthorityRequired]);
 
+  const recoverLegacyRuntimeSettings = useCallback(async (
+    choice: LegacyRuntimeSettingsRecoveryChoice,
+  ): Promise<void> => {
+    const candidate = legacyRuntimeRecoveryCandidates[0];
+    const database = activeDatabaseRef.current;
+    if (!candidate || !database || legacyRuntimeRecoveryBusy) return;
+    if (candidate.envelope.active_database_path !== database.active_database_path) {
+      setToast("旧运行设置恢复记录属于其他数据库，未执行任何写入");
+      return;
+    }
+    if (
+      timelineRevisionConflictRef.current || timelineSyncRequiredRef.current ||
+      timelinePersistedRevision.current < timelineRevision.current ||
+      runtimeSettingsOperation.current || runtimeSettingsDesired.current
+    ) {
+      setToast("当前项目或运行设置仍有未完成同步，暂不能恢复旧运行设置");
+      return;
+    }
+    setLegacyRuntimeRecoveryBusy(true);
+    try {
+      const needsProjects = choice.kind === "apply-all-projects" ||
+        choice.kind === "apply-specific-projects";
+      const projectList = needsProjects ? await directorApi.listProjects() : { projects: [] };
+      const requestedIds = "project_ids" in choice ? choice.project_ids : [];
+      if (
+        choice.kind === "apply-all-projects" &&
+        (requestedIds.length !== projectList.projects.length ||
+          requestedIds.some((id) => !projectList.projects.some((project) => project.id === id)))
+      ) throw new Error("项目列表在恢复确认后发生变化，请重新选择恢复范围");
+      const projectAuthorities = await Promise.all(requestedIds.map(async (projectId) => ({
+        project_id: projectId,
+        authority: await fetchTimelineForProject(projectId),
+      })));
+      const runtimeAuthority = choice.kind === "discard"
+        ? { settings: authoritativeSettingsRef.current, authority_token: authoritativeSettingsTokenRef.current }
+        : await directorApi.getSettingsAuthority();
+      if (!runtimeAuthority.authority_token && choice.kind !== "discard") {
+        throw new Error("无法确认运行设置 CAS 权威");
+      }
+      const plan = buildLegacyRuntimeSettingsRecoveryPlan(
+        candidate,
+        choice,
+        projectAuthorities.map(({ project_id, authority }) => ({
+          project_id,
+          document: authority.document,
+        })),
+        runtimeAuthority.settings,
+      );
+      if (!plan) throw new Error("旧运行设置恢复记录或所选项目范围已不可验证");
+
+      for (const update of plan.project_updates) {
+        const authority = projectAuthorities.find((entry) =>
+          entry.project_id === update.project_id)?.authority;
+        if (!authority) throw new Error("恢复计划缺少项目 CAS 权威");
+        if (!timelineProjectsEqual(authority.document, update.document)) {
+          await saveTimelineForProject(
+            update.project_id,
+            update.document,
+            authority.revision,
+          );
+        }
+      }
+      if (
+        plan.runtime_settings &&
+        !sameRuntimeSettings(runtimeAuthority.settings, plan.runtime_settings)
+      ) {
+        await directorApi.updateSettingsAuthority(
+          plan.runtime_settings,
+          runtimeAuthority.authority_token!,
+        );
+      }
+      if (!clearLegacyRuntimeSettingsWalCandidate(candidate)) {
+        throw new Error("恢复写入已确认，但旧 WAL 原始字节已变化；新证据已保留，未清理");
+      }
+      setLegacyRuntimeRecoveryCandidates((current) =>
+        current.filter((entry) => entry.storage_key !== candidate.storage_key));
+      setLegacyRuntimeRecoveryProjectId("");
+      if (choice.kind !== "discard") {
+        await refreshRuntime(undefined, false);
+      }
+      if (plan.project_updates.some((update) =>
+        update.project_id === activeProjectIdRef.current)) {
+        restartTimelineHydrationForProject(activeProjectIdRef.current, true);
+      }
+      setToast(choice.kind === "discard"
+        ? "已放弃这条旧运行设置恢复记录；未修改任何项目或运行设置"
+        : choice.kind === "retain-lora-compat"
+          ? "已保留旧 Standard LoRA 精确映射；未修改任何项目创作配置"
+          : `旧运行设置已通过 CAS 应用到 ${plan.project_updates.length} 个明确选择的项目`);
+    } catch (reason) {
+      setToast(`${reason instanceof Error ? reason.message : "旧运行设置恢复失败"}；原始隔离记录仍保留`);
+    } finally {
+      setLegacyRuntimeRecoveryBusy(false);
+    }
+  }, [
+    legacyRuntimeRecoveryBusy,
+    legacyRuntimeRecoveryCandidates,
+    refreshRuntime,
+    restartTimelineHydrationForProject,
+  ]);
+
+  const recoverRuntimeSettingsV2 = useCallback(async (
+    evidence: RuntimeSettingsV2WalEvidence,
+    choice: RuntimeSettingsV2RecoveryChoice | "discard",
+  ): Promise<void> => {
+    const database = activeDatabaseRef.current;
+    if (!database || runtimeSettingsV2RecoveryBusy) return;
+    if (choice === "discard") {
+      if (!discardRuntimeSettingsV2WalCandidate(evidence)) {
+        setToast("RuntimeSettingsV2 隔离原始字节已变化，未执行放弃清理");
+        return;
+      }
+      setRuntimeSettingsV2RecoveryEvidence((current) =>
+        current.filter((entry) => entry.storage_key !== evidence.storage_key));
+      setToast("已放弃这条 RuntimeSettingsV2 恢复记录；未写入运行设置");
+      return;
+    }
+    if (evidence.kind !== "recoverable") {
+      setToast("该 RuntimeSettingsV2 隔离记录不可验证，只能导出或放弃；未执行任何权威写入");
+      return;
+    }
+    const candidate: RuntimeSettingsV2WalCandidate = evidence;
+    if (candidate.envelope.active_database_path !== database.active_database_path) {
+      setToast("RuntimeSettingsV2 恢复记录不属于当前数据库，未执行任何写入");
+      return;
+    }
+    // Hydration state is not an authority: another tab can create a V3 WAL at
+    // any time, including immediately before this click.
+    const hasV3ConflictNow = hasIndependentRuntimeSettingsV3PendingWal();
+    setRuntimeSettingsV2RecoveryHasV3Conflict(hasV3ConflictNow);
+    if (hasV3ConflictNow) {
+      setToast("检测到独立 RuntimeSettingsV3 待同步记录；两份证据均保留，请刷新后再恢复 V2");
+      return;
+    }
+    if (
+      runtimeSettingsOperation.current || runtimeSettingsDesired.current ||
+      runtimeSettingsAutosaveTimer.current !== null || rayLightRecoveryPendingRef.current
+    ) {
+      setToast("当前 RuntimeSettingsV3 仍有未完成同步，暂不能恢复 V2 记录");
+      return;
+    }
+
+    setRuntimeSettingsV2RecoveryBusy(true);
+    setRuntimeSettingsOperationOwner("resync");
+    setRuntimeAuthorityRequired(true);
+    setCompileReport(null);
+    let recoveryResult: Awaited<ReturnType<typeof recoverRuntimeSettingsV2WalCandidate>> | null =
+      null;
+    const operation = (async (): Promise<RuntimeSettings> => {
+      recoveryResult = await recoverRuntimeSettingsV2WalCandidate(candidate, choice, {
+        read: () => directorApi.getSettingsAuthority(),
+        write: (document, expectedToken) =>
+          directorApi.updateSettingsAuthority(document, expectedToken),
+      });
+      return recoveryResult.authority.settings;
+    })();
+    runtimeSettingsOperation.current = operation;
+    try {
+      await operation;
+      const result = recoveryResult!;
+      setRuntimeSettingsV2RecoveryEvidence((current) =>
+        current.filter((entry) => entry.storage_key !== candidate.storage_key));
+      authoritativeSettingsRef.current = structuredClone(result.authority.settings);
+      authoritativeSettingsTokenRef.current = result.authority.authority_token;
+      runtimeSettingsAuthorityReadyRef.current = true;
+      dispatch({ type: "settings/replace", settings: result.authority.settings });
+      setRuntimeSettingsDraft(result.authority.settings);
+      runtimeSettingsDraftValidRef.current = true;
+      setRuntimeSettingsDraftValid(true);
+      setRuntimeSettingsPausedError(null);
+      invalidateAndRefreshTaskSnapshots();
+      const refreshed = await refreshRuntime(undefined, true);
+      setToast(refreshed
+        ? choice === "merge-exact-mappings"
+          ? "已通过 RuntimeSettingsV3 CAS 合并旧精确 LoRA 映射"
+          : "已通过 RuntimeSettingsV3 CAS 应用旧运行参数并合并精确 LoRA 映射"
+        : "旧 RuntimeSettingsV2 已确认恢复；运行资源回读失败，生成保持锁定");
+    } catch (reason) {
+      // A 409, unprovable lost ACK, capacity error, or binding conflict keeps
+      // the exact quarantined bytes. Re-read authority before unlocking.
+      setRuntimeSettingsV2RecoveryHasV3Conflict(
+        hasIndependentRuntimeSettingsV3PendingWal(),
+      );
+      await refreshRuntime(undefined, true).catch(() => null);
+      setToast(`${reason instanceof Error ? reason.message : "RuntimeSettingsV2 恢复失败"}；原始隔离记录仍保留`);
+    } finally {
+      runtimeSettingsOperation.current = null;
+      setRuntimeSettingsOperationOwner(null);
+      setRuntimeSettingsV2RecoveryBusy(false);
+    }
+  }, [
+    invalidateAndRefreshTaskSnapshots,
+    refreshRuntime,
+    runtimeSettingsV2RecoveryBusy,
+    setRuntimeAuthorityRequired,
+  ]);
+
   const updateRuntimeSettingsDraft = useCallback((draft: RuntimeSettings) => {
     setRuntimeSettingsDraft(draft);
     setRuntimeSettingsPausedError(null);
@@ -2409,6 +2760,58 @@ export default function App() {
     clearPendingRuntimeSettings();
     setRuntimeAuthorityRequired(true);
   }, [setRuntimeAuthorityRequired]);
+
+  const saveLoraLoaderOverride = useCallback(async (
+    edit: LoraLoaderOverrideEdit,
+  ): Promise<RuntimeSettings> => {
+    if (
+      runtimeSettingsOperation.current ||
+      runtimeSettingsDesired.current ||
+      runtimeSettingsAutosaveTimer.current !== null
+    ) throw new Error("其他运行设置仍在同步；完成后再修改 LoRA 加载器映射");
+    const authorityToken = authoritativeSettingsTokenRef.current;
+    if (!authorityToken || !runtimeSettingsAuthorityReadyRef.current) {
+      throw new Error("运行设置权威尚未就绪");
+    }
+    setRuntimeSettingsOperationOwner("lora-mapping");
+    setRuntimeAuthorityRequired(true);
+    setCompileReport(null);
+    const operation = (async () => {
+      const committed = await saveLoraLoaderOverrideWithCas(
+        edit,
+        {
+          settings: structuredClone(authoritativeSettingsRef.current),
+          authority_token: authorityToken,
+        },
+        {
+          read: () => directorApi.getSettingsAuthority(),
+          write: (settings, expectedToken) =>
+            directorApi.updateSettingsAuthority(settings, expectedToken),
+        },
+      );
+      authoritativeSettingsRef.current = structuredClone(committed.settings);
+      authoritativeSettingsTokenRef.current = committed.authority_token;
+      const confirmed = await refreshRuntime(undefined, true);
+      if (!confirmed) {
+        throw new Error("LoRA 加载器映射已提交，但权威运行资源回读失败");
+      }
+      setRuntimeSettingsDraft(confirmed);
+      runtimeSettingsDraftValidRef.current = true;
+      setRuntimeSettingsDraftValid(true);
+      setRuntimeSettingsPausedError(null);
+      invalidateAndRefreshTaskSnapshots();
+      return confirmed;
+    })();
+    runtimeSettingsOperation.current = operation;
+    try {
+      return await operation;
+    } finally {
+      if (runtimeSettingsOperation.current === operation) {
+        runtimeSettingsOperation.current = null;
+        setRuntimeSettingsOperationOwner(null);
+      }
+    }
+  }, [invalidateAndRefreshTaskSnapshots, refreshRuntime, setRuntimeAuthorityRequired]);
 
   useEffect(() => {
     if (runtimeSettingsDesired.current) {
@@ -2473,10 +2876,15 @@ export default function App() {
     }
     const snapshot = normalizeTimelineProject(structuredClone(timelineRef.current.project));
     if (!snapshot) return Promise.reject(new Error("时间线结构无效，请检查项目字段"));
+    const creativeBindingsChanged = !sameProjectCreativeBindings(
+      snapshot,
+      expectedServerProject,
+    );
 
     let mayDrainImmediately = false;
     let failedRevisionWasSuperseded = false;
     let observedConflictAuthority: TimelineAuthority | null = null;
+    if (creativeBindingsChanged) setCreativeAuthorityWritePending(true);
     const operation = (async (): Promise<TimelineProject | null> => {
       let response: TimelineAuthority;
       try {
@@ -2571,6 +2979,10 @@ export default function App() {
       }
       installTimelineAuthority(confirmed, { clearHistory: false });
       clearLocalTimeline();
+      const legacyCandidate = activeLegacyTimelineWalCandidateRef.current;
+      if (legacyCandidate && clearLegacyTimelineWalCandidate(legacyCandidate)) {
+        activeLegacyTimelineWalCandidateRef.current = null;
+      }
       persistTimelineJournal(
         durableHistory,
         { document: confirmed, revision: response.revision },
@@ -2669,6 +3081,7 @@ export default function App() {
       if (timelineSaveRequest.current === operation) {
         timelineSaveRequest.current = null;
         timelineSaveRequestRevision.current = null;
+        if (creativeBindingsChanged) setCreativeAuthorityWritePending(false);
       }
       if (
         (mayDrainImmediately || failedRevisionWasSuperseded) &&
@@ -2783,7 +3196,27 @@ export default function App() {
         const candidateDatabase = {
           active_database_path: storage.active_database_path,
         };
+        const runtimeSettingsV2Evidence = listRuntimeSettingsV2WalEvidence(
+          candidateDatabase.active_database_path,
+        );
+        const hasIndependentRuntimeSettingsV3Wal =
+          hasIndependentRuntimeSettingsV3PendingWal();
         const persistedRuntimeSettings = loadPendingRuntimeSettings(candidateDatabase);
+        const legacyRuntimeCandidates = listLegacyRuntimeSettingsWalCandidates(
+          candidateDatabase.active_database_path,
+        );
+        if (ownsHydration()) {
+          setRuntimeSettingsV2RecoveryEvidence(runtimeSettingsV2Evidence);
+          setRuntimeSettingsV2RecoveryHasV3Conflict(
+            runtimeSettingsV2Evidence.length > 0 && hasIndependentRuntimeSettingsV3Wal,
+          );
+          setLegacyRuntimeRecoveryCandidates(legacyRuntimeCandidates);
+          if (!legacyRuntimeCandidates.length) setLegacyRuntimeRecoveryProjectId("");
+        }
+        const legacyTimelineCandidates = legacyTimelineWalCandidates(
+          candidateDatabase,
+          hydratingProjectId,
+        );
         const walBranches = listLocalTimelineWalBranches(
           candidateDatabase,
           hydratingProjectId,
@@ -2803,6 +3236,14 @@ export default function App() {
             hydratingProjectId !== DEFAULT_PROJECT_ID
           )) throw reason;
 
+          // A create-like endpoint already acknowledged this project in the
+          // current page. Its timeline GET/list membership may still lag that
+          // commit, so retry hydration instead of treating the stale 404 as
+          // proof that the project was deleted.
+          if (locallyCommittedProjectsRef.current.has(hydratingProjectId)) {
+            throw reason;
+          }
+
           // A missing persisted project is the one bootstrap path that cannot
           // wait for a successful timeline latch. Bind the membership decision
           // to the exact database observed before and after the scoped list.
@@ -2819,25 +3260,60 @@ export default function App() {
             // of guessing whether creation/deletion won the inter-request race.
             throw reason;
           }
-          setProjects(list.projects);
+          setProjects(reconcileServerProjectList(list.projects));
           restartTimelineHydrationForProject(DEFAULT_PROJECT_ID);
           return;
         }
         if (!ownsHydration()) return;
         const serverProject = normalizeTimelineProject(authority.document);
         if (!serverProject) throw new Error("服务器返回的时间线结构无效");
-        const persistenceAuthority = {
-          document: serverProject,
-          revision: authority.revision,
-        };
+        const legacyTimelineCandidate = legacyTimelineCandidates[0] ?? null;
         const persistenceScope = timelinePersistenceScope(
           candidateDatabase,
           hydratingProjectId,
           hydratingOwnerId,
         );
+        const hasLegacyJournalEvidence =
+          await hasLegacyV4TimelineHistoryJournalEvidence(persistenceScope);
+        let legacyTimelineReceipt = null;
+        if (legacyTimelineCandidate || hasLegacyJournalEvidence) {
+          try {
+            legacyTimelineReceipt = await directorApi.getLatestProjectMigrationReceipt(
+              hydratingProjectId,
+              controller.signal,
+            );
+          } catch (reason) {
+            // A v4 WAL cannot be classified without its exact receipt. A lone
+            // legacy journal remains visible as corrupt evidence instead of
+            // making the current v5 authority unavailable.
+            if (legacyTimelineCandidate) throw reason;
+          }
+        }
+        const legacyTimelineResolution = legacyTimelineCandidate
+          ? resolveLegacyTimelineWalWithReceipt(
+              legacyTimelineCandidate.wal,
+              legacyTimelineReceipt,
+              { document: serverProject, revision: authority.revision },
+            )
+          : null;
+        if (legacyTimelineCandidate && !legacyTimelineResolution) {
+          throw new Error("旧时间线 WAL 或迁移回执不可验证");
+        }
+        const persistenceAuthority = {
+          document: serverProject,
+          revision: authority.revision,
+        };
         const [journal, journalBranchList] = await Promise.all([
-          loadTimelineHistoryJournal(persistenceScope, persistenceAuthority),
-          listTimelineHistoryJournalBranches(persistenceScope, persistenceAuthority),
+          loadTimelineHistoryJournal(
+            persistenceScope,
+            persistenceAuthority,
+            legacyTimelineReceipt,
+          ),
+          listTimelineHistoryJournalBranches(
+            persistenceScope,
+            persistenceAuthority,
+            legacyTimelineReceipt,
+          ),
         ]);
         if (!ownsHydration()) return;
         const verification = await directorApi.getStorage(controller.signal);
@@ -2918,7 +3394,29 @@ export default function App() {
 
         const journalCarriesHistory = journal.status === "restored" ||
           journal.status === "acknowledged";
-        if (walResolution?.status === "conflict") {
+        if (legacyTimelineResolution?.status === "replay" && legacyTimelineCandidates.length === 1) {
+          hydratedProject = legacyTimelineResolution.project;
+          hasPendingProject = true;
+        } else if (legacyTimelineResolution?.status === "acknowledged" && legacyTimelineCandidates.length === 1) {
+          hydratedProject = serverProject;
+        } else if (legacyTimelineResolution) {
+          const migratedLegacy = legacyTimelineResolution.status === "conflict"
+            ? migrateLegacyTimelineProjectToV5(
+                legacyTimelineResolution.legacy_project,
+                legacyTimelineReceipt!.legacy_creative_binding_context,
+              )
+            : legacyTimelineResolution.project;
+          if (!migratedLegacy) throw new Error("旧时间线冲突草稿无法完整迁移");
+          hydratedProject = migratedLegacy;
+          hasPendingProject = true;
+          hydrationConflict = {
+            projectId: hydratingProjectId,
+            localProject: hydratedProject,
+            serverAuthority: persistenceAuthority,
+            source: "legacy-wal",
+            resolving: false,
+          };
+        } else if (walResolution?.status === "conflict") {
           hydratedProject = walResolution.local_project;
           hasPendingProject = true;
           hydrationConflict = {
@@ -2960,7 +3458,7 @@ export default function App() {
           hasPendingProject = !timelineProjectsEqual(hydratedProject, serverProject);
         }
 
-        if (explicitRecoverySelectionRequired) {
+        if (!legacyTimelineCandidate && explicitRecoverySelectionRequired) {
           // Foreign branches are never installed merely because they exist.
           // The server remains visible and the editor stays gated until the
           // user selects one branch or explicitly continues without deleting it.
@@ -2978,6 +3476,7 @@ export default function App() {
             selectedRecoveryBranchId: null,
           };
         } else if (
+          !legacyTimelineCandidate &&
           !hasPendingProject &&
           !hydrationConflict &&
           recovery.newestAcknowledgedHistory
@@ -2990,6 +3489,7 @@ export default function App() {
 
         acceptTimelineServerAuthority(persistenceAuthority);
         activeTimelineWalRef.current = wal;
+        activeLegacyTimelineWalCandidateRef.current = legacyTimelineCandidate;
         timelineRevision.current = hasPendingProject ? 1 : 0;
         timelinePersistedRevision.current = 0;
         timelineHadLocal.current = hasPendingProject || hydratedHistory.head !== null;
@@ -3004,7 +3504,16 @@ export default function App() {
         timelineHydrationReady.current = true;
         setTimelineHydrationStatus("ready");
 
-        if (wal && walResolution?.status === "acknowledged" && !hydrationConflict) {
+        if (
+          legacyTimelineCandidate &&
+          legacyTimelineResolution?.status === "acknowledged" &&
+          legacyTimelineCandidates.length === 1 &&
+          !hydrationConflict
+        ) {
+          if (clearLegacyTimelineWalCandidate(legacyTimelineCandidate)) {
+            activeLegacyTimelineWalCandidateRef.current = null;
+          }
+        } else if (wal && walResolution?.status === "acknowledged" && !hydrationConflict) {
           clearLocalTimeline(wal);
         } else if (!wal && hasPendingProject && !hydrationConflict) {
           saveLocalTimeline(hydratedProject, candidateDatabase, hydratingProjectId);
@@ -3044,7 +3553,7 @@ export default function App() {
       if (timelineHydrationRetryTimer !== null) window.clearTimeout(timelineHydrationRetryTimer);
       controller.abort();
     };
-  }, [acceptTimelineServerAuthority, clearLocalTimeline, clearTimelineHistory, commitTimelineHistory, installTimelineAuthority, persistTimelineJournal, refreshRuntime, loadTasks, loadAssets, saveLocalTimeline, setTimelineRevisionConflict, timelineHydrationEpoch]);
+  }, [acceptTimelineServerAuthority, clearLocalTimeline, clearTimelineHistory, commitTimelineHistory, installTimelineAuthority, persistTimelineJournal, reconcileServerProjectList, refreshRuntime, loadTasks, loadAssets, saveLocalTimeline, setTimelineRevisionConflict, timelineHydrationEpoch]);
 
   useEffect(() => { saveDirectorState(state); }, [state]);
   useEffect(() => {
@@ -3068,10 +3577,11 @@ export default function App() {
       activeDatabaseRef.current?.active_database_path === database.active_database_path;
     void directorApi.listProjects(controller.signal).then((list) => {
       if (!ownsList()) return;
-      setProjects(list.projects);
+      const reconciledProjects = reconcileServerProjectList(list.projects);
+      setProjects(reconciledProjects);
       if (
         projectId !== DEFAULT_PROJECT_ID &&
-        !list.projects.some((project) => project.id === projectId)
+        !reconciledProjects.some((project) => project.id === projectId)
       ) {
         restartTimelineHydrationForProject(DEFAULT_PROJECT_ID);
       }
@@ -3080,7 +3590,7 @@ export default function App() {
       // A later hydration/project transition starts a fresh scoped request.
     });
     return () => controller.abort();
-  }, [activeProjectId, restartTimelineHydrationForProject, timelineHydrationStatus]);
+  }, [activeProjectId, reconcileServerProjectList, restartTimelineHydrationForProject, timelineHydrationStatus]);
   useEffect(() => {
     if (timelineHydrationStatus !== "ready") return;
     // Project hand-off updates the synchronous owner before React publishes
@@ -3777,6 +4287,12 @@ export default function App() {
       setTimelineDirty(false);
       setTimelinePausedError(null);
       clearLocalTimeline();
+      if (conflict.source === "legacy-wal") {
+        const legacyCandidate = activeLegacyTimelineWalCandidateRef.current;
+        if (legacyCandidate && clearLegacyTimelineWalCandidate(legacyCandidate)) {
+          activeLegacyTimelineWalCandidateRef.current = null;
+        }
+      }
       persistTimelineJournal(
         durableHistory,
         { document: confirmed, revision: response.revision },
@@ -3826,13 +4342,8 @@ export default function App() {
 
   const submitTimeline = async (segmentIds: string[]) => {
     if (submitting) return;
-    if (
-      rayLightRecoveryPendingRef.current ||
-      !runtimeResourcesReadyRef.current ||
-      !rayLightRuntimeStatusRef.current ||
-      rayLightRuntimeStatusRef.current.recovery_required
-    ) {
-      setToast("ComfyUI 与 RayLight 运行状态尚未完成权威核对；暂不能生成");
+    if (!featureCatalogReadyRef.current) {
+      setToast(featureCatalogErrorRef.current ?? "功能目录与宿主能力尚未完成核对；暂不能生成");
       return;
     }
     if (!segmentIds.length) {
@@ -3873,17 +4384,15 @@ export default function App() {
       }
       let validationErrors = [
         ...validateTimelineProject(config, clickedSegmentIds),
-        ...runtimeTimelineValidation(config, capabilities, state.settings, clickedSegmentIds),
       ];
       if (validationErrors.length) throw new Error(validationErrors[0]);
 
       // Re-roll random seeds exactly like one submission would; the same
       // concrete value goes into the flushed timeline and the task payload.
-      config = await rerollRandomSeeds(config, clickedSegmentIds);
+      config = await rerollAndPersistRandomSeeds(config, clickedSegmentIds);
       expectedTimelineRevision = timelineRevision.current;
       validationErrors = [
         ...validateTimelineProject(config, clickedSegmentIds),
-        ...runtimeTimelineValidation(config, capabilities, state.settings, clickedSegmentIds),
       ];
       if (validationErrors.length) throw new Error(validationErrors[0]);
       if (
@@ -3895,6 +4404,11 @@ export default function App() {
         runtimeSettingsGeneration.current !== executionGeneration ||
         !sameRuntimeSettings(authoritativeSettingsRef.current, executionSettings)
       ) throw new Error("运行设置权威状态已变化，请重新生成");
+      // Submission is the only authoritative execution gate and recaptures
+      // current host/model/runtime facts before creating any upstream side
+      // effect. Do not synchronously run the advisory preflight immediately
+      // beforehand; it duplicates the expensive host scan and makes every
+      // click wait twice for the same observation.
       const task = await submitTimelineForProject(clickedProjectId, {
         config: structuredClone(config),
         segment_ids: clickedSegmentIds,
@@ -3909,6 +4423,13 @@ export default function App() {
       void loadTasks(undefined, true);
       setToast(`已提交 ${clickedSegmentIds.length} 个原生分段子图`);
     } catch (reason) {
+      if (reason instanceof FeatureCatalogDriftError) {
+        featureCatalogReadyRef.current = false;
+        featureCatalogErrorRef.current = reason.message;
+        setFeatureCatalog(null);
+        setFeatureCatalogStatus({ ready: false, error: reason.message });
+        void refreshRuntimeResources(runtimeResourcesReadyRef.current);
+      }
       setToast(reason instanceof Error ? reason.message : "时间线任务提交失败");
     } finally {
       setSubmitting(false);
@@ -3927,34 +4448,18 @@ export default function App() {
    * Simulate the exact submission step for one run: re-roll every family the
    * selected segments use when its editor contract is `random_seed`, persist
    * the concrete value (updating the greyed-out seed fields), and return the
-   * authoritative project. Both the generate and the preflight entries share
-   * this so the flushed timeline, compile reports and the ComfyUI prompt
-   * always carry the same JSON-safe seed.
+   * authoritative project. This write-producing path is submission-only;
+   * compile preflight materializes its seed on a detached draft instead.
    */
-  const rerollRandomSeeds = async (
+  const rerollAndPersistRandomSeeds = async (
     config: TimelineProject,
     segmentIds: string[],
   ): Promise<TimelineProject> => {
-    const selection = new Set(segmentIds);
-    const usedFamilies = new Set(
-      config.segments
-        .filter((segment) => segment.enabled && selection.has(segment.id))
-        .map((segment) => timelineSamplingFamily(segment.mode)),
-    );
-    let rerolled = false;
-    for (const family of usedFamilies) {
-      const sampling = config.sampling[family];
-      if (!sampling.random_seed) continue;
-      config.sampling[family] = {
-        ...sampling,
-        seed: nextRandomSeed(sampling.seed),
-      };
-      rerolled = true;
-    }
+    const { project: concrete, rerolled } = materializeRandomSeeds(config, segmentIds);
     if (!rerolled) return config;
     // Keep the disabled fields equal to the exact value sent to the job.
     dispatchTimeline(
-      { type: "project/replace", project: structuredClone(config) },
+      { type: "project/replace", project: concrete },
       { historyLabel: "更新随机 Seed" },
     );
     const expected = timelineRevision.current;
@@ -3967,13 +4472,8 @@ export default function App() {
 
   const inspectTimelineExecution = async (segmentIds: string[]) => {
     if (compiling) return;
-    if (
-      rayLightRecoveryPendingRef.current ||
-      !runtimeResourcesReadyRef.current ||
-      !rayLightRuntimeStatusRef.current ||
-      rayLightRuntimeStatusRef.current.recovery_required
-    ) {
-      setToast("ComfyUI 与 RayLight 运行状态尚未完成权威核对；暂不能预检");
+    if (!featureCatalogReadyRef.current) {
+      setToast(featureCatalogErrorRef.current ?? "功能目录与宿主能力尚未完成核对；暂不能预检");
       return;
     }
     if (!segmentIds.length) {
@@ -3995,7 +4495,6 @@ export default function App() {
     if (!config) { setToast("时间线结构无效，请检查项目字段"); return; }
     let validationErrors = [
       ...validateTimelineProject(config, clickedSegmentIds),
-      ...runtimeTimelineValidation(config, capabilities, state.settings, clickedSegmentIds),
     ];
     if (validationErrors.length) { setToast(validationErrors[0]); return; }
     const executionGeneration = runtimeSettingsGeneration.current;
@@ -4005,15 +4504,36 @@ export default function App() {
     runtimeExecutionIntent.current += 1;
     setCompiling(true);
     try {
-      // 与生成入口一致：预检前也模拟一次提交，重掷随机 seed 并持久化，
-      // 让 compile 报告携带这次预检实际使用的值，灰显数字框同步显示。
-      config = await rerollRandomSeeds(config, clickedSegmentIds);
+      // Preflight is strictly read-only: make random seeds concrete on this
+      // detached draft without dispatch, history, WAL, autosave or timeline PUT.
+      config = materializeRandomSeeds(config, clickedSegmentIds).project;
       const clickedTimelineRevision = timelineRevision.current;
       validationErrors = [
         ...validateTimelineProject(config, clickedSegmentIds),
-        ...runtimeTimelineValidation(config, capabilities, state.settings, clickedSegmentIds),
       ];
       if (validationErrors.length) { setToast(validationErrors[0]); return; }
+      const capabilityPreflight = await directorApi.preflightFeatures({
+        config: structuredClone(config),
+        segment_ids: clickedSegmentIds,
+        project_id: clickedProjectId,
+      });
+      if (
+        activeProjectIdRef.current !== clickedProjectId ||
+        timelineRevision.current !== clickedTimelineRevision ||
+        segmentSelectionGeneration.current !== clickedSegmentSelectionGeneration ||
+        runtimeSettingsGeneration.current !== executionGeneration ||
+        !sameRuntimeSettings(authoritativeSettingsRef.current, executionSettings) ||
+        runtimeSettingsDesired.current !== null ||
+        runtimeSettingsSyncRequiredRef.current
+      ) {
+        setToast("项目、时间线、分段选择或运行设置已变化，请重新预检");
+        return;
+      }
+      requireSuccessfulFeaturePreflight(
+        capabilityPreflight,
+        config,
+        featureCatalogRef.current,
+      );
       const report = await compileTimelineForProject(clickedProjectId, { config: structuredClone(config), segment_ids: clickedSegmentIds });
       if (
         activeProjectIdRef.current !== clickedProjectId ||
@@ -4030,6 +4550,13 @@ export default function App() {
       setCompileReport(report);
       setToast(`已预检 ${report.plans.length} 个服务端原生执行计划`);
     } catch (reason) {
+      if (reason instanceof FeatureCatalogDriftError) {
+        featureCatalogReadyRef.current = false;
+        featureCatalogErrorRef.current = reason.message;
+        setFeatureCatalog(null);
+        setFeatureCatalogStatus({ ready: false, error: reason.message });
+        void refreshRuntimeResources(runtimeResourcesReadyRef.current);
+      }
       setCompileReport(null);
       setToast(reason instanceof Error ? reason.message : "执行计划预检失败");
     } finally {
@@ -4043,37 +4570,6 @@ export default function App() {
         runtimeSettingsDrainRef.current();
       }
     }
-  };
-
-  const updateRuntimeModel = async (
-    role: DiffusionModelRole,
-    patch: Partial<DiffusionModelBinding>,
-  ) => {
-    setCompileReport(null);
-    const base = runtimeSettingsDesired.current ?? runtimeSettingsDraft;
-    const currentBinding = base.models[role];
-    const selectedArtifactChanged =
-      ("lora_name" in patch && patch.lora_name !== currentBinding.lora_name) ||
-      ("filename" in patch && patch.filename !== currentBinding.filename);
-    const nextBinding = {
-      ...currentBinding,
-      ...patch,
-      ...(selectedArtifactChanged ? { standard_lora_loader_override: null } : {}),
-    };
-      const nextResidencyPolicy = rayLightResidencyPolicyAfterBindingChange(
-        base,
-        role,
-        nextBinding,
-      );
-      const next = sanitizeRuntimeSettings({
-        ...base,
-        raylight_residency_policy: nextResidencyPolicy,
-        models: {
-          ...base.models,
-          [role]: nextBinding,
-        },
-      });
-    void queueRuntimeSettings(role, next);
   };
 
   const cancel = async (id: string) => {
@@ -4250,11 +4746,11 @@ export default function App() {
       // Restore the historical source as a brand-new project instead of
       // overwriting the one currently being edited.
       projectListGeneration.current += 1;
-      const created = await directorApi.importProject({
-        title: snapshot.project.title,
-        document: snapshot.project,
-      });
-      setProjects((current) => [...current, created]);
+      const created = await directorApi.saveHistoricalJobAsProject(
+        id,
+        snapshot.project.title,
+      );
+      publishLocallyCommittedProject(created);
       if (!await switchProject(created.id)) return;
       if (snapshot.segment_ids !== null && snapshot.segment_ids.length > 0) {
         dispatchTimeline({ type: "segment/set-selection", ids: snapshot.segment_ids });
@@ -4328,6 +4824,14 @@ export default function App() {
       return await directorApi.getTaskDiagnostic(id);
     } catch (reason) {
       setToast(reason instanceof Error ? reason.message : "任务诊断导出失败");
+      throw reason;
+    }
+  };
+  const exportTaskProjectConfig = async (id: string) => {
+    try {
+      return await directorApi.getTaskProject(id);
+    } catch (reason) {
+      setToast(reason instanceof Error ? reason.message : "任务创作配置导出失败");
       throw reason;
     }
   };
@@ -4803,26 +5307,33 @@ export default function App() {
       };
     }
   }
-  const runtimeReady = capabilities.connection === "online" &&
+  const runtimeResourcesConfirmed = capabilities.connection === "online" &&
     runtimeResourcesReady && rayLightRuntimeStatus !== null;
+  const runtimeReady = runtimeResourcesConfirmed && featureCatalogStatus.ready;
   const rayLightRecoveryRequired = runtimeReady &&
     rayLightRuntimeStatus?.recovery_required === true;
   const runtimeAuthorityPending = runtimeSettingsOperationOwner !== null || runtimeSettingsSyncRequired;
   const timelineHydrated = timelineHydrationStatus === "ready";
   const databaseIdentityStale = timelineHydrationStatus === "stale";
-  const workspaceRuntimeReady = runtimeReady && !rayLightRecoveryRequired && !rayLightRecoveryPending && timelineHydrated && !runtimeAuthorityPending && !timelineSyncRequired && !timelineRevisionConflict && !assetsDeleting && !assetsUploading;
-  const workspaceCapabilities: CapabilityReport = !runtimeReady || rayLightRecoveryRequired || rayLightRecoveryPending || runtimeAuthorityPending || timelineSyncRequired || timelineRevisionConflict || assetsDeleting || assetsUploading
+  const workspaceRuntimeReady = runtimeReady && !rayLightRecoveryRequired && !rayLightRecoveryPending && timelineHydrated && !runtimeAuthorityPending && !creativeAuthorityWritePending && !timelineSyncRequired && !timelineRevisionConflict && !assetsDeleting && !assetsUploading;
+  const workspaceCapabilities: CapabilityReport = !runtimeReady || rayLightRecoveryRequired || rayLightRecoveryPending || runtimeAuthorityPending || creativeAuthorityWritePending || timelineSyncRequired || timelineRevisionConflict || assetsDeleting || assetsUploading
     ? {
         ...capabilities,
         connection: "checking",
         message: !runtimeReady
-          ? "ComfyUI 运行资源等待权威核对"
+          ? featureCatalogStatus.error ?? (
+              !featureCatalogStatus.ready
+                ? "功能目录与宿主能力等待权威核对"
+                : "ComfyUI 运行资源等待权威核对"
+            )
           : rayLightRecoveryRequired
           ? "旧 RayLight 运行状态等待重启确认"
           : rayLightRecoveryPending
             ? "正在核对 RayLight 重启恢复结果"
           : runtimeAuthorityPending
           ? "运行设置等待服务器权威回读"
+          : creativeAuthorityWritePending
+            ? "项目创作配置等待服务器 CAS 确认"
           : timelineSyncRequired
             ? "时间线等待服务器权威回读"
             : timelineRevisionConflict
@@ -4854,22 +5365,22 @@ export default function App() {
   const selectionTimelineErrors = [
     ...(!timelineHydrated ? [databaseIdentityStale ? "本页数据库身份已过期，请刷新整个页面" : "正在从服务器恢复时间线"] : []),
     ...(runtimeAuthorityPending ? ["运行设置尚未完成服务器权威回读"] : []),
-    ...(!runtimeReady ? ["ComfyUI 与 RayLight 运行资源尚未完成权威核对"] : []),
-    ...(rayLightRecoveryRequired ? ["旧 RayLight 运行状态引用当前不可见 GPU；请在系统设置确认 ComfyUI 已重启并恢复"] : []),
-    ...(rayLightRecoveryPending ? ["正在核对 RayLight 重启恢复结果"] : []),
+    ...(!featureCatalogStatus.ready
+      ? [featureCatalogStatus.error ?? "功能目录与宿主能力尚未完成权威核对"]
+      : []),
+    ...(creativeAuthorityWritePending ? ["项目创作配置正在等待服务器 CAS 确认"] : []),
     ...(timelineSyncRequired ? ["素材级联已提交，但服务器时间线尚未完成权威回读"] : []),
     ...(timelineRevisionConflict ? ["服务器时间线存在修订冲突，请先选择采用服务器版本或保留本地版本"] : []),
+    ...(assetsDeleting ? ["正在原子解除素材引用"] : []),
+    ...(assetsUploading ? ["正在上传并绑定本地素材"] : []),
     ...(timelinePausedMessage ? [timelinePausedMessage] : []),
     ...emptySelectionErrors,
     ...(selectedEnabledIds.length ? validateTimelineProject(timeline.project, selectedEnabledIds) : []),
     ...(inactiveSelectionAssetReferences.length
       ? [`当前 ComfyUI 素材库不包含所选片段的引用素材：${[...new Set(inactiveSelectionAssetReferences)].join("、")}`]
       : []),
-    ...(selectedEnabledIds.length
-      ? runtimeTimelineValidation(timeline.project, capabilities, state.settings, selectedEnabledIds)
-      : []),
   ];
-  const timelineRunActionsReady = workspaceCapabilities.connection === "online" &&
+  const timelineRunActionsReady = featureCatalogStatus.ready &&
     selectionTimelineErrors.length === 0 && selectedEnabledIds.length > 0;
   const timelineHistoryBlocked = state.view !== "workspace" ||
     !timelineHydrated || databaseIdentityStale ||
@@ -5184,7 +5695,7 @@ export default function App() {
     }
     try {
       const created = await directorApi.createProject(title);
-      setProjects((current) => [...current, created]);
+      publishLocallyCommittedProject(created);
       await switchProject(created.id);
     } catch (reason) {
       setToast(`新建项目失败：${reason instanceof Error ? reason.message : "未知错误"}`);
@@ -5211,6 +5722,7 @@ export default function App() {
       ) return;
       const response = await directorApi.deleteProject(projectId);
       projectListGeneration.current += 1;
+      locallyCommittedProjectsRef.current.delete(projectId);
       setProjects((current) => current.filter((project) => project.id !== projectId));
       if (activeProjectIdRef.current === projectId) {
         restartTimelineHydrationForProject(DEFAULT_PROJECT_ID);
@@ -5280,6 +5792,145 @@ export default function App() {
         />
 
       <div className="app-main">
+        {runtimeSettingsV2RecoveryEvidence.length > 0 && <div
+          className="timeline-hydration-notice timeline-revision-conflict runtime-settings-recovery-notice"
+          role="alert"
+          aria-label="RuntimeSettingsV2 恢复"
+        >
+          {runtimeSettingsV2RecoveryBusy && <Spinner />}
+          <span>
+            检测到升级前的 RuntimeSettingsV2 隔离证据。页面加载不会自动写入；
+            尚有 {runtimeSettingsV2RecoveryEvidence.length} 条记录。
+          </span>
+          {runtimeSettingsV2RecoveryHasV3Conflict && <span>
+            同时检测到独立的 RuntimeSettingsV3 待同步记录。两份均已保留；请先完成该记录并刷新页面，
+            再决定是否恢复 V2。
+          </span>}
+          {runtimeSettingsV2RecoveryEvidence.map((evidence, index) => <div
+            key={evidence.storage_key}
+            className="runtime-settings-recovery-evidence"
+          >
+            <span>
+              记录 {index + 1}：摘要 <code>{evidence.raw_digest}</code>；
+              浏览器归属 {evidence.ownership.owner_id ?? "无法安全解析"}；
+              数据库归属 {evidence.ownership.database_scope === "current"
+                ? "当前数据库"
+                : evidence.ownership.database_scope === "other"
+                  ? "其他数据库"
+                  : "无法安全解析"}。
+            </span>
+            {evidence.kind === "corrupt" ? <>
+              <span>
+                此隔离记录无法通过完整性、格式或当前数据库归属校验。内容已脱敏隐藏，绝不会用于 CAS 恢复。
+              </span>
+              <div role="group" aria-label={`RuntimeSettingsV2 不可恢复记录 ${index + 1}`}>
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={runtimeSettingsV2RecoveryBusy}
+                  onClick={() => downloadRuntimeSettingsV2WalEvidence(evidence)}
+                >导出原始记录</button>
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={runtimeSettingsV2RecoveryBusy}
+                  onClick={() => {
+                    if (window.confirm("放弃这条不可恢复的 RuntimeSettingsV2 原始记录？不会写入运行设置。")) {
+                      void recoverRuntimeSettingsV2(evidence, "discard");
+                    }
+                  }}
+                >放弃</button>
+              </div>
+            </> : <div role="group" aria-label={`RuntimeSettingsV2 恢复选择 ${index + 1}`}>
+              <button
+                type="button"
+                className="button button--ghost"
+                disabled={runtimeSettingsV2RecoveryBusy || runtimeSettingsV2RecoveryHasV3Conflict}
+                onClick={() => void recoverRuntimeSettingsV2(evidence, "merge-exact-mappings")}
+              >仅合并精确 LoRA 映射</button>
+              <button
+                type="button"
+                className="button button--primary"
+                disabled={runtimeSettingsV2RecoveryBusy || runtimeSettingsV2RecoveryHasV3Conflict}
+                onClick={() => void recoverRuntimeSettingsV2(
+                  evidence,
+                  "apply-runtime-and-merge-mappings",
+                )}
+              >应用旧运行参数并合并精确 LoRA 映射</button>
+              <button
+                type="button"
+                className="button button--ghost"
+                disabled={runtimeSettingsV2RecoveryBusy}
+                onClick={() => {
+                  if (window.confirm("放弃这条 RuntimeSettingsV2 恢复记录？不会写入运行设置。")) {
+                    void recoverRuntimeSettingsV2(evidence, "discard");
+                  }
+                }}
+              >放弃</button>
+            </div>}
+          </div>)}
+        </div>}
+        {legacyRuntimeRecoveryCandidates.length > 0 && <div
+          className="timeline-hydration-notice timeline-revision-conflict"
+          role="alert"
+          aria-label="旧运行设置恢复"
+        >
+          {legacyRuntimeRecoveryBusy && <Spinner />}
+          <span>
+            检测到升级前尚未确认的运行设置。原始字节已隔离保留；它不会自动套用到当前项目。
+            请选择明确的恢复范围（尚有 {legacyRuntimeRecoveryCandidates.length} 条）。
+          </span>
+          <label>
+            指定项目
+            <select
+              aria-label="旧运行设置指定恢复项目"
+              value={legacyRuntimeRecoveryProjectId}
+              disabled={legacyRuntimeRecoveryBusy}
+              onChange={(event) => setLegacyRuntimeRecoveryProjectId(event.target.value)}
+            >
+              <option value="">请选择项目（不会默认当前项目）</option>
+              {projects.map((project) => <option key={project.id} value={project.id}>
+                {project.title}
+              </option>)}
+            </select>
+          </label>
+          <div role="group" aria-label="旧运行设置恢复选择">
+            <button
+              type="button"
+              className="button button--ghost"
+              disabled={legacyRuntimeRecoveryBusy || projects.length === 0}
+              onClick={() => void recoverLegacyRuntimeSettings({
+                kind: "apply-all-projects",
+                project_ids: projects.map((project) => project.id),
+              })}
+            >应用到所有已迁移项目</button>
+            <button
+              type="button"
+              className="button button--primary"
+              disabled={legacyRuntimeRecoveryBusy || !legacyRuntimeRecoveryProjectId}
+              onClick={() => void recoverLegacyRuntimeSettings({
+                kind: "apply-specific-projects",
+                project_ids: [legacyRuntimeRecoveryProjectId],
+              })}
+            >应用到指定项目</button>
+            <button
+              type="button"
+              className="button button--ghost"
+              disabled={legacyRuntimeRecoveryBusy}
+              onClick={() => void recoverLegacyRuntimeSettings({ kind: "retain-lora-compat" })}
+            >仅保留 Standard LoRA 精确映射</button>
+            <button
+              type="button"
+              className="button button--ghost"
+              disabled={legacyRuntimeRecoveryBusy}
+              onClick={() => {
+                if (window.confirm("放弃这条旧运行设置恢复记录？不会修改任何项目或运行设置。")) {
+                  void recoverLegacyRuntimeSettings({ kind: "discard" });
+                }
+              }}
+            >放弃</button>
+          </div>
+        </div>}
         {projectSwitchHandoffPending && <div className="timeline-hydration-notice" role="status" aria-live="polite">
           <Spinner />
           <span>正在完成项目切换交接；完成前不能编辑当前项目</span>
@@ -5431,6 +6082,17 @@ export default function App() {
                 )}
                 <option value="__new__">＋ 新建项目</option>
               </select>
+              <ProjectImportDialog
+                currentProject={timeline.project}
+                disabled={!timelineHydrated || databaseIdentityStale ||
+                  Boolean(timelineRevisionConflict) || submitting || compiling ||
+                  assetsDeleting || assetsUploading || projectSwitchHandoffPending ||
+                  projectDeletingId !== null || creativeAuthorityWritePending}
+                onImported={async (imported) => {
+                  publishLocallyCommittedProject(imported);
+                  await switchProject(imported.id);
+                }}
+              />
               {activeProjectId !== DEFAULT_PROJECT_ID && (
                 <button
                   type="button"
@@ -5566,10 +6228,8 @@ export default function App() {
               id={GLOBAL_SETTINGS_ID}
               open={globalSettingsOpen}
               project={timeline.project}
-              settings={runtimeSettingsDraft}
               models={models}
               runtimeReady={runtimeSettingsDraftValid && runtimeResourcesReady && capabilities.connection === "online" && !rayLightRecoveryRequired}
-              modelSaving={runtimeSettingsOperationOwner !== null}
               onClose={() => { setGlobalSettingsOpen(false); window.requestAnimationFrame(() => globalSettingsToggleRef.current?.focus()); }}
               onProjectPatch={(patch) => dispatchTimeline({ type: "project/patch", patch })}
               onSamplingChange={(family, patch) => dispatchTimeline({
@@ -5577,7 +6237,18 @@ export default function App() {
                 family,
                 patch,
               })}
-              onRuntimeModelChange={(role, patch) => void updateRuntimeModel(role, patch)}
+              onModelChange={(role, filename) => {
+                setCompileReport(null);
+                dispatchTimeline({ type: "project/update-model", role, filename });
+              }}
+              onLoraChange={(family, patch) => {
+                setCompileReport(null);
+                dispatchTimeline({
+                  type: "feature/set-project",
+                  featureId: "lora",
+                  selection: updateLoraFeatureFamily(timeline.project.features, family, patch),
+                });
+              }}
             />
             <TimelineHistoryPanel
               id={TIMELINE_HISTORY_PANEL_ID}
@@ -5610,7 +6281,7 @@ export default function App() {
                 }
               }}
             />
-            {!workspaceRuntimeReady && <div className="timeline-runtime-notice">{!runtimeSettingsDraftValid ? "系统设置有无效输入，请打开并修正；有效后自动应用。" : runtimeSettingsPausedError ? `服务器拒绝当前系统设置：${runtimeSettingsPausedError}。请打开并修改；有效修改后自动应用。` : rayLightRecoveryRequired ? "旧 RayLight 运行状态引用了当前不可见 GPU；请打开系统设置，确认 ComfyUI 已重启后执行恢复。" : runtimeSettingsSyncRequired ? "运行设置或素材库正在后台自动核对；恢复权威状态前，生成与素材操作保持锁定。" : runtimeSettingsOperationOwner !== null ? "运行设置正在同步并从服务器权威回读；完成前不能生成或操作素材。" : timelineRevisionConflict ? "服务器时间线存在修订冲突；本地草稿已保留，请在页面顶部选择处理方式。" : timelineSyncRequired ? "素材操作结果正在自动核对；恢复权威时间线前，编辑与生成保持锁定。" : assetsDeleting ? "正在原子解除素材引用；时间线编辑与生成暂时锁定。" : assetsUploading ? assetUploadProgress ? `${describeUploadProgress(assetUploadProgress)}；完成前暂时锁定同步、预检和生成。` : "正在上传并绑定本地素材；完成前暂时锁定同步、预检和生成。" : capabilities.connection === "offline" ? "ComfyUI 当前离线；编辑内容会在 Director 连接恢复后自动同步，暂时不能生成。" : "正在检查 ComfyUI 能力…"}</div>}
+            {!workspaceRuntimeReady && <div className="timeline-runtime-notice">{!runtimeSettingsDraftValid ? "系统设置有无效输入，请打开并修正；有效后自动应用。" : runtimeSettingsPausedError ? `服务器拒绝当前系统设置：${runtimeSettingsPausedError}。请打开并修改；有效修改后自动应用。` : featureCatalogStatus.error ? `${featureCatalogStatus.error}；生成与预检保持锁定。` : rayLightRecoveryRequired ? "旧 RayLight 运行状态引用了当前不可见 GPU；服务器预检会按最新状态给出阻断原因，也可在系统设置确认重启恢复。" : runtimeSettingsSyncRequired ? "运行设置或素材库正在后台自动核对；恢复权威状态前，生成与素材操作保持锁定。" : runtimeSettingsOperationOwner !== null ? "运行设置正在同步并从服务器权威回读；完成前不能生成或操作素材。" : creativeAuthorityWritePending ? "项目创作配置正在提交 CAS；确认前不能生成或操作素材。" : timelineRevisionConflict ? "服务器时间线存在修订冲突；本地草稿已保留，请在页面顶部选择处理方式。" : timelineSyncRequired ? "素材操作结果正在自动核对；恢复权威时间线前，编辑与生成保持锁定。" : assetsDeleting ? "正在原子解除素材引用；时间线编辑与生成暂时锁定。" : assetsUploading ? assetUploadProgress ? `${describeUploadProgress(assetUploadProgress)}；完成前暂时锁定同步、预检和生成。` : "正在上传并绑定本地素材；完成前暂时锁定同步、预检和生成。" : capabilities.connection === "offline" ? "ComfyUI 当前离线；编辑内容会继续保留，恢复后由服务器实时核对执行能力。" : !featureCatalogStatus.ready ? "正在读取功能目录与宿主能力…" : "正在检查设置页所需的 ComfyUI 资源；执行能力由服务器实时预检。"}</div>}
             <LongFormTimelineWorkspace
               state={timeline}
               capabilities={workspaceCapabilities}
@@ -5632,6 +6303,7 @@ export default function App() {
             confirmedSettings={state.settings}
             resourcesReady={runtimeResourcesReady}
             capabilities={capabilities}
+            featureCatalog={featureCatalogStatus.ready ? featureCatalog : null}
             gpus={gpus}
             models={models}
             rayLightRuntimeStatus={rayLightRuntimeStatus}
@@ -5651,7 +6323,9 @@ export default function App() {
             onThemeChange={setTheme}
             onDraftChange={updateRuntimeSettingsDraft}
             onSaved={(next) => queueRuntimeSettings("settings-page", next)}
-            onConnectionTestSucceeded={refreshAuthoritativeResourcesAfterConnectionTest}
+            onSaveLoraLoaderOverride={saveLoraLoaderOverride}
+            onConnectionTestSucceeded={refreshAuthoritativeRuntimeResources}
+            onHostCapabilitiesChanged={refreshAuthoritativeRuntimeResources}
             onConfirmRayLightRuntimeRecovery={confirmRayLightRuntimeRecovery}
             onRequestClose={(restoreFocus = true) => {
               dispatch({ type: "navigate/workspace" });
@@ -5661,7 +6335,7 @@ export default function App() {
         )}
       </div>
 
-      <TaskDrawer id="task-drawer" open={state.taskPanelOpen} tasks={state.tasks} loading={tasksLoading} supportsCancel={capabilities.supports_cancel} deletingTaskIds={deletingTaskIds} clearing={clearingTasks} onClose={() => dispatch({ type: "tasks/panel", open: false })} onRefresh={() => void loadTasks(undefined, true)} onCancel={(id) => cancel(id)} onConfirmComfyRestart={(id) => confirmComfyRestartRecovery(id)} onBulkCancel={cancelMany} onLoadProject={loadTaskProject} onLoadGenerationDetails={(id) => directorApi.getTaskGenerationDetails(id)} onExportDiagnostic={exportTaskDiagnostic} onImportOutput={importTaskOutput} onDelete={(id) => deleteTask(id)} onClearCompleted={() => clearTerminalTasks()} />
+      <TaskDrawer id="task-drawer" open={state.taskPanelOpen} tasks={state.tasks} loading={tasksLoading} supportsCancel={capabilities.supports_cancel} deletingTaskIds={deletingTaskIds} clearing={clearingTasks} onClose={() => dispatch({ type: "tasks/panel", open: false })} onRefresh={() => void loadTasks(undefined, true)} onCancel={(id) => cancel(id)} onConfirmComfyRestart={(id) => confirmComfyRestartRecovery(id)} onBulkCancel={cancelMany} onLoadProject={loadTaskProject} onExportProjectConfig={exportTaskProjectConfig} onLoadGenerationDetails={(id) => directorApi.getTaskGenerationDetails(id)} onExportDiagnostic={exportTaskDiagnostic} onImportOutput={importTaskOutput} onDelete={(id) => deleteTask(id)} onClearCompleted={() => clearTerminalTasks()} />
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         <span key={timelineHistoryAnnouncement.sequence}>{timelineHistoryAnnouncement.message}</span>
       </div>

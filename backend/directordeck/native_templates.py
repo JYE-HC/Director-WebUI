@@ -16,26 +16,50 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
-from .compiler import unified_continuity_predecessors
 from .schemas import (
     AssetReference,
     DiffusionModelBinding,
     RuntimeSettings,
-    SamplingConfig,
-    StandardLoraLoader,
     UnifiedFL2VASegment,
     UnifiedRef2VASegment,
     UnifiedTimelineDraft,
     UnifiedTimelineSegment,
-    timeline_segment_recipe,
 )
+from .workflow.audit import (
+    FeatureAuditTrace,
+    GraphAuditError,
+    ResolvedNodeEmission,
+    build_graph_audit_spec,
+    validate_bound_graph,
+    validate_graph_audit_spec,
+)
+from .workflow.contracts import (
+    FeatureResolution,
+    GraphAuditSpec,
+    NodeContractEvidence,
+    ResolvedImplementationIdentity,
+    NodeContractRegistry,
+)
+from .workflow.compile_report import (
+    CompiledFeatureNotice,
+    CompiledFeatureResolution,
+)
+from .workflow.node_contracts import (
+    V4_NODE_CONTRACT_REGISTRY,
+    native_expected_module_policy,
+    native_provenance_policy,
+)
+from .workflow.lora_factory import ResolvedLoraAdapter
+from .workflow.execution import PreviewSpec, ProgressSpec
 
 
 ModelFamily = Literal["fl2va", "ref2va"]
 ExecutionBackend = Literal["standard", "raylight"]
 ContinuitySource = Literal["same_run", "historical_take"]
+RaylightAttentionMode = Literal["ck_int8", "torch_flash"]
+RaylightXFuserAttention = Literal["COMFY_KITCHEN_INT8", "TORCH_FLASH"]
 
 # Director always assigns RayLight an explicit local logical GPU pool.  Keep
 # Comfy-managed CLIP/VAE models on every other logical GPU warm by asking the
@@ -45,20 +69,75 @@ ContinuitySource = Literal["same_run", "historical_take"]
 # old third-party workflows, while Director must never silently regain that
 # endpoint-global cleanup behavior.
 _RAYLIGHT_DRIVER_CLEANUP_POLICY = "ray_devices"
-# Director's RayLight Ulysses templates use comfy-kitchen's INT8 attention
-# adapter by default. Keep this as one server-owned value because it is also
-# part of the actor namespace fingerprint below: changing attention backends
-# must never reuse a pool initialized with a different kernel contract.
-_RAYLIGHT_XFUSER_ATTENTION = "COMFY_KITCHEN_INT8"
+# Director's frozen v4 RayLight templates use comfy-kitchen's INT8 attention
+# adapter by default. Stage 8 adds one strict semantic enum for v5 while this
+# alias preserves the exact v4 prompt bytes. The semantic value is resolved to
+# a reviewed host enum before it can enter either a prompt or actor namespace:
+# changing attention backends must never reuse a pool initialized with a
+# different kernel contract.
+_RAYLIGHT_DEFAULT_ATTENTION_MODE: RaylightAttentionMode = "ck_int8"
+_RAYLIGHT_ATTENTION_BY_MODE: dict[
+    RaylightAttentionMode, RaylightXFuserAttention
+] = {
+    "ck_int8": "COMFY_KITCHEN_INT8",
+    "torch_flash": "TORCH_FLASH",
+}
+_RAYLIGHT_XFUSER_ATTENTION: RaylightXFuserAttention = (
+    _RAYLIGHT_ATTENTION_BY_MODE[_RAYLIGHT_DEFAULT_ATTENTION_MODE]
+)
 # Per-worker LRU cap for base models offloaded to CPU RAM on a model switch
 # (installed RayLight fork feature). 2 models at ~37GB per GPU on 48GB cards
 # keeps both resident in RAM across A<->B switches; raise it only after
 # accounting for world_size x model_bytes per cached model.
 _RAYLIGHT_RAM_CACHE_MAX_MODELS = 2
 
+# DirectorDeck 0.2.7 gave its maintained RayLight fork independent ComfyUI
+# class IDs. Runtime descriptors are Director-owned durable orchestration
+# data, so descriptors written by an earlier Director build must be translated
+# at this boundary before the current RayKill planner replays their loader
+# chain. Keep this migration deliberately limited to the three class types
+# that can legally occur in ``loader_subgraph``; unknown nodes remain invalid.
+_LEGACY_RAYLIGHT_LOADER_CLASS_TYPE_ALIASES = {
+    "RayInitializerAdvanced": "DirectorDeckRayInitializerAdvanced",
+    "RayLoraLoader": "DirectorDeckRayLoraLoader",
+    "RayUNETLoader": "DirectorDeckRayUNETLoader",
+}
+
 
 class NativeTemplateError(ValueError):
     """The timeline cannot be represented by the validated native templates."""
+
+
+def resolve_raylight_attention_backend(
+    mode: RaylightAttentionMode | str,
+    *,
+    binding: DiffusionModelBinding | None = None,
+) -> RaylightXFuserAttention:
+    """Resolve Director's strict RayLight enum to the exact host literal.
+
+    The optional binding check belongs at this common boundary so namespace
+    calculation and prompt emission cannot disagree about topology support.
+    Comfy-kitchen INT8 has only been reviewed for non-ring execution; selecting
+    it with a ring degree above one therefore fails before any actor starts.
+    """
+
+    if mode == "ck_int8":
+        attention: RaylightXFuserAttention = "COMFY_KITCHEN_INT8"
+    elif mode == "torch_flash":
+        attention = "TORCH_FLASH"
+    else:
+        raise NativeTemplateError(
+            "RayLight attention mode must be 'ck_int8' or 'torch_flash'"
+        )
+    if (
+        binding is not None
+        and mode == "ck_int8"
+        and binding.raylight.ring_degree > 1
+    ):
+        raise NativeTemplateError(
+            "RayLight ck_int8 attention requires ring_degree=1"
+        )
+    return attention
 
 
 _UNBOUND_PREDECESSOR_OUTPUT = (
@@ -76,6 +155,7 @@ class NativeContinuityDependency:
     source: ContinuitySource = "same_run"
     historical_take_id: str | None = None
     resolved: bool = False
+    bound_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +165,15 @@ class NativeHistoricalTake:
     id: str
     segment_id: str
     output: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class NativeFeatureIdentityEvidence:
+    """Interpreter-owned identity captured from the same active resolution."""
+
+    feature_id: str
+    cache_identity: Any
+    runtime_pool_identity: Any | None
 
 
 @dataclass(frozen=True)
@@ -103,6 +192,15 @@ class NativeWorkflowUnit:
     prompt: dict[str, Any]
     output_nodes: dict[str, str]
     continuity: NativeContinuityDependency | None = None
+    graph_audit_spec: GraphAuditSpec | None = None
+    graph_audit_traces: tuple[FeatureAuditTrace, ...] = ()
+    compile_feature_resolutions: tuple[CompiledFeatureResolution, ...] = ()
+    compile_feature_notices: tuple[CompiledFeatureNotice, ...] = ()
+    feature_identity_evidence: tuple[NativeFeatureIdentityEvidence, ...] = ()
+    progress_spec: ProgressSpec | None = None
+    preview_spec: PreviewSpec | None = None
+    raylight_runtime_epoch: int | None = None
+    raylight_runtime_namespace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -114,131 +212,27 @@ class NativeCompileResult:
     node_policy: dict[str, Any]
 
 
-_H3_DEDICATED_TURBO_LORA = re.compile(
-    r"^minimax_h3_turbo_v4_step600(?:_ema)?\.safetensors$", re.IGNORECASE
+_PROVENANCE: dict[str, str] = dict(native_provenance_policy())
+EXPECTED_NATIVE_NODE_MODULES: dict[str, str] = dict(
+    native_expected_module_policy()
 )
-_H3_QUANTIZED_COMPAT_LORA = re.compile(
-    r"^minimax_h3_fl2v_turbo_(?:8step_v1\.0|4step_v1\.0_768p)_"
-    r"10erosmax_beta1_pruned_compat_v001_t8\.safetensors$",
-    re.IGNORECASE,
-)
-_H3_COMFY_GENERIC_LORA = re.compile(
-    r"^minimax_h3_(?:fl2v_turbo_(?:8step_v1\.0|4step_v1\.0_768p)|"
-    r"ref2v_turbo_4step_v0\.1)_comfyui_bf16\.safetensors$",
-    re.IGNORECASE,
-)
-
-_STANDARD_LORA_NODES: dict[StandardLoraLoader, str] = {
-    "dedicated": "MiniMaxH3TurboLoRA",
-    "bypass_model_only": "LoraLoaderBypassModelOnly",
-    "model_only": "LoraLoaderModelOnly",
-}
-
-_PROVENANCE: dict[str, str] = {
-    "UNETLoader": "comfy-core",
-    "CLIPLoader": "comfy-core",
-    "VAELoader": "comfy-core",
-    "LoadImage": "comfy-core",
-    "LoraLoaderModelOnly": "comfy-core",
-    "VAEDecode": "comfy-core",
-    "SelectModelDevice": "comfy-extras",
-    "SelectCLIPDevice": "comfy-extras",
-    "SelectVAEDevice": "comfy-extras",
-    "LoadVideo": "comfy-extras",
-    "Video Slice": "comfy-extras",
-    "GetVideoComponents": "comfy-extras",
-    "LoadAudio": "comfy-extras",
-    "MiniMaxH3ImageToVideo": "comfy-core-official-minimax-h3",
-    "MiniMaxH3ReferenceToVideo": "comfy-core-official-minimax-h3",
-    "MiniMaxH3AddGuide": "comfy-core-official-minimax-h3",
-    "MiniMaxH3SigmaShift": "comfy-core-official-minimax-h3",
-    "BasicGuider": "comfy-extras",
-    "BasicScheduler": "comfy-extras",
-    "KSamplerSelect": "comfy-extras",
-    "RandomNoise": "comfy-extras",
-    "SamplerCustomAdvanced": "comfy-extras",
-    "VAEDecodeAudio": "comfy-extras",
-    "TrimAudioDuration": "comfy-extras",
-    "CreateVideo": "comfy-extras",
-    "SaveVideo": "comfy-extras",
-    "ImageFromBatch": "comfy-extras",
-    "MiniMaxH3TurboLoRA": "lora-custom",
-    "LoraLoaderBypassModelOnly": "comfy-extras",
-    "RayInitializerAdvanced": "raylight",
-    "RayLoraLoader": "raylight",
-    "RayUNETLoader": "raylight",
-    "RayMiniMaxH3SigmaShift": "raylight",
-    "RayBasicGuider": "raylight",
-    "RayBasicScheduler": "raylight",
-    "XFuserSamplerCustomAdvanced": "raylight",
-    "RayKill": "raylight",
-}
-
-EXPECTED_NATIVE_NODE_MODULES: dict[str, str] = {
-    "UNETLoader": "nodes",
-    "CLIPLoader": "nodes",
-    "VAELoader": "nodes",
-    "LoadImage": "nodes",
-    "LoraLoaderModelOnly": "nodes",
-    "VAEDecode": "nodes",
-    "SelectModelDevice": "comfy_extras.nodes_multigpu",
-    "SelectCLIPDevice": "comfy_extras.nodes_multigpu",
-    "SelectVAEDevice": "comfy_extras.nodes_multigpu",
-    "LoadVideo": "comfy_extras.nodes_video",
-    "Video Slice": "comfy_extras.nodes_video",
-    "GetVideoComponents": "comfy_extras.nodes_video",
-    "LoadAudio": "comfy_extras.nodes_audio",
-    "MiniMaxH3ImageToVideo": "comfy_extras.nodes_minimax_h3",
-    "MiniMaxH3ReferenceToVideo": "comfy_extras.nodes_minimax_h3",
-    "MiniMaxH3AddGuide": "comfy_extras.nodes_minimax_h3",
-    "MiniMaxH3SigmaShift": "comfy_extras.nodes_minimax_h3",
-    "BasicGuider": "comfy_extras.nodes_custom_sampler",
-    "BasicScheduler": "comfy_extras.nodes_custom_sampler",
-    "KSamplerSelect": "comfy_extras.nodes_custom_sampler",
-    "RandomNoise": "comfy_extras.nodes_custom_sampler",
-    "SamplerCustomAdvanced": "comfy_extras.nodes_custom_sampler",
-    "VAEDecodeAudio": "comfy_extras.nodes_audio",
-    "TrimAudioDuration": "comfy_extras.nodes_audio",
-    "CreateVideo": "comfy_extras.nodes_video",
-    "SaveVideo": "comfy_extras.nodes_video",
-    "ImageFromBatch": "comfy_extras.nodes_images",
-    "MiniMaxH3TurboLoRA": "custom_nodes.ComfyUI-MiniMax-H3-Turbo",
-    "LoraLoaderBypassModelOnly": "comfy_extras.nodes_lora_debug",
-    "RayInitializerAdvanced": "custom_nodes.raylight",
-    "RayLoraLoader": "custom_nodes.raylight",
-    "RayUNETLoader": "custom_nodes.raylight",
-    "RayMiniMaxH3SigmaShift": "custom_nodes.raylight",
-    "RayBasicGuider": "custom_nodes.raylight",
-    "RayBasicScheduler": "custom_nodes.raylight",
-    "XFuserSamplerCustomAdvanced": "custom_nodes.raylight",
-    "RayKill": "custom_nodes.raylight",
-}
-
-if set(EXPECTED_NATIVE_NODE_MODULES) != set(_PROVENANCE):
-    raise AssertionError("native node provenance and exact module policies diverged")
 
 _RAYLIGHT_REQUIRED = frozenset(
     {
-        "RayInitializerAdvanced",
-        "RayUNETLoader",
-        "RayMiniMaxH3SigmaShift",
-        "RayBasicGuider",
-        "RayBasicScheduler",
-        "XFuserSamplerCustomAdvanced",
+        "DirectorDeckRayInitializerAdvanced",
+        "DirectorDeckRayUNETLoader",
+        "DirectorDeckRayMiniMaxH3SigmaShift",
+        "DirectorDeckRayBasicGuider",
+        "DirectorDeckRayBasicScheduler",
+        "DirectorDeckRayXFuserSamplerCustomAdvanced",
     }
 )
 
 
-class _Graph:
-    def __init__(self) -> None:
-        self.prompt: dict[str, Any] = {}
-        self._counter = 0
+class _NativeNodeEmitter(Protocol):
+    """Ordered node append boundary shared by the built-in interpreters."""
 
-    def add(self, class_type: str, **inputs: Any) -> str:
-        self._counter += 1
-        node_id = str(self._counter)
-        self.prompt[node_id] = {"class_type": class_type, "inputs": inputs}
-        return node_id
+    def add(self, class_type: str, **inputs: Any) -> str: ...
 
 
 def _edge(node_id: str, output: int = 0) -> list[Any]:
@@ -307,6 +301,37 @@ def _annotated_predecessor_output(output: Mapping[str, Any]) -> str:
     return f"{relative.as_posix()} [output]"
 
 
+def _bound_late_values(unit: NativeWorkflowUnit) -> dict[str, Any]:
+    """Return independent evidence for every dependency already materialized."""
+
+    values: dict[str, Any] = {}
+    dependency = unit.continuity
+    if (
+        dependency is not None
+        and dependency.resolved
+        and dependency.bound_file is not None
+    ):
+        values[
+            f"/{dependency.load_video_node_id}/inputs/file"
+        ] = dependency.bound_file
+    if unit.raylight_runtime_namespace is not None:
+        runtime_pointers = tuple(
+            item.input_pointer
+            for item in (
+                unit.graph_audit_spec.allowed_late_bound_inputs
+                if unit.graph_audit_spec is not None
+                else ()
+            )
+            if item.source_kind == "runtime_epoch"
+        )
+        if len(runtime_pointers) != 1:
+            raise NativeTemplateError(
+                f"RayLight workflow '{unit.id}' has invalid bound epoch evidence"
+            )
+        values[runtime_pointers[0]] = unit.raylight_runtime_namespace
+    return values
+
+
 def bind_native_workflow_predecessor_output(
     unit: NativeWorkflowUnit,
     output: Mapping[str, Any],
@@ -341,11 +366,36 @@ def bind_native_workflow_predecessor_output(
         raise NativeTemplateError(
             f"native workflow '{unit.id}' continuity placeholder was modified"
         )
-    inputs["file"] = _annotated_predecessor_output(output)
+    annotated_output = _annotated_predecessor_output(output)
+    inputs["file"] = annotated_output
+    if unit.graph_audit_spec is not None:
+        pointer = f"/{dependency.load_video_node_id}/inputs/file"
+        expected_values = _bound_late_values(unit)
+        expected_values[pointer] = annotated_output
+        try:
+            validate_bound_graph(
+                prompt_base=unit.prompt,
+                bound_prompt=prompt,
+                spec=unit.graph_audit_spec,
+                node_contract_registry=V4_NODE_CONTRACT_REGISTRY,
+                model_family=unit.family,
+                backend=unit.backend,
+                feature_traces=unit.graph_audit_traces,
+                expected_late_bound_values=expected_values,
+                enforce_runtime_effects=False,
+            )
+        except GraphAuditError as exc:
+            raise NativeTemplateError(
+                f"native workflow '{unit.id}' continuity binding failed graph audit: {exc}"
+            ) from exc
     return replace(
         unit,
         prompt=prompt,
-        continuity=replace(dependency, resolved=True),
+        continuity=replace(
+            dependency,
+            resolved=True,
+            bound_file=annotated_output,
+        ),
     )
 
 
@@ -360,6 +410,38 @@ def normalize_native_output_descriptor(
         "subfolder": str(output.get("subfolder") or ""),
         "type": "output",
     }
+
+
+def validate_native_workflow_runtime_effects(
+    unit: NativeWorkflowUnit,
+    *,
+    node_contract_registry: NodeContractRegistry = V4_NODE_CONTRACT_REGISTRY,
+) -> None:
+    """Reject a compiled graph whose output path is not fail-closed.
+
+    This gate intentionally does not require continuity or runtime-epoch late
+    binding.  Submission endpoints can therefore run it before creating any
+    durable job rows, while :func:`validate_native_workflow_ready` reruns the
+    same audit against the exact materialized prompt immediately before POST.
+    """
+
+    if unit.graph_audit_spec is None or not unit.graph_audit_traces:
+        raise NativeTemplateError(
+            f"native workflow '{unit.id}' has no submission-ready graph audit"
+        )
+    try:
+        validate_graph_audit_spec(
+            prompt=unit.prompt,
+            spec=unit.graph_audit_spec,
+            node_contract_registry=node_contract_registry,
+            model_family=unit.family,
+            backend=unit.backend,
+            feature_traces=unit.graph_audit_traces,
+        )
+    except GraphAuditError as exc:
+        raise NativeTemplateError(
+            f"native workflow '{unit.id}' failed submission graph audit: {exc}"
+        ) from exc
 
 
 def validate_native_workflow_ready(unit: NativeWorkflowUnit) -> None:
@@ -379,24 +461,63 @@ def validate_native_workflow_ready(unit: NativeWorkflowUnit) -> None:
             raise NativeTemplateError(
                 f"native workflow '{unit.id}' contains an undeclared continuity input"
             )
-        return
-    if not dependency.resolved:
-        raise NativeTemplateError(
-            f"native workflow '{unit.id}' is waiting for predecessor segment "
-            f"'{dependency.predecessor_segment_id}'"
+    else:
+        if not dependency.resolved or dependency.bound_file is None:
+            raise NativeTemplateError(
+                f"native workflow '{unit.id}' is waiting for predecessor segment "
+                f"'{dependency.predecessor_segment_id}'"
+            )
+        node = unit.prompt.get(dependency.load_video_node_id)
+        if (
+            not isinstance(node, dict)
+            or node.get("class_type") != "LoadVideo"
+            or not isinstance(node.get("inputs"), dict)
+            or node["inputs"].get("file") != dependency.bound_file
+            or placeholder_nodes
+        ):
+            raise NativeTemplateError(
+                f"native workflow '{unit.id}' predecessor input differs from its "
+                "exact bound output evidence"
+            )
+
+    runtime_epoch_pointers = tuple(
+        item.input_pointer
+        for item in (
+            unit.graph_audit_spec.allowed_late_bound_inputs
+            if unit.graph_audit_spec is not None
+            else ()
         )
-    node = unit.prompt.get(dependency.load_video_node_id)
-    if (
-        not isinstance(node, dict)
-        or node.get("class_type") != "LoadVideo"
-        or not isinstance(node.get("inputs"), dict)
-        or not isinstance(node["inputs"].get("file"), str)
-        or not node["inputs"]["file"].endswith(" [output]")
-        or placeholder_nodes
-    ):
-        raise NativeTemplateError(
-            f"native workflow '{unit.id}' has an invalid bound predecessor input"
-        )
+        if item.source_kind == "runtime_epoch"
+    )
+    if runtime_epoch_pointers:
+        if len(runtime_epoch_pointers) != 1 or unit.backend != "raylight":
+            raise NativeTemplateError(
+                f"native workflow '{unit.id}' has an invalid runtime-epoch dependency"
+            )
+        descriptor = raylight_runtime_descriptor(unit)
+        if descriptor is None:
+            raise NativeTemplateError(
+                f"RayLight workflow '{unit.id}' has no runtime epoch descriptor"
+            )
+        compatibility_key = str(descriptor["compatibility_key"])
+        runtime_namespace = str(descriptor["runtime_namespace"])
+        expected_epoch = unit.raylight_runtime_epoch
+        expected_namespace = unit.raylight_runtime_namespace
+        if (
+            not isinstance(expected_epoch, int)
+            or isinstance(expected_epoch, bool)
+            or expected_epoch < 1
+            or not isinstance(expected_namespace, str)
+            or not expected_namespace.startswith("director-")
+            or expected_namespace != f"{compatibility_key}-e{expected_epoch}"
+            or runtime_namespace != expected_namespace
+        ):
+            raise NativeTemplateError(
+                f"RayLight workflow '{unit.id}' differs from its exact bound "
+                "runtime epoch evidence"
+            )
+
+    validate_native_workflow_runtime_effects(unit)
 
 
 def _asset_path(asset: AssetReference) -> str:
@@ -440,102 +561,6 @@ def _require_h3_source_range(
         )
 
 
-def _known_standard_lora_loader(basename: str) -> StandardLoraLoader | None:
-    """Return the audited loader for a known upstream artifact basename."""
-
-    if _H3_DEDICATED_TURBO_LORA.fullmatch(basename):
-        return "dedicated"
-    if _H3_QUANTIZED_COMPAT_LORA.fullmatch(basename):
-        return "bypass_model_only"
-    if _H3_COMFY_GENERIC_LORA.fullmatch(basename):
-        return "model_only"
-    return None
-
-
-def _metadata_standard_lora_loader(
-    binding: DiffusionModelBinding,
-    basename: str,
-    metadata: Mapping[str, Any] | None,
-) -> StandardLoraLoader:
-    """Infer a Standard loader from ComfyUI-served safetensors metadata.
-
-    Director may run on a different host from ComfyUI, so it cannot inspect
-    model files directly.  ComfyUI's read-only ``/view_metadata/loras`` route
-    is the authority for an unknown artifact.  Only explicit, audited metadata
-    contracts are accepted; an absent or ambiguous header remains fail-closed
-    and can be resolved with the visible per-binding override.
-    """
-
-    if metadata is not None:
-        target_format = metadata.get("target_format")
-        if (
-            isinstance(target_format, str)
-            and target_format.strip().casefold() == "comfyui generic lora"
-        ):
-            compatible_main = metadata.get("compatible_main_file")
-            if isinstance(compatible_main, str) and compatible_main.strip():
-                selected_base = PurePosixPath(
-                    binding.filename.replace("\\", "/")
-                ).name
-                compatible_base = PurePosixPath(
-                    compatible_main.replace("\\", "/")
-                ).name
-                if selected_base != compatible_base:
-                    raise NativeTemplateError(
-                        f"LoRA '{basename}' declares exact compatibility with "
-                        f"'{compatible_base}', not selected model "
-                        f"'{selected_base}'"
-                    )
-                compatibility_scope = metadata.get("compatibility_scope")
-                compatible_sha256 = metadata.get("compatible_main_sha256")
-                if (
-                    compatibility_scope == "exact_checkpoint_sha256_validated"
-                    and isinstance(compatible_sha256, str)
-                    and re.fullmatch(r"[0-9a-fA-F]{64}", compatible_sha256)
-                ):
-                    return "bypass_model_only"
-                raise NativeTemplateError(
-                    f"LoRA '{basename}' has checkpoint-specific compatibility "
-                    "metadata but does not declare whether Standard should use "
-                    "the generic or bypass loader; choose it explicitly in "
-                    "Settings"
-                )
-            return "model_only"
-
-        application = metadata.get("application")
-        base_model = metadata.get("base_model")
-        if (
-            isinstance(application, str)
-            and application.strip() == "W_eff = W + lora_B @ lora_A"
-            and isinstance(base_model, str)
-            and base_model.strip().casefold() == "minimax-h3"
-        ):
-            return "dedicated"
-
-    raise NativeTemplateError(
-        f"LoRA loader cannot be inferred safely from '{basename}': ComfyUI "
-        "did not expose a supported safetensors metadata contract; choose a "
-        "Standard LoRA loader explicitly in Settings"
-    )
-
-
-def _resolve_standard_lora(
-    binding: DiffusionModelBinding,
-    metadata: Mapping[str, Any] | None = None,
-) -> str | None:
-    if binding.lora_name is None:
-        return None
-    if binding.standard_lora_loader_override is not None:
-        return _STANDARD_LORA_NODES[
-            binding.standard_lora_loader_override.loader
-        ]
-    basename = PurePosixPath(binding.lora_name.replace("\\", "/")).name
-    loader = _known_standard_lora_loader(basename)
-    if loader is None:
-        loader = _metadata_standard_lora_loader(binding, basename, metadata)
-    return _STANDARD_LORA_NODES[loader]
-
-
 def resolve_execution_backend(binding: DiffusionModelBinding) -> ExecutionBackend:
     """Derive the sole execution route from the configured logical GPU pool.
 
@@ -554,11 +579,14 @@ def required_nodes_for_backend(
 ) -> frozenset[str]:
     nodes = set(_RAYLIGHT_REQUIRED if backend == "raylight" else ())
     if backend == "raylight" and has_lora:
-        nodes.add("RayLoraLoader")
+        nodes.add("DirectorDeckRayLoraLoader")
     return frozenset(nodes)
 
 
-def _shared_core(graph: _Graph, settings: RuntimeSettings) -> dict[str, list[Any]]:
+def _shared_core(
+    graph: _NativeNodeEmitter,
+    settings: RuntimeSettings,
+) -> dict[str, list[Any]]:
     clip_loader = graph.add(
         "CLIPLoader",
         clip_name=settings.models.clip.filename,
@@ -593,123 +621,16 @@ def _shared_core(graph: _Graph, settings: RuntimeSettings) -> dict[str, list[Any
     }
 
 
-def _standard_model(
-    graph: _Graph,
+def raylight_runtime_namespace(
     binding: DiffusionModelBinding,
-    sampling: SamplingConfig,
     *,
-    lora_metadata: Mapping[str, Any] | None = None,
-) -> list[Any]:
-    loader = graph.add(
-        "UNETLoader", unet_name=binding.filename, weight_dtype="default"
-    )
-    selected = graph.add(
-        "SelectModelDevice", model=_edge(loader), device=binding.device
-    )
-    model = _edge(selected)
-    lora_node = _resolve_standard_lora(binding, lora_metadata)
-    if lora_node is not None:
-        assert binding.lora_name is not None
-        if lora_node == "MiniMaxH3TurboLoRA":
-            lora_inputs = {
-                "model": model,
-                "lora_name": binding.lora_name,
-                "strength": binding.lora_strength,
-                # Loader selection is automatic, so its old loader-specific
-                # tuning flag cannot remain as an invisible behavior switch.
-                "low_vram": False,
-            }
-        else:
-            lora_inputs = {
-                "model": model,
-                "lora_name": binding.lora_name,
-                "strength_model": binding.lora_strength,
-            }
-        model = _edge(graph.add(lora_node, **lora_inputs))
-    shifted = graph.add(
-        "MiniMaxH3SigmaShift",
-        model=model,
-        shift_video=sampling.shift,
-        shift_audio=sampling.audio_shift,
-    )
-    return _edge(shifted)
-
-
-def _raylight_model(
-    graph: _Graph,
-    binding: DiffusionModelBinding,
-    sampling: SamplingConfig,
-    *,
-    namespace: str,
-    clear_vram_after_sampling: bool,
-) -> list[Any]:
-    profile = binding.raylight
-    if len(profile.gpu_select) < 2:
-        raise NativeTemplateError("RayLight workflow needs at least two logical GPUs")
-    if profile.fsdp or profile.cpu_offload:
-        raise NativeTemplateError(
-            "RayLight FSDP/CPU offload is disabled in native timeline v1 until "
-            "its post-sampling CUDA cleanup is verified"
-        )
-    initializer = graph.add(
-        "RayInitializerAdvanced",
-        ray_cluster_address="local",
-        ray_cluster_namespace=namespace,
-        GPU=len(profile.gpu_select),
-        GPU_SELECT=",".join(str(index) for index in profile.gpu_select),
-        driver_cleanup_policy=_RAYLIGHT_DRIVER_CLEANUP_POLICY,
-        ulysses_degree=profile.ulysses_degree,
-        ring_degree=profile.ring_degree,
-        # The installed RayLight workers have an exact model + LoRA cache key.
-        # Keeping this false preserves their CUDA weights across stable
-        # per-segment prompts. Director handles a later incompatible Ray or
-        # Standard prompt with an explicit, awaited RayKill transition because
-        # driver-side Comfy model management cannot evict allocations owned by
-        # the separate Ray worker processes.
-        clear_vram_after_sampling=clear_vram_after_sampling,
-        ram_cache_max_models=_RAYLIGHT_RAM_CACHE_MAX_MODELS,
-        cfg_degree=profile.cfg_degree,
-        dp_degree=profile.dp_degree,
-        sync_ulysses=False,
-        FSDP=profile.fsdp,
-        FSDP_CPU_OFFLOAD=profile.cpu_offload,
-        XFuser_attention=_RAYLIGHT_XFUSER_ATTENTION,
-        skip_comm_test=False,
-        use_mmap=False,
-    )
-    lora: list[Any] | None = None
-    if binding.lora_name is not None:
-        lora = _edge(
-            graph.add(
-                "RayLoraLoader",
-                lora_name=binding.lora_name,
-                strength_model=binding.lora_strength,
-            )
-        )
-    loader_inputs: dict[str, Any] = {
-        "ray_actors_init": _edge(initializer),
-        "unet_name": binding.filename,
-        "weight_dtype": "default",
-    }
-    if lora is not None:
-        loader_inputs["lora"] = lora
-    actors = graph.add("RayUNETLoader", **loader_inputs)
-    shifted = graph.add(
-        "RayMiniMaxH3SigmaShift",
-        ray_actors=_edge(actors),
-        shift_video=sampling.shift,
-        shift_audio=sampling.audio_shift,
-    )
-    return _edge(shifted)
-
-
-def _raylight_namespace(
-    family: ModelFamily, binding: DiffusionModelBinding
+    attention_mode: RaylightAttentionMode = _RAYLIGHT_DEFAULT_ATTENTION_MODE,
+    enforce_attention_topology: bool = True,
 ) -> str:
     """Return a stable actor namespace for one compatible resident pool.
 
     A job identifier must not participate in this key: doing so would force
-    ``RayInitializerAdvanced`` to tear down and recreate the same actors for
+    ``DirectorDeckRayInitializerAdvanced`` to tear down and recreate the same actors for
     every take.  Only the GPU pool and topology participate.  Model file, LoRA
     and family deliberately do NOT participate: the installed worker RAM cache
     moves the outgoing model to CPU RAM on a key change and re-activates it
@@ -720,6 +641,10 @@ def _raylight_namespace(
     """
 
     profile = binding.raylight
+    attention = resolve_raylight_attention_backend(
+        attention_mode,
+        binding=binding if enforce_attention_topology else None,
+    )
     gpu_pool = "-".join(str(index) for index in profile.gpu_select)
     compatibility_document = {
         "backend": "raylight",
@@ -732,7 +657,7 @@ def _raylight_namespace(
         "dp_degree": profile.dp_degree,
         "fsdp": profile.fsdp,
         "cpu_offload": profile.cpu_offload,
-        "attention": _RAYLIGHT_XFUSER_ATTENTION,
+        "attention": attention,
         "use_mmap": False,
     }
     fingerprint = hashlib.sha256(
@@ -752,10 +677,33 @@ def _raylight_namespace(
     )
 
 
+def _raylight_namespace(
+    family: ModelFamily,
+    binding: DiffusionModelBinding,
+    *,
+    attention_mode: RaylightAttentionMode = _RAYLIGHT_DEFAULT_ATTENTION_MODE,
+) -> str:
+    """Compatibility wrapper retaining the frozen v4 compiler signature.
+
+    ``family`` deliberately does not participate in resident-pool identity;
+    the same actors can swap model families through the worker RAM cache.
+    """
+
+    del family
+    return raylight_runtime_namespace(
+        binding,
+        attention_mode=attention_mode,
+        # This wrapper is part of the frozen v4 compiler boundary.  V4
+        # historically emitted ck-int8 with ring parallelism, so the new v5
+        # semantic-mode guard must not retroactively reject that graph.
+        enforce_attention_topology=False,
+    )
+
+
 def raylight_runtime_descriptor(unit: NativeWorkflowUnit) -> dict[str, Any] | None:
     """Return the exact cached loader chain needed for a later kill.
 
-    ``RayKill`` consumes ``RAY_ACTORS`` while ``RayInitializerAdvanced`` only
+    ``DirectorDeckRayKill`` consumes ``RAY_ACTORS`` while ``DirectorDeckRayInitializerAdvanced`` only
     produces ``RAY_ACTORS_INIT``.  Persisting just the initializer would make
     the transition graph type-invalid.  The descriptor therefore owns the
     complete, minimal initializer -> optional LoRA -> UNET-loader subgraph.
@@ -767,7 +715,7 @@ def raylight_runtime_descriptor(unit: NativeWorkflowUnit) -> dict[str, Any] | No
     matches = [
         (node_id, node)
         for node_id, node in unit.prompt.items()
-        if node.get("class_type") == "RayInitializerAdvanced"
+        if node.get("class_type") == "DirectorDeckRayInitializerAdvanced"
     ]
     if not matches:
         return None
@@ -791,7 +739,7 @@ def raylight_runtime_descriptor(unit: NativeWorkflowUnit) -> dict[str, Any] | No
     loader_matches = [
         (candidate_id, candidate)
         for candidate_id, candidate in unit.prompt.items()
-        if candidate.get("class_type") == "RayUNETLoader"
+        if candidate.get("class_type") == "DirectorDeckRayUNETLoader"
     ]
     if len(loader_matches) != 1:
         raise NativeTemplateError(
@@ -820,7 +768,7 @@ def raylight_runtime_descriptor(unit: NativeWorkflowUnit) -> dict[str, Any] | No
                 f"RayLight unit '{unit.id}' has an invalid LoRA edge"
             )
         lora_node = unit.prompt.get(lora_edge[0])
-        if not isinstance(lora_node, dict) or lora_node.get("class_type") != "RayLoraLoader":
+        if not isinstance(lora_node, dict) or lora_node.get("class_type") != "DirectorDeckRayLoraLoader":
             raise NativeTemplateError(
                 f"RayLight unit '{unit.id}' loader has an invalid LoRA dependency"
             )
@@ -833,22 +781,22 @@ def raylight_runtime_descriptor(unit: NativeWorkflowUnit) -> dict[str, Any] | No
     # The runtime key deliberately excludes the loader inputs (model file and
     # LoRA): the workers own a per-worker RAM cache and swap bases in place,
     # so a model switch keeps the pool and its epoch.  The key still crosses
-    # the RayKill/epoch boundary on namespace (topology) changes and on sigma
+    # the DirectorDeckRayKill/epoch boundary on namespace (topology) changes and on sigma
     # mutations, which the workers cannot absorb safely.
-    # RayMiniMaxH3SigmaShift mutates each worker's ModelPatcher in place. Its
+    # DirectorDeckRayMiniMaxH3SigmaShift mutates each worker's ModelPatcher in place. Its
     # cached output is therefore valid only for the exact shift pair: in
     # A(12) -> B(8) -> A(12), ComfyUI could otherwise return A's old output
     # while the shared actors still hold B's mutation. Treat a shift change as
-    # an incompatible runtime key and cross the normal RayKill/epoch boundary.
+    # an incompatible runtime key and cross the normal DirectorDeckRayKill/epoch boundary.
     sigma_matches = [
         candidate
         for candidate in unit.prompt.values()
-        if candidate.get("class_type") == "RayMiniMaxH3SigmaShift"
+        if candidate.get("class_type") == "DirectorDeckRayMiniMaxH3SigmaShift"
     ]
-    # Shutdown units intentionally contain only the loader chain plus RayKill;
+    # Shutdown units intentionally contain only the loader chain plus DirectorDeckRayKill;
     # their descriptor was already persisted from a complete generation unit.
     is_shutdown_unit = any(
-        candidate.get("class_type") == "RayKill"
+        candidate.get("class_type") == "DirectorDeckRayKill"
         for candidate in unit.prompt.values()
     )
     if is_shutdown_unit:
@@ -860,7 +808,7 @@ def raylight_runtime_descriptor(unit: NativeWorkflowUnit) -> dict[str, Any] | No
     sigma_inputs = sigma_matches[0]["inputs"]
     # Pool-level inputs of the initializer participate (minus the namespace,
     # which is the canonical compatibility_key). This deliberately includes
-    # XFuser_attention: a legacy TORCH_FLASH pool must cross RayKill before a
+    # XFuser_attention: a legacy TORCH_FLASH pool must cross DirectorDeckRayKill before a
     # COMFY_KITCHEN_INT8 prompt can start. The model file and LoRA live in the
     # loader node and deliberately do not, so a model switch keeps the same
     # runtime key and reuses the pool via the worker RAM cache.
@@ -871,7 +819,7 @@ def raylight_runtime_descriptor(unit: NativeWorkflowUnit) -> dict[str, Any] | No
             if key != "ray_cluster_namespace"
         },
         "__runtime_mutations__": {
-            "RayMiniMaxH3SigmaShift": {
+            "DirectorDeckRayMiniMaxH3SigmaShift": {
                 "shift_video": sigma_inputs.get("shift_video"),
                 "shift_audio": sigma_inputs.get("shift_audio"),
             }
@@ -938,6 +886,38 @@ def _raylight_logical_gpu_indices(inputs: Mapping[str, Any]) -> tuple[int, ...]:
     return tuple(indices)
 
 
+def migrate_legacy_raylight_runtime_descriptor(
+    descriptor: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Translate only Director's former RayLight loader class IDs.
+
+    The persisted descriptor is not a user workflow: Director created it from
+    an already-compiled RayLight unit so a later Standard/model/topology switch
+    can enqueue an exact cleanup barrier. Renaming the maintained fork's class
+    IDs must therefore migrate that internal ledger instead of turning it into
+    a permanent runtime authorization failure.
+    """
+
+    migrated = deepcopy(dict(descriptor))
+    if migrated.get("version") != 2:
+        return migrated
+    loader_subgraph = migrated.get("loader_subgraph")
+    if not isinstance(loader_subgraph, dict):
+        return migrated
+    for node in loader_subgraph.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        replacement = (
+            _LEGACY_RAYLIGHT_LOADER_CLASS_TYPE_ALIASES.get(class_type)
+            if isinstance(class_type, str)
+            else None
+        )
+        if replacement is not None:
+            node["class_type"] = replacement
+    return migrated
+
+
 def raylight_runtime_logical_gpu_indices(
     descriptor: Mapping[str, Any],
 ) -> tuple[int, ...]:
@@ -954,7 +934,7 @@ def raylight_runtime_logical_gpu_indices(
     initializer = loader_subgraph.get(initializer_node_id)
     if (
         not isinstance(initializer, Mapping)
-        or initializer.get("class_type") != "RayInitializerAdvanced"
+        or initializer.get("class_type") != "DirectorDeckRayInitializerAdvanced"
         or not isinstance(initializer.get("inputs"), Mapping)
     ):
         raise NativeTemplateError("persisted RayLight initializer is invalid")
@@ -970,7 +950,7 @@ def raylight_workflow_logical_gpu_indices(
         node
         for node in unit.prompt.values()
         if isinstance(node, Mapping)
-        and node.get("class_type") == "RayInitializerAdvanced"
+        and node.get("class_type") == "DirectorDeckRayInitializerAdvanced"
     ]
     if len(initializers) != 1 or not isinstance(initializers[0].get("inputs"), Mapping):
         raise NativeTemplateError(
@@ -991,18 +971,130 @@ def bind_raylight_runtime_epoch(
         raise NativeTemplateError(
             f"RayLight unit '{unit.id}' has no initializer to bind"
         )
+    compatibility_key = str(descriptor["compatibility_key"])
+    if not compatibility_key.startswith("director-"):
+        raise NativeTemplateError(
+            f"RayLight workflow '{unit.id}' has a non-Director runtime namespace"
+        )
     prompt = deepcopy(unit.prompt)
-    initializer = prompt[str(descriptor["initializer_node_id"])]
-    initializer["inputs"]["ray_cluster_namespace"] = (
-        f"{descriptor['compatibility_key']}-e{epoch}"
+    initializer_node_id = str(descriptor["initializer_node_id"])
+    initializer = prompt[initializer_node_id]
+    runtime_namespace = f"{compatibility_key}-e{epoch}"
+    initializer["inputs"]["ray_cluster_namespace"] = runtime_namespace
+    if unit.graph_audit_spec is not None:
+        pointer = f"/{initializer_node_id}/inputs/ray_cluster_namespace"
+        expected_values = _bound_late_values(unit)
+        expected_values[pointer] = runtime_namespace
+        try:
+            validate_bound_graph(
+                prompt_base=unit.prompt,
+                bound_prompt=prompt,
+                spec=unit.graph_audit_spec,
+                node_contract_registry=V4_NODE_CONTRACT_REGISTRY,
+                model_family=unit.family,
+                backend=unit.backend,
+                feature_traces=unit.graph_audit_traces,
+                expected_late_bound_values=expected_values,
+                enforce_runtime_effects=False,
+            )
+        except GraphAuditError as exc:
+            raise NativeTemplateError(
+                f"RayLight workflow '{unit.id}' epoch binding failed graph audit: {exc}"
+            ) from exc
+    return replace(
+        unit,
+        prompt=prompt,
+        raylight_runtime_epoch=epoch,
+        raylight_runtime_namespace=runtime_namespace,
     )
-    return replace(unit, prompt=prompt)
+
+
+def _release_node_contract_snapshot(
+    prompt: Mapping[str, Any],
+) -> dict[str, NodeContractEvidence]:
+    snapshot: dict[str, NodeContractEvidence] = {}
+    for node_id, node in prompt.items():
+        class_type = str(node.get("class_type") or "")
+        contract = V4_NODE_CONTRACT_REGISTRY.require(class_type)
+        if len(contract.allowed_python_modules) != 1:
+            raise NativeTemplateError(
+                f"native node contract must select one module: {class_type}"
+            )
+        snapshot[str(node_id)] = NodeContractEvidence(
+            contract_id=contract.contract_id,
+            semantic_version=contract.semantic_version,
+            class_type=contract.class_type,
+            python_module=contract.allowed_python_modules[0],
+            runtime_fingerprint=contract.supported_runtime_fingerprints[0],
+            execution_terminal_role=contract.execution_terminal_role,
+            persistent_artifact_role=contract.persistent_artifact_role,
+        )
+    return snapshot
+
+
+def _raylight_control_audit(
+    prompt: Mapping[str, Any],
+    *,
+    family: ModelFamily,
+) -> tuple[GraphAuditSpec, tuple[FeatureAuditTrace, ...]]:
+    ordered_classes = tuple(
+        dict.fromkeys(str(node["class_type"]) for node in prompt.values())
+    )
+    implementations: list[ResolvedImplementationIdentity] = []
+    binding_by_class: dict[str, str] = {}
+    for class_type in ordered_classes:
+        contract = V4_NODE_CONTRACT_REGISTRY.require(class_type)
+        binding_key = "raylight_kill_control." + re.sub(
+            r"[^A-Za-z0-9_.:-]", "_", class_type
+        )
+        binding_by_class[class_type] = binding_key
+        implementations.append(
+            ResolvedImplementationIdentity(
+                role="node",
+                class_type=class_type,
+                implementation_id=contract.contract_id,
+                semantic_version=contract.semantic_version,
+                runtime_fingerprint=contract.supported_runtime_fingerprints[0],
+                binding_key=binding_key,
+            )
+        )
+    resolution = FeatureResolution(
+        state="active",
+        implementations=tuple(implementations),
+        resolution_details={"source": "persisted_raylight_loader_descriptor"},
+    )
+    trace = FeatureAuditTrace(
+        feature_id="raylight_kill_control",
+        resolution=resolution,
+        emitted_nodes=tuple(
+            ResolvedNodeEmission(
+                node_id=str(node_id),
+                implementation_binding_key=binding_by_class[str(node["class_type"])],
+                output_affecting=False,
+            )
+            for node_id, node in prompt.items()
+        ),
+        structural_influence=False,
+    )
+    spec = build_graph_audit_spec(
+        prompt=prompt,
+        node_contract_registry=V4_NODE_CONTRACT_REGISTRY,
+        node_contract_snapshot=_release_node_contract_snapshot(prompt),
+        public_writes=(),
+        public_reads=(),
+        feature_traces=(trace,),
+        model_family=family,
+        backend="raylight",
+        unit_kind="control",
+        control_kind="ray_kill",
+    )
+    return spec, (trace,)
 
 
 def build_raylight_shutdown_unit(
     descriptor: dict[str, Any], *, unit_id: str
 ) -> NativeWorkflowUnit:
-    """Build a forced RayKill barrier from a persisted resident descriptor.
+    """Build a forced DirectorDeckRayKill barrier from a persisted resident descriptor.
 
     Reusing the original loader subgraph normally retrieves live ``RAY_ACTORS``
     from ComfyUI's cache. If that cache was cleared, running the initializer is
@@ -1040,22 +1132,22 @@ def build_raylight_shutdown_unit(
         or initializer_node_id not in loader_subgraph
         or loader_node_id not in loader_subgraph
         or not node_types <= {
-            "RayInitializerAdvanced",
-            "RayLoraLoader",
-            "RayUNETLoader",
+            "DirectorDeckRayInitializerAdvanced",
+            "DirectorDeckRayLoraLoader",
+            "DirectorDeckRayUNETLoader",
         }
-        or "RayInitializerAdvanced" not in node_types
-        or "RayUNETLoader" not in node_types
+        or "DirectorDeckRayInitializerAdvanced" not in node_types
+        or "DirectorDeckRayUNETLoader" not in node_types
     ):
         raise NativeTemplateError("persisted RayLight loader subgraph is invalid")
     initializer_node = loader_subgraph[initializer_node_id]
     loader_node = loader_subgraph[loader_node_id]
     if (
         not isinstance(initializer_node, dict)
-        or initializer_node.get("class_type") != "RayInitializerAdvanced"
+        or initializer_node.get("class_type") != "DirectorDeckRayInitializerAdvanced"
         or not isinstance(initializer_node.get("inputs"), dict)
         or not isinstance(loader_node, dict)
-        or loader_node.get("class_type") != "RayUNETLoader"
+        or loader_node.get("class_type") != "DirectorDeckRayUNETLoader"
         or not isinstance(loader_node.get("inputs"), dict)
         or loader_node["inputs"].get("ray_actors_init")
         != _edge(initializer_node_id)
@@ -1066,12 +1158,16 @@ def build_raylight_shutdown_unit(
         raise NativeTemplateError("RayLight shutdown node id collides with loader graph")
     prompt = deepcopy(loader_subgraph)
     prompt[kill_node_id] = {
-        "class_type": "RayKill",
+        "class_type": "DirectorDeckRayKill",
         "inputs": {
             "ray_actors": _edge(loader_node_id),
             "kill_mode": "Kill Entire Cluster",
         },
     }
+    graph_audit_spec, graph_audit_traces = _raylight_control_audit(
+        prompt,
+        family=family,
+    )
     return NativeWorkflowUnit(
         id=unit_id,
         family=family,
@@ -1079,15 +1175,17 @@ def build_raylight_shutdown_unit(
         segment_ids=(),
         prompt=prompt,
         output_nodes={},
+        graph_audit_spec=graph_audit_spec,
+        graph_audit_traces=graph_audit_traces,
     )
 
 
-def _load_image(graph: _Graph, asset: AssetReference) -> list[Any]:
+def _load_image(graph: _NativeNodeEmitter, asset: AssetReference) -> list[Any]:
     return _edge(graph.add("LoadImage", image=_asset_path(asset)))
 
 
 def _load_video_components(
-    graph: _Graph,
+    graph: _NativeNodeEmitter,
     asset: AssetReference,
     *,
     start: float | None = None,
@@ -1117,7 +1215,7 @@ def _load_video_components(
     return _edge(components, 0), _edge(components, 1)
 
 
-def _load_audio(graph: _Graph, asset: AssetReference) -> list[Any]:
+def _load_audio(graph: _NativeNodeEmitter, asset: AssetReference) -> list[Any]:
     return _edge(graph.add("LoadAudio", audio=_asset_path(asset)))
 
 
@@ -1153,7 +1251,7 @@ def _validate_native_reference_slots(segment: UnifiedTimelineSegment) -> None:
 
 
 def _conditioning(
-    graph: _Graph,
+    graph: _NativeNodeEmitter,
     segment: UnifiedTimelineSegment,
     draft: UnifiedTimelineDraft,
     shared: dict[str, list[Any]],
@@ -1233,7 +1331,7 @@ def _conditioning(
 
 
 def _add_continuity_guides(
-    graph: _Graph,
+    graph: _NativeNodeEmitter,
     *,
     conditioning: list[Any],
     latent: list[Any],
@@ -1295,348 +1393,6 @@ def _add_continuity_guides(
     return conditioning, predecessor_video
 
 
-def _sample(
-    graph: _Graph,
-    *,
-    backend: ExecutionBackend,
-    model: list[Any],
-    conditioning: list[Any],
-    latent: list[Any],
-    sampling: SamplingConfig,
-    seed: int,
-) -> list[Any]:
-    if backend == "standard":
-        guider = graph.add(
-            "BasicGuider", model=model, conditioning=conditioning
-        )
-        scheduler = graph.add(
-            "BasicScheduler",
-            model=model,
-            scheduler=sampling.scheduler,
-            steps=sampling.steps,
-            denoise=1.0,
-        )
-        sampler = graph.add(
-            "KSamplerSelect", sampler_name=sampling.sampler
-        )
-        noise = graph.add("RandomNoise", noise_seed=seed)
-        sampled = graph.add(
-            "SamplerCustomAdvanced",
-            noise=_edge(noise),
-            guider=_edge(guider),
-            sampler=_edge(sampler),
-            sigmas=_edge(scheduler),
-            latent_image=latent,
-        )
-        return _edge(sampled, 0)
-    guider = graph.add(
-        "RayBasicGuider", ray_actors=model, conditioning=conditioning
-    )
-    scheduler = graph.add(
-        "RayBasicScheduler",
-        ray_actors=model,
-        scheduler=sampling.scheduler,
-        steps=sampling.steps,
-        denoise=1.0,
-    )
-    sampler = graph.add("KSamplerSelect", sampler_name=sampling.sampler)
-    sampled = graph.add(
-        "XFuserSamplerCustomAdvanced",
-        add_noise=True,
-        noise_seed=seed,
-        guider=_edge(guider),
-        sampler=_edge(sampler),
-        sigmas=_edge(scheduler),
-        latent_image=latent,
-    )
-    return _edge(sampled, 0)
-
-
-def _decode_and_save(
-    graph: _Graph,
-    *,
-    samples: list[Any],
-    source_audio: list[Any] | None,
-    draft: UnifiedTimelineDraft,
-    shared: dict[str, list[Any]],
-    job_id: str,
-    segment: UnifiedTimelineSegment,
-    visible_frames: int,
-    continuity_prefix_frames: int,
-) -> str:
-    images = graph.add(
-        "VAEDecode", samples=samples, vae=shared["video_vae"]
-    )
-    visible_images = _edge(images)
-    if continuity_prefix_frames:
-        visible_images = _edge(
-            graph.add(
-                "ImageFromBatch",
-                image=visible_images,
-                batch_index=continuity_prefix_frames,
-                length=visible_frames,
-            )
-        )
-    video_inputs: dict[str, Any] = {
-        "images": visible_images,
-        "fps": draft.render.fps,
-        "bit_depth": 8,
-    }
-    if segment.audio_mode == "generate":
-        audio = graph.add(
-            "VAEDecodeAudio", samples=samples, vae=shared["audio_vae"]
-        )
-        visible_audio = _edge(audio)
-        if continuity_prefix_frames:
-            visible_audio = _edge(
-                graph.add(
-                    "TrimAudioDuration",
-                    audio=visible_audio,
-                    start_index=continuity_prefix_frames / draft.render.fps,
-                    duration=visible_frames / draft.render.fps,
-                )
-            )
-        video_inputs["audio"] = visible_audio
-    elif segment.audio_mode == "source":
-        if source_audio is None:
-            raise NativeTemplateError(
-                "source audio is available only for v2v/rv2v segments"
-            )
-        source_segment = segment
-        if (
-            not isinstance(source_segment, UnifiedRef2VASegment)
-            or source_segment.source_video is None
-        ):
-            raise NativeTemplateError(
-                "source audio is available only for v2v/rv2v segments"
-            )
-        assert source_segment.source_video is not None
-        assert source_segment.source_video.metadata is not None
-        if not source_segment.source_video.metadata.has_audio:
-            raise NativeTemplateError(
-                f"segment '{segment.id}' cannot use audio_mode='source': "
-                "the server-probed source video has no audio stream"
-            )
-        video_inputs["audio"] = source_audio
-    video = graph.add("CreateVideo", **video_inputs)
-    safe_segment = re.sub(r"[^A-Za-z0-9_-]+", "_", segment.id)[:64]
-    return graph.add(
-        "SaveVideo",
-        video=_edge(video),
-        filename_prefix=(
-            f"video/DirectorDeck_timeline_{job_id[:8]}_{safe_segment}"
-        ),
-        format="auto",
-        codec="auto",
-    )
-
-
-def _selected_segments(
-    draft: UnifiedTimelineDraft, segment_ids: list[str] | None
-) -> list[UnifiedTimelineSegment]:
-    enabled = [segment for segment in draft.segments if segment.enabled]
-    by_id = {segment.id: segment for segment in enabled}
-    if segment_ids is None:
-        selected = enabled
-    else:
-        missing = [segment_id for segment_id in segment_ids if segment_id not in by_id]
-        if missing:
-            raise NativeTemplateError(
-                "segment selection contains unknown or disabled IDs: "
-                + ", ".join(missing)
-            )
-        selected_set = set(segment_ids)
-        # Timeline order, not request order, is authoritative.
-        selected = [segment for segment in enabled if segment.id in selected_set]
-    if not selected:
-        raise NativeTemplateError("at least one enabled timeline segment is required")
-    return selected
-
-
-def standard_lora_metadata_requests(
-    draft: UnifiedTimelineDraft,
-    settings: RuntimeSettings,
-    segment_ids: list[str] | None = None,
-) -> dict[ModelFamily, str]:
-    """Return unknown auto Standard LoRAs that ComfyUI must inspect.
-
-    Known audited artifacts and explicit visible overrides compile without an
-    upstream metadata request. RayLight has its own fixed loader and is never
-    part of this Standard-only probe contract.
-    """
-
-    requests: dict[ModelFamily, str] = {}
-    for segment in _selected_segments(draft, segment_ids):
-        family = segment.mode
-        if family in requests:
-            continue
-        binding = getattr(settings.models, family)
-        if (
-            resolve_execution_backend(binding) != "standard"
-            or binding.lora_name is None
-            or binding.standard_lora_loader_override is not None
-        ):
-            continue
-        basename = PurePosixPath(binding.lora_name.replace("\\", "/")).name
-        if _known_standard_lora_loader(basename) is None:
-            requests[family] = binding.lora_name
-    return requests
-
-
-def _compile_unit(
-    *,
-    draft: UnifiedTimelineDraft,
-    settings: RuntimeSettings,
-    job_id: str,
-    family: ModelFamily,
-    backend: ExecutionBackend,
-    segments: list[UnifiedTimelineSegment],
-    unit_id: str,
-    clear_raylight_vram_after_sampling: bool,
-    predecessor_segment_id: str | None,
-    continuity_source: ContinuitySource | None,
-    historical_take: NativeHistoricalTake | None,
-    continuity_overlap_frames: int,
-    anchor_reset: bool,
-    standard_lora_metadata: Mapping[str, Any] | None,
-) -> tuple[NativeWorkflowUnit, list[dict[str, Any]]]:
-    if len(segments) != 1:
-        raise AssertionError("native workflow units must contain exactly one segment")
-    graph = _Graph()
-    shared = _shared_core(graph, settings)
-    binding = getattr(settings.models, family)
-    sampling = getattr(draft.sampling, family)
-    seed = sampling.seed
-    namespace = _raylight_namespace(family, binding)
-    if backend == "raylight":
-        model = _raylight_model(
-            graph,
-            binding,
-            sampling,
-            namespace=namespace,
-            clear_vram_after_sampling=clear_raylight_vram_after_sampling,
-        )
-    else:
-        model = _standard_model(
-            graph,
-            binding,
-            sampling,
-            lora_metadata=standard_lora_metadata,
-        )
-    output_nodes: dict[str, str] = {}
-    plans: list[dict[str, Any]] = []
-    continuity_dependency: NativeContinuityDependency | None = None
-    for segment in segments:
-        visible_frames = _align_h3_frames(
-            segment.duration_seconds, draft.render.fps
-        )
-        context_frames = (
-            continuity_overlap_frames if predecessor_segment_id is not None else 0
-        )
-        sample_frames = _align_h3_frame_count(visible_frames + context_frames)
-        conditioning, latent, source_audio = _conditioning(
-            graph,
-            segment,
-            draft,
-            shared,
-            frames=sample_frames,
-        )
-        if predecessor_segment_id is not None:
-            conditioning, load_video_node_id = _add_continuity_guides(
-                graph,
-                conditioning=conditioning,
-                latent=latent,
-                segment=segment,
-                draft=draft,
-                shared=shared,
-                visible_frames=visible_frames,
-                overlap_frames=context_frames,
-            )
-            continuity_dependency = NativeContinuityDependency(
-                predecessor_segment_id=predecessor_segment_id,
-                overlap_frames=context_frames,
-                load_video_node_id=load_video_node_id,
-                source=continuity_source or "same_run",
-                historical_take_id=(
-                    historical_take.id if historical_take is not None else None
-                ),
-            )
-        samples = _sample(
-            graph,
-            backend=backend,
-            model=model,
-            conditioning=conditioning,
-            latent=latent,
-            sampling=sampling,
-            seed=seed,
-        )
-        output_node = _decode_and_save(
-            graph,
-            samples=samples,
-            source_audio=source_audio,
-            draft=draft,
-            shared=shared,
-            job_id=job_id,
-            segment=segment,
-            visible_frames=visible_frames,
-            continuity_prefix_frames=context_frames,
-        )
-        output_nodes[segment.id] = output_node
-        node_classes = tuple(
-            dict.fromkeys(
-                node["class_type"] for node in graph.prompt.values()
-            )
-        )
-        plans.append(
-            {
-                "segment_id": segment.id,
-                "mode": segment.mode,
-                "recipe": timeline_segment_recipe(segment),
-                "model_family": family,
-                "backend": backend,
-                "frame_count": visible_frames,
-                "visible_frame_count": visible_frames,
-                "sample_frame_count": sample_frames,
-                "continuity_context_frames": context_frames,
-                "alignment_tail_frame_count": (
-                    sample_frames - visible_frames - context_frames
-                ),
-                "predecessor_segment_id": predecessor_segment_id,
-                "continuity_source": continuity_source,
-                "historical_take_id": (
-                    historical_take.id if historical_take is not None else None
-                ),
-                "anchor_reset": anchor_reset,
-                # Randomness is resolved by the editor before submission. The
-                # report always exposes the exact JSON-safe value that this
-                # graph carries, even when the UI intends to re-roll it before
-                # a later submit.
-                "seed_mode": "random" if sampling.random_seed else "fixed",
-                "seed": seed,
-                "conditioning_node": (
-                    "MiniMaxH3ImageToVideo"
-                    if segment.mode == "fl2va"
-                    else "MiniMaxH3ReferenceToVideo"
-                ),
-                "node_classes": list(node_classes),
-            }
-        )
-    unit = NativeWorkflowUnit(
-            id=unit_id,
-            family=family,
-            backend=backend,
-            segment_ids=tuple(segment.id for segment in segments),
-            prompt=graph.prompt,
-            output_nodes=output_nodes,
-            continuity=continuity_dependency,
-        )
-    if historical_take is not None:
-        unit = bind_native_workflow_predecessor_output(
-            unit, historical_take.output
-        )
-    return unit, plans
-
-
 def compile_native_timeline(
     draft: UnifiedTimelineDraft,
     settings: RuntimeSettings,
@@ -1644,304 +1400,26 @@ def compile_native_timeline(
     segment_ids: list[str] | None = None,
     *,
     historical_takes: Mapping[str, NativeHistoricalTake] | None = None,
-    standard_lora_metadata: Mapping[
-        ModelFamily, Mapping[str, Any] | None
+    resolved_lora_adapters: Mapping[
+        ModelFamily, ResolvedLoraAdapter
     ] | None = None,
 ) -> NativeCompileResult:
-    """Compile one server-owned prompt per selected timeline segment.
+    """Compile v4 timeline data through the validated feature templates.
 
-    Segment prompts deliberately repeat stable loader node IDs and inputs.
-    ComfyUI can therefore reuse its endpoint-local model cache across prompts,
-    while one failed branch cannot invalidate or cancel every take in a model
-    family.  Submission order remains deterministic across recompilation.
+    The local import is intentional: the v4 compiler reuses the stable native
+    result and Ray lifecycle contracts defined above, while this module remains
+    the public compatibility entry point.
     """
 
-    if settings.memory_policy != "keep_resident":
-        raise NativeTemplateError(
-            "native segment workflows support memory_policy='keep_resident' only; "
-            "clear_between_segments has no equivalent stock ComfyUI node"
-        )
-    if draft.render.fps != 24.0:
-        raise NativeTemplateError(
-            "MiniMax H3 native temporal and reference-video contracts are fixed "
-            "at 24 fps; render.fps must equal 24"
-        )
-    selected = _selected_segments(draft, segment_ids)
-    for segment in selected:
-        _validate_native_reference_slots(segment)
-    routed: list[
-        tuple[
-            int,
-            UnifiedTimelineSegment,
-            ModelFamily,
-            ExecutionBackend,
-            str | None,
-            ContinuitySource | None,
-            NativeHistoricalTake | None,
-            bool,
-        ]
-    ] = []
-    timeline_positions = {
-        segment.id: index for index, segment in enumerate(draft.segments)
-    }
-    continuity_predecessors = unified_continuity_predecessors(draft)
-    enabled_segments = [segment for segment in draft.segments if segment.enabled]
-    previous_enabled = {
-        segment.id: enabled_segments[index - 1] if index else None
-        for index, segment in enumerate(enabled_segments)
-    }
-    selected_ids = {segment.id for segment in selected}
-    for segment in selected:
-        timeline_index = timeline_positions[segment.id]
-        family = segment.mode
-        binding = getattr(settings.models, family)
-        backend = resolve_execution_backend(binding)
-        if backend == "raylight" and not settings.multi_gpu_enabled:
-            raise NativeTemplateError(
-                "multi-GPU inference is disabled; enable it in system settings "
-                "(installs the RayLight components and requires a restart) or "
-                f"reduce {family}.raylight.gpu_select to a single GPU"
-            )
-        if backend == "raylight" and binding.device != "default":
-            raise NativeTemplateError(
-                f"{family}.device must be 'default' when RayLight is enabled; "
-                "raylight.gpu_select is the authoritative logical GPU pool"
-            )
-        predecessor_segment_id: str | None = None
-        continuity_source: ContinuitySource | None = None
-        historical_take: NativeHistoricalTake | None = None
-        explicit_anchor_reset = (
-            isinstance(segment, UnifiedFL2VASegment)
-            and segment.first_image is not None
-        )
-        anchor_reset = False
-        if segment.continuity.enabled:
-            predecessor = continuity_predecessors.get(segment.id)
-            anchor_reset = predecessor is None and (
-                previous_enabled[segment.id] is None or explicit_anchor_reset
-            )
-            if predecessor is not None:
-                predecessor_segment_id = predecessor.id
-                if predecessor.id in selected_ids:
-                    continuity_source = "same_run"
-                else:
-                    continuity_source = "historical_take"
-                    historical_take = (historical_takes or {}).get(segment.id)
-                    if historical_take is None:
-                        raise NativeTemplateError(
-                            f"continuity segment '{segment.id}' requires a "
-                            f"server-resolved historical take for predecessor "
-                            f"'{predecessor.id}'"
-                        )
-                    if historical_take.segment_id != predecessor.id:
-                        raise NativeTemplateError(
-                            f"historical take '{historical_take.id}' belongs to "
-                            f"segment '{historical_take.segment_id}', not current "
-                            f"predecessor '{predecessor.id}'"
-                        )
-        routed.append(
-            (
-                timeline_index,
-                segment,
-                family,
-                backend,
-                predecessor_segment_id,
-                continuity_source,
-                historical_take,
-                anchor_reset,
-            )
-        )
-    keep_raylight_resident = (
-        settings.raylight_residency_policy == "keep_until_switch"
-    )
-    clear_raylight_vram_after_sampling = not keep_raylight_resident
-    workflows: list[NativeWorkflowUnit] = []
-    plans: list[dict[str, Any]] = []
-    # Dependency chains must retain timeline order. Independent prompts keep
-    # the established Standard-before-Ray grouping for stable cache behavior.
-    has_continuity_edges = any(route[4] is not None for route in routed)
-    ordered_routes = (
-        sorted(routed, key=lambda route: route[0])
-        if has_continuity_edges
-        else sorted(
-            routed,
-            key=lambda route: (
-                ("standard", "raylight").index(route[3]),
-                ("fl2va", "ref2va").index(route[2]),
-                route[0],
-            ),
-        )
-    )
-    for (
-        timeline_index,
-        segment,
-        family,
-        backend,
-        predecessor_segment_id,
-        continuity_source,
-        historical_take,
-        anchor_reset,
-    ) in ordered_routes:
-        unit, unit_plans = _compile_unit(
-            draft=draft,
-            settings=settings,
-            job_id=job_id,
-            family=family,
-            backend=backend,
-            segments=[segment],
-            unit_id=f"{backend}-{family}-{timeline_index:03d}",
-            clear_raylight_vram_after_sampling=(
-                clear_raylight_vram_after_sampling
-            ),
-            predecessor_segment_id=predecessor_segment_id,
-            continuity_source=continuity_source,
-            historical_take=historical_take,
-            continuity_overlap_frames=segment.continuity.overlap_frames,
-            anchor_reset=anchor_reset,
-            standard_lora_metadata=(standard_lora_metadata or {}).get(family),
-        )
-        workflows.append(unit)
-        plans.extend(unit_plans)
-    all_nodes = sorted(
-        {
-            node["class_type"]
-            for unit in workflows
-            for node in unit.prompt.values()
-        }
-    )
-    unknown = sorted(set(all_nodes) - set(_PROVENANCE))
-    if unknown:
-        raise AssertionError(f"native template emitted unclassified nodes: {unknown}")
-    custom_nodes = sorted(
-        node
-        for node in all_nodes
-        if _PROVENANCE[node] in {"raylight", "lora-custom"}
-    )
-    families = tuple(
-        family for family in ("fl2va", "ref2va") if any(
-            unit.family == family for unit in workflows
-        )
-    )
-    lora_resolution: dict[str, dict[str, Any]] = {}
-    for family in families:
-        binding = getattr(settings.models, family)
-        if binding.lora_name is None:
-            continue
-        backend = resolve_execution_backend(binding)
-        if backend == "raylight":
-            loader_node = "RayLoraLoader"
-            source = "raylight"
-        else:
-            loader_node = _resolve_standard_lora(
-                binding, (standard_lora_metadata or {}).get(family)
-            )
-            basename = PurePosixPath(
-                binding.lora_name.replace("\\", "/")
-            ).name
-            source = (
-                "manual"
-                if binding.standard_lora_loader_override is not None
-                else "audited_profile"
-                if _known_standard_lora_loader(basename) is not None
-                else "metadata"
-            )
-        lora_resolution[family] = {
-            "lora_name": binding.lora_name,
-            "model_filename": binding.filename,
-            "backend": backend,
-            "loader_node": loader_node,
-            "source": source,
-        }
-    manifest = {
-        "version": 2,
-        "graph_source": "server",
-        "accepts_client_workflow": False,
-        "continuity": {
-            "boundaries": [
-                {
-                    "segment_id": segment.id,
-                    "predecessor_segment_id": predecessor_segment_id,
-                    "overlap_frames": segment.continuity.overlap_frames,
-                    "source": continuity_source,
-                    "historical_take_id": (
-                        historical_take.id if historical_take is not None else None
-                    ),
-                }
-                for (
-                    _,
-                    segment,
-                    _,
-                    _,
-                    predecessor_segment_id,
-                    continuity_source,
-                    historical_take,
-                    _,
-                ) in ordered_routes
-                if predecessor_segment_id is not None
-            ],
-        },
-        "submission_order": [unit.id for unit in workflows],
-        "raylight_exclusive": any(
-            unit.backend == "raylight" for unit in workflows
-        ),
-        "lora_resolution": lora_resolution,
-        "resident_cache_scope": {
-            "boundary": "comfy_endpoint",
-            "standard": "family+model_loader_inputs",
-            "prompt_partition": "one_segment",
-            "raylight_initializer": "gpu_pool+topology",
-            "raylight_model": "worker_ram_cache(model+lora+weight_dtype)",
-            "raylight_cuda_residency": (
-                "kept_for_compatible_key_until_explicit_switch"
-                if keep_raylight_resident
-                else "released_after_each_sampler"
-            ),
-            "raylight_residency_reason": (
-                "explicit_keyed_switch_policy"
-                if keep_raylight_resident
-                else "shared_endpoint_safe_default"
-            ),
-            "raylight_resident_family": None,
-        },
-        "units": [
-            {
-                "id": unit.id,
-                "family": unit.family,
-                "backend": unit.backend,
-                "segment_ids": list(unit.segment_ids),
-                "output_nodes": dict(unit.output_nodes),
-                "continuity": (
-                    {
-                        "predecessor_segment_id": (
-                            unit.continuity.predecessor_segment_id
-                        ),
-                        "overlap_frames": unit.continuity.overlap_frames,
-                        "load_video_node_id": unit.continuity.load_video_node_id,
-                        "source": unit.continuity.source,
-                        "historical_take_id": (
-                            unit.continuity.historical_take_id
-                        ),
-                        "resolved": unit.continuity.resolved,
-                    }
-                    if unit.continuity is not None
-                    else None
-                ),
-            }
-            for unit in workflows
-        ],
-    }
-    return NativeCompileResult(
-        workflows=tuple(workflows),
-        manifest=manifest,
-        plans=tuple(plans),
-        families=families,
-        node_policy={
-            "graph_source": "server",
-            "accepts_client_workflow": False,
-            "allowed_nodes": all_nodes,
-            "custom_nodes": custom_nodes,
-            "provenance": {node: _PROVENANCE[node] for node in all_nodes},
-        },
+    from .workflow.v4_compiler import compile_v4_timeline
+
+    return compile_v4_timeline(
+        draft,
+        settings,
+        job_id,
+        segment_ids,
+        historical_takes=historical_takes,
+        resolved_lora_adapters=resolved_lora_adapters,
     )
 
 
@@ -1950,14 +1428,11 @@ def validate_native_capabilities(
     available_nodes: list[str] | set[str],
     node_provenance: dict[str, str] | None = None,
 ) -> None:
-    """Fail before queue submission when a fixed template is unavailable.
+    """Fail before submission only when a required class_type is absent.
 
-    ``class_type`` names alone are not a sufficient trust boundary: a custom
-    extension can register the same name as a core node.  Real ComfyUI clients
-    therefore pass the ``python_module`` values returned by ``/object_info``
-    and every emitted class is checked against the server-owned policy.  The
-    optional argument is retained for offline compiler tests that do not own a
-    ComfyUI registry.
+    ``node_provenance`` remains in the call contract for compatibility, but is
+    advisory and deliberately ignored. ComfyUI decides whether a present node
+    implementation can execute the emitted prompt.
     """
 
     available = set(available_nodes)
@@ -1968,23 +1443,7 @@ def validate_native_capabilities(
             "ComfyUI is missing nodes required by the selected server template: "
             + ", ".join(missing)
         )
-    if node_provenance is not None:
-        invalid: list[str] = []
-        expected = result.node_policy["provenance"]
-        for node_name in sorted(required):
-            source = node_provenance.get(node_name, "")
-            policy = expected[node_name]
-            expected_module = EXPECTED_NATIVE_NODE_MODULES[node_name]
-            if source != expected_module:
-                invalid.append(
-                    f"{node_name} (expected {policy} from {expected_module}, "
-                    f"got {source or 'unknown'})"
-                )
-        if invalid:
-            raise NativeTemplateError(
-                "ComfyUI node provenance does not match the fixed template policy: "
-                + ", ".join(invalid)
-            )
+    _ = node_provenance
     forbidden = {
         node["class_type"]
         for unit in result.workflows
@@ -2000,7 +1459,7 @@ def validate_native_workflow_unit_capabilities(
     available_nodes: list[str] | set[str],
     node_provenance: dict[str, str] | None = None,
 ) -> None:
-    """Apply the exact registry/provenance boundary to an internal barrier."""
+    """Require the internal barrier's class_types to exist on the host."""
 
     node_names = sorted(
         {str(node.get("class_type") or "") for node in unit.prompt.values()}

@@ -36,8 +36,8 @@ def _load_module(name: str, file_path: Path):
     return module
 
 
-_fsdp_utils = _load_module('raylight_fsdp_utils_test', RAYLIGHT_SRC / 'raylight' / 'comfy_dist' / 'fsdp_utils.py')
-_nvfp4_patch = _load_module('raylight_nvfp4_patch_test', RAYLIGHT_SRC / 'raylight' / 'comfy_dist' / 'kitchen_patches' / 'nvfp4.py')
+_fsdp_utils = _load_module('raylight_fsdp_utils_test', RAYLIGHT_SRC / 'directordeck_raylight' / 'comfy_dist' / 'fsdp_utils.py')
+_nvfp4_patch = _load_module('raylight_nvfp4_patch_test', RAYLIGHT_SRC / 'directordeck_raylight' / 'comfy_dist' / 'kitchen_patches' / 'nvfp4.py')
 
 fully_shard_bottom_up = _fsdp_utils.fully_shard_bottom_up
 load_from_full_model_state_dict = _fsdp_utils.load_from_full_model_state_dict

@@ -1,6 +1,9 @@
 import type { AssetReference, GenerationMode, ModeDraft } from "../domain/modes";
 import type {
   DerivedGenerationRecipe,
+  FeatureConfiguration,
+  FeatureSelection,
+  ModelStack,
   TimelineGenerationMode,
   TimelineProject,
 } from "../domain/timelineProject";
@@ -16,7 +19,8 @@ export type LoraLoader =
   | "auto"
   | "dedicated"
   | "bypass_model_only"
-  | "model_only";
+  | "model_only"
+  | "minimax_h3_turbo";
 export type StandardLoraLoader = Exclude<LoraLoader, "auto">;
 
 export interface StandardLoraLoaderOverride {
@@ -57,18 +61,18 @@ export interface DiffusionModelBinding extends ModelBinding {
 }
 
 export function resolveExecutionBackend(
-  binding: DiffusionModelBinding,
+  binding: Pick<DiffusionModelBinding, "raylight"> | RuntimeDiffusionPlacement,
 ): ResolvedExecutionBackend {
   return binding.raylight.gpu_select.length >= 2 ? "raylight" : "standard";
 }
 
 export function describeLoraLoader(binding: DiffusionModelBinding): string {
-  if (resolveExecutionBackend(binding) === "raylight") return "RayLoraLoader";
+  if (resolveExecutionBackend(binding) === "raylight") return "DirectorDeckRayLoraLoader";
   switch (binding.standard_lora_loader_override?.loader) {
-    case "dedicated": return "显式：MiniMax H3 专用";
-    case "bypass_model_only": return "显式：量化旁路 Model Only";
-    case "model_only": return "显式：ComfyUI 通用 Model Only";
-    default: return "自动探测";
+    case "dedicated": return "显式：MiniMax-H3 Turbo LoRA";
+    case "bypass_model_only":
+    case "model_only": return "显式：LoRA加载器（仅模型）";
+    default: return "默认：LoRA加载器（仅模型）";
   }
 }
 
@@ -80,8 +84,8 @@ export interface SettingsModels {
   audio_vae: ModelBinding<VaeDeviceTarget>;
 }
 
-/** Exact GET/PUT /api/settings payload. */
-export interface RuntimeSettings {
+/** Frozen pre-v5 payload used only by historical snapshots and WAL recovery. */
+export interface LegacyRuntimeSettingsV1 {
   client_id: string;
   memory_policy: MemoryPolicy;
   raylight_residency_policy: RayLightResidencyPolicy;
@@ -89,9 +93,89 @@ export interface RuntimeSettings {
   models: SettingsModels;
 }
 
+export interface RuntimeDiffusionPlacement {
+  device: DeviceTarget;
+  raylight: RayLightProfile;
+}
+
+export interface RuntimePlacementV2 {
+  fl2va: RuntimeDiffusionPlacement;
+  ref2va: RuntimeDiffusionPlacement;
+  clip_device: DeviceTarget;
+  video_vae_device: VaeDeviceTarget;
+  audio_vae_device: VaeDeviceTarget;
+}
+
+export interface LegacyStandardLoraOverrideEvidence {
+  family: DiffusionModelRole;
+  model_filename: string;
+  lora_filename: string;
+  loader: StandardLoraLoader;
+}
+
+export interface LegacyLoraResolutionCompat {
+  schema_version: 1;
+  auto_resolution_strategy_version: "v4-known-filename-or-safetensors-metadata-v1";
+  explicit_overrides: LegacyStandardLoraOverrideEvidence[];
+}
+
+/** Frozen Stage-6 authority used only for pending-WAL migration. */
+export interface RuntimeSettingsV2 {
+  schema_version: 2;
+  client_id: string;
+  memory_policy: MemoryPolicy;
+  raylight_residency_policy: RayLightResidencyPolicy;
+  multi_gpu_enabled: boolean;
+  placement: RuntimePlacementV2;
+  legacy_lora_resolution_compat: LegacyLoraResolutionCompat;
+}
+
+export type LoraLoaderAdapterId = string;
+
+export interface LoraLoaderBindingKey {
+  lora_filename: string;
+}
+
+export interface LoraLoaderOverrideRecord extends LoraLoaderBindingKey {
+  adapter_id: LoraLoaderAdapterId;
+  options: Record<string, boolean>;
+}
+
+/** Exact current GET/PUT /api/settings authority document. */
+export interface RuntimeSettings {
+  schema_version: 3;
+  client_id: string;
+  memory_policy: MemoryPolicy;
+  raylight_residency_policy: RayLightResidencyPolicy;
+  multi_gpu_enabled: boolean;
+  placement: RuntimePlacementV2;
+  lora_loader_overrides: LoraLoaderOverrideRecord[];
+}
+
 export interface RuntimeSettingsAuthority {
   settings: RuntimeSettings;
   authority_token: string;
+}
+
+export interface RuntimeSettingsAuthorityWriteRequest {
+  document: RuntimeSettings;
+  expected_authority_token: string;
+  schema_version: 3;
+}
+
+export interface RuntimeSettingsMigrationNotice {
+  schema_version: 1;
+  id: string;
+  code: "legacy_lora_resolution_review_required";
+  severity: "warning";
+  action: "review_lora_loader_mappings";
+  legacy_strategy_version: "v4-known-filename-or-safetensors-metadata-v1";
+  message: string;
+  created_at: string;
+}
+
+export interface RuntimeSettingsMigrationNoticeList {
+  notices: RuntimeSettingsMigrationNotice[];
 }
 
 /** Exact GET /api/storage payload: the fixed database location of the host. */
@@ -105,7 +189,7 @@ export interface StorageConfiguration {
  * "release after sampling" choice.
  */
 export function rayLightResidencyPolicyAfterBindingChange(
-  settings: Pick<RuntimeSettings, "models" | "raylight_residency_policy">,
+  settings: Pick<LegacyRuntimeSettingsV1, "models" | "raylight_residency_policy">,
   role: DiffusionModelRole,
   nextBinding: DiffusionModelBinding,
 ): RayLightResidencyPolicy {
@@ -148,6 +232,173 @@ export interface CapabilityReport {
       };
     };
   }>;
+}
+
+/** Bounded, server-redacted JSON carried by capability diagnostics and UI hints. */
+export type CapabilityJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | CapabilityJsonValue[]
+  | { [key: string]: CapabilityJsonValue };
+
+export interface CapabilityReason {
+  code: string;
+  feature_id: string | null;
+  segment_id: string | null;
+  unit_id: string | null;
+  backend: ResolvedExecutionBackend | null;
+  rule: string;
+  message: string;
+  remediation: string;
+  safe_details: { [key: string]: CapabilityJsonValue };
+}
+
+export type FeatureAvailabilityState = "available" | "unavailable" | "conditional";
+
+export interface FeatureCatalogAdapterOption {
+  adapter_id: LoraLoaderAdapterId;
+  display_name: string;
+  class_type: string;
+  is_default: boolean;
+  backend: "standard";
+  supported_families: DiffusionModelRole[];
+  configuration_options: Array<{
+    id: string;
+    type: "boolean";
+    label: string;
+    description: string;
+    default: boolean;
+  }>;
+  adapter_fingerprint: string;
+  capability: FeatureCapabilityEvaluation;
+}
+
+export interface FeatureCatalogEntry {
+  id: string;
+  version: number;
+  title: string;
+  description: string;
+  mode: "switch" | "needed";
+  layer: "graph";
+  scopes: string[];
+  params_schema: { [key: string]: CapabilityJsonValue };
+  defaults: { [key: string]: CapabilityJsonValue };
+  backends: ResolvedExecutionBackend[];
+  availability: {
+    state: FeatureAvailabilityState;
+    reasons: CapabilityReason[];
+  };
+  adapter_options: FeatureCatalogAdapterOption[];
+  ui: { [key: string]: CapabilityJsonValue };
+}
+
+export interface FeatureCatalog {
+  template_bundle_version: number;
+  host_capability_revision: string;
+  entries: FeatureCatalogEntry[];
+}
+
+export interface DirectorDeckLoraLoaderDefinition {
+  id: LoraLoaderAdapterId;
+  display_name: string;
+  class_type: string;
+  input_contract: "model_only" | "dedicated_model";
+  supported_families: DiffusionModelRole[];
+  options: Array<{
+    id: string;
+    type: "boolean";
+    label: string;
+    description: string;
+    default: boolean;
+  }>;
+}
+
+/** Product-owned configuration; it does not claim ownership of host nodes. */
+export interface DirectorDeckConfig {
+  schema_version: 1;
+  lora: {
+    loaders: DirectorDeckLoraLoaderDefinition[];
+    fallback_policy: {
+      loader_ids: LoraLoaderAdapterId[];
+      default_loader_id: LoraLoaderAdapterId;
+    };
+    loader_policies: Array<{
+      /** Regular expression searched against the complete relative LoRA path. */
+      lora_filename: string;
+      loader_ids: LoraLoaderAdapterId[];
+      default_loader_id: LoraLoaderAdapterId;
+    }>;
+  };
+}
+
+export type FeatureCatalogFetchResult =
+  | { status: "fresh"; etag: string; catalog: FeatureCatalog }
+  | { status: "not_modified"; etag: string };
+
+export interface OperationalReadiness {
+  endpoint_online: boolean;
+  submission_allowed: boolean;
+  ray_recovery_required: boolean;
+  ray_tainted: boolean;
+  invalid_runtime_gpu_indices: number[];
+  blocking_reason_codes: string[];
+}
+
+export interface FeatureCapabilityEvaluation {
+  available: boolean;
+  reasons: CapabilityReason[];
+  verified_contracts: string[];
+  runtime_fingerprints: string[];
+}
+
+export interface ResolvedImplementationIdentity {
+  role: string;
+  class_type: string;
+  implementation_id: string;
+  semantic_version: string;
+  runtime_fingerprint: string;
+  binding_key: string;
+}
+
+export interface FeatureResolutionEvidence {
+  state: "active" | "noop";
+  implementations: ResolvedImplementationIdentity[];
+  resolution_details: { [key: string]: CapabilityJsonValue };
+}
+
+export interface EffectiveFeatureResolution {
+  id: string;
+  version: number;
+  state: "active" | "noop";
+  adapter_fingerprint: string;
+  capability: FeatureCapabilityEvaluation;
+}
+
+export interface EffectiveSegmentResolution {
+  unit_id: string;
+  backend: ResolvedExecutionBackend;
+  family: DiffusionModelRole;
+  template_id: "h3_standard_segment" | "h3_raylight_segment";
+  features: EffectiveFeatureResolution[];
+}
+
+/** Stage 6 preflight consumes the same explicit v5 creative authority as compile/submit. */
+export interface FeaturePreflightRequest {
+  config: TimelineProject;
+  segment_ids?: string[] | null;
+  /** Stable database-owned scope used for historical continuity resolution. */
+  project_id?: string;
+}
+
+export interface FeaturePreflightResponse {
+  template_bundle_version: number;
+  host_capability_revision: string;
+  operational_readiness: OperationalReadiness;
+  valid: boolean;
+  errors: CapabilityReason[];
+  effective_by_segment: Record<string, EffectiveSegmentResolution>;
 }
 
 export interface GPUResource {
@@ -242,12 +493,14 @@ export interface CreateTaskRequest {
 }
 
 export interface TimelineTaskRequest {
-  config?: TimelineProject;
+  config: TimelineProject;
   /** Stable segment identities. The workspace always sends its checkbox set. */
   segment_ids?: string[];
 }
 
 export interface TimelineCompileReport {
+  template_bundle_version: number;
+  host_capability_revision: string;
   execution_strategy: "native_segment_graph_v1";
   model_families: DiffusionModelRole[];
   plans: Array<{
@@ -288,6 +541,32 @@ export interface TimelineCompileReport {
       string,
       "comfy-core" | "comfy-core-official-minimax-h3" | "comfy-extras" | "raylight" | "lora-custom"
     >;
+  };
+  features: {
+    requested: FeatureConfiguration;
+    effective_by_segment: Record<string, EffectiveSegmentResolution>;
+    resolutions: Array<{
+      segment_id: string;
+      unit_id: string;
+      feature_id: string;
+      version: number;
+      backend: ResolvedExecutionBackend;
+      family: DiffusionModelRole;
+      template_id: EffectiveSegmentResolution["template_id"];
+      resolution: FeatureResolutionEvidence;
+      adapter_fingerprint: string;
+      capability: FeatureCapabilityEvaluation;
+    }>;
+    notices: Array<{
+      segment_id: string;
+      unit_id: string;
+      feature_id: string;
+      message: string;
+    }>;
+  };
+  effective_execution_digest: {
+    algorithm: "sha256-canonical-json-v1";
+    value: string;
   };
 }
 
@@ -422,6 +701,69 @@ export interface ProjectDeleteResponse {
   orphaned_jobs: number;
 }
 
+export interface DocumentDigest {
+  algorithm: "fnv1a32-json-stringify-v1" | "sha256-canonical-json-v1";
+  value: string;
+}
+
+export interface ProjectImportLegacyCreativeContext {
+  schema_version: 1;
+  model_stack: ModelStack;
+  lora: FeatureSelection;
+  explicit_standard_lora_overrides: LegacyStandardLoraOverrideEvidence[];
+}
+
+export interface ProjectImportCreativeSelection {
+  model_stack: ModelStack;
+  lora: FeatureSelection;
+}
+
+interface ProjectImportPreflightRequestBase {
+  title: string;
+  document: unknown;
+}
+
+/** A v4 import may carry exactly one immutable creative authority. */
+export type ProjectImportPreflightRequest = ProjectImportPreflightRequestBase & (
+  | {
+      legacy_runtime_settings: LegacyRuntimeSettingsV1;
+      legacy_creative_context?: never;
+      creative_selection?: never;
+    }
+  | {
+      legacy_runtime_settings?: never;
+      legacy_creative_context: ProjectImportLegacyCreativeContext;
+      creative_selection?: never;
+    }
+  | {
+      legacy_runtime_settings?: never;
+      legacy_creative_context?: never;
+      creative_selection: ProjectImportCreativeSelection;
+    }
+  | {
+      legacy_runtime_settings?: never;
+      legacy_creative_context?: never;
+      creative_selection?: never;
+    }
+);
+
+export interface ProjectImportPreflightResponse {
+  schema_version: 1;
+  status: "ready" | "needs_input";
+  input_digest: DocumentDigest;
+  proposed_document: TimelineProject | null;
+  missing_context: string[];
+  missing_model_bindings: string[];
+  capability_issues: Array<Record<string, unknown>>;
+  commit_token: string | null;
+  expires_at: string | null;
+}
+
+export interface ProjectImportCommitRequest {
+  commit_token: string;
+  input_digest: DocumentDigest;
+}
+
 /** Server-owned timeline document paired with its exact CAS revision. */
 export interface TimelineAuthority {
   document: TimelineProject;
@@ -552,7 +894,7 @@ export interface RV2VShotDetectionResponse {
   warnings: string[];
 }
 
-export const DEFAULT_SETTINGS: RuntimeSettings = {
+export const DEFAULT_LEGACY_SETTINGS: LegacyRuntimeSettingsV1 = {
   client_id: "directordeck",
   memory_policy: "keep_resident",
   raylight_residency_policy: "keep_until_switch",
@@ -604,6 +946,22 @@ export const DEFAULT_SETTINGS: RuntimeSettings = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: unknown, expected: readonly string[]): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length &&
+    actual.every((key, index) => key === wanted[index]);
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value as Record<string, unknown>).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`
+  ).join(",")}}`;
 }
 
 function normalizeDevice(value: unknown, allowCpu: boolean, fallback: DeviceTarget): DeviceTarget {
@@ -662,8 +1020,8 @@ function normalizeRayLightProfile(
 }
 
 /** Removes stale/unknown local-storage settings before they can reach PUT /api/settings. */
-export function sanitizeRuntimeSettings(value: unknown): RuntimeSettings {
-  const fallback = structuredClone(DEFAULT_SETTINGS);
+export function sanitizeLegacyRuntimeSettings(value: unknown): LegacyRuntimeSettingsV1 {
+  const fallback = structuredClone(DEFAULT_LEGACY_SETTINGS);
   if (!isRecord(value)) return fallback;
 
   const clientId =
@@ -762,6 +1120,322 @@ export function sanitizeRuntimeSettings(value: unknown): RuntimeSettings {
   };
 }
 
+/**
+ * Frozen RuntimeSettingsV1 boundary for historical snapshots and recovery
+ * evidence. Unlike the sanitizer this parser rejects defaults, unknown keys,
+ * and lossy normalization; callers may therefore prove that the exact bytes
+ * they quarantine are the bytes they later offer for recovery.
+ */
+export function parseLegacyRuntimeSettingsV1(value: unknown): LegacyRuntimeSettingsV1 | null {
+  if (!hasExactKeys(value, [
+    "client_id",
+    "memory_policy",
+    "raylight_residency_policy",
+    "multi_gpu_enabled",
+    "models",
+  ])) return null;
+  const models = value.models;
+  if (!hasExactKeys(models, ["fl2va", "ref2va", "clip", "video_vae", "audio_vae"])) return null;
+  for (const role of ["clip", "video_vae", "audio_vae"] as const) {
+    if (!hasExactKeys(models[role], ["filename", "device"])) return null;
+  }
+  const diffusionKeys = [
+    "filename", "device", "lora_name", "lora_strength", "lora_loader",
+    "standard_lora_loader_override", "lora_low_vram", "backend", "raylight",
+  ];
+  for (const role of ["fl2va", "ref2va"] as const) {
+    const binding = models[role];
+    if (!hasExactKeys(binding, diffusionKeys) || !hasExactKeys(binding.raylight, [
+      "gpu_select", "ulysses_degree", "ring_degree", "cfg_degree", "dp_degree",
+      "fsdp", "cpu_offload",
+    ])) return null;
+    if (
+      binding.standard_lora_loader_override !== null &&
+      !hasExactKeys(binding.standard_lora_loader_override, [
+        "loader", "lora_name", "model_filename",
+      ])
+    ) return null;
+  }
+  const normalized = sanitizeLegacyRuntimeSettings(value);
+  try {
+    return canonicalJson(value) === canonicalJson(normalized) ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
+const DEFAULT_RUNTIME_PLACEMENT: RuntimePlacementV2 = {
+  fl2va: {
+    device: "default",
+    raylight: structuredClone(DEFAULT_LEGACY_SETTINGS.models.fl2va.raylight),
+  },
+  ref2va: {
+    device: "default",
+    raylight: structuredClone(DEFAULT_LEGACY_SETTINGS.models.ref2va.raylight),
+  },
+  clip_device: "default",
+  video_vae_device: "default",
+  audio_vae_device: "default",
+};
+
+export const DEFAULT_SETTINGS: RuntimeSettings = {
+  schema_version: 3,
+  client_id: "directordeck",
+  memory_policy: "keep_resident",
+  raylight_residency_policy: "keep_until_switch",
+  multi_gpu_enabled: false,
+  placement: structuredClone(DEFAULT_RUNTIME_PLACEMENT),
+  lora_loader_overrides: [],
+};
+
+/** ECMAScript relational string order: lexicographic UTF-16 code units. */
+export function compareUtf16Strings(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+export function compareLoraLoaderBinding(
+  left: LoraLoaderBindingKey,
+  right: LoraLoaderBindingKey,
+): number {
+  return compareUtf16Strings(left.lora_filename, right.lora_filename);
+}
+
+export function sameLoraLoaderBinding(
+  left: LoraLoaderBindingKey,
+  right: LoraLoaderBindingKey,
+): boolean {
+  return compareLoraLoaderBinding(left, right) === 0;
+}
+
+function isWellFormedUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xD800 && unit <= 0xDBFF) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) return false;
+      index += 1;
+    } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function validLoraLoaderOverride(value: unknown): value is LoraLoaderOverrideRecord {
+  return isRecord(value) &&
+    hasExactKeys(value, ["lora_filename", "adapter_id", "options"]) &&
+    typeof value.lora_filename === "string" && isWellFormedUtf16(value.lora_filename) &&
+    [...value.lora_filename].length >= 1 && [...value.lora_filename].length <= 1_024 &&
+    typeof value.adapter_id === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value.adapter_id) &&
+    isRecord(value.options) && Object.keys(value.options).length <= 16 &&
+    Object.entries(value.options).every(([key, option]) =>
+      /^[a-z][a-z0-9_]{0,63}$/.test(key) && typeof option === "boolean");
+}
+
+function migrateLoraLoaderOverride(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  const keys = Object.keys(value).sort();
+  if (keys.join("\u0000") === ["adapter_id", "lora_filename", "options"].join("\u0000")) {
+    return value;
+  }
+  if (keys.join("\u0000") !== [
+    "adapter_id", "family", "lora_filename", "model_filename",
+  ].join("\u0000")) return value;
+  const adapterId = value.adapter_id === "dedicated"
+    ? "minimax_h3_turbo"
+    : value.adapter_id === "bypass_model_only"
+      ? "model_only"
+      : value.adapter_id;
+  return {
+    lora_filename: value.lora_filename,
+    adapter_id: adapterId,
+    options: adapterId === "minimax_h3_turbo" ? { low_vram: false } : {},
+  };
+}
+
+export function normalizeLoraLoaderOverrides(
+  values: readonly unknown[],
+): LoraLoaderOverrideRecord[] {
+  const sorted = values.slice(0, 256)
+    .map(migrateLoraLoaderOverride)
+    .filter(validLoraLoaderOverride)
+    .map((record) => ({ ...record, options: { ...record.options } }))
+    .sort(compareLoraLoaderBinding);
+  const collapsed = new Map<string, LoraLoaderOverrideRecord>();
+  for (const record of sorted) {
+    const previous = collapsed.get(record.lora_filename);
+    if (!previous || (
+      record.adapter_id === "minimax_h3_turbo" &&
+      previous.adapter_id !== "minimax_h3_turbo"
+    )) collapsed.set(record.lora_filename, record);
+  }
+  return [...collapsed.values()].sort(compareLoraLoaderBinding);
+}
+
+function sanitizeRuntimeSettingsBase(value: Record<string, unknown>): Omit<
+  RuntimeSettings,
+  "schema_version" | "lora_loader_overrides"
+> {
+  const fallback = DEFAULT_SETTINGS;
+  const clientId =
+    typeof value.client_id === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(value.client_id)
+      ? value.client_id
+      : fallback.client_id;
+  const placement = isRecord(value.placement) ? value.placement : {};
+  const normalizeDiffusionPlacement = (
+    role: DiffusionModelRole,
+  ): RuntimeDiffusionPlacement => {
+    const candidate = isRecord(placement[role]) ? placement[role] : {};
+    return {
+      device: normalizeDevice(candidate.device, true, fallback.placement[role].device),
+      raylight: normalizeRayLightProfile(candidate.raylight, fallback.placement[role].raylight),
+    };
+  };
+  return {
+    client_id: clientId,
+    memory_policy: "keep_resident",
+    raylight_residency_policy: ["release_after_sampling", "keep_until_switch"].includes(
+      String(value.raylight_residency_policy),
+    )
+      ? value.raylight_residency_policy as RayLightResidencyPolicy
+      : fallback.raylight_residency_policy,
+    multi_gpu_enabled: value.multi_gpu_enabled === true,
+    placement: {
+      fl2va: normalizeDiffusionPlacement("fl2va"),
+      ref2va: normalizeDiffusionPlacement("ref2va"),
+      clip_device: normalizeDevice(placement.clip_device, true, fallback.placement.clip_device),
+      video_vae_device: normalizeDevice(
+        placement.video_vae_device,
+        false,
+        fallback.placement.video_vae_device,
+      ) as VaeDeviceTarget,
+      audio_vae_device: normalizeDevice(
+        placement.audio_vae_device,
+        false,
+        fallback.placement.audio_vae_device,
+      ) as VaeDeviceTarget,
+    },
+  };
+}
+
+function strictRuntimePlacement(value: Record<string, unknown>): boolean {
+  if (!hasExactKeys(value.placement, [
+    "fl2va", "ref2va", "clip_device", "video_vae_device", "audio_vae_device",
+  ])) return false;
+  for (const role of ["fl2va", "ref2va"] as const) {
+    const placement = value.placement[role];
+    if (!hasExactKeys(placement, ["device", "raylight"]) || !hasExactKeys(placement.raylight, [
+      "gpu_select", "ulysses_degree", "ring_degree", "cfg_degree", "dp_degree",
+      "fsdp", "cpu_offload",
+    ])) return false;
+  }
+  return true;
+}
+
+/** Frozen parser for Stage-6 pending settings WALs. */
+export function parseRuntimeSettingsV2(value: unknown): RuntimeSettingsV2 | null {
+  if (!hasExactKeys(value, [
+    "schema_version",
+    "client_id",
+    "memory_policy",
+    "raylight_residency_policy",
+    "multi_gpu_enabled",
+    "placement",
+    "legacy_lora_resolution_compat",
+  ]) || value.schema_version !== 2) return null;
+  if (!strictRuntimePlacement(value)) return null;
+  const compat = value.legacy_lora_resolution_compat;
+  if (!hasExactKeys(compat, [
+    "schema_version", "auto_resolution_strategy_version", "explicit_overrides",
+  ]) || !Array.isArray(compat.explicit_overrides)) return null;
+  if (compat.explicit_overrides.some((entry) => !hasExactKeys(entry, [
+    "family", "model_filename", "lora_filename", "loader",
+  ]))) return null;
+  const explicitOverrides = compat.explicit_overrides
+    .filter((entry): entry is LegacyStandardLoraOverrideEvidence =>
+      isRecord(entry) &&
+      (entry.family === "fl2va" || entry.family === "ref2va") &&
+      typeof entry.model_filename === "string" && entry.model_filename.length >= 1 &&
+      entry.model_filename.length <= 1_024 &&
+      typeof entry.lora_filename === "string" && entry.lora_filename.length >= 1 &&
+      entry.lora_filename.length <= 1_024 &&
+      (entry.loader === "dedicated" ||
+        entry.loader === "bypass_model_only" ||
+        entry.loader === "model_only"))
+    .map((entry) => ({ ...entry }))
+    .sort((left, right) => compareUtf16Strings(left.family, right.family))
+    .filter((entry, index, records) => index === 0 || records[index - 1].family !== entry.family);
+  const normalized: RuntimeSettingsV2 = {
+    schema_version: 2,
+    ...sanitizeRuntimeSettingsBase(value),
+    legacy_lora_resolution_compat: {
+      schema_version: 1,
+      auto_resolution_strategy_version: "v4-known-filename-or-safetensors-metadata-v1",
+      explicit_overrides: explicitOverrides,
+    },
+  };
+  try {
+    return canonicalJson(value) === canonicalJson(normalized) ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
+export function migrateRuntimeSettingsV2ToV3(value: RuntimeSettingsV2): RuntimeSettings {
+  const legacyRecords = value.legacy_lora_resolution_compat.explicit_overrides.map((record) => ({
+    lora_filename: record.lora_filename,
+    adapter_id: record.loader === "dedicated" ? "minimax_h3_turbo" : "model_only",
+    options: record.loader === "dedicated" ? { low_vram: false } : {},
+  })).sort(compareLoraLoaderBinding);
+  const migratedRecords = normalizeLoraLoaderOverrides(legacyRecords);
+  return {
+    schema_version: 3,
+    client_id: value.client_id,
+    memory_policy: value.memory_policy,
+    raylight_residency_policy: value.raylight_residency_policy,
+    multi_gpu_enabled: value.multi_gpu_enabled,
+    placement: structuredClone(value.placement),
+    lora_loader_overrides: migratedRecords,
+  };
+}
+
+/** Normalizes only RuntimeSettingsV3. Older documents require explicit migration. */
+export function sanitizeRuntimeSettings(value: unknown): RuntimeSettings {
+  const fallback = structuredClone(DEFAULT_SETTINGS);
+  if (!isRecord(value) || value.schema_version !== 3) return fallback;
+  return {
+    schema_version: 3,
+    ...sanitizeRuntimeSettingsBase(value),
+    lora_loader_overrides: Array.isArray(value.lora_loader_overrides)
+      ? normalizeLoraLoaderOverrides(value.lora_loader_overrides)
+      : [],
+  };
+}
+
+export function parseRuntimeSettingsV3(value: unknown): RuntimeSettings | null {
+  if (!hasExactKeys(value, [
+    "schema_version",
+    "client_id",
+    "memory_policy",
+    "raylight_residency_policy",
+    "multi_gpu_enabled",
+    "placement",
+    "lora_loader_overrides",
+  ]) || value.schema_version !== 3 || !strictRuntimePlacement(value)) return null;
+  if (
+    !Array.isArray(value.lora_loader_overrides) ||
+    value.lora_loader_overrides.length > 256 ||
+    value.lora_loader_overrides.some((entry) => !validLoraLoaderOverride(entry))
+  ) return null;
+  const normalized = sanitizeRuntimeSettings(value);
+  try {
+    return canonicalJson(value) === canonicalJson(normalized) ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
 export const EMPTY_CAPABILITIES: CapabilityReport = {
   connection: "unknown",
   supported_modes: [],
@@ -791,7 +1465,7 @@ export const EMPTY_RAYLIGHT_RUNTIME_STATUS: RayLightRuntimeStatus = {
 };
 
 /** Exact GET /api/raylight/setup payload (multi-GPU capability and install). */
-export type RayLightInstallState = "idle" | "running" | "needs_restart" | "failed";
+export type RayLightInstallState = "idle" | "running" | "needs_restart" | "ready" | "failed";
 
 export interface RayLightInstallSnapshot {
   state: RayLightInstallState;

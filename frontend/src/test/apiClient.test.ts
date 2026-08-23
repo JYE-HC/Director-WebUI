@@ -1,5 +1,5 @@
 import { ApiError, directorApi } from "../api/client";
-import { DEFAULT_SETTINGS, type GenerationTask } from "../api/types";
+import { DEFAULT_LEGACY_SETTINGS, DEFAULT_SETTINGS, type GenerationTask } from "../api/types";
 import { createInitialDrafts, MODE_ORDER } from "../domain/modes";
 import { createTimelineProject } from "../domain/timelineProject";
 
@@ -62,6 +62,351 @@ describe("Director REST 契约", () => {
     failed: 0,
     cancelled: 0,
   };
+  const capabilityRevision = `sha256:${"a".repeat(64)}`;
+  const adapterFingerprint = `sha256:${"b".repeat(64)}`;
+  const runtimeFingerprint = `sha256:${"c".repeat(64)}`;
+  const catalogEtag = `"sha256:${"d".repeat(64)}"`;
+  const opaqueSegmentId = "123e4567-e89b-12d3-a456-426614174000";
+  const opaqueUnitId = "7/unit:123e4567-e89b-12d3-a456-426614174000";
+  const capabilityReason = {
+    code: "missing_node_contract",
+    feature_id: "sampling",
+    segment_id: opaqueSegmentId,
+    unit_id: opaqueUnitId,
+    backend: "standard",
+    rule: "node_contract_required",
+    message: "采样节点契约不可用",
+    remediation: "安装与当前模板匹配的节点版本",
+    safe_details: { missing_contracts: ["SamplerCustomAdvanced"] },
+  } as const;
+  const availableReadiness = {
+    endpoint_online: true,
+    submission_allowed: true,
+    ray_recovery_required: false,
+    ray_tainted: false,
+    invalid_runtime_gpu_indices: [],
+    blocking_reason_codes: [],
+  } as const;
+  const catalog = {
+    template_bundle_version: 4,
+    host_capability_revision: capabilityRevision,
+    entries: [{
+      id: "sampling",
+      version: 1,
+      title: "Sampling",
+      description: "Emit the segment sampler.",
+      mode: "needed",
+      layer: "graph",
+      scopes: ["segment"],
+      params_schema: { type: "object", additionalProperties: false },
+      defaults: {},
+      backends: ["standard", "raylight"],
+      availability: { state: "conditional", reasons: [capabilityReason] },
+      adapter_options: [],
+      ui: { visibility: "internal_v4" },
+    }],
+  } as const;
+  const validPreflight = {
+    template_bundle_version: 4,
+    host_capability_revision: capabilityRevision,
+    operational_readiness: availableReadiness,
+    valid: true,
+    errors: [],
+    effective_by_segment: {
+      [opaqueSegmentId]: {
+        unit_id: opaqueUnitId,
+        backend: "standard",
+        family: "fl2va",
+        template_id: "h3_standard_segment",
+        features: [{
+          id: "sampling",
+          version: 1,
+          state: "active",
+          adapter_fingerprint: adapterFingerprint,
+          capability: {
+            available: true,
+            reasons: [],
+            verified_contracts: ["sampling_contract"],
+            runtime_fingerprints: [runtimeFingerprint],
+          },
+        }],
+      },
+    },
+  } as const;
+
+  it("从独立产品配置读取 LoRA 加载器清单", async () => {
+    const config = {
+      schema_version: 1,
+      lora: {
+        loaders: [
+          {
+            id: "model_only",
+            display_name: "LoRA加载器（仅模型）",
+            class_type: "LoraLoaderModelOnly",
+            input_contract: "model_only",
+            supported_families: ["fl2va", "ref2va"],
+            options: [],
+          },
+          {
+            id: "minimax_h3_turbo",
+            display_name: "MiniMax-H3 Turbo LoRA",
+            class_type: "MiniMaxH3TurboLoRA",
+            input_contract: "dedicated_model",
+            supported_families: ["fl2va", "ref2va"],
+            options: [{
+              id: "low_vram",
+              type: "boolean",
+              label: "low_vram",
+              description: "启用低显存模式",
+              default: false,
+            }],
+          },
+        ],
+        fallback_policy: {
+          loader_ids: ["model_only"],
+          default_loader_id: "model_only",
+        },
+        loader_policies: [{
+          lora_filename: "minimax_h3_turbo_.*\\.safetensors$",
+          loader_ids: ["minimax_h3_turbo"],
+          default_loader_id: "minimax_h3_turbo",
+        }],
+      },
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse(config));
+
+    await expect(directorApi.getDirectorDeckConfig()).resolves.toEqual(config);
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/config");
+    expect(JSON.stringify(config)).not.toContain("directordeck.node");
+  });
+
+  it("功能目录严格解析强 ETag，并可用 If-None-Match 取得 304", async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify(catalog), {
+        status: 200,
+        headers: { "Content-Type": "application/json", ETag: catalogEtag },
+      }))
+      .mockResolvedValueOnce(new Response(null, {
+        status: 304,
+        headers: { ETag: catalogEtag },
+      }));
+
+    await expect(directorApi.getFeatureCatalog()).resolves.toEqual({
+      status: "fresh",
+      etag: catalogEtag,
+      catalog,
+    });
+    await expect(directorApi.getFeatureCatalog(catalogEtag)).resolves.toEqual({
+      status: "not_modified",
+      etag: catalogEtag,
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/features/catalog");
+    expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("If-None-Match"))
+      .toBeNull();
+    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("If-None-Match"))
+      .toBe(catalogEtag);
+  });
+
+  it("功能目录宽容读取 Standard LoRA adapter 宿主观测", async () => {
+    const option = {
+      adapter_id: "model_only",
+      display_name: "LoRA加载器（仅模型）",
+      class_type: "LoraLoaderModelOnly",
+      is_default: true,
+      backend: "standard",
+      supported_families: ["fl2va", "ref2va"],
+      configuration_options: [],
+      adapter_fingerprint: adapterFingerprint,
+      capability: {
+        available: true,
+        reasons: [],
+        verified_contracts: ["directordeck.node.LoraLoaderModelOnly"],
+        runtime_fingerprints: [runtimeFingerprint],
+      },
+    } as const;
+    const loraCatalog = {
+      ...catalog,
+      entries: [{
+        ...catalog.entries[0],
+        id: "lora",
+        title: "LoRA",
+        adapter_options: [option],
+      }],
+    };
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify(loraCatalog), {
+        status: 200,
+        headers: { "Content-Type": "application/json", ETag: catalogEtag },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...loraCatalog,
+        entries: [{
+          ...loraCatalog.entries[0],
+          adapter_options: [option, option],
+        }],
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", ETag: catalogEtag },
+      }));
+
+    await expect(directorApi.getFeatureCatalog()).resolves.toMatchObject({
+      status: "fresh",
+      catalog: {
+        entries: [{
+          id: "lora",
+          adapter_options: [option],
+        }],
+      },
+    });
+    await expect(directorApi.getFeatureCatalog()).resolves.toMatchObject({
+      status: "fresh",
+      catalog: {
+        entries: [{
+          id: "lora",
+          adapter_options: [option],
+        }],
+      },
+    });
+  });
+
+  it("功能目录拒绝弱 ETag、额外 wire 字段和未声明 family", async () => {
+    await expect(directorApi.getFeatureCatalog(`W/${catalogEtag}`)).rejects.toThrow(
+      "功能目录 ETag 无效",
+    );
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...catalog,
+      entries: [{ ...catalog.entries[0], families: ["fl2va"] }],
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json", ETag: catalogEtag },
+    }));
+    await expect(directorApi.getFeatureCatalog()).rejects.toThrow(
+      "功能目录条目结构无效",
+    );
+  });
+
+  it("功能目录允许同一功能的不同版本并拒绝重复 id/version", async () => {
+    const versioned = {
+      ...catalog,
+      entries: [catalog.entries[0], { ...catalog.entries[0], version: 2 }],
+    };
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify(versioned), {
+        status: 200,
+        headers: { "Content-Type": "application/json", ETag: catalogEtag },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...catalog,
+        entries: [catalog.entries[0], catalog.entries[0]],
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", ETag: catalogEtag },
+      }));
+
+    await expect(directorApi.getFeatureCatalog()).resolves.toMatchObject({
+      status: "fresh",
+      catalog: { entries: [expect.objectContaining({ version: 1 }), expect.objectContaining({ version: 2 })] },
+    });
+    await expect(directorApi.getFeatureCatalog()).rejects.toThrow(
+      "功能目录包含重复功能版本",
+    );
+  });
+
+  it("功能 preflight 使用 v4 配置并严格重建 effective resolution", async () => {
+    const project = createTimelineProject();
+    project.segments[0].id = opaqueSegmentId;
+    fetchMock.mockResolvedValueOnce(jsonResponse(validPreflight));
+
+    await expect(directorApi.preflightFeatures({
+      config: project,
+      segment_ids: [opaqueSegmentId],
+      project_id: "default",
+    })).resolves.toEqual(validPreflight);
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/features/preflight");
+    expect(fetchMock.mock.calls[0][1]?.method).toBe("POST");
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
+      config: project,
+      segment_ids: [opaqueSegmentId],
+      project_id: "default",
+    });
+  });
+
+  it("Ray taint 本身不阻止带完整 descriptor 的提交预检", async () => {
+    const taintedButRecoverable = {
+      ...validPreflight,
+      operational_readiness: {
+        ...availableReadiness,
+        ray_tainted: true,
+      },
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse(taintedButRecoverable));
+
+    await expect(directorApi.preflightFeatures({
+      config: createTimelineProject(),
+    })).resolves.toEqual(taintedButRecoverable);
+  });
+
+  it("功能有效性与顶层 Ray 运行就绪诊断相互独立", async () => {
+    const runtimeAdvisory = {
+      ...validPreflight,
+      operational_readiness: {
+        ...availableReadiness,
+        submission_allowed: false,
+        ray_recovery_required: true,
+        ray_tainted: true,
+        blocking_reason_codes: ["ray_recovery_required", "ray_cleanup_unavailable"],
+      },
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse(runtimeAdvisory));
+
+    await expect(directorApi.preflightFeatures({
+      config: createTimelineProject(),
+    })).resolves.toEqual(runtimeAdvisory);
+  });
+
+  it("功能 preflight 对有效性矛盾、未知错误字段和坏指纹失败封闭", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ ...validPreflight, valid: false }))
+      .mockResolvedValueOnce(jsonResponse({
+        ...validPreflight,
+        valid: false,
+        errors: [{ ...capabilityReason, leaked_path: "/private/model" }],
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        ...validPreflight,
+        effective_by_segment: {
+          [opaqueSegmentId]: {
+            ...validPreflight.effective_by_segment[opaqueSegmentId],
+            features: [{
+              ...validPreflight.effective_by_segment[opaqueSegmentId].features[0],
+              adapter_fingerprint: "not-a-digest",
+            }],
+          },
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        ...validPreflight,
+        effective_by_segment: {
+          "bad\nsegment": validPreflight.effective_by_segment[opaqueSegmentId],
+        },
+      }));
+
+    await expect(directorApi.preflightFeatures({
+      config: createTimelineProject(),
+    })).rejects.toThrow("功能预检有效性摘要无效");
+    await expect(directorApi.preflightFeatures({
+      config: createTimelineProject(),
+    })).rejects.toThrow("功能能力原因结构无效");
+    await expect(directorApi.preflightFeatures({
+      config: createTimelineProject(),
+    })).rejects.toThrow("功能预检解析项结构无效");
+    await expect(directorApi.preflightFeatures({
+      config: createTimelineProject(),
+    })).rejects.toThrow("功能预检包含无效分段 ID");
+  });
+
   it("能力、GPU、模型和设置使用固定 /api 路由", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ connection: "online", supported_modes: [], supports_cancel: true, available_nodes: [], missing_nodes: [] }))
@@ -108,6 +453,85 @@ describe("Director REST 契约", () => {
     expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get(
       "X-Director-Runtime-Authority",
     )).toBe(token);
+  });
+
+  it("RuntimeSettingsV3 API 严格接受 LoRA 路径与加载器配置并拒绝截断、乱序和重复", async () => {
+    const exactRecords = [
+      {
+        lora_filename: "LoRA/H3/Turbo-A.Exact.safetensors",
+        adapter_id: "minimax_h3_turbo" as const,
+        options: { low_vram: true },
+      },
+      {
+        lora_filename: "LoRA/H3/Turbo-b.Exact.safetensors",
+        adapter_id: "model_only" as const,
+        options: {},
+      },
+    ];
+    const exact = { ...CONFIGURED_SETTINGS, lora_loader_overrides: exactRecords };
+    fetchMock.mockResolvedValueOnce(jsonResponse(exact));
+    await expect(directorApi.getSettings()).resolves.toEqual(exact);
+
+    const records257 = Array.from({ length: 257 }, (_, index) => ({
+      lora_filename: `LoRA/H3/exact-${index.toString().padStart(3, "0")}.safetensors`,
+      adapter_id: "model_only",
+      options: {},
+    }));
+    const invalidDocuments: unknown[] = [
+      { ...exact, lora_loader_overrides: [...exactRecords].reverse() },
+      { ...exact, lora_loader_overrides: [exactRecords[0], exactRecords[0]] },
+      { ...exact, lora_loader_overrides: records257 },
+      {
+        ...exact,
+        lora_loader_overrides: [{ ...exactRecords[0], options: { low_vram: "yes" } }],
+      },
+      {
+        ...exact,
+        lora_loader_overrides: [{ ...exactRecords[0], unexpected: true }],
+      },
+      {
+        ...exact,
+        lora_loader_overrides: [{
+          ...exactRecords[0],
+          lora_filename: "LoRA/H3/unpaired-\uD800.safetensors",
+        }],
+      },
+    ];
+    for (const document of invalidDocuments) {
+      fetchMock.mockResolvedValueOnce(jsonResponse(document));
+      await expect(directorApi.getSettings())
+        .rejects.toThrow("运行设置响应包含过期或无效 schema");
+    }
+  });
+
+  it("严格解析 settings migration notice 并拒绝额外字段或无时区日期", async () => {
+    const notice = {
+      schema_version: 1,
+      id: "runtime-settings-v2-v3-lora-resolution-review",
+      code: "legacy_lora_resolution_review_required",
+      severity: "warning",
+      action: "review_lora_loader_mappings",
+      legacy_strategy_version: "v4-known-filename-or-safetensors-metadata-v1",
+      message: "Review exact model and LoRA adapter mappings before use.",
+      created_at: "2026-08-22T12:00:00Z",
+    } as const;
+    fetchMock.mockResolvedValueOnce(jsonResponse({ notices: [notice] }));
+    await expect(directorApi.getSettingsMigrationNotices()).resolves.toEqual({
+      notices: [notice],
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/directordeck/api/settings/migration-notices",
+    );
+
+    for (const malformed of [
+      { notices: [{ ...notice, unexpected: true }] },
+      { notices: [{ ...notice, created_at: "2026-08-22T12:00:00" }] },
+      { notices: [{ ...notice, action: "auto_create_mapping" }] },
+    ]) {
+      fetchMock.mockResolvedValueOnce(jsonResponse(malformed));
+      await expect(directorApi.getSettingsMigrationNotices())
+        .rejects.toThrow("运行设置迁移提示响应结构无效");
+    }
   });
 
   it("RayLight 运行状态 GET 与重启确认 POST 使用严格 endpoint/epoch 证书", async () => {
@@ -480,7 +904,7 @@ describe("Director REST 契约", () => {
           available: true,
           missing_nodes: [],
           conditional_requirements: {
-            lora: { available: false, missing_nodes: ["RayLoraLoader"] },
+            lora: { available: false, missing_nodes: ["DirectorDeckRayLoraLoader"] },
           },
         },
       },
@@ -495,7 +919,7 @@ describe("Director REST 契约", () => {
           available: true,
           missing_nodes: [],
           conditional_requirements: {
-            lora: { available: false, missing_nodes: ["RayLoraLoader"] },
+            lora: { available: false, missing_nodes: ["DirectorDeckRayLoraLoader"] },
           },
         },
       },
@@ -594,15 +1018,22 @@ describe("Director REST 契约", () => {
 
   it("设置和连接测试发送后端要求的 snake_case payload", async () => {
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(CONFIGURED_SETTINGS))
+      .mockResolvedValueOnce(jsonResponse({
+        settings: CONFIGURED_SETTINGS,
+        authority_token: RUNTIME_AUTHORITY_TOKEN,
+      }))
       .mockResolvedValueOnce(jsonResponse({ ok: true, message: "连接成功" }));
 
-    await directorApi.updateSettings(CONFIGURED_SETTINGS);
+    await directorApi.updateSettingsAuthority(CONFIGURED_SETTINGS, RUNTIME_AUTHORITY_TOKEN);
     await directorApi.testConnection();
 
-    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/settings");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/settings/authority");
     expect(fetchMock.mock.calls[0][1]?.method).toBe("PUT");
-    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual(CONFIGURED_SETTINGS);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
+      document: CONFIGURED_SETTINGS,
+      expected_authority_token: RUNTIME_AUTHORITY_TOKEN,
+      schema_version: 3,
+    });
     expect(fetchMock.mock.calls[1][0]).toBe("/directordeck/api/capabilities");
     expect(fetchMock.mock.calls[1][1]?.method).toBe("POST");
     expect(fetchMock.mock.calls[1][1]?.body).toBeUndefined();
@@ -783,6 +1214,11 @@ describe("Director REST 契约", () => {
       subfolder: "directordeck",
       type: "input",
       kind: "image",
+      filename: null,
+      path: null,
+      preview_url: null,
+      content_hash: null,
+      metadata: null,
     };
     fetchMock
       .mockResolvedValueOnce(jsonResponse({
@@ -815,6 +1251,11 @@ describe("Director REST 契约", () => {
       subfolder: "directordeck",
       type: "input",
       kind: "image",
+      filename: null,
+      path: null,
+      preview_url: null,
+      content_hash: null,
+      metadata: null,
     };
     fetchMock
       .mockResolvedValueOnce(jsonResponse({
@@ -884,6 +1325,11 @@ describe("Director REST 契约", () => {
       subfolder: "directordeck",
       type: "input",
       kind: "image",
+      filename: null,
+      path: null,
+      preview_url: null,
+      content_hash: null,
+      metadata: null,
     };
     const second = {
       id: "asset-two",
@@ -891,6 +1337,11 @@ describe("Director REST 契约", () => {
       subfolder: "directordeck",
       type: "input",
       kind: "audio",
+      filename: null,
+      path: null,
+      preview_url: null,
+      content_hash: null,
+      metadata: null,
     };
     const batch = {
       batch_id: "batch/one",
@@ -1314,7 +1765,11 @@ describe("Director REST 契约", () => {
     await expect(directorApi.importTaskOutput(job.id, {
       index: 3,
       segmentId: project.segments[0].id,
-    })).resolves.toMatchObject({ id: "imported-video", kind: "video" });
+    })).resolves.toMatchObject({
+      id: "imported-video",
+      kind: "video",
+      content_hash: `sha256:${"a".repeat(64)}`,
+    });
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/directordeck/api/jobs/cancel",
@@ -1407,7 +1862,22 @@ describe("Director REST 契约", () => {
 
   it("编译端点只接收服务端脱敏计划并拒绝 workflow/prompt 泄漏", async () => {
     const project = createTimelineProject();
+    const compiledLoraCapability = {
+      available: true,
+      reasons: [],
+      verified_contracts: ["node.LoraLoaderModelOnly"],
+      runtime_fingerprints: [`sha256:${"c".repeat(64)}`],
+    };
+    const compiledLora = {
+      id: "lora",
+      version: 1,
+      state: "active",
+      adapter_fingerprint: `sha256:${"d".repeat(64)}`,
+      capability: compiledLoraCapability,
+    } as const;
     const report = {
+      template_bundle_version: project.features.template_bundle_version,
+      host_capability_revision: `sha256:${"a".repeat(64)}`,
       execution_strategy: "native_segment_graph_v1",
       model_families: ["fl2va"],
       plans: [{
@@ -1441,12 +1911,63 @@ describe("Director REST 契约", () => {
           SamplerCustomAdvanced: "comfy-extras",
         },
       },
+      features: {
+        requested: project.features,
+        effective_by_segment: {
+          [project.segments[0].id]: {
+            unit_id: `segment:${project.segments[0].id}`,
+            backend: "standard",
+            family: "fl2va",
+            template_id: "h3_standard_segment",
+            features: [compiledLora],
+          },
+        },
+        resolutions: [{
+          segment_id: project.segments[0].id,
+          unit_id: `segment:${project.segments[0].id}`,
+          feature_id: compiledLora.id,
+          version: compiledLora.version,
+          backend: "standard",
+          family: "fl2va",
+          template_id: "h3_standard_segment",
+          resolution: {
+            state: compiledLora.state,
+            implementations: [{
+              role: "model_patch",
+              class_type: "LoraLoaderModelOnly",
+              implementation_id: "builtin.standard_lora",
+              semantic_version: "1.0.0",
+              runtime_fingerprint: `sha256:${"e".repeat(64)}`,
+              binding_key: "lora.loader",
+            }],
+            resolution_details: { loader: "LoraLoaderModelOnly" },
+          },
+          adapter_fingerprint: compiledLora.adapter_fingerprint,
+          capability: compiledLoraCapability,
+        }],
+        notices: [{
+          segment_id: project.segments[0].id,
+          unit_id: `segment:${project.segments[0].id}`,
+          feature_id: compiledLora.id,
+          message: "已解析项目级 LoRA。",
+        }],
+      },
+      effective_execution_digest: {
+        algorithm: "sha256-canonical-json-v1",
+        value: `sha256-${"b".repeat(64)}`,
+      },
     };
     fetchMock.mockResolvedValueOnce(jsonResponse(report));
 
     await expect(directorApi.compileTimeline({ config: project })).resolves.toEqual(report);
     expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/timeline/compile");
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({ config: project });
+    expect(() => directorApi.compileTimeline({} as never)).toThrow(
+      "时间线任务请求必须携带显式 v5 config",
+    );
+    expect(() => directorApi.compileTimeline({
+      config: { ...project, version: 4 },
+    } as never)).toThrow("时间线任务 config 不是严格 v5 文档");
 
     fetchMock.mockResolvedValueOnce(jsonResponse({
       ...report,
@@ -1493,6 +2014,28 @@ describe("Director REST 契约", () => {
           anchor_reset: false,
         },
       ],
+      features: {
+        ...report.features,
+        effective_by_segment: {
+          ...report.features.effective_by_segment,
+          "successor-segment": {
+            unit_id: "segment:successor-segment",
+            backend: "standard",
+            family: "ref2va",
+            template_id: "h3_standard_segment",
+            features: [compiledLora],
+          },
+        },
+        resolutions: [
+          ...report.features.resolutions,
+          {
+            ...report.features.resolutions[0],
+            segment_id: "successor-segment",
+            unit_id: "segment:successor-segment",
+            family: "ref2va",
+          },
+        ],
+      },
     }));
     await expect(directorApi.compileTimeline({ config: project })).resolves.toMatchObject({
       plans: [
@@ -1586,10 +2129,111 @@ describe("Director REST 契约", () => {
           alignment_tail_frame_count: 1,
         }],
       },
+      {
+        ...report,
+        template_bundle_version: report.template_bundle_version + 1,
+      },
+      {
+        ...report,
+        features: {
+          ...report.features,
+          resolutions: [{
+            ...report.features.resolutions[0],
+            unit_id: "segment:wrong-unit",
+          }],
+        },
+      },
+      {
+        ...report,
+        effective_execution_digest: {
+          algorithm: "sha256-canonical-json-v1",
+          value: `sha256:${"e".repeat(64)}`,
+        },
+      },
     ];
     for (const malformed of malformedSemanticReports) {
       fetchMock.mockResolvedValueOnce(jsonResponse(malformed));
       await expect(directorApi.compileTimeline({ config: project })).rejects.toThrow(/执行计划/);
+    }
+
+    const malformedNestedFeatureReports = [
+      {
+        ...report,
+        features: {
+          ...report.features,
+          resolutions: [{
+            ...report.features.resolutions[0],
+            resolution: {
+              ...report.features.resolutions[0].resolution,
+              implementations: [],
+            },
+          }],
+        },
+      },
+      {
+        ...report,
+        features: {
+          ...report.features,
+          resolutions: [{
+            ...report.features.resolutions[0],
+            resolution: {
+              ...report.features.resolutions[0].resolution,
+              implementations: [{
+                ...report.features.resolutions[0].resolution.implementations[0],
+                executable: "hidden",
+              }],
+            },
+          }],
+        },
+      },
+      {
+        ...report,
+        features: {
+          ...report.features,
+          resolutions: [{
+            ...report.features.resolutions[0],
+            resolution: {
+              state: "noop",
+              implementations: [],
+              resolution_details: {},
+            },
+          }],
+        },
+      },
+      {
+        ...report,
+        features: {
+          ...report.features,
+          resolutions: [{
+            ...report.features.resolutions[0],
+            resolution: {
+              ...report.features.resolutions[0].resolution,
+              resolution_details: { unsafe_integer: 9_007_199_254_740_992 },
+            },
+          }],
+        },
+      },
+      {
+        ...report,
+        features: {
+          ...report.features,
+          notices: ["旧版字符串提示"],
+        },
+      },
+      {
+        ...report,
+        features: {
+          ...report.features,
+          notices: [{
+            ...report.features.notices[0],
+            feature_id: "missing.feature",
+          }],
+        },
+      },
+    ];
+    for (const malformed of malformedNestedFeatureReports) {
+      fetchMock.mockResolvedValueOnce(jsonResponse(malformed));
+      await expect(directorApi.compileTimeline({ config: project })).rejects.toThrow(/功能/);
     }
 
     const { sample_frame_count: _omittedSampleFrames, ...legacyPlan } = report.plans[0];
@@ -1726,7 +2370,6 @@ describe("Director REST 契约", () => {
         projects: [summary],
       }))
       .mockResolvedValueOnce(jsonResponse(summary))
-      .mockResolvedValueOnce(jsonResponse(summary))
       .mockResolvedValueOnce(jsonResponse({
         deleted_project_id: "project-1",
         outputs_preserved: true,
@@ -1739,7 +2382,6 @@ describe("Director REST 契约", () => {
       projects: [summary],
     });
     await expect(directorApi.createProject("第二部影片")).resolves.toEqual(summary);
-    await expect(directorApi.renameProject("project-1", "改名")).resolves.toEqual(summary);
     await expect(directorApi.deleteProject("project-1")).resolves.toEqual({
       deleted_project_id: "project-1",
       outputs_preserved: true,
@@ -1751,7 +2393,6 @@ describe("Director REST 契约", () => {
     expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
       ["/directordeck/api/projects", "GET"],
       ["/directordeck/api/projects", "POST"],
-      ["/directordeck/api/projects/project-1", "PATCH"],
       ["/directordeck/api/projects/project-1", "DELETE"],
       ["/directordeck/api/projects/project-1/timeline", "GET"],
       ["/directordeck/api/projects/project-1/timeline", "PUT"],
@@ -1768,7 +2409,7 @@ describe("Director REST 契约", () => {
     await expect(directorApi.listProjects()).rejects.toThrow("项目列表响应结构无效");
   });
 
-  it("导入项目 POST 到 /api/projects/import 并严格解析摘要", async () => {
+  it("导入项目必须先 preflight，再用 exact digest/token commit", async () => {
     const summary = {
       id: "project-2",
       title: "历史来源",
@@ -1777,15 +2418,56 @@ describe("Director REST 契约", () => {
       segment_count: 1,
     };
     const project = createTimelineProject();
-    fetchMock.mockResolvedValueOnce(jsonResponse(summary));
+    const creativeSelection = {
+      model_stack: project.model_stack,
+      lora: project.features.project.lora,
+    };
+    const inputDigest = {
+      algorithm: "sha256-canonical-json-v1" as const,
+      value: `sha256-${"a".repeat(64)}`,
+    };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        schema_version: 1,
+        status: "ready",
+        input_digest: inputDigest,
+        proposed_document: project,
+        missing_context: [],
+        missing_model_bindings: [],
+        capability_issues: [],
+        commit_token: "commit-token".padEnd(32, "x"),
+        expires_at: "2026-08-21T01:00:00Z",
+      }))
+      .mockResolvedValueOnce(jsonResponse(summary));
 
-    await expect(directorApi.importProject({ title: "历史来源", document: project }))
+    await expect(directorApi.preflightProjectImport({
+      title: "历史来源",
+      document: project,
+      creative_selection: creativeSelection,
+    })).resolves.toMatchObject({ status: "ready", input_digest: inputDigest });
+    await expect(directorApi.commitProjectImport({
+      commit_token: "commit-token".padEnd(32, "x"),
+      input_digest: inputDigest,
+    }))
       .resolves.toEqual(summary);
-    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/projects/import");
+    expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/projects/import/preflight");
     expect(fetchMock.mock.calls[0][1]?.method).toBe("POST");
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
       title: "历史来源",
       document: project,
+      creative_selection: creativeSelection,
     });
+    expect(fetchMock.mock.calls[1][0]).toBe("/directordeck/api/projects/import/commit");
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      commit_token: "commit-token".padEnd(32, "x"),
+      input_digest: inputDigest,
+    });
+
+    expect(() => directorApi.preflightProjectImport({
+      title: "冲突上下文",
+      document: project,
+      legacy_runtime_settings: DEFAULT_LEGACY_SETTINGS,
+      creative_selection: creativeSelection,
+    } as never)).toThrow("项目导入预检创作上下文无效");
   });
 });
