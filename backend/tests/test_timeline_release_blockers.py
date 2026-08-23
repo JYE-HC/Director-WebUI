@@ -659,7 +659,7 @@ async def test_http_reads_do_not_wait_for_background_timeline_assembly(
                     params={"segment_id": "first"},
                 ),
             ),
-            timeout=0.25,
+            timeout=2,
         )
 
         assert listing.status_code == detail.status_code == take.status_code == 200

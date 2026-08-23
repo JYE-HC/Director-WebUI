@@ -1,0 +1,2 @@
+backend/tests/fixtures/extensible_workflow_v0/*.json text eol=lf
+backend/tests/fixtures/extensible_workflow_v0/*.gz binary

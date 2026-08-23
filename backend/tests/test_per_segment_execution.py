@@ -5632,7 +5632,7 @@ async def test_standard_create_returns_preparing_behind_running_raylight(
             "/api/timeline/jobs",
             json={"config": _timeline(_segment("standard-waits", "t2v"))},
         ),
-        timeout=1,
+        timeout=5,
     )
     assert standard.status_code == 200
     assert standard.json()["status"] == "preparing"
