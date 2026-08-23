@@ -8850,6 +8850,14 @@ def create_app(
             )
             yield
         finally:
+            # Explicitly stop installer subprocesses before uvicorn closes its
+            # event loop. Pending pip/download children must not survive a
+            # ComfyUI restart, especially on Windows Desktop.
+            await asyncio.gather(
+                app.state.raylight_install_manager.close(),
+                app.state.ffmpeg_install_manager.close(),
+                return_exceptions=True,
+            )
             managed_background = [
                 task
                 for task in (recovery_task, reconciler_task)
@@ -8915,7 +8923,18 @@ def create_app(
     app.state.progress_manager = progress_manager
     app.state.live_preview_cache = live_preview_cache
     app.state.raylight_install_manager = RayLightInstallManager()
-    app.state.ffmpeg_install_manager = FFmpegInstallManager()
+    host_capability_invalidator = getattr(
+        host_capability_provider,
+        "invalidate",
+        None,
+    )
+    app.state.ffmpeg_install_manager = FFmpegInstallManager(
+        on_ready=(
+            host_capability_invalidator
+            if callable(host_capability_invalidator)
+            else None
+        )
+    )
     app.state.project_import_coordinator = ProjectImportCoordinator()
     # The plugin always passes its bundled requirements file; an absent path
     # only means RayLight installation is unavailable for this build.
@@ -9292,8 +9311,16 @@ def create_app(
 
     @app.get("/api/media/setup")
     async def get_media_setup(request: Request) -> dict[str, Any]:
-        status = media_tools_status()
-        status["install"] = request.app.state.ffmpeg_install_manager.snapshot()
+        manager = request.app.state.ffmpeg_install_manager
+        # Progress polling is a lightweight in-memory read. Executable startup
+        # and encoder enumeration may be slow on Windows, so only idle/failed
+        # states perform the real probe in a worker. Re-check the manager after
+        # that await to avoid a mixed `ready:false + install:ready` response.
+        status = manager.media_status_snapshot()
+        if status is None:
+            observed = await anyio.to_thread.run_sync(media_tools_status)
+            status = manager.media_status_snapshot() or observed
+        status["install"] = manager.snapshot()
         return status
 
     @app.post("/api/media/ffmpeg/install")

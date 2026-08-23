@@ -910,6 +910,37 @@ async def test_fake_comfy_shutdown_stops_backend_and_closes_proxy_session(
     assert plugin._proxy_session is None
 
 
+async def test_internal_director_proxy_explicitly_ignores_system_proxy(
+    loaded_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = loaded_plugin.module
+    aiohttp_module = sys.modules["aiohttp"]
+    created: list[dict[str, Any]] = []
+
+    class Session:
+        closed = False
+
+    monkeypatch.setattr(
+        aiohttp_module,
+        "ClientTimeout",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        aiohttp_module,
+        "ClientSession",
+        lambda **kwargs: created.append(kwargs) or Session(),
+        raising=False,
+    )
+    plugin._proxy_session = None
+
+    await plugin._get_proxy_session()
+
+    assert len(created) == 1
+    assert created[0]["trust_env"] is False
+
+
 def test_instance_lock_failure_keeps_owner_diagnostic(
     loaded_plugin: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -1123,10 +1154,15 @@ def test_sidebar_status_contract_has_bounded_polling_and_recovery() -> None:
     source = MENU_ENTRY.read_text(encoding="utf-8")
 
     assert "const STARTING_MAX_ATTEMPTS" in source
+    assert "const STATUS_REQUEST_TIMEOUT_MS" in source
     assert "startingAttempts < STARTING_MAX_ATTEMPTS" in source
     assert "scheduleStatusQuery(RUNTIME_POLL_MS)" in source
+    assert "const controller = new AbortController()" in source
+    assert "signal: controller.signal" in source
+    assert '"后端状态：查询超时"' in source
     assert 'data.backend === "stopped"' in source
     assert 'class="director-refresh"' in source
     assert 'refreshButton.addEventListener("click"' in source
     assert "statusEl.classList.toggle" in source
-    assert "el.isConnected" in source
+    assert "if (!allowDetached && !el.isConnected) return" in source
+    assert "void queryStatus({ allowDetached: true })" in source

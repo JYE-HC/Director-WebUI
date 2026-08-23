@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { directorApi } from "../api/client";
@@ -11,6 +11,8 @@ import {
   type FeatureCapabilityEvaluation,
   type GPUResource,
   type LoraLoaderOverrideRecord,
+  type MediaToolInstallPhase,
+  type MediaToolsStatus,
   type ModelInventory,
   type RayLightRuntimeStatus,
   type RuntimeSettings,
@@ -104,6 +106,66 @@ const DIRECTORDECK_CONFIG: DirectorDeckConfig = {
     }],
   },
 };
+
+function runningMediaSetup(
+  phase?: MediaToolInstallPhase,
+  progressPercent?: number | null,
+): MediaToolsStatus {
+  return {
+    ffmpeg_available: false,
+    ffprobe_available: false,
+    ffmpeg_path: null,
+    encoders_ok: false,
+    ready: false,
+    install: {
+      state: "running",
+      phase,
+      progress_percent: progressPercent,
+      log_tail: [],
+      returncode: null,
+      error: null,
+      started_at: 1,
+    },
+  };
+}
+
+function idleMediaSetup(): MediaToolsStatus {
+  return {
+    ffmpeg_available: false,
+    ffprobe_available: false,
+    ffmpeg_path: null,
+    encoders_ok: false,
+    ready: false,
+    install: {
+      state: "idle",
+      phase: null,
+      progress_percent: null,
+      log_tail: [],
+      returncode: null,
+      error: null,
+      started_at: null,
+    },
+  };
+}
+
+function readyMediaSetup(): MediaToolsStatus {
+  return {
+    ffmpeg_available: true,
+    ffprobe_available: true,
+    ffmpeg_path: "/bundle/ffmpeg",
+    encoders_ok: true,
+    ready: true,
+    install: {
+      state: "ready",
+      phase: null,
+      progress_percent: 100,
+      log_tail: [],
+      returncode: 0,
+      error: null,
+      started_at: 1,
+    },
+  };
+}
 
 function runtimeSettings(): RuntimeSettings {
   return structuredClone(DEFAULT_SETTINGS);
@@ -491,6 +553,137 @@ describe("RuntimeSettingsV3 system settings", () => {
     await waitFor(() => expect(onSucceeded).toHaveBeenCalledTimes(1));
     expect(screen.getByText("当前实例可连接")).toBeInTheDocument();
     expect(screen.getByText(/响应 12 ms/)).toBeInTheDocument();
+  });
+
+  it("keeps the compact system sections and hides the theme chooser", () => {
+    renderSettings();
+
+    const connectionHeading = screen.getByRole("heading", { name: "ComfyUI" });
+    const connectionPanel = connectionHeading.closest(".panel");
+    expect(connectionPanel).toHaveClass("panel--inline-heading");
+    expect(within(connectionPanel as HTMLElement).getByText("连接")).toBeInTheDocument();
+    expect(within(connectionPanel as HTMLElement).getByLabelText("客户端 ID").closest(
+      ".settings-connection-row",
+    )).toContainElement(within(connectionPanel as HTMLElement).getByText("ComfyUI 在线"));
+    expect(screen.queryByText("浏览器仅连接导演台后端，由后端代理 ComfyUI。")).not.toBeInTheDocument();
+
+    expect(screen.getByRole("heading", { name: "数据存储" })).toBeInTheDocument();
+    expect(screen.queryByText("数据库固定在宿主 ComfyUI 的用户目录下，随安装走；运行时不可切换。")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "媒体工具" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "媒体工具 (ffmpeg)" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "界面主题" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["installing_package", "正在安装 static-ffmpeg Python 包…"],
+    ["downloading_binaries", "正在下载 ffmpeg 二进制，请保持代理连接…"],
+    ["verifying", "正在验证 ffmpeg、ffprobe 与编码器…"],
+    [undefined, "正在安装 ffmpeg，请稍候…"],
+  ] as const)("shows the ffmpeg install phase %s", async (phase, message) => {
+    vi.mocked(directorApi.getMediaSetup).mockResolvedValue(runningMediaSetup(phase));
+    renderSettings();
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+  });
+
+  it("shows real ffmpeg binary download progress", async () => {
+    vi.mocked(directorApi.getMediaSetup).mockResolvedValue(
+      runningMediaSetup("downloading_binaries", 42.5),
+    );
+    renderSettings();
+
+    const progress = await screen.findByRole("progressbar", {
+      name: "ffmpeg 二进制下载进度",
+    });
+    expect(progress).toHaveAttribute("max", "100");
+    expect(progress).toHaveAttribute("value", "42.5");
+    expect(within(progress.parentElement as HTMLElement).getByText("42.5%"))
+      .toBeInTheDocument();
+  });
+
+  it("keeps ffmpeg binary download progress indeterminate when no value is available", async () => {
+    vi.mocked(directorApi.getMediaSetup).mockResolvedValue(
+      runningMediaSetup("downloading_binaries", null),
+    );
+    renderSettings();
+
+    const progress = await screen.findByRole("progressbar", {
+      name: "ffmpeg 二进制下载进度",
+    });
+    expect(progress).not.toHaveAttribute("value");
+    const progressRow = progress.parentElement as HTMLElement;
+    expect(within(progressRow).getByText("下载进度计算中…")).toBeInTheDocument();
+    expect(within(progressRow).queryByText(/\d+(?:\.\d+)?%/)).not.toBeInTheDocument();
+  });
+
+  it("shows the POST install phase without waiting for another media probe", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.mocked(directorApi.getMediaSetup).mockResolvedValueOnce(idleMediaSetup());
+    vi.spyOn(directorApi, "installFfmpeg").mockResolvedValue(
+      runningMediaSetup("downloading_binaries", 7.5).install,
+    );
+    renderSettings();
+
+    await user.click(await screen.findByRole("button", { name: "安装 ffmpeg" }));
+
+    expect(await screen.findByText("正在下载 ffmpeg 二进制，请保持代理连接…"))
+      .toBeInTheDocument();
+    expect(screen.getByText("7.5%")).toBeInTheDocument();
+    expect(directorApi.getMediaSetup).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries the initial media status request after a transient failure", async () => {
+    vi.useFakeTimers();
+    vi.mocked(directorApi.getMediaSetup)
+      .mockRejectedValueOnce(new Error("temporary disconnect"))
+      .mockResolvedValueOnce(runningMediaSetup("downloading_binaries", 18));
+    const view = renderSettings();
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2500);
+      });
+
+      expect(screen.getByText("18%")).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers from a failed progress poll and still reaches verified ready", async () => {
+    vi.useFakeTimers();
+    vi.mocked(directorApi.getMediaSetup)
+      .mockResolvedValueOnce(runningMediaSetup("downloading_binaries", 10))
+      .mockRejectedValueOnce(new Error("temporary disconnect"))
+      .mockResolvedValueOnce(runningMediaSetup("downloading_binaries", 42.5))
+      .mockResolvedValueOnce(readyMediaSetup());
+    const view = renderSettings();
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByText("10%")).toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2500);
+      });
+      expect(screen.getByText("42.5%")).toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+      expect(screen.getByText("ffmpeg 可用")).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the database path hidden until the user explicitly reveals it", async () => {

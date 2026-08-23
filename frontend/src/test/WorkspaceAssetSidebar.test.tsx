@@ -40,6 +40,8 @@ function renderSidebar(overrides: Partial<WorkspaceAssetSidebarProps> = {}) {
     runtimeEnabled: true,
     connection: "online",
     settingsActive: false,
+    assetTrashOpen: false,
+    assetTrashControlsId: "asset-trash-panel",
     onUploadFiles: vi.fn().mockResolvedValue({ assets: [], failures: [], authority_stale: false }),
     onUploaded: vi.fn(),
     onSelect: vi.fn(),
@@ -49,6 +51,7 @@ function renderSidebar(overrides: Partial<WorkspaceAssetSidebarProps> = {}) {
     onDelete: vi.fn(),
     onToggle: vi.fn(),
     onWidthChange: vi.fn(),
+    onAssetTrash: vi.fn(),
     onSettings: vi.fn(),
     ...overrides,
   };
@@ -137,6 +140,18 @@ describe("WorkspaceAssetSidebar", () => {
     expect(document.querySelector(".asset-sidebar__footer > .sidebar__runtime")).not.toBeInTheDocument();
     status.click();
     expect(props.onSettings).not.toHaveBeenCalled();
+  });
+
+  it("把素材回收站入口放在素材批量操作栏", async () => {
+    const user = userEvent.setup();
+    const props = renderSidebar({ assetTrashOpen: true });
+
+    const trash = screen.getByRole("button", { name: "素材回收站" });
+    expect(trash.closest(".asset-sidebar__batch")).not.toBeNull();
+    expect(trash).toHaveAttribute("aria-expanded", "true");
+    expect(trash).toHaveAttribute("aria-controls", "asset-trash-panel");
+    await user.click(trash);
+    expect(props.onAssetTrash).toHaveBeenCalledTimes(1);
   });
 
   it.each([

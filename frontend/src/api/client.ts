@@ -48,6 +48,7 @@ import type {
   GPUResource,
   JobClearResponse,
   JobDeleteResponse,
+  MediaToolInstallSnapshot,
   MediaToolsStatus,
   ModelInventory,
   OperationalReadiness,
@@ -92,6 +93,7 @@ export function taskEventsUrl(): string {
 
 export type ApiErrorCode =
   | "raylight_recovery_in_flight"
+  | "node_unavailable"
   | "timeline_revision_conflict"
   | "timeline_schema_migrated"
   | "runtime_settings_schema_migrated"
@@ -749,6 +751,7 @@ function parseHttpError(
   }
   const candidateCode: ApiErrorCode | undefined =
     detail.code === "raylight_recovery_in_flight" ||
+    detail.code === "node_unavailable" ||
     detail.code === "timeline_revision_conflict" ||
     detail.code === "timeline_schema_migrated" ||
     detail.code === "runtime_settings_schema_migrated" ||
@@ -778,7 +781,29 @@ function parseHttpError(
       ? { message: fallback, code, details: { detail: { code } } }
       : { message: fallback };
   }
-  const usages = isStringArray(detail.usages) ? [...detail.usages] : [];
+  const missingNodeClassTypes: string[] = [];
+  if (code === "node_unavailable" && Array.isArray(detail.reasons)) {
+    const seen = new Set<string>();
+    for (const reason of detail.reasons.slice(0, 256)) {
+      if (
+        !isRecord(reason) ||
+        reason.code !== "node_unavailable" ||
+        !isRecord(reason.safe_details)
+      ) continue;
+      const classType = reason.safe_details.class_type;
+      if (
+        typeof classType !== "string" ||
+        classType.trim() !== classType ||
+        !isBoundedOpaqueId(classType, 256) ||
+        seen.has(classType)
+      ) continue;
+      seen.add(classType);
+      missingNodeClassTypes.push(classType);
+    }
+  }
+  const usages = code === "node_unavailable"
+    ? []
+    : isStringArray(detail.usages) ? [...detail.usages] : [];
   const usagesByAsset = code === "assets_in_use"
     ? parseStringArrayRecord(detail.usages_by_asset)
     : null;
@@ -786,6 +811,7 @@ function parseHttpError(
   const safeDetail = {
     ...(code ? { code } : {}),
     message: detail.message,
+    ...(missingNodeClassTypes.length ? { missing_node_class_types: missingNodeClassTypes } : {}),
     ...(usages.length ? { usages } : {}),
     ...(timelineConflict && typeof detail.project_id === "string" && detail.project_id
       ? { project_id: detail.project_id }
@@ -802,10 +828,13 @@ function parseHttpError(
     ...(usagesByAsset ? { usages_by_asset: usagesByAsset } : {}),
     ...(conflicts ? { conflicts } : {}),
   };
-  return {
-    message: usages.length
+  const message = missingNodeClassTypes.length
+    ? `缺少 ComfyUI 节点：${missingNodeClassTypes.join("、")}。请更新 ComfyUI，或安装/启用对应节点后重启。`
+    : usages.length
       ? `${detail.message}（引用位置：${usages.join("、")}）`
-      : detail.message,
+      : detail.message;
+  return {
+    message,
     details: { detail: safeDetail },
     ...(code ? { code } : {}),
   };
@@ -2717,9 +2746,9 @@ export const directorApi = {
   getMediaSetup: (signal?: AbortSignal) =>
     request<MediaToolsStatus>("/media/setup", { signal }),
   installFfmpeg: () =>
-    request<RayLightInstallSnapshot>("/media/ffmpeg/install", { method: "POST" }),
+    request<MediaToolInstallSnapshot>("/media/ffmpeg/install", { method: "POST" }),
   cancelFfmpegInstall: () =>
-    request<RayLightInstallSnapshot>("/media/ffmpeg/cancel", { method: "POST" }),
+    request<MediaToolInstallSnapshot>("/media/ffmpeg/cancel", { method: "POST" }),
   getStorage: (signal?: AbortSignal) =>
     request<unknown>("/storage", { signal }).then(parseStorageConfiguration),
   // The only endpoint is the embedded host instance; the probe takes no URL.

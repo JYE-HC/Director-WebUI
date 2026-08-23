@@ -1484,11 +1484,23 @@ export interface RayLightSetupStatus {
 }
 
 /** Exact GET /api/media/setup payload (ffmpeg/ffprobe capability and install). */
+export type MediaToolInstallPhase =
+  | "installing_package"
+  | "downloading_binaries"
+  | "verifying";
+
+export interface MediaToolInstallSnapshot extends RayLightInstallSnapshot {
+  /** Optional while older DirectorDeck backends remain supported. */
+  phase?: MediaToolInstallPhase | null;
+  /** Real download progress; absent/null means the backend cannot determine it yet. */
+  progress_percent?: number | null;
+}
+
 export interface MediaToolsStatus {
   ffmpeg_available: boolean;
   ffprobe_available: boolean;
   ffmpeg_path: string | null;
   encoders_ok: boolean;
   ready: boolean;
-  install: RayLightInstallSnapshot;
+  install: MediaToolInstallSnapshot;
 }

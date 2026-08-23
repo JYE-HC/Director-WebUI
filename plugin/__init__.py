@@ -498,12 +498,19 @@ class _ComfyHostCapabilityProvider:
         # Node registration, bounded object-info interfaces, package versions,
         # logical GPUs and media tools are process-static. Dynamic queue, model
         # inventory and Ray-ledger facts are intentionally collected elsewhere.
-        # Cache this expensive observation for the lifetime of one ComfyUI
-        # process; a full restart constructs a fresh provider automatically.
+        # Cache this expensive observation until a known process-local change
+        # explicitly invalidates it; a full restart constructs a fresh provider
+        # automatically.
         with self._snapshot_lock:
             if self._snapshot_cache is None:
                 self._snapshot_cache = self._capture_snapshot()
             return self._snapshot_cache
+
+    def invalidate(self) -> None:
+        """Discard the cached process-static observation, if one exists."""
+
+        with self._snapshot_lock:
+            self._snapshot_cache = None
 
     def _capture_snapshot(self):
         # Imports remain lazy: packaged plugin import happens before the
@@ -899,7 +906,7 @@ def _logical_gpu_inventory() -> tuple[dict[str, object], ...]:
     ) if mps_available else ()
 
 
-_MEDIA_PROBE_TIMEOUT_SECONDS = 2.0
+_MEDIA_PROBE_TIMEOUT_SECONDS = 15.0
 _REQUIRED_FFMPEG_ENCODERS = frozenset({"libx264", "aac"})
 
 
@@ -1552,7 +1559,12 @@ async def _get_proxy_session():
             if _proxy_session is None or _proxy_session.closed:
                 timeout = aiohttp.ClientTimeout(total=None)
                 _proxy_session = aiohttp.ClientSession(
-                    timeout=timeout, auto_decompress=False
+                    timeout=timeout,
+                    auto_decompress=False,
+                    # Browser traffic to /directordeck/api is forwarded to
+                    # Director's loopback-only embedded server. Public download
+                    # installers may inherit proxies; this internal hop never may.
+                    trust_env=False,
                 )
     return _proxy_session
 

@@ -35,6 +35,9 @@ export interface WorkspaceAssetSidebarProps {
   connection: CapabilityReport["connection"];
   settingsActive: boolean;
   settingsNavigationDisabled?: boolean;
+  assetTrashOpen: boolean;
+  assetTrashControlsId: string;
+  assetTrashDisabled?: boolean;
   deleting?: boolean;
   /** Human-readable segment locations keyed by stable workspace asset id. */
   assetUsages?: Record<string, string[]>;
@@ -51,6 +54,8 @@ export interface WorkspaceAssetSidebarProps {
   onToggle: () => void;
   onWidthChange: (width: number) => void;
   toggleButtonRef?: Ref<HTMLButtonElement>;
+  onAssetTrash: () => void;
+  assetTrashButtonRef?: Ref<HTMLButtonElement>;
   onSettings: () => void;
   settingsButtonRef?: Ref<HTMLButtonElement>;
 }
@@ -91,6 +96,9 @@ export function WorkspaceAssetSidebar({
   connection,
   settingsActive,
   settingsNavigationDisabled = false,
+  assetTrashOpen,
+  assetTrashControlsId,
+  assetTrashDisabled = false,
   deleting = false,
   assetUsages = {},
   onUploadFiles,
@@ -103,6 +111,8 @@ export function WorkspaceAssetSidebar({
   onToggle,
   onWidthChange,
   toggleButtonRef,
+  onAssetTrash,
+  assetTrashButtonRef,
   onSettings,
   settingsButtonRef,
 }: WorkspaceAssetSidebarProps) {
@@ -453,7 +463,19 @@ export function WorkspaceAssetSidebar({
 
       <div className="asset-sidebar__batch">
         <span>已选 {selectedIds.length} / {assets.length}</span>
-        <button className="asset-sidebar__batch-remove" type="button" disabled={!runtimeEnabled || !selectedIds.length || deleting} onClick={deleteSelected}>{deleting ? "移出中…" : "移出素材库"}</button>
+        <div className="asset-sidebar__batch-actions">
+          <button
+            ref={assetTrashButtonRef}
+            className="asset-sidebar__trash-toggle"
+            type="button"
+            aria-label="素材回收站"
+            aria-expanded={assetTrashOpen}
+            aria-controls={assetTrashControlsId}
+            disabled={assetTrashDisabled}
+            onClick={onAssetTrash}
+          >素材回收站</button>
+          <button className="asset-sidebar__batch-remove" type="button" disabled={!runtimeEnabled || !selectedIds.length || deleting} onClick={deleteSelected}>{deleting ? "移出中…" : "移出素材库"}</button>
+        </div>
       </div>
       </div>
 

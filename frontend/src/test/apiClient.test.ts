@@ -1,5 +1,10 @@
 import { ApiError, directorApi } from "../api/client";
-import { DEFAULT_LEGACY_SETTINGS, DEFAULT_SETTINGS, type GenerationTask } from "../api/types";
+import {
+  DEFAULT_LEGACY_SETTINGS,
+  DEFAULT_SETTINGS,
+  type GenerationTask,
+  type MediaToolsStatus,
+} from "../api/types";
 import { createInitialDrafts, MODE_ORDER } from "../domain/modes";
 import { createTimelineProject } from "../domain/timelineProject";
 
@@ -707,6 +712,40 @@ describe("Director REST 契约", () => {
     });
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/directordeck/api/storage"]);
+  });
+
+  it("媒体工具接口保留 ffmpeg 二进制下载阶段", async () => {
+    const status: MediaToolsStatus = {
+      ffmpeg_available: false,
+      ffprobe_available: false,
+      ffmpeg_path: null,
+      encoders_ok: false,
+      ready: false,
+      install: {
+        state: "running",
+        phase: "downloading_binaries",
+        progress_percent: 42.5,
+        log_tail: ["Downloading ffmpeg binaries"],
+        returncode: null,
+        error: null,
+        started_at: 1,
+      },
+    };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(status))
+      .mockResolvedValueOnce(jsonResponse(status.install));
+
+    await expect(directorApi.getMediaSetup()).resolves.toEqual(status);
+    await expect(directorApi.installFfmpeg()).resolves.toMatchObject({
+      state: "running",
+      phase: "downloading_binaries",
+      progress_percent: 42.5,
+    });
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"]))
+      .toEqual([
+        ["/directordeck/api/media/setup", "GET"],
+        ["/directordeck/api/media/ffmpeg/install", "POST"],
+      ]);
   });
 
   it("数据存储 GET 接受 Windows 绝对路径", async () => {
@@ -1575,6 +1614,113 @@ describe("Director REST 契约", () => {
       },
     });
     expect(JSON.stringify((error as ApiError).details)).not.toContain("private");
+  });
+
+  it("节点不可用错误显示去重后的具体 ComfyUI 节点且不泄漏其他诊断", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      detail: {
+        code: "node_unavailable",
+        message: "The mapped ComfyUI node is unavailable.",
+        reasons: [{
+          code: "node_unavailable",
+          safe_details: {
+            class_type: "MiniMaxH3ImageToVideo",
+            source_path: "C:\\private\\custom_nodes",
+          },
+        }, {
+          code: "node_unavailable",
+          safe_details: { class_type: "Video Slice" },
+        }, {
+          code: "node_unavailable",
+          safe_details: { class_type: "MiniMaxH3ImageToVideo" },
+        }, {
+          code: "model_unavailable",
+          safe_details: { class_type: "MustNotBeShown" },
+        }],
+        usages: ["private.location"],
+        internal_trace: "secret trace",
+      },
+    }, 422));
+
+    const error = await directorApi.createProjectTask(
+      "project-1",
+      { config: createTimelineProject() },
+    ).then(
+      () => { throw new Error("预期节点不可用任务提交失败"); },
+      (reason): ApiError => reason as ApiError,
+    );
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({
+      status: 422,
+      code: "node_unavailable",
+      message: "缺少 ComfyUI 节点：MiniMaxH3ImageToVideo、Video Slice。请更新 ComfyUI，或安装/启用对应节点后重启。",
+      details: {
+        detail: {
+          code: "node_unavailable",
+          message: "The mapped ComfyUI node is unavailable.",
+          missing_node_class_types: ["MiniMaxH3ImageToVideo", "Video Slice"],
+        },
+      },
+    });
+    expect(JSON.stringify((error as ApiError).details)).not.toContain("private");
+    expect(JSON.stringify((error as ApiError).details)).not.toContain("secret");
+    expect(error.message).not.toContain("MustNotBeShown");
+  });
+
+  it("节点不可用诊断非法时回退通用消息，其他错误不得借 reasons 暴露节点", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        detail: {
+          code: "node_unavailable",
+          message: "The mapped ComfyUI node is unavailable.",
+          reasons: [{
+            code: "node_unavailable",
+            safe_details: { class_type: "Bad\nNode" },
+          }, {
+            code: "node_unavailable",
+            safe_details: { class_type: "" },
+          }],
+        },
+      }, 422))
+      .mockResolvedValueOnce(jsonResponse({
+        detail: {
+          code: "creative_configuration_invalid",
+          message: "The selected timeline is not runnable.",
+          reasons: [{
+            code: "node_unavailable",
+            safe_details: { class_type: "HiddenNode" },
+          }],
+        },
+      }, 422));
+
+    const malformed = await directorApi.createProjectTask(
+      "project-1",
+      { config: createTimelineProject() },
+    ).then(
+      () => { throw new Error("预期非法节点诊断任务提交失败"); },
+      (reason): ApiError => reason as ApiError,
+    );
+    expect(malformed).toMatchObject({
+      status: 422,
+      code: "node_unavailable",
+      message: "The mapped ComfyUI node is unavailable.",
+    });
+    expect(JSON.stringify(malformed.details)).not.toContain("Bad");
+
+    const other = await directorApi.createProjectTask(
+      "project-1",
+      { config: createTimelineProject() },
+    ).then(
+      () => { throw new Error("预期其他能力错误任务提交失败"); },
+      (reason): ApiError => reason as ApiError,
+    );
+    expect(other).toMatchObject({
+      status: 422,
+      code: undefined,
+      message: "The selected timeline is not runnable.",
+    });
+    expect(JSON.stringify(other.details)).not.toContain("HiddenNode");
   });
 
   it("任务提交、列表、详情和取消与 /api/jobs 契约一致", async () => {

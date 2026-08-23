@@ -126,6 +126,32 @@ async def test_cancel_before_subprocess_spawn_still_terminates_the_install(
     assert manager.state == "idle"
 
 
+async def test_close_reaps_a_running_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_command(
+        monkeypatch,
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    manager = RayLightInstallManager()
+    await manager.start(Path("/tmp/fake-requirements.txt"))
+    for _ in range(500):
+        if manager._process is not None:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("installer subprocess did not start")
+    process = manager._process
+    assert process is not None
+
+    await asyncio.wait_for(manager.close(), timeout=10)
+
+    assert process.returncode is not None
+    assert manager._task is not None and manager._task.done()
+    assert manager.state == "idle"
+    assert manager.phase is None
+
+
 async def test_setup_endpoint_reports_capability_shape(client) -> None:
     response = await client.get("/api/raylight/setup")
     assert response.status_code == 200, response.text

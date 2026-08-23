@@ -19,6 +19,7 @@ import subprocess  # noqa: S404 - argv is fixed, no shell
 import sys
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,7 @@ class RayLightInstallManager:
 
     def __init__(self) -> None:
         self.state = "idle"  # idle | running | needs_restart | failed
+        self.phase: str | None = None
         self.log_tail: list[str] = []
         self.returncode: int | None = None
         self.error: str | None = None
@@ -87,6 +89,7 @@ class RayLightInstallManager:
     def snapshot(self) -> dict[str, Any]:
         return {
             "state": self.state,
+            "phase": self.phase,
             "log_tail": list(self.log_tail),
             "returncode": self.returncode,
             "error": self.error,
@@ -113,6 +116,7 @@ class RayLightInstallManager:
                 installer = _select_installer()
             except RayLightInstallUnavailable as exc:
                 self.state = "failed"
+                self.phase = None
                 self.error = str(exc)
                 raise
             self._begin()
@@ -127,6 +131,7 @@ class RayLightInstallManager:
                 installer = _select_installer()
             except RayLightInstallUnavailable as exc:
                 self.state = "failed"
+                self.phase = None
                 self.error = str(exc)
                 raise
             self._begin()
@@ -136,6 +141,7 @@ class RayLightInstallManager:
 
     def _begin(self) -> None:
         self.state = "running"
+        self.phase = "installing_package"
         self.log_tail = []
         self.returncode = None
         self.error = None
@@ -145,14 +151,42 @@ class RayLightInstallManager:
     def _success_state(self) -> str:
         return "needs_restart"
 
-    def _after_success(self) -> None:
+    async def _after_success(self) -> None:
         """Hook for subclasses (e.g. refresh a capability probe)."""
 
     async def cancel(self) -> None:
         self._cancel_requested = True
         process = self._process
         if process is not None and process.returncode is None:
-            process.terminate()
+            with suppress(ProcessLookupError):
+                process.terminate()
+
+    async def close(self) -> None:
+        """Stop and reap a pending installer during backend shutdown."""
+
+        await self.cancel()
+        task = self._task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            return
+        except TimeoutError:
+            process = self._process
+            if process is not None and process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process.kill()
+            task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True),
+                timeout=2,
+            )
+        except TimeoutError:
+            # The process has already been killed. Event-loop shutdown may
+            # now discard a task that ignored cancellation without orphaning
+            # an external installer.
+            return
 
     async def _run(self, requirements_path: Path, installer: list[str]) -> None:
         constraint_path: Path | None = None
@@ -174,6 +208,7 @@ class RayLightInstallManager:
             await self._execute(command)
         except Exception as exc:  # noqa: BLE001 - surfaced in the status payload
             self.state = "failed"
+            self.phase = None
             self.error = f"{type(exc).__name__}: {exc}"
             self._append(self.error)
             return
@@ -182,6 +217,7 @@ class RayLightInstallManager:
                 constraint_path.unlink(missing_ok=True)
 
     async def _execute(self, command: list[str]) -> None:
+        process: asyncio.subprocess.Process | None = None
         try:
             env = os.environ.copy()
             env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
@@ -196,7 +232,8 @@ class RayLightInstallManager:
             # A cancel that landed before the spawn assigned ``_process``
             # would otherwise be lost and the subprocess would run orphaned.
             if self._cancel_requested and process.returncode is None:
-                process.terminate()
+                with suppress(ProcessLookupError):
+                    process.terminate()
             assert process.stdout is not None
             try:
                 async with asyncio.timeout(_PIP_TIMEOUT_SECONDS):
@@ -204,14 +241,24 @@ class RayLightInstallManager:
                         self._append(raw_line.decode("utf-8", errors="replace").rstrip())
                     returncode = await process.wait()
             except TimeoutError:
-                process.kill()
+                with suppress(ProcessLookupError):
+                    process.kill()
                 await process.wait()
+                self.returncode = process.returncode
                 self.state = "failed"
+                self.phase = None
                 self.error = f"install timed out after {_PIP_TIMEOUT_SECONDS // 60} minutes"
                 self._append(self.error)
                 return
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
+            raise
         except Exception as exc:  # noqa: BLE001 - surfaced in the status payload
             self.state = "failed"
+            self.phase = None
             self.error = f"{type(exc).__name__}: {exc}"
             self._append(self.error)
             return
@@ -221,12 +268,27 @@ class RayLightInstallManager:
         self.returncode = returncode
         if self._cancel_requested:
             self.state = "idle"
+            self.phase = None
             self._append("install cancelled by user")
         elif returncode == 0:
-            self.state = self._success_state()
-            self._after_success()
+            try:
+                await self._after_success()
+            except Exception as exc:  # noqa: BLE001 - surfaced in status/logs
+                self.state = "failed"
+                self.phase = None
+                self.error = f"{type(exc).__name__}: {exc}"
+                self._append(self.error)
+            else:
+                if self._cancel_requested:
+                    self.state = "idle"
+                    self.phase = None
+                    self._append("install cancelled by user")
+                else:
+                    self.state = self._success_state()
+                    self.phase = None
         else:
             self.state = "failed"
+            self.phase = None
             self.error = f"pip exited with code {returncode}"
             self._append(self.error)
 
