@@ -35,6 +35,37 @@ describe("数字输入框", () => {
   });
 });
 
+describe("长视频全局设置", () => {
+  it("让三项编解码模型和三项族模型配置各保持为一行", () => {
+    const modelGridRules = [...styles.matchAll(
+      /\.timeline-family-settings__models\{([^}]*)\}/g,
+    )].map((match) => match[1]).join(";");
+
+    expect(modelGridRules).toMatch(
+      /grid-template-columns\s*:\s*repeat\(3,minmax\(0,1fr\)\)/,
+    );
+    expect(styles).toMatch(
+      /@container \(max-width:760px\)\{\.timeline-family-settings__models,\.timeline-sampling-fields\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}\}/,
+    );
+    expect(styles).toMatch(
+      /@container \(max-width:460px\)\{\.timeline-family-settings__models,\.timeline-sampling-fields\{grid-template-columns:1fr\}\}/,
+    );
+  });
+
+  it("让六项采样参数在宽屏保持为一行", () => {
+    const samplingGridRules = [...styles.matchAll(
+      /\.timeline-sampling-fields\{([^}]*)\}/g,
+    )].map((match) => match[1]).join(";");
+
+    expect(samplingGridRules).toMatch(
+      /grid-template-columns\s*:\s*repeat\(6,minmax\(0,1fr\)\)/,
+    );
+    expect(styles).toMatch(
+      /@container \(max-width:1200px\)\{\.timeline-sampling-fields\{grid-template-columns:repeat\(3,minmax\(0,1fr\)\)\}\}/,
+    );
+  });
+});
+
 describe("时间线单一分段选择视觉", () => {
   it("只保留实线变色选中态，并给卡片复选框足够命中区", () => {
     const selectedRules = [...styles.matchAll(/\.timeline-clip\.is-selected\{([^}]*)\}/g)]

@@ -118,15 +118,15 @@ export function TimelineGlobalSettings({
   return (
     <section id={id} className="timeline-global-settings" aria-label="时间线全局设置" hidden={!open}>
       <header className="timeline-global-settings__head">
-        <div><strong>长视频全局设置</strong><small>集中设置输出规格、模型与推理参数</small></div>
+        <strong>长视频全局设置</strong>
         <button type="button" className="icon-button" aria-label="关闭全局设置" onClick={onClose}>×</button>
       </header>
 
       <div className="timeline-global-settings__body">
         <GlobalOutputSpecs project={project} onProjectPatch={onProjectPatch} />
-        <section className="timeline-family-settings" aria-labelledby={`${id}-shared-models-title`}>
+        <section className="timeline-family-settings" aria-labelledby={`${id}-codec-models-title`}>
           <header>
-            <div className="timeline-family-settings__title"><strong id={`${id}-shared-models-title`}>共享模型</strong><small>直接保存到当前项目 model_stack</small></div>
+            <div className="timeline-family-settings__title"><strong id={`${id}-codec-models-title`}>编解码模型</strong></div>
             <div className="timeline-family-settings__models" data-timeline-history-ignore>
               {(["clip", "video_vae", "audio_vae"] as const).map((role) => {
                 const labels = { clip: "CLIP", video_vae: "Video VAE", audio_vae: "Audio VAE" } as const;
@@ -144,7 +144,7 @@ export function TimelineGlobalSettings({
           return (
             <section className="timeline-family-settings" aria-labelledby={`${id}-${role}-title`} key={role}>
               <header>
-                <div className="timeline-family-settings__title"><strong id={`${id}-${role}-title`}>{label}</strong><small>{role === "fl2va" ? "文 / 图 / 首尾帧生成" : "参考 / 源视频生成"}</small><small>模型与 LoRA 是当前项目创作配置；加载器由服务端预检解析</small></div>
+                <div className="timeline-family-settings__title"><strong id={`${id}-${role}-title`}>{label}</strong><small>{role === "fl2va" ? "文 / 图 / 首尾帧生成" : "参考 / 源视频生成"}</small></div>
                 <div className="timeline-family-settings__models" data-timeline-history-ignore>
                   <Field label="Diffusion 模型" className="field--inline"><select aria-label={`${role.toUpperCase()} Diffusion 模型快捷选择`} disabled={!runtimeReady} value={modelSelection.filename ?? ""} onChange={(event) => onModelChange(role, event.target.value || null)}><option value="">未绑定</option>{modelOptions(modelSelection.filename, models[role]).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>
                   <Field label="LoRA" className="field--inline"><select aria-label={`${role.toUpperCase()} LoRA 模型快捷选择`} disabled={!runtimeReady} value={lora.enabled ? lora.filename ?? "" : ""} onChange={(event) => onLoraChange(role, { enabled: Boolean(event.target.value), filename: event.target.value || null })}><option value="">不使用 LoRA</option>{modelOptions(lora.filename, models.loras).map((filename) => <option value={filename} key={filename}>{filename}</option>)}</select></Field>
@@ -152,7 +152,7 @@ export function TimelineGlobalSettings({
                 </div>
               </header>
               <div className="timeline-family-settings__sampling">
-                <div className="field-grid field-grid--two timeline-sampling-fields">
+                <div className="field-grid timeline-sampling-fields">
                 <Field label="步数" className="field--inline"><DeferredNumberInput aria-label={`${label} 步数`} min="1" max="200" step="1" value={sampling.steps} normalizeValue={Math.trunc} onValueCommit={(value) => updateSampling(role, { steps: value })} /></Field>
                 <Field label="Seed" className="field--inline"><div className="seed-input"><DeferredNumberInput aria-label={`${label} Seed`} min="0" max={Number.MAX_SAFE_INTEGER} step="1" disabled={sampling.random_seed} value={sampling.seed} normalizeValue={Math.trunc} onValueCommit={(value) => updateSampling(role, { seed: value })} /><label><input aria-label={`${label} 随机 Seed`} type="checkbox" checked={sampling.random_seed} onChange={(event) => updateSampling(role, { random_seed: event.target.checked, ...(event.target.checked ? { seed: randomSafeSeed() } : {}) })} /><span />随机</label></div></Field>
                 <Field label="采样器" className="field--inline"><select aria-label={`${label} 采样器`} value={sampling.sampler} onChange={(event) => updateSampling(role, { sampler: event.target.value as SamplingConfig["sampler"] })}><option value="res_multistep">res_multistep</option><option value="euler">euler</option><option value="dpmpp_2m">dpmpp_2m</option></select></Field>

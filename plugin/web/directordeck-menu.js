@@ -6,6 +6,7 @@ import { app } from "../../../scripts/app.js";
 const STARTING_POLL_MS = 1000;
 const STARTING_MAX_ATTEMPTS = 30;
 const RUNTIME_POLL_MS = 10000;
+const STATUS_REQUEST_TIMEOUT_MS = 5000;
 
 app.registerExtension({
   name: "DirectorDeck",
@@ -66,18 +67,32 @@ app.registerExtension({
           }, delay);
         };
 
-        const queryStatus = async () => {
-          if (!el.isConnected) return;
+        const queryStatus = async ({ allowDetached = false } = {}) => {
+          // ComfyUI may call a custom tab's render hook before attaching its
+          // container to the document. The first request must still run or the
+          // tab remains on the initial "querying" message forever.
+          if (!allowDetached && !el.isConnected) return;
           const requestId = ++requestSequence;
+          const controller = new AbortController();
+          const timeoutId = window.setTimeout(
+            () => controller.abort(),
+            STATUS_REQUEST_TIMEOUT_MS,
+          );
           try {
             const response = await fetch("/directordeck/status", {
               cache: "no-store",
+              signal: controller.signal,
             });
             if (!response.ok) {
               throw new Error(`HTTP ${response.status}`);
             }
             const data = await response.json();
-            if (requestId !== requestSequence || !el.isConnected) return;
+            if (
+              requestId !== requestSequence ||
+              (!allowDetached && !el.isConnected)
+            ) {
+              return;
+            }
 
             if (data.backend === "ready") {
               hasBeenReady = true;
@@ -120,9 +135,21 @@ app.registerExtension({
             }
 
             renderStatus("后端状态：未知", { error: true, refresh: true });
-          } catch (_error) {
-            if (requestId !== requestSequence || !el.isConnected) return;
-            renderStatus("后端状态：无法查询", { error: true, refresh: true });
+          } catch (error) {
+            if (
+              requestId !== requestSequence ||
+              (!allowDetached && !el.isConnected)
+            ) {
+              return;
+            }
+            renderStatus(
+              error?.name === "AbortError"
+                ? "后端状态：查询超时"
+                : "后端状态：无法查询",
+              { error: true, refresh: true },
+            );
+          } finally {
+            window.clearTimeout(timeoutId);
           }
         };
 
@@ -136,7 +163,7 @@ app.registerExtension({
           void queryStatus();
         });
 
-        void queryStatus();
+        void queryStatus({ allowDetached: true });
       },
     });
   },

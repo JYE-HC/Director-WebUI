@@ -5854,6 +5854,9 @@ export default function App() {
           runtimeEnabled={workspaceRuntimeReady}
           connection={capabilities.connection}
           settingsActive={state.view === "settings"}
+          assetTrashOpen={assetTrashPanelOpen}
+          assetTrashControlsId={ASSET_TRASH_PANEL_ID}
+          assetTrashDisabled={!timelineHydrated || state.view !== "workspace"}
           deleting={assetsDeleting}
           assetUsages={assetUsages}
           onUploadFiles={uploadWorkspaceFiles}
@@ -5874,9 +5877,20 @@ export default function App() {
           onDelete={(ids) => void deleteAssets(ids)}
           settingsNavigationDisabled={false}
           toggleButtonRef={sidebarBrandToggleRef}
+          assetTrashButtonRef={assetTrashToggleRef}
           settingsButtonRef={settingsToggleRef}
           onToggle={() => setSidebarOpenWithFocus(!sidebarOpen)}
           onWidthChange={(width) => setSidebarWidth(clampSidebarWidth(width, window.innerWidth))}
+          onAssetTrash={() => {
+            const opening = !assetTrashPanelOpen;
+            if (opening) {
+              setGlobalSettingsOpen(false);
+              setTimelineHistoryPanelOpen(false);
+              dispatch({ type: "tasks/panel", open: false });
+              void loadAssetTrash();
+            }
+            setAssetTrashPanelOpen(opening);
+          }}
           onSettings={() => {
             const opening = state.view !== "settings";
             if (opening) {
@@ -6211,6 +6225,7 @@ export default function App() {
             <div className="topbar__history-actions" role="group" aria-label="项目编辑历史">
               <button
                 type="button"
+                className="topbar__history-step"
                 aria-label="撤销"
                 aria-keyshortcuts="Control+Z Meta+Z"
                 title={nextUndoLabel ? `撤销：${nextUndoLabel} · Ctrl/Cmd+Z` : "没有可撤销的项目修改"}
@@ -6222,6 +6237,7 @@ export default function App() {
               </button>
               <button
                 type="button"
+                className="topbar__history-step"
                 aria-label="重做"
                 aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z Control+Y"
                 title={nextRedoLabel ? `重做：${nextRedoLabel} · Ctrl/Cmd+Shift+Z` : "没有可重做的项目修改"}
@@ -6231,25 +6247,25 @@ export default function App() {
               >
                 <span aria-hidden="true">↷</span>
               </button>
+              <button
+                ref={timelineHistoryToggleRef}
+                type="button"
+                className="topbar__history-toggle"
+                aria-label="编辑历史"
+                aria-expanded={timelineHistoryPanelOpen}
+                aria-controls={TIMELINE_HISTORY_PANEL_ID}
+                disabled={!timelineHydrated || state.view !== "workspace"}
+                onClick={() => {
+                  const opening = !timelineHistoryPanelOpen;
+                  if (opening) {
+                    setGlobalSettingsOpen(false);
+                    setAssetTrashPanelOpen(false);
+                    dispatch({ type: "tasks/panel", open: false });
+                  }
+                  setTimelineHistoryPanelOpen(opening);
+                }}
+              >编辑历史</button>
             </div>
-            <button
-              ref={timelineHistoryToggleRef}
-              type="button"
-              className="topbar__history-toggle"
-              aria-label="编辑历史"
-              aria-expanded={timelineHistoryPanelOpen}
-              aria-controls={TIMELINE_HISTORY_PANEL_ID}
-              disabled={!timelineHydrated || state.view !== "workspace"}
-              onClick={() => {
-                const opening = !timelineHistoryPanelOpen;
-                if (opening) {
-                  setGlobalSettingsOpen(false);
-                  setAssetTrashPanelOpen(false);
-                  dispatch({ type: "tasks/panel", open: false });
-                }
-                setTimelineHistoryPanelOpen(opening);
-              }}
-            >编辑历史</button>
             <button ref={globalSettingsToggleRef} type="button" className="topbar__global-toggle" aria-label="全局设置" aria-expanded={globalSettingsOpen} aria-controls={GLOBAL_SETTINGS_ID} onClick={() => {
               const opening = !globalSettingsOpen;
               if (opening) {
@@ -6259,25 +6275,6 @@ export default function App() {
               }
               setGlobalSettingsOpen(opening);
             }}><span>全局设置</span><i aria-hidden="true" /></button>
-            <button
-              ref={assetTrashToggleRef}
-              type="button"
-              className="topbar__asset-trash-toggle"
-              aria-label="素材回收站"
-              aria-expanded={assetTrashPanelOpen}
-              aria-controls={ASSET_TRASH_PANEL_ID}
-              disabled={!timelineHydrated || state.view !== "workspace"}
-              onClick={() => {
-                const opening = !assetTrashPanelOpen;
-                if (opening) {
-                  setGlobalSettingsOpen(false);
-                  setTimelineHistoryPanelOpen(false);
-                  dispatch({ type: "tasks/panel", open: false });
-                  void loadAssetTrash();
-                }
-                setAssetTrashPanelOpen(opening);
-              }}
-            >素材回收站</button>
             <div className="topbar__run-actions" role="group" aria-label="时间线生成操作">
               <button
                 type="button"

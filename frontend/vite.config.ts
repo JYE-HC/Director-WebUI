@@ -9,7 +9,7 @@ const frontendPort = Number(process.env.DIRECTOR_FRONTEND_PORT || "4173");
 // embedded DirectorDeck backend under /directordeck.
 const apiOrigin = process.env.DIRECTOR_API_ORIGIN || "http://127.0.0.1:8188";
 
-export default defineConfig(({ command }) => ({
+export default defineConfig(({ command, mode }) => ({
   // Built assets are served by the ComfyUI plugin under /directordeck/; a
   // relative base keeps the same dist usable from any mount point.
   base: command === "build" ? "./" : "/",
@@ -18,6 +18,13 @@ export default defineConfig(({ command }) => ({
     host: frontendHost,
     port: frontendPort,
     strictPort: true,
+    ...(mode === "test"
+      ? {
+          fs: {
+            allow: [new URL("../", import.meta.url).pathname],
+          },
+        }
+      : {}),
     proxy: {
       "/directordeck": apiOrigin,
     },

@@ -2384,6 +2384,10 @@ describe("统一长视频时间线应用", () => {
 
     const undo = screen.getByRole("button", { name: "撤销" });
     const redo = screen.getByRole("button", { name: "重做" });
+    const historyToggle = screen.getByRole("button", { name: "编辑历史" });
+    const historyActions = screen.getByRole("group", { name: "项目编辑历史" });
+    expect(historyActions).toContainElement(historyToggle);
+    expect(historyActions.lastElementChild).toBe(historyToggle);
     expect(undo).toBeDisabled();
     expect(redo).toBeDisabled();
 
@@ -3159,6 +3163,12 @@ describe("统一长视频时间线应用", () => {
     await openGlobalSettings(user);
     const globalSettings = screen.getByRole("region", { name: "时间线全局设置" });
     expect(globalSettings).toBeVisible();
+    const codecModels = within(globalSettings).getByRole("region", { name: "编解码模型" });
+    expect(codecModels).toBeVisible();
+    expect(within(globalSettings).queryByText("共享模型")).not.toBeInTheDocument();
+    expect(within(globalSettings).queryByText("集中设置输出规格、模型与推理参数")).not.toBeInTheDocument();
+    expect(within(globalSettings).queryByText("直接保存到当前项目 model_stack")).not.toBeInTheDocument();
+    expect(within(globalSettings).queryByText("模型与 LoRA 是当前项目创作配置；加载器由服务端预检解析")).not.toBeInTheDocument();
     const specs = within(globalSettings).getByRole("region", { name: "输出规格" });
     expect(specs).toBeVisible();
     expect(within(globalSettings).queryByLabelText("项目功能点")).not.toBeInTheDocument();
@@ -3168,6 +3178,11 @@ describe("统一长视频时间线应用", () => {
     expect(within(specs).getByLabelText("导出方式")).toHaveValue("all");
     expect(within(globalSettings).queryByLabelText("音频策略")).not.toBeInTheDocument();
     expect(within(globalSettings).queryByLabelText("参考图采样尺寸")).not.toBeInTheDocument();
+    const codecGrid = within(codecModels).getByLabelText("CLIP 模型选择")
+      .closest(".timeline-family-settings__models");
+    expect(codecGrid?.children).toHaveLength(3);
+    expect(codecGrid).toContainElement(within(codecModels).getByLabelText("Video VAE 模型选择"));
+    expect(codecGrid).toContainElement(within(codecModels).getByLabelText("Audio VAE 模型选择"));
     await user.selectOptions(within(specs).getByLabelText("分辨率"), "1920x1088");
     await user.selectOptions(within(specs).getByLabelText("画幅"), "9:16");
     await waitFor(() => expect(directorApi.updateTimeline).toHaveBeenLastCalledWith(
@@ -3181,6 +3196,24 @@ describe("统一长视频时间线应用", () => {
     expect(within(flFamily).getByLabelText("FL2VA 步数")).toBeInTheDocument();
     expect(within(refFamily).getByLabelText("REF2VA LoRA 模型快捷选择")).toBeInTheDocument();
     expect(within(refFamily).getByLabelText("Ref2VA Seed")).toBeInTheDocument();
+    const flSamplingGrid = within(flFamily).getByLabelText("FL2VA 步数")
+      .closest(".timeline-sampling-fields");
+    const refSamplingGrid = within(refFamily).getByLabelText("Ref2VA 步数")
+      .closest(".timeline-sampling-fields");
+    expect(flSamplingGrid?.children).toHaveLength(6);
+    expect(flSamplingGrid).toContainElement(within(flFamily).getByLabelText("FL2VA Audio Shift"));
+    expect(refSamplingGrid?.children).toHaveLength(6);
+    expect(refSamplingGrid).toContainElement(within(refFamily).getByLabelText("Ref2VA Audio Shift"));
+    const flModelGrid = within(flFamily).getByLabelText("FL2VA Diffusion 模型快捷选择")
+      .closest(".timeline-family-settings__models");
+    const refModelGrid = within(refFamily).getByLabelText("REF2VA Diffusion 模型快捷选择")
+      .closest(".timeline-family-settings__models");
+    expect(flModelGrid?.children).toHaveLength(3);
+    expect(flModelGrid).toContainElement(within(flFamily).getByLabelText("FL2VA LoRA 模型快捷选择"));
+    expect(flModelGrid).toContainElement(within(flFamily).getByLabelText("FL2VA LoRA 强度"));
+    expect(refModelGrid?.children).toHaveLength(3);
+    expect(refModelGrid).toContainElement(within(refFamily).getByLabelText("REF2VA LoRA 模型快捷选择"));
+    expect(refModelGrid).toContainElement(within(refFamily).getByLabelText("Ref2VA LoRA 强度"));
     expect(document.getElementById("timeline-global-settings-fl2va-title")?.parentElement).toHaveClass("timeline-family-settings__title");
     expect(within(flFamily).getByLabelText("FL2VA Diffusion 模型快捷选择").closest(".field")).toHaveClass("field--inline");
     expect(within(flFamily).getByLabelText("FL2VA 步数").closest(".field")).toHaveClass("field--inline");
@@ -3242,11 +3275,13 @@ describe("统一长视频时间线应用", () => {
     expect(commandbar).not.toBeNull();
     const runActions = within(topbar as HTMLElement).getByRole("group", { name: "时间线生成操作" });
     const globalSettings = within(topbar as HTMLElement).getByRole("button", { name: "全局设置" });
-    const assetTrash = within(topbar as HTMLElement).getByRole("button", { name: "素材回收站" });
+    const assetSidebar = screen.getByRole("complementary", { name: "当前工作区素材库" });
+    const assetTrash = within(assetSidebar).getByRole("button", { name: "素材回收站" });
     expect(runActions).toBeInTheDocument();
     expect(globalSettings.closest(".topbar__right")).not.toBeNull();
-    expect(globalSettings.nextElementSibling).toBe(assetTrash);
-    expect(assetTrash.nextElementSibling).toBe(runActions);
+    expect(globalSettings.nextElementSibling).toBe(runActions);
+    expect(within(topbar as HTMLElement).queryByRole("button", { name: "素材回收站" })).not.toBeInTheDocument();
+    expect(assetTrash.closest(".asset-sidebar__batch-actions")).not.toBeNull();
     expect(within(topbar as HTMLElement).getByRole("button", { name: "预检执行计划" })).toBeInTheDocument();
     expect(within(topbar as HTMLElement).getByRole("button", { name: "生成任务 1" })).toBeInTheDocument();
     expect(within(commandbar as HTMLElement).queryByRole("button", { name: "预检执行计划" })).not.toBeInTheDocument();

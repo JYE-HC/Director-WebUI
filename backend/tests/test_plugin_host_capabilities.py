@@ -269,6 +269,60 @@ def test_provider_caches_process_static_snapshot(
     assert calls == {"object_info": 1, "registry": 1, "generated_at": 1}
 
 
+def test_provider_invalidate_recaptures_after_preserving_cached_identity(
+    loaded_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = loaded_plugin.module
+    _stabilize_environment(plugin, monkeypatch)
+    object_info = _raw_object_info()
+    registry = _registry_for_object_info(object_info)
+    calls = {"object_info": 0, "registry": 0, "generated_at": 0}
+    generated_at_values = iter(
+        (
+            datetime(2026, 8, 21, 12, 30, tzinfo=timezone.utc),
+            datetime(2026, 8, 21, 12, 31, tzinfo=timezone.utc),
+        )
+    )
+
+    def load_object_info() -> dict[str, dict[str, Any]]:
+        calls["object_info"] += 1
+        return object_info
+
+    def load_registry() -> dict[str, object]:
+        calls["registry"] += 1
+        return registry
+
+    def generated_at() -> datetime:
+        calls["generated_at"] += 1
+        return next(generated_at_values)
+
+    provider = plugin._ComfyHostCapabilityProvider(
+        comfy_url="http://127.0.0.1:8188",
+        object_info_loader=load_object_info,
+        node_registry_loader=load_registry,
+        generated_at_factory=generated_at,
+    )
+
+    first = provider.snapshot()
+    cached = provider.snapshot()
+    provider.invalidate()
+    refreshed = provider.snapshot()
+
+    assert cached is first
+    assert refreshed is not first
+    assert refreshed.generated_at == datetime(
+        2026,
+        8,
+        21,
+        12,
+        31,
+        tzinfo=timezone.utc,
+    )
+    assert provider.snapshot() is refreshed
+    assert calls == {"object_info": 2, "registry": 2, "generated_at": 2}
+
+
 def test_provider_module_fingerprint_does_not_depend_on_optional_node_presence(
     loaded_plugin: Any,
     monkeypatch: pytest.MonkeyPatch,

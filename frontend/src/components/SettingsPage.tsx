@@ -12,6 +12,7 @@ import {
   type GPUResource,
   type LoraLoaderAdapterId,
   type LoraLoaderOverrideRecord,
+  type MediaToolInstallPhase,
   type MediaToolsStatus,
   type ModelInventory,
   type ModelRole,
@@ -30,6 +31,50 @@ function sameSettings(left: RuntimeSettings, right: RuntimeSettings): boolean {
 }
 
 const HIDDEN_PATH_VALUE = "••••••••••••••••";
+const MEDIA_SETUP_POLL_MS = 1500;
+const MEDIA_SETUP_RETRY_MS = 2500;
+const MEDIA_SETUP_REQUEST_TIMEOUT_MS = 10_000;
+
+function mediaToolInstallPhaseMessage(
+  phase: MediaToolInstallPhase | null | undefined,
+): string {
+  switch (phase) {
+    case "installing_package":
+      return "正在安装 static-ffmpeg Python 包…";
+    case "downloading_binaries":
+      return "正在下载 ffmpeg 二进制，请保持代理连接…";
+    case "verifying":
+      return "正在验证 ffmpeg、ffprobe 与编码器…";
+    default:
+      return "正在安装 ffmpeg，请稍候…";
+  }
+}
+
+function validMediaToolProgress(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100
+    ? value
+    : null;
+}
+
+function formatProgressPercent(value: number): string {
+  return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(value)}%`;
+}
+
+function MediaToolDownloadProgress({
+  progressPercent,
+}: {
+  progressPercent: number | null | undefined;
+}) {
+  const progress = validMediaToolProgress(progressPercent);
+  return <div className="media-install-progress">
+    <progress
+      aria-label="ffmpeg 二进制下载进度"
+      max={100}
+      {...(progress === null ? {} : { value: progress })}
+    />
+    <span>{progress === null ? "下载进度计算中…" : formatProgressPercent(progress)}</span>
+  </div>;
+}
 
 interface LoraLoaderMappingDraft {
   lora_filename: string;
@@ -156,7 +201,7 @@ export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[]
   return errors;
 }
 
-export function SettingsPage({ settings, confirmedSettings = settings, resourcesReady = false, capabilities, featureCatalog = null, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, overlay = false, theme = "dark", onThemeChange = () => undefined, onDraftChange = () => undefined, onSaved, onSaveLoraLoaderOverride, onConnectionTestSucceeded = () => undefined, onHostCapabilitiesChanged = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
+export function SettingsPage({ settings, confirmedSettings = settings, resourcesReady = false, capabilities, featureCatalog = null, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, overlay = false, onDraftChange = () => undefined, onSaved, onSaveLoraLoaderOverride, onConnectionTestSucceeded = () => undefined, onHostCapabilitiesChanged = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
   settings: RuntimeSettings; confirmedSettings?: RuntimeSettings; capabilities: CapabilityReport; gpus: GPUResource[];
   /** True once App has confirmed the four runtime resources against the host. */
   resourcesReady?: boolean;
@@ -359,9 +404,9 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     const wasRunning = ffmpegInstallWasRunningRef.current;
     ffmpegInstallWasRunningRef.current = status.install.state === "running";
     setMediaSetup(status);
-    if (wasRunning && (
-      status.install.state === "ready" || status.ready
-    )) onHostCapabilitiesChangedRef.current();
+    if (
+      wasRunning && status.install.state === "ready" && status.ready
+    ) onHostCapabilitiesChangedRef.current();
   }, []);
 
   const requestClose = useCallback((restoreFocus = true) => {
@@ -691,41 +736,86 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   };
 
   useEffect(() => {
-    let cancelled = false;
-    void directorApi.getMediaSetup().then((status) => {
-      if (!cancelled) acceptMediaSetup(status);
-    }).catch(() => {
-      if (!cancelled) setMediaSetup(null);
-    });
+    let stopped = false;
+    let retryTimer: number | null = null;
+    let requestController: AbortController | null = null;
+    const load = async () => {
+      requestController = new AbortController();
+      const requestTimeout = window.setTimeout(
+        () => requestController?.abort(),
+        MEDIA_SETUP_REQUEST_TIMEOUT_MS,
+      );
+      try {
+        const status = await directorApi.getMediaSetup(requestController.signal);
+        if (!stopped) acceptMediaSetup(status);
+      } catch {
+        if (!stopped) {
+          setMediaSetup(null);
+          retryTimer = window.setTimeout(() => void load(), MEDIA_SETUP_RETRY_MS);
+        }
+      } finally {
+        window.clearTimeout(requestTimeout);
+        requestController = null;
+      }
+    };
+    void load();
     return () => {
-      cancelled = true;
+      stopped = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      requestController?.abort();
     };
   }, [acceptMediaSetup]);
 
   useEffect(() => {
     if (mediaSetup?.install.state !== "running") return;
-    const timer = window.setTimeout(() => {
-      void directorApi.getMediaSetup().then((status) => {
-        if (mountedRef.current) acceptMediaSetup(status);
-      }).catch(() => undefined);
-    }, 1500);
-    return () => window.clearTimeout(timer);
-  }, [acceptMediaSetup, mediaSetup]);
+    let stopped = false;
+    let timer: number | null = null;
+    let requestController: AbortController | null = null;
+
+    const schedule = (delay: number) => {
+      timer = window.setTimeout(() => void poll(), delay);
+    };
+    const poll = async () => {
+      requestController = new AbortController();
+      const requestTimeout = window.setTimeout(
+        () => requestController?.abort(),
+        MEDIA_SETUP_REQUEST_TIMEOUT_MS,
+      );
+      try {
+        const status = await directorApi.getMediaSetup(requestController.signal);
+        if (stopped || !mountedRef.current) return;
+        acceptMediaSetup(status);
+        if (status.install.state === "running") schedule(MEDIA_SETUP_POLL_MS);
+      } catch {
+        if (!stopped && mountedRef.current) schedule(MEDIA_SETUP_RETRY_MS);
+      } finally {
+        window.clearTimeout(requestTimeout);
+        requestController = null;
+      }
+    };
+
+    schedule(MEDIA_SETUP_POLL_MS);
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+      requestController?.abort();
+    };
+  }, [acceptMediaSetup, mediaSetup?.install.state]);
 
   const startFfmpegInstall = async () => {
     const confirmed = window.confirm(
       "将安装媒体组件：static-ffmpeg（含 ffmpeg 与 ffprobe，全编码器）。\n" +
-      "执行方式：在 ComfyUI 的 Python 环境中运行 pip install static-ffmpeg。\n" +
+      "安装包含 Python 包和 ffmpeg 二进制下载；如需代理，请保持连接直到验证完成。\n" +
       "安装完成立即生效，无需重启。继续？",
     );
     if (!confirmed) return;
     setFfmpegInstallBusy(true);
     try {
       const started = await directorApi.installFfmpeg();
-      if (started.state === "running" || started.state === "ready") {
-        ffmpegInstallWasRunningRef.current = true;
-      }
-      acceptMediaSetup(await directorApi.getMediaSetup());
+      ffmpegInstallWasRunningRef.current = started.state === "running";
+      setMediaSetup((current) => current === null
+        ? current
+        : { ...current, install: started });
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : "ffmpeg 安装启动失败");
     } finally {
@@ -735,8 +825,10 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
 
   const cancelFfmpegInstall = async () => {
     try {
-      await directorApi.cancelFfmpegInstall();
-      acceptMediaSetup(await directorApi.getMediaSetup());
+      const cancelled = await directorApi.cancelFfmpegInstall();
+      setMediaSetup((current) => current === null
+        ? current
+        : { ...current, install: cancelled });
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : "取消安装失败");
     }
@@ -924,8 +1016,11 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
       {message && <div className="notice" role="alert">{message}</div>}
       <div className="settings-layout">
         <div className="settings-main">
-          <Panel eyebrow="连接" title="ComfyUI" description="浏览器仅连接导演台后端，由后端代理 ComfyUI。">
-            <div ref={connectionStatusRef} className="connection-card" tabIndex={-1}><StatusDot state={testing || probeResult === null && capabilities.connection === "checking" ? "checking" : probeResult ? probeResult.ok ? "online" : "offline" : capabilities.connection} /><div><strong>{testing ? "正在测试连接" : probeResult ? probeResult.ok ? "当前实例可连接" : "当前实例连接失败" : capabilities.connection === "offline" ? "ComfyUI 离线" : capabilities.connection === "online" ? "ComfyUI 在线" : "等待检测"}</strong><small>{testing ? "正在等待 ComfyUI 响应" : probeResult ? probeResult.latency_ms === undefined ? probeResult.message : `${probeResult.message} · 响应 ${probeResult.latency_ms} ms` : capabilities.connection === "offline" ? capabilities.message || "无法读取运行环境" : capabilities.latency_ms === undefined ? "尚未读取延迟" : `响应 ${capabilities.latency_ms} ms`}</small></div><button type="button" className="button button--ghost" onClick={() => void test()} disabled={testing || effectiveRuntimeEditingDisabled}>{testing ? <><Spinner />测试中…</> : "测试连接"}</button></div>
+          <Panel eyebrow="连接" title="ComfyUI" className="panel--inline-heading">
+            <div className="settings-connection-row">
+              <div ref={connectionStatusRef} className="connection-card" tabIndex={-1}><StatusDot state={testing || probeResult === null && capabilities.connection === "checking" ? "checking" : probeResult ? probeResult.ok ? "online" : "offline" : capabilities.connection} /><div><strong>{testing ? "正在测试连接" : probeResult ? probeResult.ok ? "当前实例可连接" : "当前实例连接失败" : capabilities.connection === "offline" ? "ComfyUI 离线" : capabilities.connection === "online" ? "ComfyUI 在线" : "等待检测"}</strong><small>{testing ? "正在等待 ComfyUI 响应" : probeResult ? probeResult.latency_ms === undefined ? probeResult.message : `${probeResult.message} · 响应 ${probeResult.latency_ms} ms` : capabilities.connection === "offline" ? capabilities.message || "无法读取运行环境" : capabilities.latency_ms === undefined ? "尚未读取延迟" : `响应 ${capabilities.latency_ms} ms`}</small></div><button type="button" className="button button--ghost" onClick={() => void test()} disabled={testing || effectiveRuntimeEditingDisabled}>{testing ? <><Spinner />测试中…</> : "测试连接"}</button></div>
+              <Field label="客户端 ID"><input required disabled={effectiveRuntimeEditingDisabled} maxLength={128} pattern="[A-Za-z0-9._:-]+" value={working.client_id} onChange={(event) => change({ ...working, client_id: event.target.value })} /></Field>
+            </div>
             {currentRayLightRuntimeStatus?.recovery_required && <div className="raylight-recovery-alert" role="alert" aria-labelledby="raylight-recovery-title" aria-describedby="raylight-recovery-description">
               <strong id="raylight-recovery-title">旧 RayLight 运行状态引用了当前不可见 GPU</strong>
               <div id="raylight-recovery-description" className="raylight-recovery-alert__details">
@@ -947,9 +1042,8 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                 {rayLightRecoveryPending ? <><Spinner />恢复中…</> : "确认 ComfyUI 已重启并恢复 RayLight"}
               </button>
             </div>}
-            <Field label="客户端 ID"><input required disabled={effectiveRuntimeEditingDisabled} maxLength={128} pattern="[A-Za-z0-9._:-]+" value={working.client_id} onChange={(event) => change({ ...working, client_id: event.target.value })} /></Field>
           </Panel>
-          <Panel eyebrow="数据" title="数据存储" description="数据库固定在宿主 ComfyUI 的用户目录下，随安装走；运行时不可切换。" action={storageLoading ? <Spinner label="读取数据存储配置" /> : undefined}>
+          <Panel title="数据存储" action={storageLoading ? <Spinner label="读取数据存储配置" /> : undefined}>
             {storageConfiguration && <div className="storage-current" aria-label="当前数据库存储配置">
               <div className="storage-current__path">
                 <span>当前数据库</span>
@@ -961,7 +1055,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
             </div>}
             {!storageConfiguration && !storageLoading && <div className="notice notice--error" role="alert">无法读取当前数据库路径。</div>}
           </Panel>
-          <Panel eyebrow="媒体" title="媒体工具 (ffmpeg)" description="素材探测、代理转码与长片拼接依赖 ffmpeg/ffprobe；缺失时可在此一键安装，立即生效无需重启。">
+          <Panel title="媒体工具">
             {mediaSetup === null ? <p className="muted">正在检测媒体工具…</p> : (
               <>
                 <div className="connection-card">
@@ -979,8 +1073,11 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                   )}
                 </div>
                 {mediaSetup.install.state === "running" && (
-                  <div className="raylight-setup">
-                    <p><Spinner /> 正在安装 ffmpeg，请稍候…</p>
+                  <div className="raylight-setup" aria-live="polite">
+                    <p><Spinner /> {mediaToolInstallPhaseMessage(mediaSetup.install.phase)}</p>
+                    {mediaSetup.install.phase === "downloading_binaries" && <MediaToolDownloadProgress
+                      progressPercent={mediaSetup.install.progress_percent}
+                    />}
                     <button type="button" className="button button--ghost" onClick={() => void cancelFfmpegInstall()}>取消安装</button>
                   </div>
                 )}
@@ -990,12 +1087,6 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                 )}
               </>
             )}
-          </Panel>
-          <Panel eyebrow="界面" title="界面主题" description="主题仅作用于当前浏览器，不写入 Director 或 ComfyUI 设置。">
-            <fieldset className="theme-options" aria-label="界面主题">
-              <label className={`theme-option ${theme === "light" ? "is-active" : ""}`}><input type="radio" name="ui-theme" value="light" checked={theme === "light"} onChange={() => onThemeChange("light")} /><span className="theme-option__swatch theme-option__swatch--light" aria-hidden="true" /><strong>暖色浅色</strong><small>纸张暖白与橙棕强调</small></label>
-              <label className={`theme-option ${theme === "dark" ? "is-active" : ""}`}><input type="radio" name="ui-theme" value="dark" checked={theme === "dark"} onChange={() => onThemeChange("dark")} /><span className="theme-option__swatch theme-option__swatch--dark" aria-hidden="true" /><strong>深色</strong><small>沿用导演台暗色工作区</small></label>
-            </fieldset>
           </Panel>
           <Panel eyebrow="运行" title="模型复用策略" description="RayLight 默认按完整配置键常驻；兼容任务直接复用，不兼容任务由 Director 显式安全切换。">
             <Field label="共享策略" hint="Standard 原生子图不主动卸载模型，由 ComfyUI 缓存按显存压力管理。">
