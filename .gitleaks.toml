@@ -21,3 +21,13 @@ regexes = [
 [[allowlists]]
 description = "The scanner configuration contains the exact synthetic fixture regexes"
 paths = ['''^\.gitleaks\.toml$''']
+
+[[allowlists]]
+description = "Deterministic workflow identifiers in generated compatibility golden fixtures"
+condition = "AND"
+regexTarget = "line"
+paths = ['''^backend/tests/fixtures/extensible_workflow_v0/(?:current_v4_expected|native_prompt_goldens)\.json$''']
+regexes = [
+  '''"compatibility_key": "director-g[0-9a-z-]+"''',
+  '''"runtime_key": "[0-9a-f]{64}"''',
+]
