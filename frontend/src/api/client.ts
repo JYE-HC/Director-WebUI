@@ -70,6 +70,7 @@ import type {
   ResolvedImplementationIdentity,
   StorageConfiguration,
   TaskListResponse,
+  TaskStatus,
   TaskBulkCancelResponse,
   TaskDiagnostic,
   TaskGenerationDetails,
@@ -2920,16 +2921,23 @@ export const directorApi = {
 
   createTask: (payload: CreateTaskRequest) =>
     request<unknown>("/jobs", { method: "POST", body: JSON.stringify(payload) }).then(parseGenerationTask),
-  async listTasks(signal?: AbortSignal, projectId?: string): Promise<TaskListResponse> {
+  async listTasks(
+    signal?: AbortSignal,
+    projectId?: string,
+    statuses: readonly TaskStatus[] = [],
+  ): Promise<TaskListResponse> {
     const jobs: GenerationTask[] = [];
     const seen = new Set<string>();
     let offset = 0;
     let summary: TaskListResponse["summary"];
     let total = 0;
     const projectQuery = projectId ? `&project_id=${encodeURIComponent(projectId)}` : "";
+    const statusQuery = statuses.map(
+      (status) => `&status=${encodeURIComponent(status)}`,
+    ).join("");
     for (;;) {
       const page = await request<unknown>(
-        `/jobs?limit=256&offset=${offset}&sort_by=created_at&sort_order=asc${projectQuery}`,
+        `/jobs?limit=256&offset=${offset}&sort_by=created_at&sort_order=asc${projectQuery}${statusQuery}`,
         { signal },
       ).then(parseTaskList);
       if (page.offset !== offset || page.limit !== 256) {

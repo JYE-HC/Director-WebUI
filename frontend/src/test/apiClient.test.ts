@@ -1697,6 +1697,27 @@ describe("Director REST 契约", () => {
     ]);
   });
 
+  it("活动任务刷新只请求活动状态并保留项目作用域", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      jobs: [job], total: 1, limit: 256, offset: 0, has_more: false,
+      summary: taskSummary,
+    }));
+
+    await directorApi.listTasks(undefined, "project / active", [
+      "queued",
+      "preparing",
+      "running",
+      "cancelling",
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/directordeck/api/jobs?limit=256&offset=0&sort_by=created_at&sort_order=asc" +
+      "&project_id=project%20%2F%20active" +
+      "&status=queued&status=preparing&status=running&status=cancelling",
+      expect.objectContaining({ signal: undefined }),
+    );
+  });
+
   it("批量取消、来源项目和生成结果导入只传稳定任务内身份", async () => {
     const project = createTimelineProject();
     const cancelled = { ...job, status: "cancelled", progress: 1 };

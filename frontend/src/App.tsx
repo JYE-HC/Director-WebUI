@@ -41,6 +41,7 @@ import {
 } from "./domain/assetDrag";
 import { randomSafeSeed } from "./domain/modes";
 import { isStoragePath } from "./domain/storagePath";
+import { taskLivePresentation } from "./domain/taskProgress";
 import { persistUiTheme, readUiTheme } from "./domain/theme";
 import {
   loadTimelineSegmentSelectionPreference,
@@ -998,7 +999,13 @@ export default function App() {
   const taskListRequest = useRef(0);
   const taskListInFlight = useRef<Promise<void> | null>(null);
   const taskListRefreshQueued = useRef(false);
+  const activeTaskListInFlight = useRef<Promise<void> | null>(null);
+  const activeTaskListRefreshQueued = useRef(false);
+  const activeTaskRefreshRef = useRef<(signal?: AbortSignal) => Promise<void>>(
+    async () => undefined,
+  );
   const taskListOwnerActive = useRef(false);
+  const tasksRef = useRef(state.tasks);
   const globalSettingsToggleRef = useRef<HTMLButtonElement>(null);
   const timelineHistoryToggleRef = useRef<HTMLButtonElement>(null);
   const assetTrashToggleRef = useRef<HTMLButtonElement>(null);
@@ -1064,6 +1071,10 @@ export default function App() {
     timelineRef.current = timeline;
     timelineRenderedRevision.current = timelineRevision.current;
   }, [timeline]);
+
+  useLayoutEffect(() => {
+    tasksRef.current = state.tasks;
+  }, [state.tasks]);
 
   const setSidebarOpenWithFocus = useCallback((open: boolean) => {
     setSidebarOpen(open);
@@ -1701,8 +1712,79 @@ export default function App() {
         taskListRefreshQueued.current = false;
         await loadTasks(undefined, false);
       }
+      if (activeTaskListRefreshQueued.current && taskListOwnerActive.current) {
+        activeTaskListRefreshQueued.current = false;
+        await activeTaskRefreshRef.current();
+      }
     }
   }, []);
+
+  const refreshActiveTasks = useCallback(async (signal?: AbortSignal) => {
+    if (taskListInFlight.current) {
+      activeTaskListRefreshQueued.current = true;
+      return taskListInFlight.current;
+    }
+    if (activeTaskListInFlight.current) {
+      activeTaskListRefreshQueued.current = true;
+      return activeTaskListInFlight.current;
+    }
+    const authorityRequest = taskListRequest.current;
+    const projectId = activeProjectIdRef.current;
+    const previouslyActiveIds = tasksRef.current
+      .filter((task) => ["queued", "preparing", "running", "cancelling"].includes(task.status))
+      .map((task) => task.id);
+    const operation = (async () => {
+      try {
+        const result = await directorApi.listTasks(signal, projectId, [
+          "queued",
+          "preparing",
+          "running",
+          "cancelling",
+        ]);
+        const observedIds = new Set(result.jobs.map((task) => task.id));
+        const missingIds = previouslyActiveIds.filter(
+          (id) => !observedIds.has(id),
+        );
+        const settled = await Promise.allSettled(
+          missingIds.map((id) => directorApi.getTask(id, signal, projectId)),
+        );
+        if (
+          signal?.aborted ||
+          !taskListOwnerActive.current ||
+          activeProjectIdRef.current !== projectId ||
+          taskListRequest.current !== authorityRequest
+        ) return;
+        for (const task of result.jobs) {
+          dispatch({ type: "tasks/upsert", task });
+        }
+        for (const [index, outcome] of settled.entries()) {
+          if (outcome.status === "fulfilled") {
+            dispatch({ type: "tasks/upsert", task: outcome.value });
+          } else if (outcome.reason instanceof ApiError && outcome.reason.status === 404) {
+            // A task deleted from another tab must not remain as a permanent
+            // local active ghost. Transport failures stay untouched and are
+            // retried by the next SSE/fallback refresh.
+            dispatch({ type: "tasks/remove", id: missingIds[index] });
+          }
+        }
+      } catch {
+        // The full task snapshot remains usable while the host reconnects.
+      }
+    })();
+    activeTaskListInFlight.current = operation;
+    try {
+      await operation;
+    } finally {
+      if (activeTaskListInFlight.current === operation) {
+        activeTaskListInFlight.current = null;
+      }
+      if (activeTaskListRefreshQueued.current && taskListOwnerActive.current) {
+        activeTaskListRefreshQueued.current = false;
+        await refreshActiveTasks();
+      }
+    }
+  }, []);
+  activeTaskRefreshRef.current = refreshActiveTasks;
 
   const invalidateAndRefreshTaskSnapshots = useCallback(() => {
     // A task-list response started before a timeline/settings write carries
@@ -3777,7 +3859,7 @@ export default function App() {
 
   useEffect(() => {
     if (typeof EventSource === "undefined") return;
-    const refreshTasks = () => void loadTasks(undefined, true);
+    const refreshTasks = () => void refreshActiveTasks();
     let eventSource: EventSource | null = null;
     // Defer one turn so React StrictMode's development-only setup/cleanup
     // probe cannot open a real SSE socket that an intermediate proxy retains.
@@ -3790,7 +3872,7 @@ export default function App() {
       eventSource?.removeEventListener("refresh", refreshTasks);
       eventSource?.close();
     };
-  }, [loadTasks]);
+  }, [refreshActiveTasks]);
 
   useEffect(() => {
     const supportsSSE = typeof EventSource !== "undefined";
@@ -3799,19 +3881,19 @@ export default function App() {
     // a wait-gate hint); the interval only guards against a dropped event or a
     // reconnect gap. Without SSE the interval stays the sole refresh mechanism.
     const timer = window.setInterval(
-      () => void loadTasks(undefined, true),
+      () => void refreshActiveTasks(),
       hasActiveTasks ? (supportsSSE ? 10_000 : 2500) : 30_000,
     );
     return () => window.clearInterval(timer);
-  }, [hasActiveTasks, loadTasks]);
+  }, [hasActiveTasks, refreshActiveTasks]);
 
   useEffect(() => {
     const refreshWhenVisible = () => {
-      if (document.visibilityState === "visible") void loadTasks(undefined, true);
+      if (document.visibilityState === "visible") void refreshActiveTasks();
     };
     document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => document.removeEventListener("visibilitychange", refreshWhenVisible);
-  }, [loadTasks]);
+  }, [refreshActiveTasks]);
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 4000);
@@ -4420,7 +4502,6 @@ export default function App() {
       dispatch({ type: "tasks/upsert", task });
       setGlobalSettingsOpen(false);
       dispatch({ type: "tasks/panel", open: true });
-      void loadTasks(undefined, true);
       setToast(`已提交 ${clickedSegmentIds.length} 个原生分段子图`);
     } catch (reason) {
       if (reason instanceof FeatureCatalogDriftError) {
@@ -4457,10 +4538,22 @@ export default function App() {
   ): Promise<TimelineProject> => {
     const { project: concrete, rerolled } = materializeRandomSeeds(config, segmentIds);
     if (!rerolled) return config;
-    // Keep the disabled fields equal to the exact value sent to the job.
+    // Keep the disabled fields equal to the exact value sent to the job, but
+    // do not present this submission-time mechanical update as a user edit.
+    // Rebase an existing history cursor first so the skipped dispatch cannot
+    // detach history.head from the current project or discard a redo branch.
+    if (timelineHistoryRef.current.head) {
+      const rebased = rebaseTimelineHistoryHead(
+        timelineHistoryRef.current,
+        config,
+        concrete,
+      );
+      if (rebased) commitTimelineHistory(rebased);
+      else clearTimelineHistory();
+    }
     dispatchTimeline(
       { type: "project/replace", project: concrete },
-      { historyLabel: "更新随机 Seed" },
+      { history: "skip" },
     );
     const expected = timelineRevision.current;
     const flushed = await flushTimelineAutosave();
@@ -4577,9 +4670,14 @@ export default function App() {
       const task = await directorApi.cancelTask(id, activeProjectIdRef.current);
       taskListRequest.current += 1;
       dispatch({ type: "tasks/upsert", task });
-      void loadTasks(undefined, true);
     } catch (reason) {
       setToast(reason instanceof Error ? reason.message : "取消失败");
+      // A conflict can still be a committed lifecycle transition (for
+      // example, an old ComfyUI epoch becomes restart-certificate-required).
+      // Refresh immediately so the drawer exposes the authoritative recovery
+      // action instead of leaving a stale retry button until the next poll.
+      taskListRequest.current += 1;
+      void refreshActiveTasks();
     }
   };
   const confirmComfyRestartRecovery = async (id: string) => {
@@ -4593,9 +4691,8 @@ export default function App() {
     } catch (reason) {
       const detail = reason instanceof Error ? reason.message : "恢复确认失败";
       setToast(`恢复确认失败：${detail}`);
-    } finally {
       taskListRequest.current += 1;
-      void loadTasks(undefined, true);
+      void refreshActiveTasks();
     }
   };
   const confirmRayLightRuntimeRecovery = (): Promise<void> => {
@@ -4720,7 +4817,6 @@ export default function App() {
         result.jobs.forEach((task) => dispatch({ type: "tasks/upsert", task }));
       }
       taskListRequest.current += 1;
-      void loadTasks(undefined, true);
       setToast(`已向 ${cancelledCount} 个导演台任务发送定向取消`);
     } catch (reason) {
       taskListRequest.current += 1;
@@ -4728,7 +4824,7 @@ export default function App() {
       setToast(cancelledCount > 0
         ? `已取消前 ${cancelledCount} 个任务，后续批次失败：${detail}`
         : detail);
-      void loadTasks(undefined, true);
+      void refreshActiveTasks();
     }
   };
   const loadTaskProject = async (id: string) => {
@@ -5283,7 +5379,9 @@ export default function App() {
     }
   }, [capabilities.connection, timelineRevisionConflict, timelineSyncRequired]);
 
-  const activeTasks = state.tasks.filter((task) => ["queued", "preparing", "running", "cancelling"].includes(task.status));
+  const activeTasks = state.tasks
+    .filter((task) => ["queued", "preparing", "running", "cancelling"].includes(task.status))
+    .map(taskLivePresentation);
   const activityRank: Record<string, number> = { running: 0, preparing: 1, queued: 2, cancelling: 3 };
   const activeTask = [...activeTasks].sort((left, right) =>
     (activityRank[left.status] ?? 9) - (activityRank[right.status] ?? 9) ||

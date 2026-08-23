@@ -4439,6 +4439,13 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByLabelText("FL2VA Seed")).toHaveValue(101);
     await user.keyboard("{Escape}");
 
+    await user.type(screen.getByLabelText("片段提示词"), "，镜头缓慢推进");
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    const undoTitleBeforeSubmission = screen.getByRole("button", { name: "撤销" })
+      .getAttribute("title");
+    expect(undoTitleBeforeSubmission).toMatch(/撤销：编辑提示词/);
+    update.mockClear();
+
     await user.click(screen.getByRole("button", { name: /生成任务 1/ }));
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
@@ -4453,6 +4460,12 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByLabelText("FL2VA Seed")).toBeDisabled();
     expect(screen.getByLabelText("FL2VA Seed")).toHaveValue(303);
     expect(screen.getByLabelText("Ref2VA Seed")).toHaveValue(202);
+    expect(screen.getByRole("button", { name: "撤销" }))
+      .toHaveAttribute("title", undoTitleBeforeSubmission);
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "编辑历史" }));
+    expect(screen.getByText("当前位置 1 / 1")).toBeInTheDocument();
+    expect(screen.queryByText("更新随机 Seed")).not.toBeInTheDocument();
   });
 
   it("预检只在临时草稿具体化随机 Seed，不写时间线、项目或撤销历史", async () => {
@@ -5601,7 +5614,7 @@ describe("统一长视频时间线应用", () => {
     expect(screen.queryByRole("button", { name: "任务 job-term 的更多操作" })).not.toBeInTheDocument();
   });
 
-  it("确认 ComfyUI 已重启后立即更新任务、刷新列表并提示成功", async () => {
+  it("确认 ComfyUI 已重启后使用权威响应立即更新任务并提示成功", async () => {
     const user = userEvent.setup();
     const activeProjectId = "project-recovery";
     const recoveryTask: GenerationTask = {
@@ -5645,7 +5658,7 @@ describe("统一长视频时间线应用", () => {
     expect(await screen.findByText(
       "已确认 ComfyUI 重启，导演台任务已结束",
     )).toHaveAttribute("role", "status");
-    await waitFor(() => expect(directorApi.listTasks).toHaveBeenCalledTimes(2));
+    expect(directorApi.listTasks).toHaveBeenCalledTimes(1);
     expect(screen.getByText("已取消")).toBeInTheDocument();
   });
 
@@ -5740,6 +5753,54 @@ describe("统一长视频时间线应用", () => {
     ));
   });
 
+  it("取消冲突后立即回读并显示 ComfyUI 重启确认入口", async () => {
+    const user = userEvent.setup();
+    const runningTask: GenerationTask = {
+      ...queuedTimelineTask,
+      id: "job-old-runtime",
+      status: "running",
+      progress: 0.2,
+      stage: "采样 1/4",
+    };
+    const recoveryTask: GenerationTask = {
+      ...runningTask,
+      status: "cancelling",
+      progress: 0.2,
+      stage: "restart_certificate_required",
+      error: "ComfyUI runtime instance changed; explicit restart confirmation is required",
+    };
+    mockCommonRequests();
+    vi.mocked(directorApi.getCapabilities).mockResolvedValue({
+      ...ONLINE_CAPABILITIES,
+      supports_cancel: true,
+    });
+    vi.mocked(directorApi.listTasks)
+      .mockResolvedValueOnce({ jobs: [runningTask] })
+      .mockResolvedValue({ jobs: [recoveryTask] });
+    vi.spyOn(directorApi, "cancelTask").mockRejectedValue(
+      new ApiError(
+        "ComfyUI runtime instance changed; explicit restart confirmation is required",
+        409,
+      ),
+    );
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(await screen.findByRole("button", { name: "任务，1 个进行中" }));
+    await user.click(screen.getByRole("button", { name: "取消" }));
+
+    expect(await screen.findByText(
+      "ComfyUI runtime instance changed; explicit restart confirmation is required",
+    )).toHaveAttribute("role", "status");
+    await waitFor(() => expect(directorApi.listTasks).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", {
+      name: "任务 job-old- 的更多操作",
+    }));
+    expect(screen.getByRole("menuitem", {
+      name: "确认 ComfyUI 已重启并结束任务",
+    })).toBeEnabled();
+  });
+
   it("任务刷新和活跃状态变化不会重建 SSE 连接", async () => {
     class FakeEventSource extends EventTarget {
       static instances: FakeEventSource[] = [];
@@ -5774,17 +5835,33 @@ describe("统一长视频时间线应用", () => {
     await waitFor(() => expect(directorApi.listTasks).toHaveBeenCalledTimes(
       initialTaskReads + 1,
     ));
+    expect(vi.mocked(directorApi.listTasks).mock.calls.at(-1)?.[2]).toEqual([
+      "queued",
+      "preparing",
+      "running",
+      "cancelling",
+    ]);
     expect(await screen.findByRole("button", { name: "任务，1 个进行中" })).toBeInTheDocument();
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(source.close).not.toHaveBeenCalled();
 
     const readsBeforeCompletion = vi.mocked(directorApi.listTasks).mock.calls.length;
     vi.mocked(directorApi.listTasks).mockResolvedValueOnce({
-      jobs: [succeededTask],
+      jobs: [],
+    });
+    const getTask = vi.spyOn(directorApi, "getTask").mockResolvedValue({
+      ...succeededTask,
+      id: queuedTimelineTask.id,
+      prompt_id: queuedTimelineTask.prompt_id,
     });
     act(() => source.dispatchEvent(new Event("refresh")));
     await waitFor(() => expect(directorApi.listTasks).toHaveBeenCalledTimes(
       readsBeforeCompletion + 1,
+    ));
+    await waitFor(() => expect(getTask).toHaveBeenCalledWith(
+      queuedTimelineTask.id,
+      undefined,
+      DEFAULT_PROJECT_ID,
     ));
     expect(await screen.findByRole("button", { name: "任务，0 个进行中" })).toBeInTheDocument();
     expect(FakeEventSource.instances).toHaveLength(1);
@@ -6026,6 +6103,13 @@ describe("统一长视频时间线应用", () => {
         .mockImplementationOnce(() => new Promise((resolve) => { resolveInitial = resolve; }))
         .mockImplementationOnce(() => new Promise((resolve) => { resolveSlowPoll = resolve; }))
         .mockResolvedValue({ jobs: [{ ...queuedTimelineTask, id: "queued-after-slow-refresh" }] });
+      vi.spyOn(directorApi, "getTask").mockResolvedValue({
+        ...queuedTimelineTask,
+        status: "succeeded",
+        progress: 1,
+        stage: "completed",
+        completed_at: "2026-08-12T00:01:00Z",
+      });
 
       render(<App />);
       await waitUntilReady();
