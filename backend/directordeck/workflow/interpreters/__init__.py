@@ -34,7 +34,7 @@ from .raylight_model_path import (
 from .sampling_raylight import emit_raylight_sampling
 from .sampling_standard import emit_standard_sampling
 from .save_take import emit_save_take
-from .shared_models import emit_shared_models
+from .shared_models import emit_auxiliary_models, emit_shared_models
 from .standard_model_path import (
     emit_standard_model_device,
     emit_standard_model_load,
@@ -90,6 +90,7 @@ __all__ = [
     "builtin_interpreters",
     "catalog_implementation_alternatives",
     "emit_audio_output",
+    "emit_auxiliary_models",
     "emit_continuity",
     "emit_decode_video",
     "emit_family_conditioning",

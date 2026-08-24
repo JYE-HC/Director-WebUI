@@ -21,6 +21,14 @@ class _ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
 
+class ProductConfigDiagnostic(_ConfigModel):
+    code: Literal[
+        "lora_loader_entry_invalid",
+        "lora_loader_policy_invalid",
+    ]
+    message: Annotated[str, Field(min_length=1, max_length=1_024)]
+
+
 class LoraLoaderOptionDefinition(_ConfigModel):
     id: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
     type: Literal["boolean"]
@@ -181,10 +189,98 @@ class DirectorDeckConfigManager:
         self._compiled_lora_policies: tuple[
             tuple[Pattern[str], LoraLoaderPolicy], ...
         ] = ()
+        self._diagnostics: tuple[ProductConfigDiagnostic, ...] = ()
 
     @staticmethod
     def default_path() -> Path:
         return Path(__file__).with_name("config") / "directordeck.json"
+
+    @staticmethod
+    def _runtime_snapshot(
+        raw: object,
+    ) -> tuple[DirectorDeckConfig, tuple[ProductConfigDiagnostic, ...]]:
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"schema_version", "lora"}
+            or raw.get("schema_version") != 1
+            or not isinstance(raw.get("lora"), dict)
+        ):
+            raise ValueError("product configuration root is invalid")
+        lora = raw["lora"]
+        assert isinstance(lora, dict)
+        if set(lora) - {"loaders", "fallback_policy", "loader_policies"}:
+            raise ValueError("LoRA product configuration has unknown fields")
+        loader_items = lora.get("loaders")
+        if not isinstance(loader_items, list):
+            raise ValueError("LoRA loaders must be a list")
+
+        diagnostics: list[ProductConfigDiagnostic] = []
+
+        def diagnose(code: str, message: str) -> None:
+            if len(diagnostics) < 16:
+                diagnostics.append(ProductConfigDiagnostic(code=code, message=message))
+
+        loaders: list[SupportedLoraLoaderDefinition] = []
+        loader_ids: set[str] = set()
+        for index, item in enumerate(loader_items):
+            try:
+                loader = SupportedLoraLoaderDefinition.model_validate(item)
+                if loader.id in loader_ids:
+                    raise ValueError("duplicate loader id")
+            except Exception:
+                diagnose(
+                    "lora_loader_entry_invalid",
+                    f"Ignored invalid LoRA loader entry at index {index}.",
+                )
+                continue
+            loaders.append(loader)
+            loader_ids.add(loader.id)
+        if not loaders:
+            raise ValueError("no valid LoRA loader remains")
+
+        fallback = LoraLoaderSelectionPolicy.model_validate(
+            lora.get("fallback_policy")
+        )
+        if set(fallback.loader_ids) - loader_ids:
+            raise ValueError("LoRA fallback references an unavailable loader")
+
+        policy_items = lora.get("loader_policies", [])
+        if not isinstance(policy_items, list):
+            diagnose(
+                "lora_loader_policy_invalid",
+                "Ignored the invalid LoRA loader policy list.",
+            )
+            policy_items = []
+        policies: list[LoraLoaderPolicy] = []
+        patterns: set[str] = set()
+        for index, item in enumerate(policy_items):
+            try:
+                policy = LoraLoaderPolicy.model_validate(item)
+                if (
+                    policy.lora_filename in patterns
+                    or set(policy.loader_ids) - loader_ids
+                ):
+                    raise ValueError("invalid loader policy reference")
+            except Exception:
+                diagnose(
+                    "lora_loader_policy_invalid",
+                    f"Ignored invalid LoRA loader policy at index {index}.",
+                )
+                continue
+            policies.append(policy)
+            patterns.add(policy.lora_filename)
+
+        snapshot = DirectorDeckConfig.model_validate({
+            "schema_version": 1,
+            "lora": {
+                "loaders": [loader.model_dump(mode="json") for loader in loaders],
+                "fallback_policy": fallback.model_dump(mode="json"),
+                "loader_policies": [
+                    policy.model_dump(mode="json") for policy in policies
+                ],
+            },
+        })
+        return snapshot, tuple(diagnostics)
 
     def initialize(self, path: str | Path | None = None) -> DirectorDeckConfig:
         source = Path(path) if path is not None else self.default_path()
@@ -199,18 +295,22 @@ class DirectorDeckConfigManager:
                 return self._snapshot
             try:
                 raw = json.loads(source.read_text(encoding="utf-8"))
-                snapshot = DirectorDeckConfig.model_validate(raw)
+                snapshot, diagnostics = self._runtime_snapshot(raw)
             except Exception as exc:
                 raise RuntimeError(
                     f"DirectorDeck configuration is invalid: {source}: {exc}"
                 ) from exc
             self._source = source
             self._snapshot = snapshot
+            self._diagnostics = diagnostics
             self._compiled_lora_policies = tuple(
                 (re.compile(policy.lora_filename), policy)
                 for policy in snapshot.lora.loader_policies
             )
             return snapshot
+
+    def diagnostics(self) -> tuple[ProductConfigDiagnostic, ...]:
+        return self._diagnostics
 
     def get(self) -> DirectorDeckConfig:
         snapshot = self._snapshot
@@ -248,6 +348,10 @@ def get_directordeck_config() -> DirectorDeckConfig:
     return DIRECTORDECK_CONFIG.get()
 
 
+def get_directordeck_config_diagnostics() -> tuple[ProductConfigDiagnostic, ...]:
+    return DIRECTORDECK_CONFIG.diagnostics()
+
+
 def get_lora_loader_policy(lora_filename: str) -> LoraLoaderSelectionPolicy:
     return DIRECTORDECK_CONFIG.lora_loader_policy(lora_filename)
 
@@ -264,8 +368,10 @@ __all__ = [
     "LoraLoaderOptionDefinition",
     "LoraLoaderPolicy",
     "LoraLoaderSelectionPolicy",
+    "ProductConfigDiagnostic",
     "SupportedLoraLoaderDefinition",
     "get_directordeck_config",
+    "get_directordeck_config_diagnostics",
     "get_lora_loader_policy",
     "initialize_directordeck_config",
     "is_lora_loader_allowed",

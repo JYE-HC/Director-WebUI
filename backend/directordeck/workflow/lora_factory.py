@@ -222,8 +222,20 @@ def resolve_standard_lora_adapter(
 ) -> ResolvedLoraAdapter:
     """Resolve one LoRA within its configured loader allowlist."""
 
-    config = get_directordeck_config()
-    policy = get_lora_loader_policy(binding.lora_filename)
+    try:
+        config = get_directordeck_config()
+        policy = get_lora_loader_policy(binding.lora_filename)
+    except RuntimeError as exc:
+        # Product configuration is Director-owned, but its failure belongs to
+        # this active Standard LoRA binding. Callers project this typed error
+        # into the current compile/job instead of turning it into a process- or
+        # catalog-wide gate. RayLight and projects with no active LoRA never
+        # enter this resolver.
+        raise LoraAdapterResolutionError(
+            "DirectorDeck's LoRA loader configuration is unavailable.",
+            code="lora_product_config_unavailable",
+            binding=binding,
+        ) from exc
     override = _matching_user_override(binding, overrides)
     if override is not None:
         adapter = require_lora_adapter(override.adapter_id)
@@ -234,7 +246,10 @@ def resolve_standard_lora_adapter(
                 binding=binding,
                 adapter_id=override.adapter_id,
             )
-        if adapter.backend != "standard" or binding.family not in adapter.supported_families:
+        if (
+            adapter.backend != "standard"
+            or binding.family not in adapter.supported_families
+        ):
             raise LoraAdapterResolutionError(
                 "The selected LoRA adapter does not support this Standard family.",
                 code="lora_adapter_incompatible",
@@ -261,11 +276,31 @@ def resolve_standard_lora_adapter(
         )
 
     adapter = require_lora_adapter(policy.default_loader_id)
+    if (
+        adapter.backend != "standard"
+        or binding.family not in adapter.supported_families
+    ):
+        raise LoraAdapterResolutionError(
+            "The configured default LoRA adapter does not support this "
+            "Standard family.",
+            code="lora_adapter_incompatible",
+            binding=binding,
+            adapter_id=adapter.adapter_id,
+        )
+    try:
+        options = config.normalize_lora_loader_options(adapter.adapter_id, {})
+    except (KeyError, ValueError) as exc:
+        raise LoraAdapterResolutionError(
+            "The configured default LoRA loader configuration is invalid.",
+            code="lora_loader_options_invalid",
+            binding=binding,
+            adapter_id=adapter.adapter_id,
+        ) from exc
     return ResolvedLoraAdapter(
         adapter=adapter,
         binding=binding,
         source="factory_default",
-        options=config.normalize_lora_loader_options(adapter.adapter_id, {}),
+        options=options,
     )
 
 

@@ -42,6 +42,10 @@ from .migrations.runtime_settings_v2_v3 import (
 from .migrations.feature_bundle_v4_v5 import (
     migrate_feature_bundle_v4_authorities_to_v5,
 )
+from .migrations.feature_bundle_v5_v6 import (
+    feature_bundle_migration_notice_prefix,
+    migrate_feature_bundle_v5_authorities_to_v6,
+)
 from .schemas import (
     AssetReference,
     GenerationMode,
@@ -63,6 +67,7 @@ from .schemas import (
     default_settings,
     default_timeline_draft,
     default_timeline_draft_v5,
+    default_timeline_draft_v6,
     iter_draft_assets,
     iter_timeline_assets,
     migrate_mode_drafts_to_timeline,
@@ -101,13 +106,13 @@ from .workflow.execution import (
     sha256_document_digest,
     transition_prompt_ownership,
 )
-from .workflow.node_contracts import (
-    CURRENT_NODE_CONTRACT_REGISTRY,
-    V4_NODE_CONTRACT_REGISTRY,
-)
-from .workflow.templates import CURRENT_TEMPLATE_BUNDLE, V4_TEMPLATE_BUNDLE
+from .workflow.node_contracts import node_contract_registry_for_bundle
 from .workflow.effective_features import (
     migrate_timeline_feature_authority_to_v5,
+)
+from .workflow.v6_projection import (
+    V5V6ProjectionError,
+    project_v5_authority_to_v6,
 )
 
 
@@ -179,6 +184,19 @@ class TimelineRevisionExhausted(OverflowError):
         )
         self.project_id = project_id
         self.revision = revision
+
+
+class TimelineTemplateBundleConflict(ValueError):
+    """A stale browser attempted to replace a newer project feature bundle."""
+
+    def __init__(self, project_id: str, submitted: int, current: int) -> None:
+        super().__init__(
+            f"timeline template bundle conflict for {project_id}: "
+            f"submitted {submitted}, current {current}"
+        )
+        self.project_id = project_id
+        self.submitted = submitted
+        self.current = current
 
 
 class SettingsAuthorityConflict(RuntimeError):
@@ -1174,7 +1192,7 @@ class Database:
                             ),
                         )
                 elif fresh_database:
-                    migrated = default_timeline_draft_v5(default_model_stack())
+                    migrated = default_timeline_draft_v6(default_model_stack())
                 else:
                     migrated = default_timeline_draft()
                 db.execute(
@@ -1182,7 +1200,12 @@ class Database:
                     (migrated.model_dump_json(), now),
                 )
             else:
-                raw_timeline = json.loads(timeline_row["document"])
+                try:
+                    raw_timeline = json.loads(timeline_row["document"])
+                except (json.JSONDecodeError, TypeError):
+                    raw_timeline = {}
+                if not isinstance(raw_timeline, dict):
+                    raw_timeline = {}
                 legacy_timeline_compatibility_changed = False
                 timeline_sampling = raw_timeline.get("sampling")
                 if isinstance(timeline_sampling, dict):
@@ -1211,11 +1234,17 @@ class Database:
                             legacy_timeline_compatibility_changed = True
                 is_v5_timeline = raw_timeline.get("version") == 5
                 is_frozen_v4_timeline = raw_timeline.get("version") == 4
-                normalized_timeline = (
-                    validate_timeline_draft_v5(raw_timeline).model_dump(mode="json")
-                    if is_v5_timeline
-                    else validate_timeline_draft(raw_timeline).model_dump(mode="json")
-                )
+                try:
+                    normalized_timeline = (
+                        validate_timeline_draft_v5(raw_timeline).model_dump(mode="json")
+                        if is_v5_timeline
+                        else validate_timeline_draft(raw_timeline).model_dump(mode="json")
+                    )
+                except (TypeError, ValueError, ValidationError):
+                    # Stage-2 authority migration owns project-local recovery.
+                    # Keep malformed bytes untouched so one row cannot prevent
+                    # startup or destroy the only export/delete evidence.
+                    normalized_timeline = None
                 # A valid v4 authority must reach the receipt migration with
                 # the exact browser-authored optional-key shape intact. Merely
                 # round-tripping it through Pydantic materializes absent asset
@@ -1224,7 +1253,8 @@ class Database:
                 # may still materialize current defaults; v4 is rewritten only
                 # for the explicit pre-existing unsafe-seed compatibility fix.
                 should_normalize_timeline = (
-                    json.loads(timeline_row["document"]) != normalized_timeline
+                    normalized_timeline is not None
+                    and raw_timeline != normalized_timeline
                     and (
                         is_v5_timeline
                         or not is_frozen_v4_timeline
@@ -1349,6 +1379,14 @@ class Database:
         # databases and already-migrated databases are no-ops.
         with self.connect() as migration_db:
             migrate_runtime_settings_v2_to_v3(
+                migration_db,
+                created_at=utc_now(),
+            )
+        # Bundle 6 is an authority-local cut-over.  Each row owns a short CAS
+        # transaction; an ambiguous or damaged project remains untouched and
+        # cannot prevent the default or another project from migrating.
+        with self.connect() as migration_db:
+            migrate_feature_bundle_v5_authorities_to_v6(
                 migration_db,
                 created_at=utc_now(),
             )
@@ -1782,6 +1820,21 @@ class Database:
             raise RuntimeError(
                 "stored runtime settings migration notice is invalid"
             ) from exc
+
+    def list_feature_bundle_migration_notices(
+        self,
+        project_id: str,
+    ) -> list[str]:
+        """Return bounded safe advisories for one project authority."""
+
+        prefix = feature_bundle_migration_notice_prefix(project_id) + ":"
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT message FROM migration_notices WHERE id LIKE ? "
+                "ORDER BY created_at, id LIMIT 32",
+                (prefix + "%",),
+            ).fetchall()
+        return [str(row["message"]) for row in rows]
 
     def get_raylight_runtime_state(self) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -2759,7 +2812,7 @@ class Database:
             ).fetchone()
         return None if row is None else decode_project_migration_receipt(row)
 
-    def _require_v5_timeline_write(
+    def _normalize_timeline_write(
         self,
         project_id: str,
         timeline: UnifiedTimelineDraftV5 | UnifiedTimelineDraft,
@@ -2772,11 +2825,35 @@ class Database:
             )
         if not isinstance(timeline, UnifiedTimelineDraftV5):
             raise TypeError("timeline write requires UnifiedTimelineDraftV5")
-        # Full-state browser WAL replay may still carry a valid schema-5,
-        # bundle-4 document.  Upgrade it at the CAS boundary so an old payload
-        # can never write bundle 4 back after startup migration.  Invalid or
-        # future feature authority fails closed through the shared resolver.
-        return migrate_timeline_feature_authority_to_v5(timeline)
+        bundle = timeline.features.template_bundle_version
+        if bundle in {4, 5}:
+            # Frozen bundle-4 browser WAL may still replay against a Bundle-5
+            # project.  Preserve that bounded bridge without upgrading an
+            # explicit Bundle-5 conflict project behind the user's back.
+            return migrate_timeline_feature_authority_to_v5(timeline)
+        if bundle == 6:
+            return project_v5_authority_to_v6(timeline).draft
+        raise V5V6ProjectionError(
+            "The timeline targets an unsupported feature bundle.",
+            code="template_bundle_version_unsupported",
+        )
+
+    @staticmethod
+    def _assert_no_timeline_bundle_downgrade(
+        *,
+        project_id: str,
+        candidate: UnifiedTimelineDraftV5,
+        current_document: str,
+    ) -> None:
+        current = validate_timeline_draft_v5(json.loads(current_document))
+        candidate_bundle = candidate.features.template_bundle_version
+        current_bundle = current.features.template_bundle_version
+        if candidate_bundle < current_bundle:
+            raise TimelineTemplateBundleConflict(
+                project_id,
+                candidate_bundle,
+                current_bundle,
+            )
 
     @staticmethod
     def _assert_expected_timeline_revision(
@@ -2819,13 +2896,13 @@ class Database:
     ) -> tuple[UnifiedTimelineDraftV5, int]:
         """CAS-replace the default timeline under the asset-validation lock."""
 
-        timeline = self._require_v5_timeline_write(
+        timeline = self._normalize_timeline_write(
             self.LEGACY_DEFAULT_PROJECT_ID, timeline
         )
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT revision FROM unified_timeline WHERE singleton = 1"
+                "SELECT document, revision FROM unified_timeline WHERE singleton = 1"
             ).fetchone()
             if row is None:
                 raise RuntimeError("unified timeline row is missing")
@@ -2834,6 +2911,11 @@ class Database:
                 project_id=self.LEGACY_DEFAULT_PROJECT_ID,
                 expected_revision=expected_revision,
                 actual_revision=current_revision,
+            )
+            self._assert_no_timeline_bundle_downgrade(
+                project_id=self.LEGACY_DEFAULT_PROJECT_ID,
+                candidate=timeline,
+                current_document=str(row["document"]),
             )
             self._validate_asset_iterator_in_connection(
                 db,
@@ -2852,13 +2934,20 @@ class Database:
 
     @staticmethod
     def _project_row_summary(row: sqlite3.Row) -> dict[str, Any]:
-        timeline = validate_timeline_draft_v5(json.loads(row["document"]))
+        try:
+            timeline = validate_timeline_draft_v5(json.loads(row["document"]))
+            segment_count = len(timeline.segments)
+        except (TypeError, ValueError, ValidationError):
+            # Keep a damaged authority addressable for raw export and deletion.
+            # Zero cannot collide with a valid timeline, whose schema requires
+            # at least one segment.
+            segment_count = 0
         return {
             "id": str(row["id"]),
             "title": str(row["title"]),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
-            "segment_count": len(timeline.segments),
+            "segment_count": segment_count,
         }
 
     def _legacy_project_row(self, db: sqlite3.Connection) -> dict[str, Any] | None:
@@ -2899,12 +2988,7 @@ class Database:
                 }
             )
         for row in rows:
-            try:
-                summaries.append(self._project_row_summary(row))
-            except (TypeError, ValueError, ValidationError, json.JSONDecodeError):
-                # A corrupt project row must not hide the whole list; expose it
-                # so the operator can still delete it explicitly.
-                continue
+            summaries.append(self._project_row_summary(row))
         return summaries
 
     def get_project(self, project_id: str) -> dict[str, Any] | None:
@@ -2919,13 +3003,32 @@ class Database:
             ).fetchone()
         if row is None:
             return None
+        raw_document = str(row["document"])
+        try:
+            document: Any = json.loads(raw_document)
+        except (TypeError, ValueError):
+            document = raw_document
         return {
             "id": str(row["id"]),
             "title": str(row["title"]),
-            "document": json.loads(row["document"]),
+            "document": document,
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
         }
+
+    def get_project_raw_document(self, project_id: str) -> str | None:
+        """Return the exact stored TEXT without invoking a timeline reader."""
+
+        with self.connect() as db:
+            if self._is_legacy_project_id(project_id):
+                row = db.execute(
+                    "SELECT document FROM unified_timeline WHERE singleton = 1"
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT document FROM projects WHERE id = ?", (project_id,)
+                ).fetchone()
+        return None if row is None else str(row["document"])
 
     def project_exists(self, project_id: str) -> bool:
         """Check project scope without reading its mutable creative document."""
@@ -2949,7 +3052,7 @@ class Database:
         """Create a fresh project with a new stable segment identity."""
 
         project_id = str(uuid.uuid4())
-        timeline = default_timeline_draft_v5(initial_model_stack)
+        timeline = default_timeline_draft_v6(initial_model_stack)
         # A fresh stable segment id guarantees the durable take ledger can
         # never match this project's segment against another project's render.
         fresh_segment = timeline.segments[0].model_copy(
@@ -2990,7 +3093,7 @@ class Database:
             raise TimelineSchemaMigrated("import", None)
         if not isinstance(timeline, UnifiedTimelineDraftV5):
             raise TypeError("project import requires UnifiedTimelineDraftV5")
-        timeline = migrate_timeline_feature_authority_to_v5(timeline)
+        timeline = self._normalize_timeline_write("import", timeline)
         project_id = str(uuid.uuid4())
         normalized_title = (
             title.strip() or timeline.title.strip() or "未命名长视频"
@@ -3078,11 +3181,11 @@ class Database:
                 timeline,
                 expected_revision=expected_revision,
             )
-        timeline = self._require_v5_timeline_write(project_id, timeline)
+        timeline = self._normalize_timeline_write(project_id, timeline)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT revision FROM projects WHERE id = ?",
+                "SELECT document, revision FROM projects WHERE id = ?",
                 (project_id,),
             ).fetchone()
             if row is None:
@@ -3092,6 +3195,11 @@ class Database:
                 project_id=project_id,
                 expected_revision=expected_revision,
                 actual_revision=current_revision,
+            )
+            self._assert_no_timeline_bundle_downgrade(
+                project_id=project_id,
+                candidate=timeline,
+                current_document=str(row["document"]),
             )
             self._validate_asset_iterator_in_connection(
                 db,
@@ -4597,10 +4705,11 @@ class Database:
         after: Any,
         updated_at: str,
     ) -> None:
-        # Every POST owns one exact ledger frontier, including a Standard
-        # submission that expects no Ray row.  Treating ``None -> None`` as a
-        # no-op would let a concurrently-created resident pool bypass the
-        # locked plan's compare-and-set authority.
+        # Standard submissions do not own or mutate Director's RayLight
+        # runtime ledger.  A ``None -> None`` plan is therefore an explicit
+        # no-op, so an unrelated ambiguous Ray task cannot gate Standard work.
+        if before is None and after is None:
+            return
         current = cls._raylight_runtime_state_in_connection(db)
         expected = (
             None
@@ -5137,14 +5246,14 @@ class Database:
                 template_bundle_version = persisted_plan_document.get(
                     "template_bundle_version"
                 )
-                if template_bundle_version == V4_TEMPLATE_BUNDLE.version:
-                    node_contract_registry = V4_NODE_CONTRACT_REGISTRY
-                elif template_bundle_version == CURRENT_TEMPLATE_BUNDLE.version:
-                    node_contract_registry = CURRENT_NODE_CONTRACT_REGISTRY
-                else:
+                try:
+                    node_contract_registry = node_contract_registry_for_bundle(
+                        template_bundle_version
+                    )
+                except KeyError as exc:
                     raise ValueError(
                         "persisted compiled plan uses an unsupported template bundle"
-                    )
+                    ) from exc
                 prepared = self._prepared_unit_from_compiled_plan_index(
                     db,
                     job_id=job_id,
@@ -5317,6 +5426,85 @@ class Database:
         if committed_row is None:
             raise RuntimeError("committed submission child disappeared")
         return self._job_child_row(committed_row), ownership
+
+    def fail_rejected_job_child_submission(
+        self,
+        child_id: str,
+        *,
+        expected_revision: int,
+        error: str,
+        updated_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Release a prewritten intent after a definite pre-queue rejection."""
+
+        now = updated_at.astimezone(timezone.utc).isoformat()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not self._execution_evidence_schema_exists(db):
+                return None
+            ownership = self._prompt_ownership_in_connection(db, child_id)
+            if (
+                ownership is None
+                or ownership.ownership_revision != expected_revision
+                or ownership.state != "submitting"
+                or ownership.actual_prompt_id is not None
+            ):
+                return None
+            child_row = db.execute(
+                "SELECT * FROM job_children WHERE id = ?", (child_id,)
+            ).fetchone()
+            if child_row is None:
+                raise KeyError(child_id)
+            child = self._job_child_row(child_row)
+            if (
+                child["status"] != "preparing"
+                or child.get("prompt_id") != ownership.requested_prompt_id
+            ):
+                return None
+            evidence_row = db.execute(
+                "SELECT * FROM job_child_execution_evidence WHERE child_id = ?",
+                (child_id,),
+            ).fetchone()
+            if evidence_row is None:
+                raise ExecutionEvidenceConflict(
+                    "rejected submission has no immutable execution evidence"
+                )
+            locked_plan, _exact_snapshot, _unit = self._execution_evidence_from_row(
+                evidence_row,
+                child_id=child_id,
+            )
+
+            # A 4xx /prompt response proves that this requested id never became
+            # an upstream owner. Remove the pre-network evidence as one unit so
+            # deletion/recovery cannot mistake the rejected id for a live prompt.
+            self._persist_raylight_intent_in_connection(
+                db,
+                before=locked_plan.ray_ledger_after_intent,
+                after=locked_plan.ray_ledger_before,
+                updated_at=now,
+            )
+            db.execute(
+                "DELETE FROM prompt_ownership WHERE child_id = ?", (child_id,)
+            )
+            db.execute(
+                "DELETE FROM job_child_execution_evidence WHERE child_id = ?",
+                (child_id,),
+            )
+            cursor = db.execute(
+                "UPDATE job_children SET status = 'failed', progress = 1.0, "
+                "stage = 'submission_failed', prompt_id = NULL, outputs = '[]', "
+                "error = ?, updated_at = ?, completed_at = ? "
+                "WHERE id = ? AND status = 'preparing' AND prompt_id = ?",
+                (error[:20_000], now, now, child_id, ownership.requested_prompt_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("rejected submission child changed under write lock")
+            rejected_row = db.execute(
+                "SELECT * FROM job_children WHERE id = ?", (child_id,)
+            ).fetchone()
+        if rejected_row is None:
+            raise RuntimeError("rejected submission child disappeared")
+        return self._job_child_row(rejected_row)
 
     def _prompt_ownership_in_connection(
         self,
@@ -7976,8 +8164,18 @@ class Database:
     def _serialize_job_updates(updates: dict[str, Any]) -> dict[str, Any]:
         updates = dict(updates)
         allowed = {
-            "status", "cancel_requested", "progress", "stage", "prompt_id", "outputs", "error", "prompt_snapshot",
-            "updated_at", "started_at", "completed_at",
+            "status",
+            "cancel_requested",
+            "progress",
+            "stage",
+            "prompt_id",
+            "outputs",
+            "error",
+            "settings_snapshot",
+            "prompt_snapshot",
+            "updated_at",
+            "started_at",
+            "completed_at",
         }
         unknown = set(updates) - allowed
         if unknown:
@@ -7985,8 +8183,14 @@ class Database:
         updates.setdefault("updated_at", utc_now())
         if "outputs" in updates:
             updates["outputs"] = json.dumps(updates["outputs"], ensure_ascii=False)
+        if "settings_snapshot" in updates:
+            updates["settings_snapshot"] = json.dumps(
+                updates["settings_snapshot"], ensure_ascii=False
+            )
         if "prompt_snapshot" in updates and updates["prompt_snapshot"] is not None:
-            updates["prompt_snapshot"] = json.dumps(updates["prompt_snapshot"], ensure_ascii=False)
+            updates["prompt_snapshot"] = json.dumps(
+                updates["prompt_snapshot"], ensure_ascii=False
+            )
         return updates
 
     @staticmethod

@@ -16,6 +16,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Final, Literal
 
 from pydantic import Field, model_validator
@@ -145,7 +146,6 @@ def _strict(
         "node_contract",
         "strict_wrapper",
         "director_owned_implementation",
-        "user_assumed",
     ] = "node_contract",
     notes: tuple[str, ...] = (),
 ) -> RuntimeEffectContract:
@@ -167,6 +167,7 @@ def _identity_allowed(
         "node_contract",
         "strict_wrapper",
         "director_owned_implementation",
+        "user_assumed",
     ] = "node_contract",
     unsupported_behavior: Literal["identity", "fallback"] = "identity",
     notes: tuple[str, ...],
@@ -245,6 +246,7 @@ _H3 = "comfy_extras.nodes_minimax_h3"
 _SAMPLER = "comfy_extras.nodes_custom_sampler"
 _IMAGES = "comfy_extras.nodes_images"
 _LORA_DEBUG = "comfy_extras.nodes_lora_debug"
+_MODEL_ADVANCED = "comfy_extras.nodes_model_advanced"
 _DIRECTOR_STRICT_ATTENTION = "custom_nodes.DirectorDeck-Strict-Attention"
 _DIRECTOR_STRICT_H3 = "custom_nodes.DirectorDeck-Strict-H3"
 _TURBO = "custom_nodes.ComfyUI-MiniMax-H3-Turbo"
@@ -993,6 +995,39 @@ def _stage8_node_specs() -> tuple[_NodeSpec, ...]:
     )
 
 
+def _bundle6_node_specs() -> tuple[_NodeSpec, ...]:
+    """Current CK carrier; host behavior is assumed and never authorizes use."""
+
+    return (
+        _spec(
+            "ModelAttentionBackend",
+            _MODEL_ADVANCED,
+            _object_info(
+                required={
+                    "model": _input("MODEL"),
+                    "attention": _input(
+                        "COMBO",
+                        enum_values=(
+                            "pytorch attention",
+                            "comfy kitchen attention",
+                        ),
+                    ),
+                },
+                outputs=(_output(0, "MODEL", "model"),),
+            ),
+            _identity_allowed(
+                backends=_STANDARD_ONLY,
+                validation_method="user_assumed",
+                unsupported_behavior="fallback",
+                notes=(
+                    "Director requests ComfyUI's official CK choice. ComfyUI owns "
+                    "availability and may fall back; live observation is advisory.",
+                ),
+            ),
+        ),
+    )
+
+
 def _sha256(payload: object) -> str:
     return "sha256:" + hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
@@ -1083,6 +1118,10 @@ DIRECTOR_NODE_ADAPTER_SOURCE_FILES: Final = FrozenMap(
             "workflow/interpreters/lora.py",
             "workflow/lora_factory.py",
         ),
+        _MODEL_ADVANCED: _source_closure(
+            _DIRECTOR_GRAPH_BUILDER_SOURCE,
+            "workflow/interpreters/comfy_kitchen_attention.py",
+        ),
         _TURBO: _source_closure(
             _DIRECTOR_GRAPH_BUILDER_SOURCE,
             _DIRECTOR_LEGACY_EMITTER_SOURCE,
@@ -1112,7 +1151,8 @@ DIRECTOR_NODE_ADAPTER_SOURCE_FILES: Final = FrozenMap(
 
 def _validate_director_adapter_source_files() -> None:
     required_modules = {
-        item.module for item in (*_node_specs(), *_stage8_node_specs())
+        item.module
+        for item in (*_node_specs(), *_stage8_node_specs(), *_bundle6_node_specs())
     }
     registered_modules = set(DIRECTOR_NODE_ADAPTER_SOURCE_FILES)
     if registered_modules != required_modules:
@@ -1274,15 +1314,66 @@ def _build_registry(specs: tuple[_NodeSpec, ...]) -> NodeContractRegistry:
 V4_NODE_CONTRACT_REGISTRY: Final[NodeContractRegistry] = _build_registry(
     _node_specs()
 )
-CURRENT_NODE_CONTRACT_REGISTRY: Final[NodeContractRegistry] = _build_registry(
+V5_NODE_CONTRACT_REGISTRY: Final[NodeContractRegistry] = _build_registry(
     (*_node_specs(), *_stage8_node_specs())
 )
+V6_NODE_CONTRACT_REGISTRY: Final[NodeContractRegistry] = _build_registry(
+    (*_node_specs(), *_bundle6_node_specs())
+)
+# ``CURRENT`` is a moving application default. Frozen bundle readers must use
+# their versioned registry instead, so a later default-bundle cutover cannot
+# reinterpret an already-persisted bundle-4 or bundle-5 plan.
+CURRENT_NODE_CONTRACT_REGISTRY: Final[NodeContractRegistry] = (
+    V6_NODE_CONTRACT_REGISTRY
+)
+
+_NODE_CONTRACT_REGISTRIES_BY_BUNDLE_VERSION: Final[
+    Mapping[int, NodeContractRegistry]
+] = MappingProxyType(
+    {
+        4: V4_NODE_CONTRACT_REGISTRY,
+        5: V5_NODE_CONTRACT_REGISTRY,
+        6: V6_NODE_CONTRACT_REGISTRY,
+    }
+)
+
+
+def node_contract_registry_for_bundle(
+    template_bundle_version: int,
+) -> NodeContractRegistry:
+    """Return the frozen node-contract authority for one real bundle.
+
+    Every entry is a frozen, reviewed bundle contract; future bundles must not
+    be represented by an empty placeholder.
+    """
+
+    try:
+        return _NODE_CONTRACT_REGISTRIES_BY_BUNDLE_VERSION[
+            template_bundle_version
+        ]
+    except KeyError as exc:
+        raise KeyError(
+            "unsupported node-contract template bundle: "
+            f"{template_bundle_version}"
+        ) from exc
 
 
 def require_native_node_contract(class_type: str) -> NodeContract:
     """Return the frozen v4 contract for one prompt class type."""
 
     return V4_NODE_CONTRACT_REGISTRY.require(class_type)
+
+
+def require_v5_node_contract(class_type: str) -> NodeContract:
+    """Return the frozen v5 contract for one prompt class type."""
+
+    return V5_NODE_CONTRACT_REGISTRY.require(class_type)
+
+
+def require_v6_node_contract(class_type: str) -> NodeContract:
+    """Return the frozen Bundle-6 contract for one emitted prompt class."""
+
+    return V6_NODE_CONTRACT_REGISTRY.require(class_type)
 
 
 def require_current_node_contract(class_type: str) -> NodeContract:
@@ -1323,6 +1414,15 @@ def _selected_current_contracts(
         return tuple(CURRENT_NODE_CONTRACT_REGISTRY.contracts.values())
     selected = tuple(dict.fromkeys(class_types))
     return tuple(require_current_node_contract(item) for item in selected)
+
+
+def _selected_v5_contracts(
+    class_types: Iterable[str] | None,
+) -> tuple[NodeContract, ...]:
+    if class_types is None:
+        return tuple(V5_NODE_CONTRACT_REGISTRY.contracts.values())
+    selected = tuple(dict.fromkeys(class_types))
+    return tuple(require_v5_node_contract(item) for item in selected)
 
 
 def _module_policy(
@@ -1397,6 +1497,35 @@ def current_provenance_policy(
     )
 
 
+def v5_provenance_policy(
+    class_types: Iterable[str] | None = None,
+) -> FrozenMap[ClassType, str]:
+    """Derive provenance labels from the frozen bundle-5 registry."""
+
+    modules = _module_policy(_selected_v5_contracts(class_types))
+    return FrozenMap(
+        (class_type, _provenance_for_module(module))
+        for class_type, module in modules.items()
+    )
+
+
+def v6_provenance_policy(
+    class_types: Iterable[str] | None = None,
+) -> FrozenMap[ClassType, str]:
+    """Derive provenance labels from the frozen Bundle-6 registry."""
+
+    contracts = (
+        tuple(V6_NODE_CONTRACT_REGISTRY.contracts.values())
+        if class_types is None
+        else tuple(V6_NODE_CONTRACT_REGISTRY.require(item) for item in dict.fromkeys(class_types))
+    )
+    modules = _module_policy(contracts)
+    return FrozenMap(
+        (class_type, _provenance_for_module(module))
+        for class_type, module in modules.items()
+    )
+
+
 __all__ = [
     "CURRENT_NODE_CONTRACT_REGISTRY",
     "DIRECTOR_NODE_ADAPTER_SEMANTIC_VERSION",
@@ -1408,13 +1537,20 @@ __all__ = [
     "RuntimeFingerprintMaterial",
     "V4_NODE_CONTRACT_REGISTRY",
     "V4_OUTPUT_NEUTRAL_NODE_CLASSES",
+    "V5_NODE_CONTRACT_REGISTRY",
+    "V6_NODE_CONTRACT_REGISTRY",
     "compute_runtime_fingerprint",
     "current_expected_module_policy",
     "current_provenance_policy",
     "current_release_supported_runtime_fingerprints",
     "native_expected_module_policy",
     "native_provenance_policy",
+    "node_contract_registry_for_bundle",
     "release_supported_runtime_fingerprints",
     "require_current_node_contract",
     "require_native_node_contract",
+    "require_v5_node_contract",
+    "require_v6_node_contract",
+    "v5_provenance_policy",
+    "v6_provenance_policy",
 ]

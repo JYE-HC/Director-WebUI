@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -35,9 +35,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 
-from .comfy import ComfyClient, ComfyClientProtocol, ComfyError, default_comfy_factory
+from .comfy import (
+    ComfyClient,
+    ComfyClientProtocol,
+    ComfyError,
+    ComfyPromptRejected,
+    default_comfy_factory,
+)
 from .capabilities import (
-    CapabilityEvaluator,
     CapabilityReason,
     FeaturePreflightReport,
     build_feature_catalog,
@@ -47,6 +52,16 @@ from .capabilities import (
     preflight_projected_v5_timeline,
     quote_feature_catalog_etag,
 )
+from .capabilities.comfy_kitchen_attention import (
+    ComfyKitchenAttentionCapabilityV1,
+    ComfyKitchenAttentionHostObservationV1,
+    ObjectInfoChoiceObservationV1,
+    project_comfy_kitchen_attention_capability,
+)
+from .capabilities.comfy_kitchen_attention_observer import (
+    comfy_kitchen_attention_host_observation_complete,
+    observe_comfy_kitchen_attention_host,
+)
 from .compiler import (
     DraftNotRunnable,
     timeline_segment_take_fingerprint,
@@ -55,6 +70,7 @@ from .compiler import (
 )
 from .config_manager import (
     get_directordeck_config,
+    get_directordeck_config_diagnostics,
     get_lora_loader_policy,
     initialize_directordeck_config,
 )
@@ -67,8 +83,9 @@ from .database import (
     SettingsAuthorityConflict,
     TimelineRevisionConflict,
     TimelineRevisionExhausted,
+    TimelineTemplateBundleConflict,
 )
-from .execution.submission import LockedSubmissionPlanner
+from .execution.submission import LockedSubmissionPlanner, SubmissionPlanningError
 from .host_artifacts import (
     HostOutputProbeError,
     HostOutputProbeProvider,
@@ -143,6 +160,7 @@ from .schemas import (
     AssetTrashRestoreRequest,
     DetectShotsRequest,
     DetectShotsResponse,
+    FeatureBundleMigrationNoticeListRead,
     FeaturePreflightRequest,
     GenerationMode,
     JobBulkCancelRead,
@@ -222,13 +240,19 @@ from .workflow.execution import (
     compiled_execution_plan_digest,
     sha256_document_digest,
 )
-from .workflow.compile_report import CompiledExecutionReportV2
+from .workflow.feature_config import V6FeatureConfigurationError
+from .workflow.compile_report import (
+    CompiledExecutionReportV2,
+    CompiledExecutionReportV3,
+)
 from .workflow.v5_compat import (
     V5CreativeAuthorityError,
-    compile_v5_execution_plan,
     project_v5_compile_authority,
     project_v5_contextual_host_authority,
-    project_v5_runtime_currentness,
+)
+from .workflow.project_compiler import (
+    ProjectCompilerBundleError,
+    compile_project_execution_plan,
 )
 from .workflow.runtime_snapshot import (
     JobRuntimeSnapshotV1,
@@ -242,13 +266,12 @@ from .workflow.contracts import (
     HostCapabilityProvider,
     HostCapabilitySnapshot,
     OperationalReadiness,
+    canonical_sha256,
 )
-from .workflow.node_contracts import (
-    CURRENT_NODE_CONTRACT_REGISTRY,
-    V4_NODE_CONTRACT_REGISTRY,
+from .workflow.templates import CURRENT_TEMPLATE_BUNDLE, V5_TEMPLATE_BUNDLE
+from .workflow.v6_projection import (
+    V5V6ProjectionError,
 )
-from .workflow.templates import CURRENT_TEMPLATE_BUNDLE
-from .workflow.v4_compiler import V4CapabilityEvaluationError
 from .workflow.v4_resolver import CreativeCompileInputError
 
 
@@ -256,6 +279,13 @@ ComfyFactory = Callable[[str], ComfyClientProtocol]
 _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._\-()\u4e00-\u9fff]+")
 _TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 _RAYLIGHT_GENERATION_POLL_SECONDS = 1.0
+_LEGACY_COMPILE_OBSERVATION_REVISION = canonical_sha256(
+    {
+        "schema_version": 1,
+        "authority": "compiled_execution_plan",
+        "host_observation": "advisory_only",
+    }
+)
 _TERMINAL_STATUS_ORDER = ("succeeded", "failed", "cancelled")
 _SUBMISSION_OWNERSHIP_STAGES = {
     "submitting",
@@ -698,6 +728,54 @@ def _comfy(request: Request) -> ComfyClientProtocol:
     return request.app.state.comfy_factory(request.app.state.comfy_url)
 
 
+def _ck_host_context_revision(request: Request) -> str:
+    return "ck:" + hashlib.sha256(
+        request.app.state.endpoint_identity.runtime_instance_id.encode("utf-8")
+    ).hexdigest()
+
+
+async def _comfy_kitchen_attention_capability(
+    request: Request,
+    *,
+    reachable_families: tuple[ModelFamily, ...],
+) -> ComfyKitchenAttentionCapabilityV1:
+    try:
+        settings = _db(request).get_settings()
+    except (RuntimeError, TypeError, ValidationError, ValueError):
+        unknown = ObjectInfoChoiceObservationV1(state="unknown")
+        host = ComfyKitchenAttentionHostObservationV1(
+            context_revision=_ck_host_context_revision(request),
+            host_connected=False,
+            standard_attention=unknown,
+            raylight_attention=unknown,
+        )
+        return project_comfy_kitchen_attention_capability(settings=None, host=host)
+
+    host: ComfyKitchenAttentionHostObservationV1 | None = request.app.state.ck_host_observation
+    if host is None or not comfy_kitchen_attention_host_observation_complete(host):
+        observed_generation = request.app.state.ck_host_observation_generation
+        async with request.app.state.ck_host_observation_lock:
+            host = request.app.state.ck_host_observation
+            if host is None or not comfy_kitchen_attention_host_observation_complete(host):
+                if (
+                    request.app.state.ck_host_observation_generation
+                    == observed_generation
+                ):
+                    host = await observe_comfy_kitchen_attention_host(
+                        _comfy(request),
+                        context_revision=_ck_host_context_revision(request),
+                        previous=host,
+                    )
+                    request.app.state.ck_host_observation = host
+                    request.app.state.ck_host_observation_generation += 1
+            assert host is not None
+    return project_comfy_kitchen_attention_capability(
+        settings=settings,
+        host=host,
+        reachable_families=reachable_families,
+    )
+
+
 async def _host_capability_snapshot(request: Request) -> HostCapabilitySnapshot:
     """Capture one immutable, provider-validated host observation.
 
@@ -885,9 +963,15 @@ def _host_context_observation_http_error() -> HTTPException:
 def _creative_input_reason(error: BaseException) -> CapabilityReason:
     """Project resolver/legacy validation failures into one safe wire shape."""
 
+    chain: list[BaseException] = []
     candidate: BaseException | None = error
-    if not isinstance(candidate, CreativeCompileInputError):
-        candidate = error.__cause__
+    while candidate is not None and len(chain) < 4:
+        chain.append(candidate)
+        candidate = candidate.__cause__
+    candidate = next(
+        (item for item in chain if isinstance(item, CreativeCompileInputError)),
+        None,
+    )
     if isinstance(candidate, CreativeCompileInputError):
         return CapabilityReason(
             code=candidate.code,
@@ -899,6 +983,39 @@ def _creative_input_reason(error: BaseException) -> CapabilityReason:
             message=candidate.public_message,
             remediation=candidate.remediation,
             safe_details=candidate.safe_details,
+        )
+    draft_error = next(
+        (item for item in chain if isinstance(item, DraftNotRunnable)),
+        None,
+    )
+    if isinstance(draft_error, DraftNotRunnable):
+        draft_message = str(draft_error)
+        if (
+            draft_message.startswith(
+                "segment_ids must name enabled timeline segments"
+            )
+            or draft_message == "at least one enabled timeline segment is required"
+        ):
+            return _segment_selection_reason()
+    v6_error = next(
+        (
+            item
+            for item in chain
+            if isinstance(item, (V5V6ProjectionError, V6FeatureConfigurationError))
+        ),
+        None,
+    )
+    if isinstance(v6_error, (V5V6ProjectionError, V6FeatureConfigurationError)):
+        return CapabilityReason(
+            code=v6_error.code,
+            feature_id=v6_error.feature_id,
+            segment_id=v6_error.segment_id,
+            unit_id=None,
+            backend=None,
+            rule="bundle6_project_configuration",
+            message="The selected project workflow configuration is invalid.",
+            remediation="Correct this project configuration and retry the action.",
+            safe_details=v6_error.safe_details,
         )
     rendered = str(error)
     if isinstance(error, NativeTemplateError) and re.fullmatch(
@@ -989,17 +1106,7 @@ def _creative_input_reason(error: BaseException) -> CapabilityReason:
             rendered.startswith("segment_ids must name enabled timeline segments")
             or rendered == "at least one enabled timeline segment is required"
         ):
-            return CapabilityReason(
-                code="segment_selection_invalid",
-                feature_id=None,
-                segment_id=None,
-                unit_id=None,
-                backend=None,
-                rule="segment_selection",
-                message="The requested segment selection is empty, disabled, or stale.",
-                remediation="Select only enabled segments from the current project and run preflight again.",
-                safe_details={},
-            )
+            return _segment_selection_reason()
     if (
         isinstance(error, ValueError)
         and ": asset id '" in rendered
@@ -1072,6 +1179,8 @@ def _creative_input_http_error(
 def _v5_creative_authority_reason(
     exc: V5CreativeAuthorityError,
 ) -> CapabilityReason:
+    if exc.code == "segment_selection_invalid":
+        return _segment_selection_reason()
     return CapabilityReason(
         code=exc.code,
         feature_id=exc.feature_id,
@@ -1088,17 +1197,20 @@ def _v5_creative_authority_reason(
     )
 
 
-def _capability_compile_http_error(
-    error: V4CapabilityEvaluationError,
-    *additional_reasons: CapabilityReason,
-) -> HTTPException:
-    reasons = tuple(
-        reason
-        for reason in getattr(error.evaluation, "reasons", ())
-        if isinstance(reason, CapabilityReason)
-    )
-    return _capability_reasons_http_error(
-        (*reasons, *additional_reasons),
+def _segment_selection_reason() -> CapabilityReason:
+    return CapabilityReason(
+        code="segment_selection_invalid",
+        feature_id=None,
+        segment_id=None,
+        unit_id=None,
+        backend=None,
+        rule="segment_selection",
+        message="The requested segment selection is empty, disabled, or stale.",
+        remediation=(
+            "Select only enabled segments from the current project and run "
+            "preflight again."
+        ),
+        safe_details={},
     )
 
 
@@ -1181,6 +1293,24 @@ def _timeline_revision_exhausted(exc: TimelineRevisionExhausted) -> HTTPExceptio
     return HTTPException(status_code=409, detail=detail.model_dump(mode="json"))
 
 
+def _timeline_template_bundle_conflict(
+    exc: TimelineTemplateBundleConflict,
+) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "timeline_template_bundle_conflict",
+            "message": (
+                "The project workflow bundle changed on the server; "
+                "fetch the current timeline authority before retrying."
+            ),
+            "project_id": exc.project_id,
+            "submitted_template_bundle": exc.submitted,
+            "current_template_bundle": exc.current,
+        },
+    )
+
+
 def _legacy_generation_api_retired() -> HTTPException:
     """Versioned tombstone for the six pre-timeline write APIs.
 
@@ -1247,24 +1377,71 @@ def _settings_authority_conflict() -> HTTPException:
     )
 
 
-def _new_disallowed_lora_loader_mapping(
+def _lora_product_config_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": "lora_product_config_unavailable",
+            "message": "DirectorDeck's LoRA loader configuration is unavailable.",
+        },
+    )
+
+
+def _lora_loader_options_invalid(
+    lora_filename: str,
+    adapter_id: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": "lora_loader_options_invalid",
+            "message": "The selected LoRA loader configuration is invalid.",
+            "lora_filename": lora_filename,
+            "adapter_id": adapter_id,
+        },
+    )
+
+
+def _validated_lora_loader_mapping_update(
     current: RuntimeSettingsV3,
     candidate: RuntimeSettingsV3,
-) -> tuple[str, str, tuple[str, ...]] | None:
-    """Reject new invalid mappings while keeping old records recoverable."""
+) -> RuntimeSettingsV3:
+    """Validate only new/changed mappings and preserve retired records."""
 
     current_by_filename = {
         record.lora_filename: record for record in current.lora_loader_overrides
     }
+    config = None
+    normalized_records = []
     for record in candidate.lora_loader_overrides:
-        policy = get_lora_loader_policy(record.lora_filename)
-        if record.adapter_id in policy.loader_ids:
-            continue
         previous = current_by_filename.get(record.lora_filename)
         if previous is not None and previous == record:
+            normalized_records.append(record)
             continue
-        return record.lora_filename, record.adapter_id, policy.loader_ids
-    return None
+        try:
+            if config is None:
+                config = get_directordeck_config()
+            policy = get_lora_loader_policy(record.lora_filename)
+        except RuntimeError as exc:
+            raise _lora_product_config_unavailable() from exc
+        if record.adapter_id not in policy.loader_ids:
+            raise _lora_loader_mapping_not_allowed(
+                (record.lora_filename, record.adapter_id, policy.loader_ids)
+            )
+        try:
+            options = config.normalize_lora_loader_options(
+                record.adapter_id,
+                dict(record.options),
+            )
+        except (KeyError, ValueError) as exc:
+            raise _lora_loader_options_invalid(
+                record.lora_filename,
+                record.adapter_id,
+            ) from exc
+        normalized_records.append(record.model_copy(update={"options": options}))
+    return candidate.model_copy(
+        update={"lora_loader_overrides": normalized_records}
+    )
 
 
 def _lora_loader_mapping_not_allowed(
@@ -1311,6 +1488,22 @@ def _timeline_authority_required(project_id: str) -> HTTPException:
         detail={
             "code": "timeline_authority_required",
             "message": "Timeline writes require an expected server revision.",
+            "project_id": project_id,
+        },
+    )
+
+
+def _project_document_unreadable(project_id: str) -> HTTPException:
+    """Confine a damaged creative authority to its own project."""
+
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "project_document_unreadable",
+            "message": (
+                "The stored project document is unreadable; "
+                "export or delete this project, or choose another project."
+            ),
             "project_id": project_id,
         },
     )
@@ -2224,7 +2417,7 @@ def _job_read_context_for_project(
     return active_project_id, current_timeline, database.get_settings()
 
 
-def _current_v5_effective_execution_digest(
+def _current_effective_execution_evidence(
     request: Request,
     *,
     draft: UnifiedTimelineDraftV5,
@@ -2232,22 +2425,18 @@ def _current_v5_effective_execution_digest(
     segment_ids: list[str] | None,
     project_id: str,
     job_id: str,
-    runtime_projection: Any,
     cache: dict[str, Any] | None,
 ) -> tuple[DocumentDigest, JobRuntimeSnapshotV1]:
-    """Purely re-resolve the execution identity used by currentness.
+    """Recompile with the current project's own frozen bundle compiler.
 
-    Host availability belongs to preflight and is intentionally absent from
-    ``effective_execution_digest``.  This proof therefore uses the current
-    static template/NodeContract registries and the current project-scoped
-    historical-take ledger, but performs no ComfyUI or provider I/O. Exact
-    mapping-only LoRA resolution is pure and belongs to this same proof.
+    Host observations remain absent.  Bundle 5 and Bundle 6 consume only their
+    captured project/settings inputs, exact LoRA policy result and historical
+    take ledger; neither may fall back to the process-current compiler.
     """
 
-    projection = project_v5_compile_authority(draft, settings, segment_ids)
     historical_takes = _resolve_historical_continuity_takes(
         _db(request),
-        projection.draft,
+        draft,
         segment_ids=segment_ids,
         project_id=project_id,
     )
@@ -2256,24 +2445,10 @@ def _current_v5_effective_execution_digest(
             "project_id": project_id,
             "timeline": draft.model_dump(mode="json"),
             "segment_ids": segment_ids,
-            "runtime_projection": asdict(runtime_projection),
-            # Memoize by the already-resolved, job-reachable adapter evidence.
-            # Enumerating the settings override table here would make a
-            # RayLight-only currentness read depend on Standard host knowledge,
-            # even though RayLight resolution deliberately never reads it.
-            "resolved_lora_adapters": [
-                {
-                    "family": item.family,
-                    "adapter": item.resolution.adapter.model_dump(mode="json"),
-                    "binding": (
-                        item.resolution.binding.model_dump(mode="json")
-                        if item.resolution.binding is not None
-                        else None
-                    ),
-                    "options": dict(item.resolution.options),
-                }
-                for item in projection.resolved_lora_adapters
-            ],
+            # Extra settings may invalidate this performance cache, but never
+            # enter the resulting execution digest unless the selected bundle
+            # compiler actually consumes them.
+            "settings": settings.model_dump(mode="json"),
             "historical_takes": [
                 {
                     "target_segment_id": target_segment_id,
@@ -2294,7 +2469,7 @@ def _current_v5_effective_execution_digest(
             and isinstance(cached[1], JobRuntimeSnapshotV1)
         ):
             return cached
-    plan = compile_v5_execution_plan(
+    plan = compile_project_execution_plan(
         draft,
         settings,
         job_id,
@@ -2355,18 +2530,16 @@ def _job_read_for_request(
         if isinstance(raw_job_snapshot, Mapping)
         else None
     )
-    # ``_job_v5_creative_snapshot`` may produce a read-only v5 projection for
-    # a historical v4 job.  That keeps old jobs inspectable, but it must never
-    # upgrade their take currentness implicitly: only an originally captured
-    # v5 authority has the runtime-projection contract below.
-    has_captured_v5_authority = (
+    # A historical v4 projection remains inspectable but cannot mint modern
+    # runtime currentness. Bundle 5 and 6 both use timeline schema 5 here.
+    has_captured_timeline_authority = (
         isinstance(raw_job_timeline, Mapping)
         and raw_job_timeline.get("version") == 5
     )
     if (
         job.get("mode") == "timeline"
         and snapshot_timeline is not None
-        and has_captured_v5_authority
+        and has_captured_timeline_authority
     ):
         try:
             snapshot_runtime = JobRuntimeSnapshotV1.model_validate(
@@ -2384,11 +2557,6 @@ def _job_read_for_request(
                 raise ValueError("invalid captured segment selection")
             if current_timeline is None:
                 raise ValueError("current project timeline is unavailable")
-            current_runtime = project_v5_runtime_currentness(
-                current_timeline,
-                segment_ids,
-                current_settings,
-            )
         except (TypeError, ValidationError, ValueError):
             # Historical or partially migrated jobs remain inspectable, but
             # can never be described as an exact current snapshot.
@@ -2401,14 +2569,13 @@ def _job_read_for_request(
                 (
                     current_digest,
                     current_runtime_snapshot,
-                ) = _current_v5_effective_execution_digest(
+                ) = _current_effective_execution_evidence(
                     request,
                     draft=current_timeline,
                     settings=current_settings,
                     segment_ids=segment_ids,
                     project_id=current_project_id,
                     job_id=str(job.get("id") or "currentness"),
-                    runtime_projection=current_runtime,
                     cache=current_execution_digest_cache,
                 )
                 current_snapshot = (
@@ -2421,8 +2588,10 @@ def _job_read_for_request(
             except (
                 DraftNotRunnable,
                 NativeTemplateError,
+                ProjectCompilerBundleError,
                 TypeError,
                 V5CreativeAuthorityError,
+                V5V6ProjectionError,
                 ValidationError,
                 ValueError,
             ):
@@ -5089,16 +5258,15 @@ async def _preflight_execution_plan(
     plan: CompiledExecutionPlan,
     database: Database,
 ) -> None:
-    """Verify transient Ray-ledger facts after exact static evaluation.
+    """Verify only Director-owned Ray ledger facts for the current job.
 
-    Node/media/package contracts and placements are owned by the immutable
-    host snapshot plus ``CapabilityEvaluator``. Exact selected model resources
-    are checked by ``_contextual_host_errors``. This final read only guards the
-    durable Ray ledger immediately before endpoint serialization and never
-    calls the legacy, side-effecting capability transport.
+    Standard plans deliberately skip this check. Host node, media, package,
+    model and provenance observations are advisory and are left to ComfyUI's
+    actual prompt validation/execution path.
     """
 
-    del plan  # the immutable plan was already evaluated before this boundary
+    if not any(unit.backend == "raylight" for unit in plan.segment_units):
+        return
     stats = await client.system_stats()
     try:
         runtime_status = _raylight_runtime_status(database, stats)
@@ -5123,28 +5291,14 @@ async def _preflight_raylight_transition(
     unit: PreparedControlUnit,
     database: Database,
 ) -> None:
-    """Recapture required RayLight class_types before queueing the control."""
+    """Verify only Director-owned Ray runtime state before its control prompt.
 
-    snapshot = await _host_capability_snapshot(request)
-    required = {
-        str(node.get("class_type") or "")
-        for node in unit.prompt_base.values()
-    }
-    invalid_contracts = sorted(
-        class_type
-        for class_type in required
-        if not class_type
-        or not _snapshot_has_node_class(snapshot, class_type)
-    )
-    if invalid_contracts:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "raylight_control_capability_unavailable",
-                "message": "A required RayLight control node is unavailable.",
-                "nodes": invalid_contracts,
-            },
-        )
+    Host class observations remain available through catalog/preflight, but
+    they do not authorize this production submission. ComfyUI validates the
+    actual control prompt and any failure is persisted on this job.
+    """
+
+    del request, unit
     stats = await client.system_stats()
     try:
         runtime_status = _raylight_runtime_status(database, stats)
@@ -5752,62 +5906,6 @@ async def _refresh_raylight_runtime_tail(
     )
 
 
-def _endpoint_recovery_blockers(
-    database: Database,
-    *,
-    dispatch_job_id: str,
-) -> list[dict[str, Any]]:
-    """Return old ambiguous submissions that can still enqueue on the endpoint."""
-
-    blockers: list[dict[str, Any]] = []
-    for parent in database.list_interrupted_preparing_jobs():
-        if str(parent["id"]) == dispatch_job_id:
-            continue
-        for child in database.list_job_children(str(parent["id"])):
-            ownership = _typed_prompt_ownership_for_child(database, child)
-            typed_unreleased = (
-                ownership is not None
-                and ownership.state
-                not in {"cleanup_confirmed", "terminal_confirmed"}
-            )
-            if (
-                typed_unreleased
-                or (
-                    child["status"] not in _TERMINAL_STATUSES
-                    and child.get("prompt_id")
-                    and child.get("stage") in _RECOVERY_OWNERSHIP_STAGES
-                )
-            ):
-                blockers.append(child)
-    return blockers
-
-
-async def _await_endpoint_submission_recovery(
-    request: Request,
-    database: Database,
-    *,
-    dispatch_job_id: str,
-) -> None:
-    """Keep newer Director prompts behind every ambiguous old POST.
-
-    The startup recovery worker owns directed cancellation. A lost Standard
-    ``POST /prompt`` can reach ``queue.put`` after a newer Ray submission just
-    as a lost Ray prompt can; the Ray runtime ledger alone cannot represent
-    that Standard tail. Waiting on the durable recovery marker under the same
-    endpoint submission lock closes that cross-backend restart race.
-    """
-
-    while _endpoint_recovery_blockers(
-        database, dispatch_job_id=dispatch_job_id
-    ):
-        parent = database.get_job(dispatch_job_id)
-        if parent is None:
-            raise KeyError(dispatch_job_id)
-        if parent["status"] in {"cancelling", "cancelled"}:
-            raise asyncio.CancelledError
-        await asyncio.sleep(_RAYLIGHT_GENERATION_POLL_SECONDS)
-
-
 async def _cleanup_failed_timeline_submission(
     request: Request,
     *,
@@ -6339,13 +6437,17 @@ def _resolve_historical_continuity_takes(
 def _project_summary(project: dict[str, Any]) -> ProjectSummaryRead:
     """Project a project row into its public summary without leaking the document."""
 
-    timeline = validate_timeline_draft_v5(project["document"])
+    try:
+        timeline = validate_timeline_draft_v5(project["document"])
+        segment_count = len(timeline.segments)
+    except (TypeError, ValueError, ValidationError):
+        segment_count = 0
     return ProjectSummaryRead(
         id=project["id"],
         title=project["title"],
         created_at=project["created_at"],
         updated_at=project["updated_at"],
-        segment_count=len(timeline.segments),
+        segment_count=segment_count,
     )
 
 
@@ -6525,6 +6627,11 @@ async def _project_import_capability_issues(
 ) -> list[dict[str, Any]]:
     """Observe current host compatibility without making import contingent on it."""
 
+    if draft_v5.features.template_bundle_version == 6:
+        # Bundle-6 import validity is established by its pure project
+        # contract. Live host observations are advisory and not an import
+        # token; CK has its own bounded diagnostic endpoint.
+        return []
     database = _db(request)
     captured_settings = database.get_settings()
     try:
@@ -6563,194 +6670,128 @@ async def _project_import_capability_issues(
     ]
 
 
+def _compile_report_for_preview(
+    execution_plan: CompiledExecutionPlan,
+) -> CompiledExecutionReportV2 | CompiledExecutionReportV3:
+    raw = execution_plan.model_dump(mode="json")["compile_report"]
+    encoded = json.dumps(
+        raw,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    try:
+        if execution_plan.version == 2:
+            return CompiledExecutionReportV2.model_validate_json(encoded)
+        if execution_plan.version == 3:
+            return CompiledExecutionReportV3.model_validate_json(encoded)
+    except ValidationError:
+        logger.exception("compiled execution report failed its typed invariant")
+        raise _execution_plan_invariant_http_error() from None
+    raise _execution_plan_invariant_http_error()
+
+
 async def _compile_timeline_report(
     request: Request,
     body: TimelineJobRequest,
     *,
     project_id: str | None,
 ) -> TimelineCompileRead:
-    """Compile and preflight through the same plan authority as submission."""
+    """Compile through the same immutable plan authority as submission."""
 
     database = _db(request)
     captured_settings = database.get_settings()
     owner_project_id = project_id or database.LEGACY_DEFAULT_PROJECT_ID
     if not database.project_exists(owner_project_id):
         raise _project_not_found_http_error()
-    # ``config`` is required by the v5 request schema.  Project lookup above
+    # ``config`` is required by the timeline-schema-5 request. Project lookup above
     # establishes ownership scope only; compilation never reloads its mutable
     # document as a fallback.
+    draft_v5 = body.config
     try:
-        draft_v5 = migrate_timeline_feature_authority_to_v5(body.config)
-    except (ValidationError, ValueError) as exc:
-        raise _creative_input_http_error(_creative_input_reason(exc)) from exc
-    contextual_errors: tuple[CapabilityReason, ...] = ()
-    try:
-        host_projection = project_v5_contextual_host_authority(
-            draft_v5,
-            captured_settings,
-            body.segment_ids,
-        )
-        draft = host_projection.draft
-        settings = host_projection.settings
         database.validate_timeline_assets(
-            draft,
+            draft_v5,
             segment_ids=body.segment_ids,
         )
-        validate_unified_runnable(draft, segment_ids=body.segment_ids)
+        validate_unified_runnable(draft_v5, segment_ids=body.segment_ids)
         historical_takes = _resolve_historical_continuity_takes(
             database,
-            draft,
+            draft_v5,
             segment_ids=body.segment_ids,
             project_id=owner_project_id,
         )
-        client = _comfy(request)
-        host_capability_snapshot = await _host_capability_snapshot(request)
-        operational_readiness = _host_operational_readiness(
-            request,
-            host_capability_snapshot,
-        )
-        contextual_errors = await _contextual_host_errors(
-            client,
-            draft=draft,
-            settings=settings,
-            segment_ids=body.segment_ids,
-            snapshot=host_capability_snapshot,
-        )
-        projection = project_v5_compile_authority(
-            draft_v5,
-            captured_settings,
-            body.segment_ids,
-        )
-        feature_report = preflight_projected_v5_timeline(
-            draft=draft,
-            settings=settings,
-            effective_features=projection.effective_features,
-            snapshot=host_capability_snapshot,
-            readiness=operational_readiness,
-            segment_ids=body.segment_ids,
-            historical_takes=historical_takes,
-            resolved_lora_adapters=projection.lora_adapter_map(),
-        )
-        blocking_reasons = (*feature_report.errors, *contextual_errors)
-        if blocking_reasons:
-            raise _capability_reasons_http_error(blocking_reasons)
-        execution_plan = compile_v5_execution_plan(
+        execution_plan = compile_project_execution_plan(
             draft_v5,
             captured_settings,
             f"preview-{uuid.uuid4()}",
             body.segment_ids,
             historical_takes=historical_takes,
-            host_capability_snapshot=host_capability_snapshot,
-            operational_readiness=operational_readiness,
-            capability_evaluator=CapabilityEvaluator(
-                CURRENT_NODE_CONTRACT_REGISTRY
-            ),
         )
-        # Compile reports are also the user's explicit preflight action.
-        # The response remains the stable browser projection stored inside the
-        # immutable plan, while all runtime checks consume that same plan.
-        await _preflight_execution_plan(
-            client, execution_plan, database
-        )
-    except V4CapabilityEvaluationError as exc:
-        raise _capability_compile_http_error(exc, *contextual_errors) from exc
     except V5CreativeAuthorityError as exc:
         raise _creative_input_http_error(
             _v5_creative_authority_reason(exc),
-            *contextual_errors,
         ) from exc
-    except (NativeTemplateError, DraftNotRunnable, ValidationError, ValueError) as exc:
+    except (
+        ProjectCompilerBundleError,
+        V5V6ProjectionError,
+        NativeTemplateError,
+        DraftNotRunnable,
+        ValidationError,
+        ValueError,
+    ) as exc:
         reason = _creative_input_reason(exc)
-        raise _creative_input_http_error(reason, *contextual_errors) from exc
-    except (ComfyError, httpx.HTTPError) as exc:
-        raise _host_context_observation_http_error() from exc
+        raise _creative_input_http_error(reason) from exc
     plan_document = execution_plan.model_dump(mode="json")
-    try:
-        report = CompiledExecutionReportV2.model_validate_json(
-            json.dumps(
-                plan_document["compile_report"],
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
+    report = _compile_report_for_preview(execution_plan)
+    # Bundle 5 keeps this legacy response field for wire compatibility only.
+    # Compile and submission no longer capture a live host observation or use
+    # one as authorization, so the stable value explicitly identifies the
+    # compiled-plan authority instead of pretending to be a host token.
+    host_revision = (
+        getattr(report, "host_capability_revision", None)
+        or _LEGACY_COMPILE_OBSERVATION_REVISION
+    )
+    if isinstance(report, CompiledExecutionReportV2):
+        feature_resolutions = report.feature_resolutions
+        resolutions_by_segment: dict[str, list[Any]] = {}
+        for resolution in feature_resolutions:
+            resolutions_by_segment.setdefault(resolution.segment_id, []).append(
+                resolution
             )
-        )
-    except (KeyError, ValidationError):
-        logger.exception("compiled execution report failed its typed invariant")
-        raise _execution_plan_invariant_http_error() from None
-    host_revision = host_capability_snapshot.host_capability_revision()
-    if report.host_capability_revision != host_revision:
-        logger.error("compiled execution report host revision drifted")
-        raise _execution_plan_invariant_http_error()
-    resolutions_by_segment: dict[str, list[Any]] = {}
-    for resolution in report.feature_resolutions:
-        resolutions_by_segment.setdefault(resolution.segment_id, []).append(
-            resolution
-        )
-    effective_by_segment: dict[str, dict[str, Any]] = {}
-    for segment_id, preflight_segment in feature_report.effective_by_segment.items():
-        actual = resolutions_by_segment.get(segment_id, [])
-        expected = [
-            (
-                feature.id,
-                feature.version,
-                feature.state,
-                feature.adapter_fingerprint,
-                feature.capability.model_dump(mode="json"),
-            )
-            for feature in preflight_segment.features
-        ]
-        observed = [
-            (
-                feature.feature_id,
-                feature.version,
-                feature.resolution.state,
-                feature.adapter_fingerprint,
-                feature.capability.model_dump(mode="json"),
-            )
-            for feature in actual
-        ]
-        if (
-            not actual
-            or expected != observed
-            or any(
-                feature.unit_id != preflight_segment.unit_id
-                or feature.backend != preflight_segment.backend
-                or feature.family != preflight_segment.family
-                or feature.template_id != preflight_segment.template_id
+        effective_by_segment: dict[str, dict[str, Any]] = {}
+        for segment_id, actual in resolutions_by_segment.items():
+            if not actual:
+                raise _execution_plan_invariant_http_error()
+            first = actual[0]
+            if any(
+                feature.unit_id != first.unit_id
+                or feature.backend != first.backend
+                or feature.family != first.family
+                or feature.template_id != first.template_id
                 for feature in actual
-            )
-        ):
-            logger.error(
-                "compiled feature evidence drifted from captured preflight",
-                extra={"segment_id": segment_id},
-            )
-            raise _execution_plan_invariant_http_error()
-        effective_by_segment[segment_id] = {
-            "unit_id": actual[0].unit_id,
-            "backend": actual[0].backend,
-            "family": actual[0].family,
-            "template_id": actual[0].template_id,
-            "features": [
-                {
-                    "id": feature.feature_id,
-                    "version": feature.version,
-                    "state": feature.resolution.state,
-                    "adapter_fingerprint": feature.adapter_fingerprint,
-                    "capability": feature.capability,
-                }
-                for feature in actual
-            ],
-        }
-    if set(resolutions_by_segment) != set(effective_by_segment):
-        logger.error("compiled feature evidence contains an unexpected segment")
-        raise _execution_plan_invariant_http_error()
-    return TimelineCompileRead(
-        template_bundle_version=execution_plan.template_bundle_version,
-        host_capability_revision=host_revision,
-        model_families=list(report.families),
-        plans=plan_document["compile_report"]["plans"],
-        node_policy=plan_document["node_policy"],
-        features={
+            ):
+                logger.error(
+                    "compiled feature evidence contains inconsistent route identity",
+                    extra={"segment_id": segment_id},
+                )
+                raise _execution_plan_invariant_http_error()
+            effective_by_segment[segment_id] = {
+                "unit_id": first.unit_id,
+                "backend": first.backend,
+                "family": first.family,
+                "template_id": first.template_id,
+                "features": [
+                    {
+                        "id": feature.feature_id,
+                        "version": feature.version,
+                        "state": feature.resolution.state,
+                        "adapter_fingerprint": feature.adapter_fingerprint,
+                        "capability": feature.capability,
+                    }
+                    for feature in actual
+                ],
+            }
+        features_payload: dict[str, Any] = {
             "requested": draft_v5.features.model_dump(mode="json"),
             "effective_by_segment": effective_by_segment,
             "resolutions": [
@@ -6766,10 +6807,28 @@ async def _compile_timeline_report(
                     "adapter_fingerprint": resolution.adapter_fingerprint,
                     "capability": resolution.capability,
                 }
-                for resolution in report.feature_resolutions
+                for resolution in feature_resolutions
             ],
+            "uses": [],
             "notices": list(report.notices),
-        },
+            "advisories": [],
+        }
+    else:
+        features_payload = {
+            "requested": draft_v5.features.model_dump(mode="json"),
+            "effective_by_segment": {},
+            "resolutions": [],
+            "uses": list(report.feature_resolutions),
+            "notices": list(report.notices),
+            "advisories": list(report.advisories),
+        }
+    return TimelineCompileRead(
+        template_bundle_version=execution_plan.template_bundle_version,
+        host_capability_revision=host_revision,
+        model_families=list(report.families),
+        plans=plan_document["compile_report"]["plans"],
+        node_policy=plan_document["node_policy"],
+        features=features_payload,
         effective_execution_digest=(
             execution_plan.effective_execution_digest.model_dump(mode="json")
         ),
@@ -6961,6 +7020,50 @@ def _fail_continuity_descendants(
     return failed_segments
 
 
+def _fail_admitted_timeline_job(
+    database: Database,
+    job_id: str,
+    *,
+    detail: Any,
+    stage: str = "compile_failed",
+) -> dict[str, Any]:
+    """Persist a local failure after the public job row already exists."""
+
+    error = (
+        detail
+        if isinstance(detail, str)
+        else json.dumps(detail, ensure_ascii=False)
+    )
+    failed = database.update_job_if_status(
+        job_id,
+        "preparing",
+        status="failed",
+        progress=1.0,
+        stage=stage,
+        error=error,
+        completed_at=utc_now(),
+    )
+    if failed is not None:
+        for child in database.list_job_children(job_id):
+            if child["status"] in _TERMINAL_STATUSES:
+                continue
+            database.update_job_child_if_snapshot(
+                child["id"],
+                expected_status=child["status"],
+                expected_updated_at=child["updated_at"],
+                status="failed",
+                progress=1.0,
+                stage=stage,
+                error=error,
+                completed_at=utc_now(),
+            )
+        return failed
+    latest = database.get_job(job_id)
+    if latest is None:
+        raise KeyError(job_id)
+    return latest
+
+
 async def _create_timeline_job_impl(
     request: Request,
     body: TimelineJobRequest,
@@ -6996,124 +7099,41 @@ async def _create_timeline_job_impl(
     # not become a second document read or a live-settings creative fallback.
     draft_v5 = body.config
     try:
-        host_projection = project_v5_contextual_host_authority(
-            draft_v5,
-            captured_settings,
-            body.segment_ids,
-        )
-        draft = host_projection.draft
-        settings = host_projection.settings
+        if draft_v5.features.template_bundle_version not in {5, 6}:
+            raise ProjectCompilerBundleError(
+                draft_v5.features.template_bundle_version
+            )
+        # Exact feature/adapter projection belongs to the one post-admission
+        # compiler call. This admission pass checks only cheap creative scope
+        # so any local compiler failure is persisted on the accepted job.
+        draft = draft_v5
+        settings = captured_settings
         database.validate_timeline_assets(
             draft,
             segment_ids=body.segment_ids,
         )
+        validate_unified_runnable(draft, segment_ids=body.segment_ids)
     except V5CreativeAuthorityError as exc:
         raise _creative_input_http_error(
             _v5_creative_authority_reason(exc)
         ) from exc
-    except (ValidationError, ValueError) as exc:
+    except (
+        ProjectCompilerBundleError,
+        V5V6ProjectionError,
+        ValidationError,
+        ValueError,
+    ) as exc:
         raise _creative_input_http_error(_creative_input_reason(exc)) from exc
     job_id = job_id or str(uuid.uuid4())
-    contextual_errors: tuple[CapabilityReason, ...] = ()
-    try:
-        validate_unified_runnable(draft, segment_ids=body.segment_ids)
-        historical_takes = _resolve_historical_continuity_takes(
-            database,
-            draft,
-            segment_ids=body.segment_ids,
-            project_id=owner_project_id,
-        )
-        host_capability_snapshot = await _host_capability_snapshot(request)
-        operational_readiness = _host_operational_readiness(
-            request,
-            host_capability_snapshot,
-        )
-        contextual_errors = await _contextual_host_errors(
-            client,
-            draft=draft,
-            settings=settings,
-            segment_ids=body.segment_ids,
-            snapshot=host_capability_snapshot,
-        )
-        projection = project_v5_compile_authority(
-            draft_v5,
-            captured_settings,
-            body.segment_ids,
-        )
-        draft = projection.draft
-        settings = projection.settings
-        feature_report = preflight_projected_v5_timeline(
-            draft=draft,
-            settings=settings,
-            effective_features=projection.effective_features,
-            snapshot=host_capability_snapshot,
-            readiness=operational_readiness,
-            segment_ids=body.segment_ids,
-            historical_takes=historical_takes,
-            resolved_lora_adapters=projection.lora_adapter_map(),
-        )
-        blocking_reasons = (*feature_report.errors, *contextual_errors)
-        if blocking_reasons:
-            raise _capability_reasons_http_error(blocking_reasons)
-        # The browser never submits a workflow.  Production compilation
-        # exposes one authority only: immutable prepared segment units. Ray
-        # ledger readiness remains a separate plan-level concern and is
-        # recaptured by `_preflight_execution_plan` before any endpoint side
-        # effect rather than being copied onto every feature.
-        execution_plan = compile_v5_execution_plan(
-            draft_v5,
-            captured_settings,
-            job_id,
-            body.segment_ids,
-            historical_takes=historical_takes,
-            host_capability_snapshot=host_capability_snapshot,
-            operational_readiness=operational_readiness,
-            capability_evaluator=CapabilityEvaluator(
-                CURRENT_NODE_CONTRACT_REGISTRY
-            ),
-        )
-        execution_plan_digest = compiled_execution_plan_digest(execution_plan)
-        continuity_dependents = _execution_continuity_graph(execution_plan)
-    except V4CapabilityEvaluationError as exc:
-        raise _capability_compile_http_error(exc, *contextual_errors) from exc
-    except V5CreativeAuthorityError as exc:
-        raise _creative_input_http_error(
-            _v5_creative_authority_reason(exc),
-            *contextual_errors,
-        ) from exc
-    except (NativeTemplateError, DraftNotRunnable, ValidationError, ValueError) as exc:
-        reason = _creative_input_reason(exc)
-        raise _creative_input_http_error(reason, *contextual_errors) from exc
-    except (ComfyError, httpx.HTTPError) as exc:
-        raise _host_context_observation_http_error() from exc
-    try:
-        job_runtime_snapshot = build_job_runtime_snapshot(
-            draft_v5,
-            body.segment_ids,
-            captured_settings,
-            execution_plan,
-        )
-    except (TypeError, ValidationError, ValueError):
-        logger.exception("job runtime snapshot failed its typed invariant")
-        raise _execution_plan_invariant_http_error() from None
-    database = _db(request)
     now = utc_now()
-    compile_report = execution_plan.model_dump(mode="json")["compile_report"]
-    compiled_manifest = compile_report.get("manifest")
-    if not isinstance(compiled_manifest, dict):
-        raise _execution_plan_invariant_http_error()
     database.create_job(
         {
             "id": job_id,
             "mode": parent_mode,
             "status": "preparing",
             "progress": 0.0,
-            "stage": "preflight",
-            # A native timeline has multiple prompt IDs; never overload this
-            # legacy column with a made-up representative child.
+            "stage": "compiling",
             "prompt_id": None,
-            # Timeline jobs carry their owning project. Legacy six-mode
-            # submissions stay project-less and appear under "旧任务".
             "project_id": owner_project_id if parent_mode == "timeline" else None,
             "outputs": [],
             "error": None,
@@ -7121,57 +7141,204 @@ async def _create_timeline_job_impl(
                 "timeline": draft_v5.model_dump(mode="json"),
                 "segment_ids": body.segment_ids,
             },
-            "settings_snapshot": job_runtime_snapshot.model_dump(mode="json"),
-            "prompt_snapshot": compiled_manifest,
+            # The bounded runtime and prompt snapshots are filled from the one
+            # immutable compiler result below. This empty value exists only
+            # while the admitted background task is in its local compile stage.
+            "settings_snapshot": {},
+            "prompt_snapshot": None,
             "created_at": now,
             "updated_at": now,
             "started_at": None,
             "completed_at": None,
         }
     )
-    database.create_job_execution_plan(job_id, execution_plan)
-    child_ids: dict[str, str] = {}
-    child_ids_by_segment: dict[str, str] = {}
-    for index, unit in enumerate(execution_plan.segment_units):
-        child_id = str(uuid.uuid4())
-        child_ids[unit.id] = child_id
-        child_ids_by_segment[unit.owner_segment_id] = child_id
-        database.create_job_child(
-            {
-                "id": child_id,
-                "job_id": job_id,
-                # Leave the preceding even slot available for a dynamically
-                # planned RayKill barrier once the endpoint queue-tail state is
-                # read under its submission lock.
-                "group_index": index * 2 + 1,
-                "family": unit.family,
-                "backend": unit.backend,
-                "segment_ids": [unit.owner_segment_id],
-                "output_nodes": {
-                    unit.owner_segment_id: unit.expected_output_spec.node_id
-                },
-                "status": "preparing",
-                "progress": 0.0,
-                "stage": "preflight",
-                "prompt_id": None,
-                "outputs": [],
-                "error": None,
-                "prompt_snapshot": unit.model_dump(mode="json")["prompt_base"],
-                "created_at": now,
-                "updated_at": now,
-                "started_at": None,
-                "completed_at": None,
-            }
+    # Preserve HTTP admission order without making compilation part of the
+    # public response.  Later jobs may compile in parallel, but their ComfyUI
+    # side effects remain chained behind this durable parent.
+    endpoint_key = _EMBEDDED_ENDPOINT_KEY
+    submission_ticket = asyncio.get_running_loop().create_future()
+    predecessor: asyncio.Future[None] | None
+    async with request.app.state.submission_ticket_lock:
+        predecessor = request.app.state.submission_tails.get(endpoint_key)
+        request.app.state.submission_tails[endpoint_key] = submission_ticket
+    ticket_settlement_requested = False
+
+    def release_submission_ticket(
+        _completed_predecessor: asyncio.Future[None] | None = None,
+    ) -> None:
+        if not submission_ticket.done():
+            submission_ticket.set_result(None)
+        if request.app.state.submission_tails.get(endpoint_key) is submission_ticket:
+            request.app.state.submission_tails.pop(endpoint_key, None)
+
+    def settle_submission_ticket() -> None:
+        nonlocal ticket_settlement_requested
+        if ticket_settlement_requested:
+            return
+        ticket_settlement_requested = True
+        if predecessor is not None and not predecessor.done():
+            # A failed/cancelled job still proxies the unfinished predecessor,
+            # so a third admission cannot jump across the original order.
+            predecessor.add_done_callback(release_submission_ticket)
+        else:
+            release_submission_ticket()
+
+    if accepted is not None:
+        accepted.set()
+        if accepted_release is not None:
+            try:
+                await accepted_release.wait()
+            except BaseException:
+                settle_submission_ticket()
+                raise
+
+    try:
+        before_timeline_compile = getattr(
+            request.app.state, "before_timeline_compile", None
         )
+        if before_timeline_compile is not None:
+            await before_timeline_compile(job_id)
+        historical_takes = _resolve_historical_continuity_takes(
+            database,
+            draft,
+            segment_ids=body.segment_ids,
+            project_id=owner_project_id,
+        )
+        execution_plan = compile_project_execution_plan(
+            draft_v5,
+            captured_settings,
+            job_id,
+            body.segment_ids,
+            historical_takes=historical_takes,
+        )
+        execution_plan_digest = compiled_execution_plan_digest(execution_plan)
+        continuity_dependents = _execution_continuity_graph(execution_plan)
+        job_runtime_snapshot = build_job_runtime_snapshot(
+            draft_v5,
+            body.segment_ids,
+            captured_settings,
+            execution_plan,
+        )
+        compile_report = execution_plan.model_dump(mode="json")["compile_report"]
+        compiled_manifest = compile_report.get("manifest")
+        if not isinstance(compiled_manifest, dict):
+            raise _execution_plan_invariant_http_error()
+        prepared_parent = database.update_job_if_status(
+            job_id,
+            "preparing",
+            stage="preflight",
+            settings_snapshot=job_runtime_snapshot.model_dump(mode="json"),
+            prompt_snapshot=compiled_manifest,
+        )
+        if prepared_parent is None:
+            latest = database.get_job(job_id)
+            if latest is None:
+                raise KeyError(job_id)
+            latest["children"] = database.list_job_children(job_id)
+            settle_submission_ticket()
+            return project_job_read(latest)
+        database.create_job_execution_plan(job_id, execution_plan)
+    except V5CreativeAuthorityError as exc:
+        failure = _creative_input_http_error(
+            _v5_creative_authority_reason(exc)
+        )
+        failed = _fail_admitted_timeline_job(
+            database, job_id, detail=failure.detail
+        )
+        failed["children"] = database.list_job_children(job_id)
+        settle_submission_ticket()
+        return project_job_read(failed)
+    except (
+        ProjectCompilerBundleError,
+        V5V6ProjectionError,
+        NativeTemplateError,
+        DraftNotRunnable,
+        ValidationError,
+        ValueError,
+    ) as exc:
+        failure = _creative_input_http_error(_creative_input_reason(exc))
+        failed = _fail_admitted_timeline_job(
+            database, job_id, detail=failure.detail
+        )
+        failed["children"] = database.list_job_children(job_id)
+        settle_submission_ticket()
+        return project_job_read(failed)
+    except HTTPException as exc:
+        failed = _fail_admitted_timeline_job(
+            database, job_id, detail=exc.detail
+        )
+        failed["children"] = database.list_job_children(job_id)
+        settle_submission_ticket()
+        return project_job_read(failed)
+    except Exception:
+        logger.exception("timeline compilation failed after job admission")
+        failure = _execution_plan_invariant_http_error()
+        failed = _fail_admitted_timeline_job(
+            database, job_id, detail=failure.detail
+        )
+        failed["children"] = database.list_job_children(job_id)
+        settle_submission_ticket()
+        return project_job_read(failed)
+    except BaseException:
+        settle_submission_ticket()
+        raise
+
+    try:
+        now = utc_now()
+        child_ids: dict[str, str] = {}
+        child_ids_by_segment: dict[str, str] = {}
+        for index, unit in enumerate(execution_plan.segment_units):
+            child_id = str(uuid.uuid4())
+            child_ids[unit.id] = child_id
+            child_ids_by_segment[unit.owner_segment_id] = child_id
+            database.create_job_child(
+                {
+                    "id": child_id,
+                    "job_id": job_id,
+                    # Leave the preceding even slot available for a dynamically
+                    # planned RayKill barrier once the endpoint queue-tail state is
+                    # read under its submission lock.
+                    "group_index": index * 2 + 1,
+                    "family": unit.family,
+                    "backend": unit.backend,
+                    "segment_ids": [unit.owner_segment_id],
+                    "output_nodes": {
+                        unit.owner_segment_id: unit.expected_output_spec.node_id
+                    },
+                    "status": "preparing",
+                    "progress": 0.0,
+                    "stage": "preflight",
+                    "prompt_id": None,
+                    "outputs": [],
+                    "error": None,
+                    "prompt_snapshot": unit.model_dump(mode="json")["prompt_base"],
+                    "created_at": now,
+                    "updated_at": now,
+                    "started_at": None,
+                    "completed_at": None,
+                }
+            )
+    except Exception:
+        logger.exception("timeline child materialization failed after job admission")
+        failure = _execution_plan_invariant_http_error()
+        failed = _fail_admitted_timeline_job(
+            database,
+            job_id,
+            detail=failure.detail,
+            stage="preflight_failed",
+        )
+        failed["children"] = database.list_job_children(job_id)
+        settle_submission_ticket()
+        return project_job_read(failed)
+    except BaseException:
+        settle_submission_ticket()
+        raise
     submitted_children: list[tuple[str, str]] = []
     # Insert before awaiting POST /prompt: a thrown response can still follow
     # an accepted upstream side effect.
     possibly_submitted: dict[str, str] = {}
     submission_lock: anyio.Lock | None = None
     lock_acquired = False
-    endpoint_key: str | None = None
-    submission_ticket: asyncio.Future[None] | None = None
-    predecessor: asyncio.Future[None] | None = None
     continuity_outputs: dict[str, dict[str, str]] = {}
     dependency_failed_segments: set[str] = set()
     try:
@@ -7185,19 +7352,6 @@ async def _create_timeline_job_impl(
                 raise HTTPException(status_code=404, detail="job disappeared during submission")
             latest["children"] = database.list_job_children(job_id)
             return project_job_read(latest)
-        endpoint_key = _EMBEDDED_ENDPOINT_KEY
-        loop = asyncio.get_running_loop()
-        submission_ticket = loop.create_future()
-        async with request.app.state.submission_ticket_lock:
-            predecessor = request.app.state.submission_tails.get(endpoint_key)
-            request.app.state.submission_tails[endpoint_key] = submission_ticket
-        # Register endpoint order before acknowledging a Ray request. Thus a
-        # second HTTP request can return quickly without racing its background
-        # task ahead of the first one at the process-local AnyIO lock.
-        if accepted is not None:
-            accepted.set()
-            if accepted_release is not None:
-                await accepted_release.wait()
         if predecessor is not None:
             await asyncio.shield(predecessor)
         # Subscribe before POST /prompt and briefly await the initial socket
@@ -7215,19 +7369,7 @@ async def _create_timeline_job_impl(
         )
         await submission_lock.acquire()
         lock_acquired = True
-        await _await_endpoint_submission_recovery(
-            request,
-            database,
-            dispatch_job_id=job_id,
-        )
-        # This is a conservative queue-tail ledger, not a claim that CUDA
-        # weights are already physically resident. State is advanced before a
-        # Ray POST because a lost response may still have accepted the prompt;
-        # cancellation/failure therefore leaves a conservative key that forces
-        # a later incompatible request through another barrier. Epoch never
-        # resets, including across Standard, so A -> B -> A cannot hit A's old
-        # cached initializer output containing actor handles killed by B.
-        runtime_state = database.get_raylight_runtime_state() or {
+        empty_runtime_state = {
             "version": 2,
             "epoch": 0,
             "current": None,
@@ -7235,42 +7377,54 @@ async def _create_timeline_job_impl(
             "tail_action": None,
             "tainted": False,
         }
-        # The initial timeline preflight can precede an endpoint-ticket wait.
-        # Re-read visibility while holding the submission lock and before even
-        # refreshing the old queue tail, so a ComfyUI restart/GPU change in
-        # that interval cannot mutate or replay an incompatible ledger.
-        try:
-            locked_runtime_status = _raylight_runtime_status(
-                database,
-                await client.system_stats(),
-                state=runtime_state,
-            )
-        except NativeTemplateError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "raylight_runtime_state_invalid",
-                    "message": str(exc),
-                },
-            ) from exc
-        if locked_runtime_status.recovery_required:
-            raise HTTPException(
-                status_code=409,
-                detail=_raylight_runtime_recovery_detail(locked_runtime_status),
-            )
-        runtime_state = await _refresh_raylight_runtime_tail(
-            client, database, runtime_state
+        plan_uses_raylight = any(
+            unit.backend == "raylight" for unit in execution_plan.segment_units
         )
-        if runtime_state.get("legacy_unknown") and any(
-            unit.backend == "standard" for unit in execution_plan.segment_units
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "检测到旧版 RayLight 运行状态，无法证明旧 GPU actor 已释放；"
-                    "为避免与 Standard 争用显存，本任务已阻止。请先提交一次 RayLight "
-                    "任务以显式重建运行池，再提交 Standard 任务。"
-                ),
+        standard_tracks_raylight_runtime = True
+        try:
+            stored_runtime_state = database.get_raylight_runtime_state()
+        except (NativeTemplateError, TypeError, ValueError):
+            if plan_uses_raylight:
+                raise
+            # A damaged Ray-only ledger is not authority over a Standard plan.
+            # Preserve it for explicit Ray recovery and submit Standard without
+            # reading or rewriting that unrelated state.
+            stored_runtime_state = None
+            standard_tracks_raylight_runtime = False
+        runtime_state = stored_runtime_state or empty_runtime_state
+        if not plan_uses_raylight:
+            # A Standard job still shuts down a settled Director-owned pool,
+            # but it must not inherit an old ambiguous Ray prompt as global
+            # submission authority.  That old job keeps converging through its
+            # own recovery worker while this Standard plan uses no Ray ledger.
+            if bool(runtime_state.get("tainted")):
+                runtime_state = empty_runtime_state
+                standard_tracks_raylight_runtime = False
+        if plan_uses_raylight:
+            # Only a selected Ray path consumes Director's bundled runtime
+            # ledger. Standard work must not inherit unrelated Ray recovery as
+            # a global host gate.
+            try:
+                locked_runtime_status = _raylight_runtime_status(
+                    database,
+                    await client.system_stats(),
+                    state=runtime_state,
+                )
+            except NativeTemplateError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "raylight_runtime_state_invalid",
+                        "message": str(exc),
+                    },
+                ) from exc
+            if locked_runtime_status.recovery_required:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_raylight_runtime_recovery_detail(locked_runtime_status),
+                )
+            runtime_state = await _refresh_raylight_runtime_tail(
+                client, database, runtime_state
             )
         tail_prompt_id = runtime_state.get("tail_prompt_id")
         tail_action = runtime_state.get("tail_action")
@@ -7288,6 +7442,20 @@ async def _create_timeline_job_impl(
             )
             if len(tail_children) == 1:
                 tail_child = tail_children[0]
+                if (
+                    tail_child["status"] not in _TERMINAL_STATUSES
+                    and tail_child.get("stage") in _PROCESS_OWNERSHIP_STAGES
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "raylight_transition_recovery_pending",
+                            "message": (
+                                "A previous Director RayLight submission is still "
+                                "being reconciled."
+                            ),
+                        },
+                    )
                 terminal = await _await_raylight_generation(
                     client,
                     database,
@@ -7318,24 +7486,21 @@ async def _create_timeline_job_impl(
                 tail_prompt_id
             )
             tail_child = tail_children[0] if len(tail_children) == 1 else None
-            while (
+            if (
                 tail_child is not None
                 and tail_child["status"] not in _TERMINAL_STATUSES
                 and tail_child.get("stage") in _PROCESS_OWNERSHIP_STAGES
             ):
-                # A lost RayKill POST response can be followed by delayed
-                # queue.put. Its recovery owner must first provide an exact
-                # terminal/cancel certificate; otherwise a newer barrier could
-                # run first and the delayed old RayKill would kill the new pool.
-                dispatch_parent = database.get_job(job_id)
-                if dispatch_parent is None:
-                    raise KeyError(job_id)
-                if dispatch_parent["status"] in {"cancelling", "cancelled"}:
-                    raise asyncio.CancelledError
-                await asyncio.sleep(_RAYLIGHT_GENERATION_POLL_SECONDS)
-                tail_child = database.get_job_child(str(tail_child["id"]))
-                if tail_child is None:
-                    raise KeyError(tail_prompt_id)
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "raylight_transition_recovery_pending",
+                        "message": (
+                            "A previous Director RayLight shutdown is still "
+                            "being reconciled."
+                        ),
+                    },
+                )
             if tail_child is None or tail_child["status"] == "succeeded":
                 await _await_raylight_transition(client, tail_prompt_id)
                 database.settle_raylight_runtime_prompt(
@@ -7380,7 +7545,11 @@ async def _create_timeline_job_impl(
             planned_manifest["submission_order"] = [
                 unit.id for unit in planned_units
             ]
-            current_ray_ledger = database.get_raylight_runtime_state()
+            current_ray_ledger = (
+                database.get_raylight_runtime_state()
+                if plan_uses_raylight or standard_tracks_raylight_runtime
+                else None
+            )
             planned_manifest["runtime_epoch"] = (
                 int(current_ray_ledger["epoch"])
                 if current_ray_ledger is not None
@@ -7516,7 +7685,14 @@ async def _create_timeline_job_impl(
                     source_unit_ordinal=ordinal,
                     segment_child_id=child_ids[prepared.id],
                     continuity_evidence=continuity_evidence_for(prepared),
-                    ray_ledger_before=database.get_raylight_runtime_state(),
+                    ray_ledger_before=(
+                        database.get_raylight_runtime_state()
+                        if (
+                            prepared.backend == "raylight"
+                            or standard_tracks_raylight_runtime
+                        )
+                        else None
+                    ),
                     source_compiled_plan_digest=execution_plan_digest,
                 )
                 segment_plan = wave
@@ -8037,6 +8213,7 @@ async def _create_timeline_job_impl(
             # it locally failed would orphan the upstream prompt and erase the
             # only recovery owner while releasing the endpoint lock.
             try:
+                settle_submission_ticket()
                 await _cleanup_failed_timeline_submission(
                     request,
                     job_id=job_id,
@@ -8047,36 +8224,125 @@ async def _create_timeline_job_impl(
             except BaseException:
                 _mark_timeline_submission_interrupted(database, job_id)
                 raise
-            raise
+            latest = database.get_job(job_id)
+            if latest is None:
+                raise KeyError(job_id)
+            latest["children"] = database.list_job_children(job_id)
+            return project_job_read(latest)
         if cleanup_already_owned:
             # The late-submit cancellation branch already attempted the exact
             # prompt id and persisted an unconfirmed recovery owner before it
             # raised this HTTPException.  A second cleanup pass would overwrite
             # the more precise ``cancel_failed`` state.
-            raise
-        failed_parent = database.update_job_if_status(
+            latest = database.get_job(job_id)
+            if latest is None:
+                raise KeyError(job_id)
+            latest["children"] = database.list_job_children(job_id)
+            return project_job_read(latest)
+        failed_parent = _fail_admitted_timeline_job(
+            database,
             job_id,
-            "preparing",
-            status="failed",
-            progress=1.0,
+            detail=exc.detail,
             stage="preflight_failed",
-            error=json.dumps(exc.detail, ensure_ascii=False),
-            completed_at=utc_now(),
         )
-        if failed_parent is not None:
-            for child in database.list_job_children(job_id):
-                if child["status"] not in _TERMINAL_STATUSES:
-                    database.update_job_child_if_snapshot(
-                        child["id"],
-                        expected_status=child["status"],
-                        expected_updated_at=child["updated_at"],
-                        status="failed",
-                        progress=1.0,
-                        stage="preflight_failed",
-                        error=json.dumps(exc.detail, ensure_ascii=False),
-                        completed_at=utc_now(),
+        failed_parent["children"] = database.list_job_children(job_id)
+        return project_job_read(failed_parent)
+    except (
+        ExecutionEvidenceConflict,
+        NativeTemplateError,
+        SubmissionPlanningError,
+        ValidationError,
+        ValueError,
+    ) as exc:
+        if lock_acquired and submission_lock is not None:
+            submission_lock.release()
+            lock_acquired = False
+        if possibly_submitted:
+            try:
+                settle_submission_ticket()
+                await _cleanup_failed_timeline_submission(
+                    request,
+                    job_id=job_id,
+                    client=client,
+                    error=exc,
+                    possibly_submitted=possibly_submitted,
+                )
+            except BaseException:
+                _mark_timeline_submission_interrupted(database, job_id)
+                raise
+            latest = database.get_job(job_id)
+            if latest is None:
+                raise KeyError(job_id)
+            latest["children"] = database.list_job_children(job_id)
+            return project_job_read(latest)
+        failed_parent = _fail_admitted_timeline_job(
+            database,
+            job_id,
+            detail={
+                "code": "submission_plan_invalid",
+                "message": str(exc),
+            },
+            stage="preflight_failed",
+        )
+        failed_parent["children"] = database.list_job_children(job_id)
+        return project_job_read(failed_parent)
+    except ComfyPromptRejected as exc:
+        if lock_acquired and submission_lock is not None:
+            submission_lock.release()
+            lock_acquired = False
+        rejection_detail = {
+            "code": "comfy_prompt_rejected",
+            "message": "ComfyUI rejected the generated prompt before queue admission.",
+            "status_code": exc.status_code,
+            "detail": exc.detail,
+        }
+        rejection_error = json.dumps(rejection_detail, ensure_ascii=False)
+        try:
+            rejected_child = database.fail_rejected_job_child_submission(
+                child_id,
+                expected_revision=initial_ownership.ownership_revision,
+                error=rejection_error,
+                updated_at=datetime.now(timezone.utc),
+            )
+            if rejected_child is None:
+                # A concurrent lifecycle owner changed the intent. Preserve the
+                # existing conservative cleanup path instead of overwriting it.
+                settle_submission_ticket()
+                await _cleanup_failed_timeline_submission(
+                    request,
+                    job_id=job_id,
+                    client=client,
+                    error=exc,
+                    possibly_submitted=possibly_submitted,
+                )
+            else:
+                possibly_submitted.pop(child_id, None)
+                if possibly_submitted:
+                    # Earlier units may already own real prompts; only the current
+                    # rejected intent is side-effect free.
+                    settle_submission_ticket()
+                    await _cleanup_failed_timeline_submission(
+                        request,
+                        job_id=job_id,
+                        client=client,
+                        error=exc,
+                        possibly_submitted=possibly_submitted,
                     )
-        raise
+                else:
+                    _fail_admitted_timeline_job(
+                        database,
+                        job_id,
+                        detail=rejection_detail,
+                        stage="submission_failed",
+                    )
+        except BaseException:
+            _mark_timeline_submission_interrupted(database, job_id)
+            raise
+        latest = database.get_job(job_id)
+        if latest is None:
+            raise KeyError(job_id)
+        latest["children"] = database.list_job_children(job_id)
+        return project_job_read(latest)
     except (ComfyError, httpx.HTTPError, KeyError) as exc:
         # An incompatible ComfyUI may ignore our caller-assigned prompt id and
         # queue another one. ComfyClient reports both ids after attempting an
@@ -8091,6 +8357,7 @@ async def _create_timeline_job_impl(
             if lock_acquired and submission_lock is not None:
                 submission_lock.release()
                 lock_acquired = False
+            settle_submission_ticket()
             await _cleanup_failed_timeline_submission(
                 request,
                 job_id=job_id,
@@ -8105,7 +8372,11 @@ async def _create_timeline_job_impl(
                 lock_acquired = False
             _mark_timeline_submission_interrupted(database, job_id)
             raise
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        latest = database.get_job(job_id)
+        if latest is None:
+            raise KeyError(job_id)
+        latest["children"] = database.list_job_children(job_id)
+        return project_job_read(latest)
     except asyncio.CancelledError:
         if lock_acquired and submission_lock is not None:
             submission_lock.release()
@@ -8127,31 +8398,7 @@ async def _create_timeline_job_impl(
         _mark_timeline_submission_interrupted(database, job_id)
         raise
     finally:
-        if submission_ticket is not None:
-            ticket = submission_ticket
-
-            def release_submission_ticket(
-                _completed_predecessor: asyncio.Future[None] | None = None,
-            ) -> None:
-                if not ticket.done():
-                    ticket.set_result(None)
-                if (
-                    endpoint_key is not None
-                    and request.app.state.submission_tails.get(endpoint_key)
-                    is ticket
-                ):
-                    request.app.state.submission_tails.pop(endpoint_key, None)
-
-            if predecessor is not None and not predecessor.done():
-                # A cancelled waiter may end before the task ahead of it. Its
-                # dispatcher ownership can be released immediately (making
-                # the terminal record deletable), but its endpoint ticket must
-                # keep proxying that predecessor. Otherwise a task created
-                # after the cancellation could jump across the unfinished
-                # ticket chain before either task has acquired the AnyIO lock.
-                predecessor.add_done_callback(release_submission_ticket)
-            else:
-                release_submission_ticket()
+        settle_submission_ticket()
     published_children = database.list_job_children(job_id)
     published_segment_children = [
         child for child in published_children if child["segment_ids"]
@@ -8218,17 +8465,18 @@ async def _create_timeline_job(
     runs. A hard process exit is reconciled by lifespan startup recovery.
     """
 
-    try:
-        body = body.model_copy(
-            update={
-                "config": migrate_timeline_feature_authority_to_v5(
-                    body.config
-                )
-            },
-            deep=True,
-        )
-    except (ValidationError, ValueError) as exc:
-        raise _creative_input_http_error(_creative_input_reason(exc)) from exc
+    if body.config.features.template_bundle_version == 4:
+        try:
+            body = body.model_copy(
+                update={
+                    "config": migrate_timeline_feature_authority_to_v5(
+                        body.config
+                    )
+                },
+                deep=True,
+            )
+        except (ValidationError, ValueError) as exc:
+            raise _creative_input_http_error(_creative_input_reason(exc)) from exc
 
     accepted = asyncio.Event()
     accepted_release = asyncio.Event()
@@ -8794,9 +9042,19 @@ def create_app(
         try:
             reconcile_wake_event.clear()
             # Product-owned support configuration is parsed exactly once per
-            # DirectorDeck process. All later consumers read its immutable
-            # in-memory snapshot rather than reopening the JSON file.
-            initialize_directordeck_config()
+            # DirectorDeck process. A broken Director-owned file is diagnosed
+            # locally: persistence and the API still start, while only a
+            # request that needs the unavailable LoRA policy fails explicitly.
+            try:
+                initialize_directordeck_config()
+            except Exception as exc:
+                app.state.product_config_initialization_failed = True
+                logger.error(
+                    "DirectorDeck product configuration failed to initialize: %s",
+                    type(exc).__name__,
+                )
+            else:
+                app.state.product_config_initialization_failed = False
             database.initialize()
             database.recover_interrupted_assemblies()
             # Startup is intentionally local-only.  The previous process
@@ -8902,6 +9160,7 @@ def create_app(
 
     app = FastAPI(title="Director Web API", version="0.1.0", lifespan=lifespan)
     app.state.database = database
+    app.state.product_config_initialization_failed = False
     app.state.instance_lock = instance_lock
     app.state.storage = storage
     app.state.comfy_url = comfy_url
@@ -8917,6 +9176,9 @@ def create_app(
         if comfy_tls_context is not None
         else default_comfy_factory
     )
+    app.state.ck_host_observation = None
+    app.state.ck_host_observation_generation = 0
+    app.state.ck_host_observation_lock = asyncio.Lock()
     app.state.host_capability_provider = host_capability_provider
     app.state.host_output_probe = host_output_probe
     app.state.comfy_tls_context = comfy_tls_context
@@ -9040,12 +9302,13 @@ def create_app(
         current, current_authority = database.get_settings_authority()
         if current_authority != body.expected_authority_token:
             raise _settings_authority_conflict()
-        issue = _new_disallowed_lora_loader_mapping(current, body.document)
-        if issue is not None:
-            raise _lora_loader_mapping_not_allowed(issue)
+        validated_document = _validated_lora_loader_mapping_update(
+            current,
+            body.document,
+        )
         try:
             settings, authority = database.put_settings_v3_authority(
-                body.document,
+                validated_document,
                 expected_authority_token=body.expected_authority_token,
                 schema_version=body.schema_version,
             )
@@ -9063,7 +9326,9 @@ def create_app(
         snapshot = await _host_capability_snapshot(request)
         catalog = build_feature_catalog(
             snapshot,
-            template_bundle=CURRENT_TEMPLATE_BUNDLE,
+            # This endpoint is a frozen Bundle-5 compatibility/debug wire.
+            # Bundle 6 uses its native compiler and dedicated product controls.
+            template_bundle=V5_TEMPLATE_BUNDLE,
         )
         etag = quote_feature_catalog_etag(
             feature_catalog_etag(
@@ -9086,11 +9351,43 @@ def create_app(
         )
 
     @app.get("/api/config")
-    async def get_product_config() -> Response:
+    async def get_product_config(request: Request) -> Response:
         """Return the immutable product configuration loaded at startup."""
 
+        try:
+            if request.app.state.product_config_initialization_failed:
+                raise RuntimeError("product configuration unavailable")
+            config = get_directordeck_config()
+        except RuntimeError:
+            payload: dict[str, Any] = {
+                "schema_version": 1,
+                "lora": {
+                    "loaders": [],
+                    "fallback_policy": None,
+                    "loader_policies": [],
+                },
+                "diagnostics": [
+                    {
+                        "code": "lora_product_config_unavailable",
+                        "message": (
+                            "DirectorDeck's LoRA loader configuration is unavailable."
+                        ),
+                    }
+                ],
+            }
+        else:
+            payload = config.model_dump(mode="json")
+            payload["diagnostics"] = [
+                diagnostic.model_dump(mode="json")
+                for diagnostic in get_directordeck_config_diagnostics()
+            ]
         return Response(
-            content=get_directordeck_config().model_dump_json(),
+            content=json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ),
             media_type="application/json",
         )
 
@@ -9102,8 +9399,9 @@ def create_app(
         request: Request,
         body: FeaturePreflightRequest,
     ) -> FeaturePreflightReport:
-        # This route is deliberately advisory and read-only.  Submission and
-        # explicit compile recapture and reevaluate all capability evidence.
+        # This route is deliberately advisory and read-only. Production
+        # compile/submission do not consume its capability evidence as an
+        # authorization token.
         snapshot = await _host_capability_snapshot(request)
         readiness = _host_operational_readiness(request, snapshot)
         database = _db(request)
@@ -9275,6 +9573,25 @@ def create_app(
             }
         _assert_runtime_authority(request, authority)
         return report
+
+    @app.get(
+        "/api/capabilities/comfy-kitchen-attention",
+        response_model=ComfyKitchenAttentionCapabilityV1,
+    )
+    async def get_comfy_kitchen_attention_capability(
+        request: Request,
+        family: Annotated[
+            list[Literal["fl2va", "ref2va"]] | None,
+            Query(),
+        ] = None,
+    ) -> ComfyKitchenAttentionCapabilityV1:
+        """Return a cached UI hint; it never authorizes compilation/submission."""
+
+        reachable_families = tuple(dict.fromkeys(family or ("fl2va", "ref2va")))
+        return await _comfy_kitchen_attention_capability(
+            request,
+            reachable_families=reachable_families,
+        )
 
     @app.post("/api/capabilities")
     async def test_capabilities(request: Request) -> dict[str, Any]:
@@ -9665,6 +9982,29 @@ def create_app(
         document, revision = _db(request).get_timeline_authority()
         return TimelineAuthorityRead(document=document, revision=revision)
 
+    def feature_bundle_migration_notices(
+        database: Database,
+        project_id: str,
+    ) -> FeatureBundleMigrationNoticeListRead:
+        if not database.project_exists(project_id):
+            raise HTTPException(status_code=404, detail="project not found")
+        return FeatureBundleMigrationNoticeListRead(
+            notices=database.list_feature_bundle_migration_notices(project_id)
+        )
+
+    @app.get(
+        "/api/timeline/migration-notices",
+        response_model=FeatureBundleMigrationNoticeListRead,
+    )
+    async def get_timeline_migration_notices(
+        request: Request,
+    ) -> FeatureBundleMigrationNoticeListRead:
+        database = _db(request)
+        return feature_bundle_migration_notices(
+            database,
+            database.LEGACY_DEFAULT_PROJECT_ID,
+        )
+
     @app.put("/api/timeline/authority", response_model=TimelineAuthorityRead)
     async def put_timeline_authority(
         request: Request,
@@ -9689,6 +10029,8 @@ def create_app(
             raise _timeline_revision_conflict(exc) from None
         except TimelineRevisionExhausted as exc:
             raise _timeline_revision_exhausted(exc) from None
+        except TimelineTemplateBundleConflict as exc:
+            raise _timeline_template_bundle_conflict(exc) from None
         except (ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
         return TimelineAuthorityRead(document=document, revision=revision)
@@ -9845,6 +10187,20 @@ def create_app(
             raise HTTPException(status_code=404, detail="project not found")
         return _project_summary(project)
 
+    @app.get("/api/projects/{project_id}/export")
+    async def export_project(request: Request, project_id: str) -> Response:
+        raw_document = _db(request).get_project_raw_document(project_id)
+        if raw_document is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        filename = quote(f"{project_id}.directordeck-project.json", safe="")
+        return Response(
+            content=raw_document.encode("utf-8"),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}"
+            },
+        )
+
     @app.patch("/api/projects/{project_id}")
     async def rename_project(project_id: str) -> None:
         raise _project_rename_api_retired(project_id)
@@ -9882,6 +10238,8 @@ def create_app(
             return _db(request).get_project_timeline(project_id)
         except KeyError:
             raise HTTPException(status_code=404, detail="project not found") from None
+        except (TypeError, ValueError, ValidationError):
+            raise _project_document_unreadable(project_id) from None
 
     @app.put("/api/projects/{project_id}/timeline")
     async def put_project_timeline(
@@ -9907,7 +10265,19 @@ def create_app(
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="project not found") from None
+        except (TypeError, ValueError, ValidationError):
+            raise _project_document_unreadable(project_id) from None
         return TimelineAuthorityRead(document=document, revision=revision)
+
+    @app.get(
+        "/api/projects/{project_id}/migration-notices",
+        response_model=FeatureBundleMigrationNoticeListRead,
+    )
+    async def get_project_migration_notices(
+        request: Request,
+        project_id: str,
+    ) -> FeatureBundleMigrationNoticeListRead:
+        return feature_bundle_migration_notices(_db(request), project_id)
 
     @app.put(
         "/api/projects/{project_id}/timeline/authority",
@@ -9942,6 +10312,8 @@ def create_app(
             raise _timeline_revision_conflict(exc) from None
         except TimelineRevisionExhausted as exc:
             raise _timeline_revision_exhausted(exc) from None
+        except TimelineTemplateBundleConflict as exc:
+            raise _timeline_template_bundle_conflict(exc) from None
         except (ValidationError, ValueError) as exc:
             raise _validation_error(exc) from exc
         return TimelineAuthorityRead(document=document, revision=revision)
@@ -10941,7 +11313,11 @@ def create_app(
                 completed_at=utc_now(),
             )
             if job is not None:
-                return read_job(job)
+                return read_job(
+                    await _quiesce_cancelled_submission_dispatcher(
+                        request, job
+                    )
+                )
             latest = database.get_job(job_id)
             if latest is None:
                 raise HTTPException(status_code=404, detail="job not found")

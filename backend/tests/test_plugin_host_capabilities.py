@@ -544,7 +544,7 @@ def test_provider_never_uses_provenance_or_source_as_capability_authority(
     _stabilize_environment(plugin, monkeypatch)
     object_info = _raw_object_info(current=True)
     registry = _registry_for_object_info(object_info)
-    class_type = "DirectorStrictModelAttentionBackend"
+    class_type = "UNETLoader"
     registry[class_type] = type(
         "UserModifiedAttention",
         (),

@@ -19,6 +19,7 @@ from .contracts import (
     JsonObject,
     ModelFamily,
     PositiveVersion,
+    ResolvedFeatureImplementation,
     Sha256Digest,
 )
 
@@ -129,11 +130,96 @@ class CompiledExecutionReportV2(ContractModel):
         return self
 
 
+class NodeEmissionEvidenceV3(ContractModel):
+    node_id: Annotated[str, Field(min_length=1, max_length=128)]
+    class_type: Annotated[str, Field(min_length=1, max_length=128)]
+    feature_id: Identifier
+    implementation_id: Identifier
+
+
+class CompiledFeatureUseV3(ContractModel):
+    segment_id: Annotated[str, Field(min_length=1, max_length=128)]
+    unit_id: Annotated[str, Field(min_length=1, max_length=256)]
+    feature_id: Identifier
+    version: PositiveVersion
+    backend: Backend
+    family: ModelFamily
+    template_id: Identifier
+    state: Literal["inactive", "applicable"]
+    config_source: Literal["definition_default", "project", "segment", "context"]
+    reason_code: Identifier | None = None
+    implementation: ResolvedFeatureImplementation | None = None
+    execution_identity: JsonObject | None = None
+    runtime_pool_identity: JsonObject | None = None
+    node_emissions: tuple[NodeEmissionEvidenceV3, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_state(self) -> "CompiledFeatureUseV3":
+        applicable = self.state == "applicable"
+        if applicable != (self.implementation is not None):
+            raise ValueError("applicable feature use requires one implementation")
+        if applicable != (self.execution_identity is not None):
+            raise ValueError("applicable feature use requires execution identity")
+        if applicable and self.reason_code is not None:
+            raise ValueError("applicable feature use cannot have inactive reason")
+        if not applicable and (
+            self.reason_code is None
+            or self.runtime_pool_identity is not None
+            or self.node_emissions
+        ):
+            raise ValueError("inactive feature use may contain only its reason")
+        if any(item.feature_id != self.feature_id for item in self.node_emissions):
+            raise ValueError("node emission owner does not match feature use")
+        if self.implementation is not None and any(
+            item.implementation_id != self.implementation.implementation_id
+            for item in self.node_emissions
+        ):
+            raise ValueError("node emission implementation does not match feature use")
+        return self
+
+
+class CompiledExecutionReportV3(ContractModel):
+    source: Literal["bundle6_native_compile_v3"] = "bundle6_native_compile_v3"
+    manifest: JsonObject
+    plans: tuple[JsonObject, ...]
+    families: tuple[ModelFamily, ...]
+    unit_effective_execution_digests: tuple[CompiledUnitDigest, ...]
+    feature_resolutions: Annotated[
+        tuple[CompiledFeatureUseV3, ...],
+        Field(min_length=1, max_length=8_192),
+    ]
+    notices: Annotated[tuple[CompiledFeatureNotice, ...], Field(max_length=256)] = ()
+    advisories: Annotated[tuple[CompiledCapabilityReason, ...], Field(max_length=256)] = ()
+
+    @model_validator(mode="after")
+    def validate_report_identity(self) -> "CompiledExecutionReportV3":
+        units = [item.unit_id for item in self.unit_effective_execution_digests]
+        if len(units) != len(set(units)):
+            raise ValueError("compiled report unit digests must be unique")
+        keys = [
+            (item.segment_id, item.unit_id, item.feature_id, item.version)
+            for item in self.feature_resolutions
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("compiled feature-use identities must be unique")
+        node_ids = [
+            (item.unit_id, node.node_id)
+            for item in self.feature_resolutions
+            for node in item.node_emissions
+        ]
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("each emitted node must have one feature owner")
+        return self
+
+
 __all__ = [
     "CompiledCapabilityEvaluation",
     "CompiledCapabilityReason",
     "CompiledExecutionReportV2",
+    "CompiledExecutionReportV3",
+    "CompiledFeatureUseV3",
     "CompiledFeatureNotice",
     "CompiledFeatureResolution",
     "CompiledUnitDigest",
+    "NodeEmissionEvidenceV3",
 ]

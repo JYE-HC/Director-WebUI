@@ -45,9 +45,11 @@ from .workflow.contracts import (
 from .workflow.compile_report import (
     CompiledFeatureNotice,
     CompiledFeatureResolution,
+    CompiledFeatureUseV3,
 )
 from .workflow.node_contracts import (
     V4_NODE_CONTRACT_REGISTRY,
+    V6_NODE_CONTRACT_REGISTRY,
     native_expected_module_policy,
     native_provenance_policy,
 )
@@ -195,6 +197,7 @@ class NativeWorkflowUnit:
     graph_audit_spec: GraphAuditSpec | None = None
     graph_audit_traces: tuple[FeatureAuditTrace, ...] = ()
     compile_feature_resolutions: tuple[CompiledFeatureResolution, ...] = ()
+    compile_feature_uses: tuple[CompiledFeatureUseV3, ...] = ()
     compile_feature_notices: tuple[CompiledFeatureNotice, ...] = ()
     feature_identity_evidence: tuple[NativeFeatureIdentityEvidence, ...] = ()
     progress_spec: ProgressSpec | None = None
@@ -332,9 +335,25 @@ def _bound_late_values(unit: NativeWorkflowUnit) -> dict[str, Any]:
     return values
 
 
+def _late_binding_audit_traces(
+    unit: NativeWorkflowUnit,
+    registry: NodeContractRegistry,
+) -> tuple[FeatureAuditTrace, ...] | None:
+    """Bridge only native V6 units whose full audit was proven at compile time."""
+
+    if unit.graph_audit_traces:
+        return unit.graph_audit_traces
+    if registry is V6_NODE_CONTRACT_REGISTRY and unit.compile_feature_uses:
+        return None
+    # Preserve the frozen V4/V5 fail-closed behavior for malformed legacy units.
+    return unit.graph_audit_traces
+
+
 def bind_native_workflow_predecessor_output(
     unit: NativeWorkflowUnit,
     output: Mapping[str, Any],
+    *,
+    node_contract_registry: NodeContractRegistry = V4_NODE_CONTRACT_REGISTRY,
 ) -> NativeWorkflowUnit:
     """Purely bind one successor graph to its predecessor's SaveVideo output.
 
@@ -377,10 +396,13 @@ def bind_native_workflow_predecessor_output(
                 prompt_base=unit.prompt,
                 bound_prompt=prompt,
                 spec=unit.graph_audit_spec,
-                node_contract_registry=V4_NODE_CONTRACT_REGISTRY,
+                node_contract_registry=node_contract_registry,
                 model_family=unit.family,
                 backend=unit.backend,
-                feature_traces=unit.graph_audit_traces,
+                feature_traces=_late_binding_audit_traces(
+                    unit,
+                    node_contract_registry,
+                ),
                 expected_late_bound_values=expected_values,
                 enforce_runtime_effects=False,
             )
@@ -960,7 +982,10 @@ def raylight_workflow_logical_gpu_indices(
 
 
 def bind_raylight_runtime_epoch(
-    unit: NativeWorkflowUnit, epoch: int
+    unit: NativeWorkflowUnit,
+    epoch: int,
+    *,
+    node_contract_registry: NodeContractRegistry = V4_NODE_CONTRACT_REGISTRY,
 ) -> NativeWorkflowUnit:
     """Bind a Ray unit to one persistent endpoint transition epoch."""
 
@@ -990,10 +1015,13 @@ def bind_raylight_runtime_epoch(
                 prompt_base=unit.prompt,
                 bound_prompt=prompt,
                 spec=unit.graph_audit_spec,
-                node_contract_registry=V4_NODE_CONTRACT_REGISTRY,
+                node_contract_registry=node_contract_registry,
                 model_family=unit.family,
                 backend=unit.backend,
-                feature_traces=unit.graph_audit_traces,
+                feature_traces=_late_binding_audit_traces(
+                    unit,
+                    node_contract_registry,
+                ),
                 expected_late_bound_values=expected_values,
                 enforce_runtime_effects=False,
             )

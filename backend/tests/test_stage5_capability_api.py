@@ -5,6 +5,7 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
@@ -98,6 +99,18 @@ def _reason_semantics(reason: dict[str, object]) -> tuple[object, ...]:
     )
 
 
+def _bundle6_feature_use(response, feature_id: str) -> dict[str, Any]:
+    document = response.json()
+    assert document["template_bundle_version"] == 6
+    matches = [
+        use
+        for use in document["features"]["uses"]
+        if use["feature_id"] == feature_id
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def _provider_snapshot(client) -> HostCapabilitySnapshot:
     provider = client.director_app.state.host_capability_provider
     assert provider is not None
@@ -151,6 +164,14 @@ def _error_codes(document: dict[str, object]) -> set[str]:
         for error in errors
         if isinstance(error, dict) and "code" in error
     }
+
+
+async def _wait_until(predicate) -> None:
+    async def ready() -> None:
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(ready(), timeout=2.0)
 
 
 async def test_feature_catalog_has_strong_stable_etag_and_304_is_bodyless(
@@ -419,7 +440,7 @@ async def test_feature_preflight_ignores_interface_node_fingerprint_drift(
     ),
     ids=("take-observation-ffprobe", "timeline-assembly-ffmpeg"),
 )
-async def test_media_capability_reason_is_shared_by_catalog_preflight_compile_and_submit(
+async def test_media_capability_reason_remains_diagnostic_only(
     client,
     fake_comfy,
     monkeypatch,
@@ -469,23 +490,19 @@ async def test_media_capability_reason_is_shared_by_catalog_preflight_compile_an
         )
 
     database = client.director_app.state.database
-    jobs_before = database.list_jobs()
-    for endpoint in ("/api/timeline/compile", "/api/timeline/jobs"):
-        rejected = await client.post(endpoint, json=request_body)
-        assert rejected.status_code == 422, rejected.text
-        detail = rejected.json()["detail"]
-        assert detail["code"] == "media_tool_unavailable"
-        endpoint_reason = next(
-            reason
-            for reason in detail["reasons"]
-            if reason["safe_details"] == {"tool": tool}
-        )
-        assert _reason_semantics(endpoint_reason) == _reason_semantics(
-            preflight_reasons[0]
-        )
+    job_ids_before = {job["id"] for job in database.list_jobs()}
+    compiled = await client.post("/api/timeline/compile", json=request_body)
+    assert compiled.status_code == 200, compiled.text
+    assert {job["id"] for job in database.list_jobs()} == job_ids_before
 
-    assert database.list_jobs() == jobs_before
-    assert fake_comfy.prompts == []
+    submitted = await client.post("/api/timeline/jobs", json=request_body)
+    assert submitted.status_code == 200, submitted.text
+    job_id = submitted.json()["id"]
+    await _wait_until(lambda: bool(fake_comfy.prompts))
+    stored = database.get_job(job_id)
+    assert stored is not None
+    assert stored["status"] in {"preparing", "queued", "running", "succeeded"}
+    assert fake_comfy.prompts
     assert fake_comfy.cancelled == []
 
 
@@ -615,12 +632,35 @@ async def test_preflight_and_compile_never_use_legacy_capability_cancel_probe(
     assert compile_report["features"]["requested"][
         "template_bundle_version"
     ] == compile_report["template_bundle_version"]
-    assert set(compile_report["features"]["effective_by_segment"]) == {
+    assert compile_report["features"]["effective_by_segment"] == {}
+    assert compile_report["features"]["resolutions"] == []
+    assert {
+        use["segment_id"] for use in compile_report["features"]["uses"]
+    } == {
         plan["segment_id"] for plan in compile_report["plans"]
     }
-    assert compile_report["features"]["resolutions"]
-    resolution = compile_report["features"]["resolutions"][0]
-    assert set(resolution) == {
+    assert {
+        use["feature_id"] for use in compile_report["features"]["uses"]
+    } == {
+        "auxiliary_models",
+        "diffusion_model",
+        "execution_strategy",
+        "lora",
+        "comfy_kitchen_attention",
+        "sigma_schedule",
+        "multimodal_conditioning",
+        "continuity",
+        "sampling_pipeline",
+        "video_decode",
+        "audio_output",
+        "save_take",
+    }
+    feature_use = next(
+        use
+        for use in compile_report["features"]["uses"]
+        if use["feature_id"] == "auxiliary_models"
+    )
+    assert set(feature_use) == {
         "segment_id",
         "unit_id",
         "feature_id",
@@ -628,17 +668,19 @@ async def test_preflight_and_compile_never_use_legacy_capability_cancel_probe(
         "backend",
         "family",
         "template_id",
-        "resolution",
-        "adapter_fingerprint",
-        "capability",
-    }
-    assert set(resolution["resolution"]) == {
         "state",
-        "implementations",
-        "resolution_details",
+        "config_source",
+        "reason_code",
+        "implementation",
+        "execution_identity",
+        "runtime_pool_identity",
+        "node_emissions",
     }
-    assert resolution["resolution"]["implementations"]
+    assert feature_use["state"] == "applicable"
+    assert feature_use["implementation"]
+    assert feature_use["node_emissions"]
     assert compile_report["features"]["notices"] == []
+    assert compile_report["features"]["advisories"] == []
     assert compile_report["effective_execution_digest"]["algorithm"] == (
         "sha256-canonical-json-v1"
     )
@@ -656,7 +698,7 @@ async def test_preflight_and_compile_never_use_legacy_capability_cancel_probe(
     ) == cancel_before
 
 
-async def test_host_context_observation_failure_has_one_safe_entrypoint_contract(
+async def test_host_context_observation_failure_does_not_gate_production(
     client,
     fake_comfy,
     monkeypatch,
@@ -665,28 +707,24 @@ async def test_host_context_observation_failure_has_one_safe_entrypoint_contract
         raise ComfyError("private upstream detail must not cross the API")
 
     monkeypatch.setattr(fake_comfy, "models", unavailable_models)
-    expected_semantics: tuple[object, ...] | None = None
-    for endpoint in (
-        "/api/features/preflight",
-        "/api/timeline/compile",
-        "/api/timeline/jobs",
-    ):
-        response = await client.post(endpoint, json=_v4_t2v_request())
-        if endpoint.endswith("preflight"):
-            assert response.status_code == 200, response.text
-            reason = response.json()["errors"][0]
-        else:
-            assert response.status_code == 502, response.text
-            detail = response.json()["detail"]
-            assert detail["code"] == "host_context_unavailable"
-            reason = detail["reasons"][0]
-        semantics = _reason_semantics(reason)
-        expected_semantics = expected_semantics or semantics
-        assert semantics == expected_semantics
-        assert "private upstream detail" not in response.text
+    preflight = await client.post(
+        "/api/features/preflight", json=_v4_t2v_request()
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["errors"][0]["code"] == "host_context_unavailable"
+    assert "private upstream detail" not in preflight.text
 
-    assert client.director_app.state.database.list_jobs() == []
-    assert fake_comfy.prompts == []
+    compiled = await client.post("/api/timeline/compile", json=_v4_t2v_request())
+    assert compiled.status_code == 200, compiled.text
+    submitted = await client.post("/api/timeline/jobs", json=_v4_t2v_request())
+    assert submitted.status_code == 200, submitted.text
+    job_id = submitted.json()["id"]
+    await _wait_until(
+        lambda: job_id not in client.director_app.state.submission_jobs
+    )
+    stored = client.director_app.state.database.get_job(job_id)
+    assert stored is not None and stored["status"] == "queued"
+    assert fake_comfy.prompts
 
 
 async def test_segment_selection_reason_is_identical_and_does_not_echo_ids(
@@ -755,7 +793,7 @@ async def test_missing_asset_has_one_safe_entrypoint_contract(
 
 
 @pytest.mark.parametrize("missing_model", (False, True), ids=("creative-only", "creative-and-host"))
-async def test_unmapped_standard_lora_uses_default_loader_without_hiding_host_errors(
+async def test_unmapped_standard_lora_uses_default_loader_with_advisory_host_errors(
     client,
     fake_comfy,
     missing_model: bool,
@@ -773,37 +811,35 @@ async def test_unmapped_standard_lora_uses_default_loader_without_hiding_host_er
     )
 
     compiled = await client.post("/api/timeline/compile", json=body)
-    if missing_model:
-        assert compiled.status_code == 422, compiled.text
-        assert compiled.json()["detail"]["reasons"] == expected_reasons
-    else:
-        assert compiled.status_code == 200, compiled.text
-        lora_resolution = next(
-            resolution
-            for resolution in compiled.json()["features"]["resolutions"]
-            if resolution["feature_id"] == "lora"
-        )
-        assert lora_resolution["resolution"]["resolution_details"] == {
-            "source": "legacy_v4_exact_native_fragment",
-            "backend": "standard",
-            "family": "fl2va",
-            "adapter_id": "model_only",
-            "binding": {
-                "family": "fl2va",
-                "model_filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-                "lora_filename": "style.safetensors",
-            },
-            "mapping_source": "factory_default",
-            "strength": 1.0,
-            "loader_options": {},
-        }
-        assert [
-            implementation["class_type"]
-            for implementation in lora_resolution["resolution"]["implementations"]
-        ] == ["LoraLoaderModelOnly"]
+    assert compiled.status_code == 200, compiled.text
+    lora_use = _bundle6_feature_use(compiled, "lora")
+    assert lora_use["state"] == "applicable"
+    assert lora_use["implementation"] == {
+        "implementation_id": "directordeck.v6.lora.standard",
+        "implementation_version": 1,
+        "carrier_kind": "comfy_node",
+        "responsibility": "host_user",
+        "class_types": ["LoraLoaderModelOnly"],
+        "binding_key": "model_only",
+    }
+    assert lora_use["execution_identity"]["details"]["config"] == {
+        "backend": "standard",
+        "family": "fl2va",
+        "model_filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "lora_filename": "style.safetensors",
+        "strength": 1.0,
+        "adapter_id": "model_only",
+        "class_type": "LoraLoaderModelOnly",
+        "input_contract": "model_only",
+        "source": "factory_default",
+        "options": {},
+    }
+    assert [
+        emission["class_type"] for emission in lora_use["node_emissions"]
+    ] == ["LoraLoaderModelOnly"]
 
 
-async def test_standard_lora_adapter_fingerprint_is_shared_by_catalog_preflight_and_compile(
+async def test_standard_lora_adapter_fingerprint_is_stable_without_compile_host_verification(
     client,
     fake_comfy,
 ) -> None:
@@ -837,20 +873,24 @@ async def test_standard_lora_adapter_fingerprint_is_shared_by_catalog_preflight_
         for feature in segment["features"]
         if feature["id"] == "lora"
     )
-    compiled_lora = next(
-        resolution
-        for resolution in compile_response.json()["features"]["resolutions"]
-        if resolution["feature_id"] == "lora"
-    )
+    compiled_lora = _bundle6_feature_use(compile_response, "lora")
 
     assert catalog_option["adapter_fingerprint"] == (
         preflight_lora["adapter_fingerprint"]
-    ) == compiled_lora["adapter_fingerprint"]
+    )
     assert catalog_option["capability"] == preflight_lora["capability"]
-    assert catalog_option["capability"] == compiled_lora["capability"]
+    assert compiled_lora["implementation"] == {
+        "implementation_id": "directordeck.v6.lora.standard",
+        "implementation_version": 1,
+        "carrier_kind": "comfy_node",
+        "responsibility": "host_user",
+        "class_types": ["LoraLoaderModelOnly"],
+        "binding_key": "model_only",
+    }
+    assert "runtime_fingerprint" not in json.dumps(compiled_lora, sort_keys=True)
 
 
-async def test_standard_lora_adapter_reason_is_shared_by_catalog_preflight_and_compile(
+async def test_standard_lora_adapter_reason_is_diagnostic_without_gating_compile(
     client,
 ) -> None:
     await _enable_mapped_standard_lora(client)
@@ -870,7 +910,7 @@ async def test_standard_lora_adapter_reason_is_shared_by_catalog_preflight_and_c
     assert catalog_response.status_code == 200, catalog_response.text
     assert preflight_response.status_code == 200, preflight_response.text
     assert preflight_response.json()["valid"] is False
-    assert compile_response.status_code == 422, compile_response.text
+    assert compile_response.status_code == 200, compile_response.text
 
     lora_catalog = next(
         entry
@@ -892,19 +932,18 @@ async def test_standard_lora_adapter_reason_is_shared_by_catalog_preflight_and_c
     )
     catalog_reason = catalog_option["capability"]["reasons"][0]
     preflight_reason = preflight_lora["capability"]["reasons"][0]
-    compile_reason = next(
-        reason
-        for reason in compile_response.json()["detail"]["reasons"]
-        if reason["feature_id"] == "lora"
-        and reason["code"] == "node_unavailable"
-    )
+    compiled_lora = _bundle6_feature_use(compile_response, "lora")
 
     assert catalog_option["adapter_fingerprint"] == (
         preflight_lora["adapter_fingerprint"]
     )
     assert _reason_semantics(catalog_reason) == _reason_semantics(
         preflight_reason
-    ) == _reason_semantics(compile_reason)
+    )
+    assert [
+        emission["class_type"]
+        for emission in compiled_lora["node_emissions"]
+    ] == ["LoraLoaderModelOnly"]
     assert client.director_app.state.database.list_jobs() == []
 
 
@@ -918,7 +957,7 @@ async def test_standard_lora_adapter_reason_is_shared_by_catalog_preflight_and_c
     ),
     ids=("posix", "windows-drive", "windows-unc", "file-uri"),
 )
-async def test_missing_model_reason_never_echoes_private_filename(
+async def test_missing_model_reason_is_advisory_and_privacy_safe(
     client,
     fake_comfy,
     private_filename: str,
@@ -933,30 +972,29 @@ async def test_missing_model_reason_never_echoes_private_filename(
         },
     )
     assert saved.status_code == 200, saved.text
-    expected_reasons: list[dict[str, object]] | None = None
+    preflight = await client.post(
+        "/api/features/preflight", json=_v4_t2v_request()
+    )
+    assert preflight.status_code == 200, preflight.text
+    reason = next(
+        item
+        for item in preflight.json()["errors"]
+        if item["code"] == "model_binding_unavailable"
+    )
+    assert reason["safe_details"] == {"bindings": ["fl2va"]}
+    assert private_filename not in preflight.text
 
-    for endpoint in (
-        "/api/features/preflight",
-        "/api/timeline/compile",
-        "/api/timeline/jobs",
-    ):
-        response = await client.post(endpoint, json=_v4_t2v_request())
-        if endpoint.endswith("preflight"):
-            assert response.status_code == 200, response.text
-            reasons = response.json()["errors"]
-        else:
-            assert response.status_code == 422, response.text
-            reasons = response.json()["detail"]["reasons"]
-        reason = next(
-            item for item in reasons if item["code"] == "model_binding_unavailable"
-        )
-        assert reason["safe_details"] == {"bindings": ["fl2va"]}
-        expected_reasons = expected_reasons or reasons
-        assert reasons == expected_reasons
-        assert private_filename not in response.text
-
-    assert client.director_app.state.database.list_jobs() == []
-    assert fake_comfy.prompts == []
+    compiled = await client.post("/api/timeline/compile", json=_v4_t2v_request())
+    assert compiled.status_code == 200, compiled.text
+    submitted = await client.post("/api/timeline/jobs", json=_v4_t2v_request())
+    assert submitted.status_code == 200, submitted.text
+    job_id = submitted.json()["id"]
+    await _wait_until(
+        lambda: job_id not in client.director_app.state.submission_jobs
+    )
+    stored = client.director_app.state.database.get_job(job_id)
+    assert stored is not None and stored["status"] == "queued"
+    assert fake_comfy.prompts
 
 
 async def test_missing_project_is_rejected_consistently_before_execution(
@@ -1021,7 +1059,7 @@ async def test_project_execution_requires_explicit_v5_snapshot_before_lookup(
         ("missing-asset", "asset_unavailable"),
     ),
 )
-async def test_safe_creative_failure_is_identical_across_execution_entrypoints(
+async def test_safe_creative_failure_closes_before_or_after_job_admission(
     client,
     fake_comfy,
     case: str,
@@ -1052,16 +1090,32 @@ async def test_safe_creative_failure_is_identical_across_execution_entrypoints(
     expected_reasons = preflight.json()["errors"]
     assert expected_reasons[0]["code"] == expected_code
 
-    for endpoint in ("/api/timeline/compile", "/api/timeline/jobs"):
-        rejected = await client.post(endpoint, json=body)
-        assert rejected.status_code == 422, rejected.text
-        assert rejected.json()["detail"]["reasons"] == expected_reasons
+    rejected_compile = await client.post("/api/timeline/compile", json=body)
+    assert rejected_compile.status_code == 422, rejected_compile.text
+    assert rejected_compile.json()["detail"]["reasons"] == expected_reasons
+
+    submitted = await client.post("/api/timeline/jobs", json=body)
+    if case == "frame-limit":
+        assert submitted.status_code == 200, submitted.text
+        job_id = submitted.json()["id"]
+        await _wait_until(
+            lambda: job_id not in client.director_app.state.submission_jobs
+        )
+        stored = client.director_app.state.database.get_job(job_id)
+        assert stored is not None and stored["status"] == "failed"
+        assert expected_code in stored["error"]
+    else:
+        assert submitted.status_code == 422, submitted.text
+        assert submitted.json()["detail"]["reasons"] == expected_reasons
         if private_value:
-            assert private_value not in rejected.text
+            assert private_value not in submitted.text
 
     if private_value:
         assert private_value not in preflight.text
-    assert client.director_app.state.database.list_jobs() == []
+        assert private_value not in rejected_compile.text
+    assert len(client.director_app.state.database.list_jobs()) == (
+        1 if case == "frame-limit" else 0
+    )
     assert fake_comfy.prompts == []
 
 
@@ -1070,7 +1124,7 @@ async def test_safe_creative_failure_is_identical_across_execution_entrypoints(
     ("/api/timeline/compile", "/api/timeline/jobs"),
     ids=("compile", "submit"),
 )
-async def test_compile_and_submit_recapture_drift_before_emit_or_persistence(
+async def test_compile_and_submit_do_not_authorize_from_host_observation(
     client,
     fake_comfy,
     monkeypatch,
@@ -1088,30 +1142,156 @@ async def test_compile_and_submit_recapture_drift_before_emit_or_persistence(
     assert advisory.json()["valid"] is True
     assert provider.calls == 1
 
-    # CLIPLoader belongs to the first active feature. If the endpoint reuses
-    # the advisory result, or evaluates after graph emission, this assertion
-    # catches the authority violation before any job row can be accepted.
+    # The diagnostic endpoint still reports its captured observation. Compile
+    # and submit deliberately do not recapture or authorize from that result.
     provider.current = _without_node(provider.current, "CLIPLoader")
-    emitted_features: list[str] = []
-    original_emit = V4BuiltinInterpreter.emit
-
-    def tracking_emit(self, *args, **kwargs):
-        emitted_features.append(self.id)
-        return original_emit(self, *args, **kwargs)
-
-    monkeypatch.setattr(V4BuiltinInterpreter, "emit", tracking_emit)
+    monkeypatch.setattr(
+        "directordeck.app.project_v5_contextual_host_authority",
+        lambda *_args, **_kwargs: pytest.fail(
+            "compile/submit must not run the advisory contextual projection"
+        ),
+    )
     database = client.director_app.state.database
-    jobs_before = database.list_jobs()
+    job_ids_before = {job["id"] for job in database.list_jobs()}
 
-    rejected = await client.post(endpoint, json=_v4_t2v_request())
+    response = await client.post(endpoint, json=_v4_t2v_request())
 
-    assert rejected.status_code == 422, rejected.text
-    assert rejected.json()["detail"]["code"] == "node_unavailable"
-    assert provider.calls == 2
-    assert emitted_features == []
-    assert database.list_jobs() == jobs_before
-    assert fake_comfy.prompts == []
+    assert response.status_code == 200, response.text
+    assert provider.calls == 1
+    if endpoint.endswith("compile"):
+        uses = response.json()["features"]["uses"]
+        assert uses
+        assert any(
+            use["feature_id"] == "auxiliary_models"
+            and any(
+                emission["class_type"] == "CLIPLoader"
+                for emission in use["node_emissions"]
+            )
+            for use in uses
+        )
+        assert {job["id"] for job in database.list_jobs()} == job_ids_before
+        assert fake_comfy.prompts == []
+    else:
+        job_id = response.json()["id"]
+        await _wait_until(
+            lambda: job_id not in client.director_app.state.submission_jobs
+        )
+        stored = database.get_job(job_id)
+        assert stored is not None and stored["status"] == "queued"
+        plan = database.get_job_execution_plan(job_id)
+        assert plan is not None and plan.version == 3
+        assert any(
+            use.feature_id == "auxiliary_models"
+            and any(
+                emission.class_type == "CLIPLoader"
+                for emission in use.node_emissions
+            )
+            for use in plan.compile_report.feature_resolutions
+        )
+        assert len(fake_comfy.prompts) == 1
+        assert any(
+            node.get("class_type") == "CLIPLoader"
+            for node in fake_comfy.prompts[0]["prompt"].values()
+        )
     assert fake_comfy.cancelled == []
+
+
+async def test_submit_compile_failure_is_persisted_on_the_admitted_job(
+    client,
+    fake_comfy,
+    monkeypatch,
+) -> None:
+    def fail_compile(*_args, **_kwargs):
+        from directordeck.native_templates import NativeTemplateError
+
+        raise NativeTemplateError("synthetic internal compile failure")
+
+    monkeypatch.setattr(
+        "directordeck.app.compile_project_execution_plan",
+        fail_compile,
+    )
+
+    response = await client.post("/api/timeline/jobs", json=_v4_t2v_request())
+
+    assert response.status_code == 200, response.text
+    job_id = response.json()["id"]
+    assert response.json()["status"] == "preparing"
+    await _wait_until(
+        lambda: job_id not in client.director_app.state.submission_jobs
+    )
+    stored = client.director_app.state.database.get_job(job_id)
+    assert stored is not None
+    assert stored["status"] == "failed"
+    assert stored["stage"] == "compile_failed"
+    assert "creative_configuration_invalid" in stored["error"]
+    assert fake_comfy.prompts == []
+
+
+async def test_submit_child_materialization_failure_closes_the_admitted_job(
+    client,
+    fake_comfy,
+    monkeypatch,
+) -> None:
+    database = client.director_app.state.database
+
+    def fail_child_materialization(_child):
+        raise RuntimeError("synthetic child persistence failure")
+
+    monkeypatch.setattr(
+        database,
+        "create_job_child",
+        fail_child_materialization,
+    )
+
+    response = await client.post("/api/timeline/jobs", json=_v4_t2v_request())
+
+    assert response.status_code == 200, response.text
+    job_id = response.json()["id"]
+    await _wait_until(
+        lambda: job_id not in client.director_app.state.submission_jobs
+    )
+    stored = database.get_job(job_id)
+    assert stored is not None
+    assert stored["status"] == "failed"
+    assert stored["stage"] == "preflight_failed"
+    assert "execution_plan_invariant_failed" in stored["error"]
+    assert fake_comfy.prompts == []
+
+
+async def test_submit_planning_failure_is_persisted_with_its_local_reason(
+    client,
+    fake_comfy,
+    monkeypatch,
+) -> None:
+    def fail_planning(*_args, **_kwargs):
+        from directordeck.execution.submission import SubmissionPlanningError
+
+        raise SubmissionPlanningError("synthetic locked-plan failure")
+
+    monkeypatch.setattr(
+        "directordeck.app.LockedSubmissionPlanner.build_wave",
+        fail_planning,
+    )
+
+    response = await client.post("/api/timeline/jobs", json=_v4_t2v_request())
+
+    assert response.status_code == 200, response.text
+    job_id = response.json()["id"]
+    await _wait_until(
+        lambda: job_id not in client.director_app.state.submission_jobs
+    )
+    stored = client.director_app.state.database.get_job(job_id)
+    assert stored is not None
+    assert stored["status"] == "failed"
+    assert stored["stage"] == "preflight_failed"
+    assert "submission_plan_invalid" in stored["error"]
+    assert "synthetic locked-plan failure" in stored["error"]
+    assert fake_comfy.prompts == []
+    assert client.director_app.state.submission_tails == {}
+    assert all(
+        not lock.locked()
+        for lock in client.director_app.state.submission_locks.values()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1129,7 +1309,7 @@ async def test_compile_and_submit_recapture_drift_before_emit_or_persistence(
     ),
     ids=("not-a-mapping", "category-not-a-list"),
 )
-async def test_invalid_model_inventory_has_one_safe_entrypoint_contract(
+async def test_invalid_model_inventory_does_not_gate_production(
     client,
     fake_comfy,
     monkeypatch,
@@ -1139,26 +1319,23 @@ async def test_invalid_model_inventory_has_one_safe_entrypoint_contract(
         return invalid_inventory
 
     monkeypatch.setattr(fake_comfy, "models", invalid_models)
-    expected_reason: dict[str, object] | None = None
+    preflight = await client.post(
+        "/api/features/preflight", json=_v4_t2v_request()
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["errors"][0]["code"] == "host_context_unavailable"
 
-    for endpoint in (
-        "/api/features/preflight",
-        "/api/timeline/compile",
-        "/api/timeline/jobs",
-    ):
-        response = await client.post(endpoint, json=_v4_t2v_request())
-        if endpoint.endswith("preflight"):
-            assert response.status_code == 200, response.text
-            reason = response.json()["errors"][0]
-        else:
-            assert response.status_code == 502, response.text
-            reason = response.json()["detail"]["reasons"][0]
-        assert reason["code"] == "host_context_unavailable"
-        expected_reason = expected_reason or reason
-        assert reason == expected_reason
-
-    assert client.director_app.state.database.list_jobs() == []
-    assert fake_comfy.prompts == []
+    compiled = await client.post("/api/timeline/compile", json=_v4_t2v_request())
+    assert compiled.status_code == 200, compiled.text
+    submitted = await client.post("/api/timeline/jobs", json=_v4_t2v_request())
+    assert submitted.status_code == 200, submitted.text
+    job_id = submitted.json()["id"]
+    await _wait_until(
+        lambda: job_id not in client.director_app.state.submission_jobs
+    )
+    stored = client.director_app.state.database.get_job(job_id)
+    assert stored is not None and stored["status"] == "queued"
+    assert fake_comfy.prompts
     assert fake_comfy.cancelled == []
 
 
@@ -1172,7 +1349,7 @@ async def test_invalid_model_inventory_has_one_safe_entrypoint_contract(
     ),
     ids=("catalog", "preflight", "compile", "submit"),
 )
-async def test_missing_host_capability_provider_fails_closed(
+async def test_missing_host_capability_provider_only_disables_diagnostics(
     client,
     fake_comfy,
     monkeypatch,
@@ -1183,7 +1360,7 @@ async def test_missing_host_capability_provider_fails_closed(
     _install_forbidden_legacy_capabilities(monkeypatch, fake_comfy)
     client.director_app.state.host_capability_provider = None
     database = client.director_app.state.database
-    jobs_before = database.list_jobs()
+    job_ids_before = {job["id"] for job in database.list_jobs()}
 
     if body is not None and isinstance(body.get("config"), dict):
         body = {
@@ -1193,10 +1370,24 @@ async def test_missing_host_capability_provider_fails_closed(
 
     response = await client.request(method, endpoint, json=body)
 
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"]["code"] == (
-        "host_capability_provider_unavailable"
-    )
-    assert database.list_jobs() == jobs_before
-    assert fake_comfy.prompts == []
+    if endpoint in {"/api/features/catalog", "/api/features/preflight"}:
+        assert response.status_code == 503, response.text
+        assert response.json()["detail"]["code"] == (
+            "host_capability_provider_unavailable"
+        )
+        assert {job["id"] for job in database.list_jobs()} == job_ids_before
+        assert fake_comfy.prompts == []
+    elif endpoint.endswith("compile"):
+        assert response.status_code == 200, response.text
+        assert {job["id"] for job in database.list_jobs()} == job_ids_before
+        assert fake_comfy.prompts == []
+    else:
+        assert response.status_code == 200, response.text
+        job_id = response.json()["id"]
+        await _wait_until(
+            lambda: job_id not in client.director_app.state.submission_jobs
+        )
+        stored = database.get_job(job_id)
+        assert stored is not None and stored["status"] == "queued"
+        assert fake_comfy.prompts
     assert fake_comfy.cancelled == []

@@ -19,9 +19,10 @@ from pydantic import (
 )
 
 from .h3_capabilities import H3_REFERENCE_LIMITS
-from .config_manager import get_directordeck_config
 from .workflow.compile_report import (
     CompiledCapabilityEvaluation,
+    CompiledCapabilityReason,
+    CompiledFeatureUseV3,
     CompiledFeatureNotice,
 )
 from .workflow.canonical import utf16_sort_key
@@ -303,7 +304,15 @@ class RuntimeSettingsV2(StrictModel):
 
 
 class LoraLoaderOverrideRecord(StrictModel):
-    """One exact LoRA-path mapping to a supported loader and its options."""
+    """One exact LoRA-path mapping retained as user-owned runtime data.
+
+    This model deliberately validates only the durable wire structure. Product
+    support policy is mutable across DirectorDeck releases, so consulting the
+    current product configuration here would make a retired mapping impossible
+    to read, preserve, or delete. New and changed records are validated at the
+    settings PUT boundary; active records are validated again when a Standard
+    LoRA is resolved for one project/job.
+    """
 
     lora_filename: Annotated[str, Field(min_length=1, max_length=1024)]
     adapter_id: Annotated[
@@ -329,21 +338,6 @@ class LoraLoaderOverrideRecord(StrictModel):
             normalized["adapter_id"] = "model_only"
         normalized.setdefault("options", {})
         return normalized
-
-    @model_validator(mode="after")
-    def validate_supported_loader(self) -> "LoraLoaderOverrideRecord":
-        config = get_directordeck_config()
-        try:
-            normalized = config.normalize_lora_loader_options(
-                self.adapter_id,
-                self.options,
-            )
-        except (KeyError, ValueError) as exc:
-            raise ValueError(
-                f"unsupported LoRA loader or options: {self.adapter_id}"
-            ) from exc
-        self.options = normalized
-        return self
 
     def binding_tuple(self) -> tuple[str]:
         return (self.lora_filename,)
@@ -1667,7 +1661,7 @@ def default_timeline_draft() -> UnifiedTimelineDraft:
 def default_timeline_draft_v5(
     initial_model_stack: ModelStack | None = None,
 ) -> UnifiedTimelineDraftV5:
-    """Create a v5 project; omitted model choices remain visibly incomplete."""
+    """Create the frozen Bundle-5 project default for compatibility paths."""
 
     legacy = default_timeline_draft()
     return UnifiedTimelineDraftV5.model_validate(
@@ -1703,6 +1697,30 @@ def default_timeline_draft_v5(
                 "by_segment": {},
             },
         }
+    )
+
+
+def default_timeline_draft_v6(
+    initial_model_stack: ModelStack | None = None,
+) -> UnifiedTimelineDraftV5:
+    """Create a timeline-schema-5 project using the Bundle-6 feature default."""
+
+    legacy = default_timeline_draft_v5(initial_model_stack)
+    return legacy.model_copy(
+        update={
+            "features": FeatureConfiguration(
+                template_bundle_version=6,
+                project={
+                    "lora": legacy.features.project["lora"].model_copy(deep=True),
+                    "comfy_kitchen_attention": FeatureSelection(
+                        enabled=False,
+                        params={},
+                    ),
+                },
+                by_segment={},
+            )
+        },
+        deep=True,
     )
 
 
@@ -1950,13 +1968,20 @@ class TimelineCompileFeaturesRead(StrictModel):
             TimelineCompileEffectiveSegmentRead,
         ],
         Field(max_length=128),
-    ]
+    ] = Field(default_factory=dict)
     resolutions: Annotated[
         list[TimelineCompileFeatureResolutionRead],
         Field(max_length=8_192),
-    ]
+    ] = Field(default_factory=list)
+    uses: Annotated[list[CompiledFeatureUseV3], Field(max_length=8_192)] = Field(
+        default_factory=list
+    )
     notices: Annotated[
         list[CompiledFeatureNotice],
+        Field(max_length=256),
+    ] = Field(default_factory=list)
+    advisories: Annotated[
+        list[CompiledCapabilityReason],
         Field(max_length=256),
     ] = Field(default_factory=list)
 
@@ -1980,9 +2005,50 @@ class TimelineCompileRead(StrictModel):
         plan_ids = [plan.segment_id for plan in self.plans]
         if len(plan_ids) != len(set(plan_ids)):
             raise ValueError("compile report plan segment ids must be unique")
+        plans_by_segment = {plan.segment_id: plan for plan in self.plans}
+        if self.template_bundle_version == 6:
+            if self.features.effective_by_segment or self.features.resolutions:
+                raise ValueError("Bundle 6 cannot carry legacy feature resolutions")
+            uses_by_segment = {segment_id: [] for segment_id in plan_ids}
+            for use in self.features.uses:
+                plan = plans_by_segment.get(use.segment_id)
+                if plan is None:
+                    raise ValueError("feature use references an uncompiled segment")
+                if use.backend != plan.backend or use.family != plan.model_family:
+                    raise ValueError("feature use route differs from its plan")
+                uses_by_segment[use.segment_id].append(use)
+            if any(not uses for uses in uses_by_segment.values()):
+                raise ValueError("compiled segment has no Bundle-6 feature uses")
+            use_notice_keys = {
+                (item.segment_id, item.unit_id, item.feature_id)
+                for item in self.features.uses
+            }
+            if any(
+                (notice.segment_id, notice.unit_id, notice.feature_id)
+                not in use_notice_keys
+                for notice in self.features.notices
+            ):
+                raise ValueError("compile notice has no matching feature use")
+        else:
+            if self.features.uses or self.features.advisories:
+                raise ValueError("legacy compile report cannot carry Bundle-6 evidence")
+            self._validate_legacy_compile_features(plans_by_segment)
+        expected_families = [
+            family
+            for family in ("fl2va", "ref2va")
+            if any(plan.model_family == family for plan in self.plans)
+        ]
+        if self.model_families != expected_families:
+            raise ValueError("compile report family summary differs from plans")
+        return self
+
+    def _validate_legacy_compile_features(
+        self,
+        plans_by_segment: dict[str, TimelineSegmentPlanRead],
+    ) -> None:
+        plan_ids = list(plans_by_segment)
         if set(self.features.effective_by_segment) != set(plan_ids):
             raise ValueError("effective feature scopes must exactly cover compiled plans")
-        plans_by_segment = {plan.segment_id: plan for plan in self.plans}
         resolutions_by_segment: dict[
             str, list[TimelineCompileFeatureResolutionRead]
         ] = {segment_id: [] for segment_id in plan_ids}
@@ -2037,14 +2103,6 @@ class TimelineCompileRead(StrictModel):
             for notice in self.features.notices
         ):
             raise ValueError("compile notice has no matching feature resolution")
-        expected_families = [
-            family
-            for family in ("fl2va", "ref2va")
-            if any(plan.model_family == family for plan in self.plans)
-        ]
-        if self.model_families != expected_families:
-            raise ValueError("compile report family summary differs from plans")
-        return self
 
 
 class AssetListRead(StrictModel):
@@ -2393,7 +2451,10 @@ class ProjectSummaryRead(StrictModel):
     title: str
     created_at: str
     updated_at: str
-    segment_count: Annotated[int, Field(ge=1)]
+    # Zero is the bounded sentinel for a preserved project whose raw document
+    # cannot be decoded by the current reader. Valid timeline documents still
+    # contain at least one segment.
+    segment_count: Annotated[int, Field(ge=0)]
 
 
 class ProjectListRead(StrictModel):
@@ -2426,6 +2487,15 @@ class TimelineAuthorityRead(StrictModel):
 
     document: UnifiedTimelineDraftV5
     revision: Annotated[int, Field(ge=0, le=MAX_TIMELINE_REVISION)]
+
+
+class FeatureBundleMigrationNoticeListRead(StrictModel):
+    """Bounded, advisory-only messages owned by one project authority."""
+
+    notices: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=512)]],
+        Field(max_length=32),
+    ]
 
 
 class TimelineAuthorityWriteRequest(StrictModel):

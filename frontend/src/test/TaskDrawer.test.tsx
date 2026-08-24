@@ -355,6 +355,43 @@ describe("ComfyUI 风格的任务历史抽屉", () => {
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
   });
 
+  it("结构化失败在悬停详情和错误对话框中显示中文说明", () => {
+    vi.useFakeTimers();
+    const structuredError = JSON.stringify({
+      code: "model_binding_required",
+      message: "The selected project workflow configuration is invalid.",
+      reasons: [{
+        code: "model_binding_required",
+        safe_details: { bindings: ["clip", "video_vae"] },
+      }],
+    });
+    const failedTask: GenerationTask = {
+      ...baseTask,
+      id: "job-structured-failure",
+      status: "failed",
+      error: structuredError,
+      completed_at: "2026-08-12T15:03:00Z",
+    };
+    const { container } = renderDrawer({ tasks: [failedTask] });
+    const row = container.querySelector(".task-row");
+    expect(row).not.toBeNull();
+
+    fireEvent.mouseEnter(row!);
+    act(() => vi.advanceTimersByTime(200));
+    const hoverDetails = screen.getByRole("tooltip");
+    expect(hoverDetails).toHaveTextContent(
+      "当前项目缺少编码模型（CLIP）、视频编解码模型（Video VAE）。",
+    );
+    expect(hoverDetails).not.toHaveTextContent("The selected project workflow configuration is invalid.");
+
+    fireEvent.click(screen.getByRole("button", { name: "任务 job-stru 的更多操作" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "查看错误详情" }));
+    const dialog = screen.getByRole("dialog", { name: "任务错误详情" });
+    expect(dialog).toHaveTextContent("当前项目缺少编码模型（CLIP）、视频编解码模型（Video VAE）。");
+    expect(dialog).toHaveTextContent("错误代码：model_binding_required");
+    expect(dialog.querySelector("details")).not.toHaveAttribute("open");
+  });
+
   it("排队详情把当前运行工作计入前方数量和预计等待", () => {
     vi.useFakeTimers();
     const running = { ...baseTask, progress: 0.5 };

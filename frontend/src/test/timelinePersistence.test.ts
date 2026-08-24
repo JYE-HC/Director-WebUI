@@ -2,6 +2,7 @@ import "fake-indexeddb/auto";
 import {
   createTimelineProject,
   migrateTimelineFeatureBundle4To5,
+  migrateTimelineFeatureBundle5To6,
   type TimelineProject,
 } from "../domain/timelineProject";
 import {
@@ -100,6 +101,16 @@ describe("timeline IndexedDB persistence", () => {
   function bundle4Project(): TimelineProject {
     const project = createTimelineProject();
     project.features.template_bundle_version = 4;
+    return project;
+  }
+
+  function bundle5Project(): TimelineProject {
+    const project = createTimelineProject();
+    project.features = {
+      template_bundle_version: 5,
+      project: { lora: structuredClone(project.features.project.lora) },
+      by_segment: {},
+    };
     return project;
   }
 
@@ -314,6 +325,48 @@ describe("timeline IndexedDB persistence", () => {
     });
     expect(JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope))))
       .toBe(lostAckRaw);
+  });
+
+  it("bundle 5 journal 跨 Bundle 6 revision 复用原 history 与 checkpoint", async () => {
+    const base = bundle5Project();
+    let before = base;
+    let history = createTimelineHistory();
+    for (let index = 1; index <= 22; index += 1) {
+      const after = { ...structuredClone(before), title: `bundle 5 edit ${index}` };
+      history = recordTimelineHistory(history, {
+        label: `编辑 ${index}`,
+        before,
+        after,
+        now: index,
+      });
+      before = after;
+    }
+    history = undoTimelineHistory(history)!.history;
+    await saveTimelineHistoryJournal(scope, { document: base, revision: 50 }, history);
+    const rawBefore = JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope)));
+    const migratedBase = migrateTimelineFeatureBundle5To6(base)!;
+
+    const restored = await loadTimelineHistoryJournal(scope, {
+      document: migratedBase,
+      revision: 51,
+    });
+
+    expect(restored).toMatchObject({
+      status: "restored",
+      confirmedRevision: 51,
+      project: {
+        title: "bundle 5 edit 21",
+        features: { template_bundle_version: 6 },
+      },
+    });
+    if (restored.status !== "restored") throw new Error("expected Bundle 6 replay");
+    expect(restored.history.checkpoints.every(
+      (checkpoint) => checkpoint.project.features.template_bundle_version === 6,
+    )).toBe(true);
+    expect(undoTimelineHistory(restored.history)?.snapshot.project.features)
+      .toMatchObject({ template_bundle_version: 6 });
+    expect(JSON.stringify(await readRawJournal(timelineHistoryJournalKey(scope))))
+      .toBe(rawBefore);
   });
 
   it("bundle 4 current journal 遇到同 revision 的无关服务器编辑仍保留冲突证据", async () => {

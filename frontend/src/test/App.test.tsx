@@ -3,12 +3,10 @@ import { IDBFactory } from "fake-indexeddb";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import App, {
-  FeatureCatalogDriftError,
   QUARANTINED_MISMATCHED_RUNTIME_SETTINGS_PENDING_KEY,
   QUARANTINED_UNBOUND_RUNTIME_SETTINGS_PENDING_KEY,
   RUNTIME_SETTINGS_PENDING_KEY,
   UNBOUND_RUNTIME_SETTINGS_PENDING_KEY,
-  requireSuccessfulFeaturePreflight,
 } from "../App";
 import { ApiError, directorApi } from "../api/client";
 import {
@@ -17,10 +15,8 @@ import {
   EMPTY_RAYLIGHT_RUNTIME_STATUS,
   type AssetTrashBatch,
   type CapabilityReport,
+  type ComfyKitchenAttentionCapability,
   type DirectorDeckConfig,
-  type FeatureCatalog,
-  type FeatureCatalogFetchResult,
-  type FeaturePreflightResponse,
   type GenerationTask,
   type MediaToolsStatus,
   type TimelineCompileReport,
@@ -282,125 +278,6 @@ const ONLINE_CAPABILITIES: CapabilityReport = {
   },
 };
 
-const VALID_FEATURE_PREFLIGHT: FeaturePreflightResponse = {
-  template_bundle_version: 5,
-  host_capability_revision: `sha256:${"a".repeat(64)}`,
-  operational_readiness: {
-    endpoint_online: true,
-    submission_allowed: true,
-    ray_recovery_required: false,
-    ray_tainted: false,
-    invalid_runtime_gpu_indices: [],
-    blocking_reason_codes: [],
-  },
-  valid: true,
-  errors: [],
-  effective_by_segment: {},
-};
-
-const FEATURE_CATALOG_ETAG = `"sha256:${"d".repeat(64)}"`;
-const FEATURE_CATALOG: FeatureCatalog = {
-  template_bundle_version: 5,
-  host_capability_revision: `sha256:${"a".repeat(64)}`,
-  entries: [{
-    id: "lora",
-    version: 1,
-    title: "LoRA",
-    description: "Apply the selected fail-closed LoRA adapter.",
-    mode: "switch",
-    layer: "graph",
-    scopes: ["project"],
-    params_schema: {},
-    defaults: {},
-    backends: ["standard", "raylight"],
-    availability: { state: "conditional", reasons: [] },
-    adapter_options: ([
-      ["model_only", "LoRA加载器（仅模型）", "LoraLoaderModelOnly", true],
-      ["minimax_h3_turbo", "MiniMax-H3 Turbo LoRA", "MiniMaxH3TurboLoRA", false],
-    ] as const).map(([adapter_id, display_name, class_type, is_default], index) => ({
-      adapter_id,
-      display_name,
-      class_type,
-      is_default,
-      backend: "standard" as const,
-      supported_families: ["fl2va", "ref2va"] as const,
-      configuration_options: adapter_id === "minimax_h3_turbo" ? [{
-        id: "low_vram",
-        type: "boolean" as const,
-        label: "low_vram",
-        description: "启用低显存模式",
-        default: false,
-      }] : [],
-      adapter_fingerprint: `sha256:${String(index + 1).repeat(64)}`,
-      capability: {
-        available: true,
-        reasons: [],
-        verified_contracts: ["directordeck.node.test-lora"],
-        runtime_fingerprints: [`sha256:${"c".repeat(64)}`],
-      },
-    })),
-    ui: { visibility: "internal_v4" },
-  }],
-};
-
-describe("feature preflight authority guard", () => {
-  it("accepts only a valid result from the exact catalog and bundle snapshot", () => {
-    expect(() => requireSuccessfulFeaturePreflight(
-      VALID_FEATURE_PREFLIGHT,
-      createTimelineProject(),
-      FEATURE_CATALOG,
-    )).not.toThrow();
-  });
-
-  it("does not turn top-level Ray readiness diagnostics into a feature gate", () => {
-    const runtimeAdvisory = {
-      ...VALID_FEATURE_PREFLIGHT,
-      operational_readiness: {
-        ...VALID_FEATURE_PREFLIGHT.operational_readiness,
-        submission_allowed: false,
-        ray_recovery_required: true,
-        ray_tainted: true,
-        blocking_reason_codes: ["ray_recovery_required"],
-      },
-    };
-    expect(() => requireSuccessfulFeaturePreflight(
-      runtimeAdvisory,
-      createTimelineProject(),
-      FEATURE_CATALOG,
-    )).not.toThrow();
-  });
-
-  it.each([
-    ["missing catalog", null, VALID_FEATURE_PREFLIGHT],
-    ["catalog bundle drift", { ...FEATURE_CATALOG, template_bundle_version: 4 }, VALID_FEATURE_PREFLIGHT],
-    ["preflight bundle drift", FEATURE_CATALOG, { ...VALID_FEATURE_PREFLIGHT, template_bundle_version: 4 }],
-    [
-      "host capability drift",
-      FEATURE_CATALOG,
-      { ...VALID_FEATURE_PREFLIGHT, host_capability_revision: `sha256:${"b".repeat(64)}` },
-    ],
-  ])("rejects %s before trusting readiness", (_label, catalog, result) => {
-    expect(() => requireSuccessfulFeaturePreflight(
-      result,
-      createTimelineProject(),
-      catalog,
-    )).toThrow(FeatureCatalogDriftError);
-  });
-
-  it("surfaces the server remediation for a stable rejected result", () => {
-    expect(() => requireSuccessfulFeaturePreflight(
-      rejectedFeaturePreflight("strict_attention_unavailable", "attention_backend_override"),
-      createTimelineProject(),
-      FEATURE_CATALOG,
-    )).toThrow(/strict_attention_unavailable/);
-  });
-});
-const FRESH_FEATURE_CATALOG: FeatureCatalogFetchResult = {
-  status: "fresh",
-  etag: FEATURE_CATALOG_ETAG,
-  catalog: FEATURE_CATALOG,
-};
-
 const DIRECTORDECK_CONFIG: DirectorDeckConfig = {
   schema_version: 1,
   lora: {
@@ -438,29 +315,8 @@ const DIRECTORDECK_CONFIG: DirectorDeckConfig = {
       default_loader_id: "minimax_h3_turbo",
     }],
   },
+  diagnostics: [],
 };
-
-function rejectedFeaturePreflight(
-  message: string,
-  remediation: string,
-  code = "feature_unavailable",
-): FeaturePreflightResponse {
-  return {
-    ...VALID_FEATURE_PREFLIGHT,
-    valid: false,
-    errors: [{
-      code,
-      feature_id: null,
-      segment_id: null,
-      unit_id: null,
-      backend: null,
-      rule: "contextual_capability_required",
-      message,
-      remediation,
-      safe_details: {},
-    }],
-  };
-}
 
 const ORIGINAL_VIEWPORT_WIDTH = window.innerWidth;
 
@@ -536,9 +392,19 @@ function mockCommonRequests(settings = CONFIGURED_SETTINGS) {
   });
   vi.spyOn(directorApi, "getStorage").mockResolvedValue(ACTIVE_STORAGE_CONFIGURATION);
   vi.spyOn(directorApi, "getCapabilities").mockResolvedValue(ONLINE_CAPABILITIES);
-  vi.spyOn(directorApi, "getFeatureCatalog").mockResolvedValue(FRESH_FEATURE_CATALOG);
+  vi.spyOn(directorApi, "getComfyKitchenAttentionCapability").mockResolvedValue({
+    context_revision: "ctx:app-test",
+    backend: settings.multi_gpu_enabled ? "raylight" : "standard",
+    state: "available",
+    reasons: [],
+  });
+  vi.spyOn(directorApi, "getFeatureCatalog").mockRejectedValue(
+    new Error("App must not call the legacy feature catalog endpoint"),
+  );
   vi.spyOn(directorApi, "getDirectorDeckConfig").mockResolvedValue(DIRECTORDECK_CONFIG);
-  vi.spyOn(directorApi, "preflightFeatures").mockResolvedValue(VALID_FEATURE_PREFLIGHT);
+  vi.spyOn(directorApi, "preflightFeatures").mockRejectedValue(
+    new Error("App must not call the legacy feature preflight endpoint"),
+  );
   vi.spyOn(directorApi, "getGpus").mockResolvedValue([]);
   vi.spyOn(directorApi, "getRayLightRuntimeStatus").mockResolvedValue(
     EMPTY_RAYLIGHT_RUNTIME_STATUS,
@@ -3045,15 +2911,30 @@ describe("统一长视频时间线应用", () => {
     });
   });
 
-  it("后端离线时仍可编排，但所有生成入口均禁用", async () => {
+  it("后端离线时仍可编排和发起操作，由后端收敛当前 transport 结果", async () => {
     const user = userEvent.setup();
     mockCommonRequests();
     vi.mocked(directorApi.getSettingsAuthority).mockRejectedValue(new Error("离线"));
+    const compile = vi.spyOn(directorApi, "compileTimeline").mockRejectedValue(
+      new Error("当前 transport 无法连接 ComfyUI"),
+    );
+    const submit = vi.spyOn(directorApi, "createTimelineTask").mockRejectedValue(
+      new Error("当前 executor 无法连接 ComfyUI"),
+    );
 
     render(<App />);
     expect(await screen.findByText("ComfyUI 离线")).toBeInTheDocument();
     await user.type(screen.getByLabelText("片段提示词"), "雨夜追车");
-    expect(screen.getByRole("button", { name: /生成任务/ })).toBeDisabled();
+    const preflight = screen.getByRole("button", { name: "预检执行计划" });
+    const generate = screen.getByRole("button", { name: /生成任务/ });
+    expect(preflight).toBeEnabled();
+    expect(generate).toBeEnabled();
+    await user.click(preflight);
+    await waitFor(() => expect(compile).toHaveBeenCalledTimes(1));
+    await user.click(generate);
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("当前 executor 无法连接 ComfyUI"))
+      .toBeInTheDocument();
     expect(screen.getByText(/编辑内容会继续保留，恢复后由服务器实时核对执行能力/)).toBeInTheDocument();
   });
 
@@ -3084,7 +2965,7 @@ describe("统一长视频时间线应用", () => {
     expect(screen.queryByText(/配置解析为 RayLight 执行，但当前 ComfyUI 不可用/)).not.toBeInTheDocument();
   });
 
-  it("启用 RayLight LoRA 时由服务端统一 preflight 失败封闭", async () => {
+  it("启用 RayLight LoRA 时由服务端 compile 返回具体失败", async () => {
     const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "RayLight LoRA 预检";
@@ -3117,14 +2998,9 @@ describe("统一长视频时间线应用", () => {
         },
       },
     });
-    vi.mocked(directorApi.preflightFeatures).mockResolvedValue(
-      rejectedFeaturePreflight(
-        "RayLight LoRA 配置不可用：缺少 DirectorDeckRayLoraLoader",
-        "安装匹配的 RayLight 节点",
-        "raylight_lora_unavailable",
-      ),
+    const compile = vi.spyOn(directorApi, "compileTimeline").mockRejectedValue(
+      new ApiError("RayLight LoRA 配置不可用：缺少 DirectorDeckRayLoraLoader", 409),
     );
-    const compile = vi.spyOn(directorApi, "compileTimeline");
 
     render(<App />);
     await waitUntilReady();
@@ -3135,8 +3011,44 @@ describe("统一长视频时间线应用", () => {
     await user.click(preflight);
     expect(await screen.findByText(/RayLight LoRA 配置不可用.*DirectorDeckRayLoraLoader/))
       .toBeInTheDocument();
-    expect(directorApi.preflightFeatures).toHaveBeenCalled();
-    expect(compile).not.toHaveBeenCalled();
+    expect(directorApi.preflightFeatures).not.toHaveBeenCalled();
+    expect(compile).toHaveBeenCalledTimes(1);
+  });
+
+  it("预检模型缺失时在页面上部持久显示中文原因并可直达编解码设置", async () => {
+    const user = userEvent.setup();
+    const project = createTimelineProject();
+    project.segments[0].prompt = "结构化模型错误";
+    saveLocalTimeline(project);
+    mockCommonRequests();
+    vi.spyOn(directorApi, "compileTimeline").mockRejectedValue(new ApiError(
+      "The selected project workflow configuration is invalid.",
+      422,
+      {
+        detail: {
+          code: "model_binding_required",
+          bindings: ["clip", "video_vae", "audio_vae"],
+        },
+      },
+      "model_binding_required",
+    ));
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "预检执行计划" }));
+
+    const failure = await screen.findByRole("alert", { name: "执行计划预检未通过" });
+    expect(failure).toHaveTextContent(
+      "当前项目缺少编码模型（CLIP）、视频编解码模型（Video VAE）、音频编解码模型（Audio VAE）。",
+    );
+    expect(within(failure).getByText("请打开“全局设置”，完成对应模型选择后重新预检。"))
+      .toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "服务端执行计划" })).not.toBeInTheDocument();
+
+    await user.click(within(failure).getByRole("button", { name: "打开全局设置" }));
+    const codecModels = screen.getByRole("region", { name: "编解码模型" });
+    expect(codecModels).toBeVisible();
+    await waitFor(() => expect(codecModels).toHaveFocus());
   });
 
   it("全局设置是默认关闭的悬浮层，并把两族模型与 LoRA 直接写入项目文档", async () => {
@@ -3156,6 +3068,10 @@ describe("统一长视频时间线应用", () => {
     mockCommonRequests();
     vi.mocked(directorApi.getTimeline).mockResolvedValue(initial);
     const update = vi.mocked(directorApi.updateTimeline);
+    const ckCapability = vi.mocked(
+      directorApi.getComfyKitchenAttentionCapability,
+    );
+    ckCapability.mockClear();
 
     render(<App />);
     await waitUntilReady();
@@ -3171,6 +3087,26 @@ describe("统一长视频时间线应用", () => {
     expect(within(globalSettings).queryByText("模型与 LoRA 是当前项目创作配置；加载器由服务端预检解析")).not.toBeInTheDocument();
     const specs = within(globalSettings).getByRole("region", { name: "输出规格" });
     expect(specs).toBeVisible();
+    const ckAttention = within(globalSettings).getByRole("region", { name: "推理加速" });
+    expect(specs.nextElementSibling).toBe(ckAttention);
+    await waitFor(() => expect(within(ckAttention).getByText("可用")).toBeInTheDocument());
+    expect(ckCapability).toHaveBeenCalledTimes(1);
+    const ckToggle = within(ckAttention).getByRole("checkbox", {
+      name: "启用 Comfy Kitchen Attention",
+    });
+    expect(ckToggle).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+    await user.click(ckToggle);
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "撤销" }).getAttribute("title"))
+      .toContain("修改 CK Attention");
+    await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      features: expect.objectContaining({
+        project: expect.objectContaining({
+          comfy_kitchen_attention: { enabled: true, params: {} },
+        }),
+      }),
+    })));
     expect(within(globalSettings).queryByLabelText("项目功能点")).not.toBeInTheDocument();
     expect(within(globalSettings).queryByText("Attention backend override")).not.toBeInTheDocument();
     expect(within(specs).getByLabelText("画幅")).toHaveValue("16:9");
@@ -3192,6 +3128,9 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByLabelText("REF2VA Diffusion 模型快捷选择")).toBeInTheDocument();
     const flFamily = within(globalSettings).getByRole("region", { name: "FL2VA" });
     const refFamily = within(globalSettings).getByRole("region", { name: "Ref2VA" });
+    expect(refFamily.nextElementSibling).toBe(codecModels);
+    expect(codecModels.nextElementSibling).toBeNull();
+    expect(codecModels).toHaveClass("timeline-family-settings--codec");
     expect(within(flFamily).getByLabelText("FL2VA Diffusion 模型快捷选择")).toBeInTheDocument();
     expect(within(flFamily).getByLabelText("FL2VA 步数")).toBeInTheDocument();
     expect(within(refFamily).getByLabelText("REF2VA LoRA 模型快捷选择")).toBeInTheDocument();
@@ -3257,9 +3196,55 @@ describe("统一长视频时间线应用", () => {
         }),
       }),
     })));
+    expect(ckCapability).toHaveBeenCalledTimes(1);
     await user.keyboard("{Escape}");
     expect(document.getElementById("timeline-global-settings")).toHaveAttribute("hidden");
     await waitFor(() => expect(screen.getByRole("button", { name: "全局设置" })).toHaveFocus());
+  });
+
+  it("运行设置权威变化会重新读取 CK 能力且草稿未确认时显示检测中", async () => {
+    const user = userEvent.setup();
+    mockCommonRequests();
+    const ckCapability = vi.mocked(
+      directorApi.getComfyKitchenAttentionCapability,
+    );
+    ckCapability.mockClear();
+    let authority = runtimeAuthority(CONFIGURED_SETTINGS);
+    vi.mocked(directorApi.getSettingsAuthority).mockImplementation(async () =>
+      structuredClone(authority));
+    let confirmUpdate!: () => void;
+    vi.mocked(directorApi.updateSettingsAuthority).mockImplementation(
+      (next) => new Promise((resolve) => {
+        confirmUpdate = () => {
+          authority = runtimeAuthority(next);
+          resolve(structuredClone(authority));
+        };
+      }),
+    );
+
+    render(<App />);
+    await waitUntilReady();
+    await openGlobalSettings(user);
+    const acceleration = screen.getByRole("region", { name: "推理加速" });
+    await waitFor(() => expect(within(acceleration).getByText("可用"))
+      .toBeInTheDocument());
+    const callsBeforeEdit = ckCapability.mock.calls.length;
+    await user.click(screen.getByRole("button", { name: "关闭全局设置" }));
+    await user.click(screen.getByRole("button", { name: "系统设置" }));
+    await user.selectOptions(screen.getByLabelText("FL2VA 扩散模型设备"), "cpu");
+    await waitFor(() => expect(directorApi.updateSettingsAuthority)
+      .toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
+    await openGlobalSettings(user);
+    expect(within(screen.getByRole("region", { name: "推理加速" }))
+      .getByText("检测中")).toBeInTheDocument();
+
+    await act(async () => confirmUpdate());
+    await waitFor(() => expect(ckCapability.mock.calls.length)
+      .toBeGreaterThan(callsBeforeEdit));
+    await waitFor(() => expect(within(screen.getByRole("region", {
+      name: "推理加速",
+    })).getByText("可用")).toBeInTheDocument());
   });
 
   it("预检与生成主操作只渲染在顶栏右侧，并跟随可执行选择数量", async () => {
@@ -3408,6 +3393,56 @@ describe("统一长视频时间线应用", () => {
     expect(directorApi.updateProjectTimelineAuthority).not.toHaveBeenCalled();
   });
 
+  it("持久活动项目损坏时保留列表记录并回到默认项目，不进入无限 hydration 重试", async () => {
+    const damagedProjectId = "damaged-project";
+    const defaultProject = createTimelineProject();
+    defaultProject.title = "默认项目权威";
+    localStorage.setItem("directordeck:v1:active-project-id", damagedProjectId);
+    mockCommonRequests();
+    vi.mocked(directorApi.getProjectTimelineAuthority).mockRejectedValue(
+      new ApiError(
+        "The stored project document is unreadable.",
+        409,
+        undefined,
+        "project_document_unreadable",
+      ),
+    );
+    vi.mocked(directorApi.getTimelineAuthority).mockResolvedValue({
+      document: defaultProject,
+      revision: 23,
+    });
+    vi.mocked(directorApi.listProjects).mockResolvedValue({
+      projects: [
+        {
+          id: DEFAULT_PROJECT_ID,
+          title: defaultProject.title,
+          created_at: "2026-08-12T00:00:00Z",
+          updated_at: "2026-08-12T00:00:00Z",
+          segment_count: 1,
+        },
+        {
+          id: damagedProjectId,
+          title: "损坏项目",
+          created_at: "2026-08-12T00:00:00Z",
+          updated_at: "2026-08-12T00:00:00Z",
+          segment_count: 0,
+        },
+      ],
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", {
+      name: `重命名项目，当前名称：${defaultProject.title}`,
+    })).toBeInTheDocument();
+    expect(localStorage.getItem("directordeck:v1:active-project-id"))
+      .toBe(DEFAULT_PROJECT_ID);
+    expect(screen.getByRole("combobox", { name: "切换项目" }))
+      .toHaveValue(DEFAULT_PROJECT_ID);
+    expect(screen.getByRole("option", { name: "损坏项目" })).toBeInTheDocument();
+    expect(directorApi.getProjectTimelineAuthority).toHaveBeenCalledTimes(1);
+  });
+
   it("持久项目 404 的列表尾验发现数据库已切换时 fail-closed 且不安装默认项目", async () => {
     const removedProjectId = "removed-project";
     const databaseB = {
@@ -3488,6 +3523,10 @@ describe("统一长视频时间线应用", () => {
     fireEvent.change(screen.getByRole("combobox", { name: "切换项目" }), {
       target: { value: "__new__" },
     });
+    await waitFor(() => expect(directorApi.createProject).toHaveBeenCalledWith(
+      undefined,
+      defaultProject.model_stack,
+    ));
     expect(await screen.findByRole("button", {
       name: `重命名项目，当前名称：${createdProject.title}`,
     })).toBeInTheDocument();
@@ -4415,6 +4454,32 @@ describe("统一长视频时间线应用", () => {
     expect(screen.getByText(/时间线、分段选择或运行设置已变化，请重新预检/)).toBeInTheDocument();
   });
 
+  it("分段选择变化后不会回灌在途旧预检错误", async () => {
+    const user = userEvent.setup();
+    const first = { ...createTimelineSegment("fl2va", 1), prompt: "第一段" };
+    const second = { ...createTimelineSegment("fl2va", 2), prompt: "第二段" };
+    saveLocalTimeline({ ...createTimelineProject(), segments: [first, second] });
+    mockCommonRequests();
+    let rejectCompile!: (reason: unknown) => void;
+    vi.spyOn(directorApi, "compileTimeline").mockImplementation(
+      () => new Promise((_, reject) => { rejectCompile = reject; }),
+    );
+
+    render(<App />);
+    await waitUntilReady();
+    await user.click(screen.getByRole("button", { name: "预检执行计划" }));
+    await user.click(screen.getByRole("button", { name: /^聚焦并选择片段 2：/ }));
+    await act(async () => rejectCompile(new ApiError(
+      "stale model error",
+      422,
+      { detail: { code: "model_binding_required", bindings: ["clip"] } },
+      "model_binding_required",
+    )));
+
+    expect(screen.queryByRole("alert", { name: "执行计划预检未通过" }))
+      .not.toBeInTheDocument();
+  });
+
   it("生成等待的旧 revision 失败但已被新编辑取代时，继续确认最新版再提交", async () => {
     const user = userEvent.setup();
     mockCommonRequests();
@@ -4521,7 +4586,6 @@ describe("统一长视频时间线应用", () => {
     );
     mockCommonRequests();
     const update = vi.spyOn(directorApi, "updateTimeline").mockImplementation(async (value) => value);
-    const capabilityPreflight = vi.mocked(directorApi.preflightFeatures);
     const compile = vi.spyOn(directorApi, "compileTimeline").mockResolvedValue({
       ...emptyCompileReport(project),
       model_families: ["fl2va"],
@@ -4539,12 +4603,7 @@ describe("统一长视频时间线应用", () => {
     await user.click(screen.getByRole("button", { name: "预检执行计划" }));
     await waitFor(() => expect(compile).toHaveBeenCalledTimes(1));
     expect(update).not.toHaveBeenCalled();
-    expect(capabilityPreflight).toHaveBeenCalledTimes(1);
-    expect(capabilityPreflight.mock.invocationCallOrder[0])
-      .toBeLessThan(compile.mock.invocationCallOrder[0]);
-    expect(capabilityPreflight.mock.calls[0][0].config.sampling.fl2va)
-      .toMatchObject({ seed: 303, random_seed: true });
-    expect(capabilityPreflight.mock.calls[0][0].project_id).toBe(DEFAULT_PROJECT_ID);
+    expect(directorApi.preflightFeatures).not.toHaveBeenCalled();
     const compiled = compile.mock.calls[0][0].config!;
     expect(compiled.sampling.fl2va).toMatchObject({ seed: 303, random_seed: true });
     expect(compiled.sampling.ref2va).toMatchObject({ seed: 202, random_seed: false });
@@ -4731,12 +4790,15 @@ describe("统一长视频时间线应用", () => {
   it("当前权威 ComfyUI 重启后测试连接会原子刷新 GPU、能力与模型资源", async () => {
     const user = userEvent.setup();
     mockCommonRequests();
-    vi.mocked(directorApi.getFeatureCatalog)
-      .mockResolvedValueOnce(FRESH_FEATURE_CATALOG)
-      .mockResolvedValue({
-        status: "not_modified",
-        etag: FEATURE_CATALOG_ETAG,
-      });
+    const ckCapability = vi.mocked(
+      directorApi.getComfyKitchenAttentionCapability,
+    );
+    const staleCapabilityResolvers: Array<(
+      capability: ComfyKitchenAttentionCapability,
+    ) => void> = [];
+    ckCapability.mockImplementation(() => new Promise((resolve) => {
+      staleCapabilityResolvers.push(resolve);
+    }));
     vi.mocked(directorApi.getGpus)
       .mockResolvedValueOnce([GPU_ZERO])
       .mockResolvedValue([GPU_ZERO, GPU_ONE]);
@@ -4757,12 +4819,23 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    expect(ckCapability).not.toHaveBeenCalled();
+    await openGlobalSettings(user);
+    await waitFor(() => expect(staleCapabilityResolvers.length).toBeGreaterThan(0));
+    await user.click(screen.getByRole("button", { name: "关闭全局设置" }));
+    ckCapability.mockResolvedValue({
+      context_revision: "ctx:after-refresh",
+      backend: "standard",
+      state: "available",
+      reasons: [],
+    });
     await user.click(screen.getByRole("button", { name: "系统设置" }));
     const gpuPanel = screen.getByRole("heading", { name: "GPU 状态" }).closest("section");
     if (!gpuPanel) throw new Error("GPU status panel missing");
     expect(within(gpuPanel).getByText("GPU 0")).toBeInTheDocument();
     expect(within(gpuPanel).queryByText("GPU 1")).not.toBeInTheDocument();
 
+    ckCapability.mockClear();
     await user.click(screen.getByRole("button", { name: "测试连接" }));
 
     expect(await screen.findByText("当前实例可连接")).toBeInTheDocument();
@@ -4771,21 +4844,31 @@ describe("统一长视频时间线应用", () => {
     expect(directorApi.getGpus).toHaveBeenCalledTimes(2);
     expect(directorApi.getModels).toHaveBeenCalledTimes(2);
     expect(directorApi.getRayLightRuntimeStatus).toHaveBeenCalledTimes(2);
-    expect(directorApi.getFeatureCatalog).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(directorApi.getFeatureCatalog).mock.calls[0][0]).toBeUndefined();
-    expect(vi.mocked(directorApi.getFeatureCatalog).mock.calls[1][0])
-      .toBe(FEATURE_CATALOG_ETAG);
+    expect(ckCapability).not.toHaveBeenCalled();
+    expect(directorApi.getFeatureCatalog).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "关闭系统设置" }));
+    await openGlobalSettings(user);
+    await waitFor(() => expect(ckCapability).toHaveBeenCalledTimes(1));
+    const acceleration = screen.getByRole("region", { name: "推理加速" });
+    await waitFor(() => expect(within(acceleration).getByText("可用"))
+      .toBeInTheDocument());
+    await act(async () => {
+      staleCapabilityResolvers.forEach((resolve) => resolve({
+        context_revision: "ctx:stale-before-refresh",
+        backend: "standard",
+        state: "unavailable",
+        reasons: [{ code: "stale", message: "过期 CK 结果" }],
+      }));
+      await Promise.resolve();
+    });
+    expect(within(acceleration).getByText("可用")).toBeInTheDocument();
+    expect(within(acceleration).queryByText("过期 CK 结果")).not.toBeInTheDocument();
   });
 
-  it("ffmpeg 安装轮询变为 ready 后重取宿主资源与 catalog", async () => {
+  it("ffmpeg 安装轮询变为 ready 后只重取当前宿主资源", async () => {
     const user = userEvent.setup();
     mockCommonRequests();
-    vi.mocked(directorApi.getFeatureCatalog)
-      .mockResolvedValueOnce(FRESH_FEATURE_CATALOG)
-      .mockResolvedValue({
-        status: "not_modified",
-        etag: FEATURE_CATALOG_ETAG,
-      });
     const runningMedia: MediaToolsStatus = {
       ffmpeg_available: false,
       ffprobe_available: false,
@@ -4832,16 +4915,20 @@ describe("统一长视频时间线应用", () => {
 
     render(<App />);
     await waitUntilReady();
+    const ckCapability = vi.mocked(
+      directorApi.getComfyKitchenAttentionCapability,
+    );
+    ckCapability.mockClear();
     await user.click(screen.getByRole("button", { name: "系统设置" }));
     expect(await screen.findByText(/正在安装 ffmpeg/)).toBeInTheDocument();
 
     await waitFor(() => expect(mediaSetup).toHaveBeenCalledTimes(2), { timeout: 3_000 });
-    await waitFor(() => expect(directorApi.getFeatureCatalog).toHaveBeenCalledTimes(2));
-    expect(vi.mocked(directorApi.getFeatureCatalog).mock.calls[1][0])
-      .toBe(FEATURE_CATALOG_ETAG);
+    expect(ckCapability).not.toHaveBeenCalled();
+    expect(directorApi.getFeatureCatalog).not.toHaveBeenCalled();
   }, 5_000);
 
-  it("功能目录或 provider 加载失败时显示明确状态并锁定生成与预检", async () => {
+  it("主运行路径不请求旧功能目录且不影响预检与生成", async () => {
+    const user = userEvent.setup();
     const project = createTimelineProject();
     project.segments[0].prompt = "等待功能目录";
     saveLocalTimeline(project);
@@ -4849,15 +4936,26 @@ describe("统一长视频时间线应用", () => {
     vi.mocked(directorApi.getFeatureCatalog).mockRejectedValue(
       new Error("宿主 capability provider 暂不可用"),
     );
+    const compile = vi.spyOn(directorApi, "compileTimeline").mockResolvedValue(
+      emptyCompileReport(project),
+    );
+    const submit = vi.spyOn(directorApi, "createTimelineTask").mockResolvedValue(
+      queuedTimelineTask,
+    );
 
     render(<App />);
-    await waitUntilTimelineReady();
+    await waitUntilReady();
 
-    expect(await screen.findByText(
-      /功能目录与宿主能力不可用：宿主 capability provider 暂不可用；生成与预检保持锁定/,
-    )).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "预检执行计划" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeDisabled();
+    expect(screen.queryByText(/功能目录与宿主能力不可用/)).not.toBeInTheDocument();
+    const preflight = screen.getByRole("button", { name: "预检执行计划" });
+    const generate = screen.getByRole("button", { name: /生成任务 1/ });
+    expect(preflight).toBeEnabled();
+    expect(generate).toBeEnabled();
+    await user.click(preflight);
+    await waitFor(() => expect(compile).toHaveBeenCalledTimes(1));
+    await user.click(generate);
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    expect(directorApi.getFeatureCatalog).not.toHaveBeenCalled();
     expect(directorApi.preflightFeatures).not.toHaveBeenCalled();
   });
 
@@ -4971,13 +5069,17 @@ describe("统一长视频时间线应用", () => {
     vi.mocked(directorApi.getRayLightRuntimeStatus).mockRejectedValue(
       new Error("runtime status unavailable"),
     );
+    const compile = vi.spyOn(directorApi, "compileTimeline").mockResolvedValue(
+      emptyCompileReport(project),
+    );
 
     render(<App />);
     await waitFor(() => expect(directorApi.getRayLightRuntimeStatus).toHaveBeenCalled());
     expect(screen.getByRole("button", { name: "预检执行计划" })).toBeEnabled();
     expect(screen.getByRole("button", { name: /生成任务 1/ })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "预检执行计划" }));
-    await waitFor(() => expect(directorApi.preflightFeatures).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(compile).toHaveBeenCalledTimes(1));
+    expect(directorApi.preflightFeatures).not.toHaveBeenCalled();
   });
 
   it("四资源部分失败时不展示未形成同源权威的 RayLight 告警", async () => {

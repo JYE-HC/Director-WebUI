@@ -44,20 +44,14 @@ from .compile_report import (
 from .contracts import (
     AllowedLateBoundInput,
     CapabilitySet,
-    EdgeRef,
     FeatureEmission,
     FeatureResolution,
     FeatureTemplateEntry,
     FeatureInterpreter,
     HostCapabilitySnapshot,
-    ListRef,
     NodeContractRegistry,
-    NodeContractEvidence,
     PublicResourceRead,
     PublicResourceWrite,
-    PublishedValueRef,
-    RecordRef,
-    Resource,
     ResourcePool,
     OperationalReadiness,
     TerminalRef,
@@ -71,8 +65,8 @@ from .interpreters import (
 from .node_contracts import (
     V4_NODE_CONTRACT_REGISTRY,
     V4_OUTPUT_NEUTRAL_NODE_CLASSES,
-    current_provenance_policy,
     native_provenance_policy,
+    v5_provenance_policy,
 )
 from .lora_factory import ResolvedLoraAdapter
 from .effective_features import (
@@ -81,6 +75,13 @@ from .effective_features import (
     feature_parameter_model,
 )
 from .execution import derive_feature_execution_specs
+from .feature_compiler_support import (
+    commit_emission as _commit_emission,
+    node_contract_snapshot as _node_contract_snapshot,
+    public_reads as _scope_public_reads,
+    public_writes as _scope_public_writes,
+    read_resources as _read_resources,
+)
 from .registry import FeatureInterpreterRegistry, ValidatedFeatureTemplate
 from .templates import (
     V4_RAYLIGHT_SEGMENT_TEMPLATE,
@@ -118,206 +119,6 @@ def _plain_feature_params(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_plain_feature_params(item) for item in value]
     return value
-
-
-def _published_node_ids(value: PublishedValueRef) -> tuple[str, ...]:
-    if isinstance(value, (EdgeRef, TerminalRef)):
-        return (value.node_id,)
-    children = value.items if isinstance(value, ListRef) else value.fields.values()
-    ordered: list[str] = []
-    for child in children:
-        for node_id in _published_node_ids(child):
-            if node_id not in ordered:
-                ordered.append(node_id)
-    return tuple(ordered)
-
-
-def _plain_published_ref(value: PublishedValueRef) -> Any:
-    if isinstance(value, EdgeRef):
-        return [value.node_id, value.output_slot]
-    if isinstance(value, TerminalRef):
-        return {"kind": "terminal", "node_id": value.node_id}
-    if isinstance(value, ListRef):
-        return [_plain_published_ref(item) for item in value.items]
-    return {
-        key: _plain_published_ref(item) for key, item in value.fields.items()
-    }
-
-
-def _published_edge_pointers(
-    value: PublishedValueRef,
-    *,
-    pointer: str,
-) -> tuple[tuple[str, EdgeRef], ...]:
-    if isinstance(value, EdgeRef):
-        return ((pointer, value),)
-    if isinstance(value, TerminalRef):
-        raise AssertionError("terminal resources cannot be consumed by graph inputs")
-    if isinstance(value, ListRef):
-        return tuple(
-            leaf
-            for index, item in enumerate(value.items)
-            for leaf in _published_edge_pointers(
-                item,
-                pointer=f"{pointer}/{index}",
-            )
-        )
-    return tuple(
-        leaf
-        for key, item in value.fields.items()
-        for leaf in _published_edge_pointers(
-            item,
-            pointer=(
-                f"{pointer}/{key.replace('~', '~0').replace('/', '~1')}"
-            ),
-        )
-    )
-
-
-def _read_resources(
-    pool: ResourcePool,
-    entry: FeatureTemplateEntry,
-) -> dict[str, Any]:
-    inputs: dict[str, Any] = {}
-    for declaration in entry.reads:
-        resource = (
-            pool.read_required(
-                declaration.name,
-                expected_type=declaration.type,
-            )
-            if declaration.required
-            else pool.read_optional(
-                declaration.name,
-                expected_type=declaration.type,
-            )
-        )
-        if resource is not None:
-            inputs[declaration.name] = resource
-    return inputs
-
-
-def _scope_public_reads(
-    *,
-    inputs: Mapping[str, Resource],
-    scope: Any,
-) -> tuple[PublicResourceRead, ...]:
-    """Explain every cross-scope input, including composite resources, once."""
-
-    local_nodes = set(scope.emitted_node_ids)
-    external_evidence = tuple(
-        item
-        for item in scope.input_edge_evidence
-        if item.value.node_id not in local_nodes
-    )
-    evidence_by_key = {
-        (item.consumer_node_id, item.input_pointer, item.value): item
-        for item in external_evidence
-    }
-    if len(evidence_by_key) != len(external_evidence):
-        raise AssertionError(
-            f"feature {scope.feature_id!r} produced duplicate input-edge evidence"
-        )
-
-    reads: list[PublicResourceRead] = []
-    claimed: set[tuple[str, str, EdgeRef]] = set()
-    for consumer_node_id, node in scope.prompt_fragment.items():
-        for input_name, actual_value in node["inputs"].items():
-            pointer = (
-                f"/{consumer_node_id}/inputs/"
-                f"{input_name.replace('~', '~0').replace('/', '~1')}"
-            )
-            matching_resources = [
-                resource
-                for resource in inputs.values()
-                if _plain_published_ref(resource.value) == actual_value
-            ]
-            related_evidence = tuple(
-                item
-                for item in external_evidence
-                if item.consumer_node_id == consumer_node_id
-                and (
-                    item.input_pointer == pointer
-                    or item.input_pointer.startswith(pointer + "/")
-                )
-            )
-            if not related_evidence:
-                continue
-            if len(matching_resources) != 1:
-                raise AssertionError(
-                    f"feature {scope.feature_id!r} cross-scope input at "
-                    f"{pointer!r} must match exactly one typed resource"
-                )
-            resource = matching_resources[0]
-            expected = set(
-                (consumer_node_id, leaf_pointer, value)
-                for leaf_pointer, value in _published_edge_pointers(
-                    resource.value,
-                    pointer=pointer,
-                )
-            )
-            observed = {
-                (item.consumer_node_id, item.input_pointer, item.value)
-                for item in related_evidence
-            }
-            if observed != expected:
-                raise AssertionError(
-                    f"feature {scope.feature_id!r} composite resource at "
-                    f"{pointer!r} does not match its exact typed leaves"
-                )
-            if claimed & expected:
-                raise AssertionError(
-                    f"feature {scope.feature_id!r} cross-scope evidence has "
-                    "more than one resource owner"
-                )
-            claimed.update(expected)
-            reads.append(
-                PublicResourceRead(
-                    resource_name=resource.name,
-                    type=resource.type,
-                    revision=resource.revision,
-                    consumer_node_id=consumer_node_id,
-                    input_pointer=pointer,
-                    value=resource.value,
-                )
-            )
-
-    unclaimed = set(evidence_by_key) - claimed
-    if unclaimed:
-        _consumer, pointer, _value = min(
-            unclaimed,
-            key=lambda item: (item[0], item[1], item[2].node_id, item[2].output_slot),
-        )
-        raise AssertionError(
-            f"feature {scope.feature_id!r} cross-scope edge at {pointer!r} "
-            "must match exactly one whole typed resource"
-        )
-    return tuple(reads)
-
-
-def _scope_public_writes(
-    *,
-    before: ResourcePool,
-    after: ResourcePool,
-    entry: FeatureTemplateEntry,
-    emission: FeatureEmission,
-) -> tuple[PublicResourceWrite, ...]:
-    emitted_names = set(emission.outputs)
-    writes: list[PublicResourceWrite] = []
-    for declaration in entry.writes:
-        if declaration.name not in emitted_names:
-            continue
-        resource = after.resources[declaration.name]
-        previous = before.resources.get(declaration.name)
-        writes.append(
-            PublicResourceWrite(
-                operation=declaration.operation,
-                resource=resource,
-                previous_revision=(
-                    previous.revision if previous is not None else None
-                ),
-            )
-        )
-    return tuple(writes)
 
 
 def _scope_trace_parts(
@@ -362,29 +163,6 @@ def _scope_trace_parts(
     return entry.id, resolution, tuple(emitted)
 
 
-def _node_contract_snapshot(
-    prompt: Mapping[str, Any],
-    node_contract_registry: NodeContractRegistry = V4_NODE_CONTRACT_REGISTRY,
-) -> dict[str, NodeContractEvidence]:
-    snapshot: dict[str, NodeContractEvidence] = {}
-    for node_id, node in prompt.items():
-        contract = node_contract_registry.require(node["class_type"])
-        if len(contract.allowed_python_modules) != 1:
-            raise AssertionError(
-                f"v4 node contract must select one module: {contract.class_type}"
-            )
-        snapshot[str(node_id)] = NodeContractEvidence(
-            contract_id=contract.contract_id,
-            semantic_version=contract.semantic_version,
-            class_type=contract.class_type,
-            python_module=contract.allowed_python_modules[0],
-            runtime_fingerprint=contract.supported_runtime_fingerprints[0],
-            execution_terminal_role=contract.execution_terminal_role,
-            persistent_artifact_role=contract.persistent_artifact_role,
-        )
-    return snapshot
-
-
 def _allowed_late_bindings(
     *,
     prompt: Mapping[str, Any],
@@ -420,54 +198,6 @@ def _allowed_late_bindings(
             )
         )
     return tuple(allowed)
-
-
-def _commit_emission(
-    *,
-    pool: ResourcePool,
-    entry: FeatureTemplateEntry,
-    emission: FeatureEmission,
-    scope: Any,
-) -> ResourcePool:
-    writes = {declaration.name: declaration for declaration in entry.writes}
-    unexpected = set(emission.outputs) - set(writes)
-    if unexpected:
-        raise AssertionError(
-            f"feature {entry.id!r} emitted undeclared resources: "
-            + ", ".join(sorted(unexpected))
-        )
-    missing = {
-        name
-        for name, declaration in writes.items()
-        if declaration.required and name not in emission.outputs
-    }
-    if missing:
-        raise AssertionError(
-            f"feature {entry.id!r} omitted declared resources: "
-            + ", ".join(sorted(missing))
-        )
-
-    transaction = pool.begin()
-    for name, value in emission.outputs.items():
-        declaration = writes[name]
-        producers = _published_node_ids(value)
-        if declaration.operation == "define":
-            transaction = transaction.define(
-                name=name,
-                type=declaration.type,
-                value=value,
-                source_feature_id=entry.id,
-                producer_node_ids=producers,
-            )
-        else:
-            transaction = transaction.replace(
-                name=name,
-                value=value,
-                source_feature_id=entry.id,
-                producer_node_ids=producers,
-                expected_type=declaration.type,
-            )
-    return scope.commit_emission(emission, transaction)
 
 
 def _entry_enabled(
@@ -932,7 +662,8 @@ def _compile_route(
             )
             pool = _commit_emission(
                 pool=pool,
-                entry=entry,
+                owner_id=entry.id,
+                use=entry,
                 emission=emission,
                 scope=scope,
             )
@@ -951,7 +682,7 @@ def _compile_route(
             _scope_public_writes(
                 before=before_pool,
                 after=pool,
-                entry=entry,
+                use=entry,
                 emission=emission,
             )
         )
@@ -1238,7 +969,7 @@ def _compile_resolved_input(
     provenance = dict(
         native_provenance_policy(all_nodes)
         if node_contract_registry is V4_NODE_CONTRACT_REGISTRY
-        else current_provenance_policy(all_nodes)
+        else v5_provenance_policy(all_nodes)
     )
     custom_nodes = sorted(
         node
@@ -1357,7 +1088,7 @@ def compile_projected_v5_timeline(
         )
     except CreativeCompileInputError as exc:
         raise NativeTemplateError(str(exc)) from exc
-    from .node_contracts import CURRENT_NODE_CONTRACT_REGISTRY
+    from .node_contracts import V5_NODE_CONTRACT_REGISTRY
     from .v5_registry import V5_VALIDATED_TEMPLATES
 
     return _compile_resolved_input(
@@ -1371,7 +1102,7 @@ def compile_projected_v5_timeline(
         validated_templates=V5_VALIDATED_TEMPLATES,
         template_bundle_version=effective_features.template_bundle_version,
         effective_features=effective_features,
-        node_contract_registry=CURRENT_NODE_CONTRACT_REGISTRY,
+        node_contract_registry=V5_NODE_CONTRACT_REGISTRY,
     )
 
 

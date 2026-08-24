@@ -69,6 +69,8 @@ import {
   promptCharacterCount,
 } from "../domain/promptLimits";
 import { DeferredNumberInput, Field } from "./ui";
+import { PreflightResultPanel } from "./PreflightResultPanel";
+import type { LocalizedProblem } from "../i18n";
 import {
   loadTimelineSegmentCopyOptions,
   loadTimelineWorkspacePreferences,
@@ -87,9 +89,11 @@ interface LongFormTimelineWorkspaceProps {
     result: GenerationTask["segment_results"][number];
   }>;
   compileReport: TimelineCompileReport | null;
+  compileFailure?: LocalizedProblem | null;
   selectionValidationErrors: string[];
   onDispatch: (action: TimelineUserAction) => void;
   onCloseCompile: () => void;
+  onOpenPreflightSettings?: () => void;
   onCancelTask: (taskId: string) => void;
   onUploadFiles?: (
     files: File[],
@@ -1301,9 +1305,11 @@ export function LongFormTimelineWorkspace({
   activeTask,
   segmentCandidates,
   compileReport,
+  compileFailure = null,
   selectionValidationErrors,
   onDispatch,
   onCloseCompile,
+  onOpenPreflightSettings = () => undefined,
   onCancelTask,
   onUploadFiles,
 }: LongFormTimelineWorkspaceProps) {
@@ -2132,32 +2138,13 @@ export function LongFormTimelineWorkspace({
   return (
     <main className="longform-workspace" aria-label="长视频时间线工作区">
       {selectionValidationErrors.length > 0 && <div id={TIMELINE_RUN_VALIDATION_ID} className="timeline-validation" role="alert"><strong>所选片段生成前还需完成 {selectionValidationErrors.length} 项</strong><span>{selectionValidationErrors.slice(0, 4).join("；")}{selectionValidationErrors.length > 4 ? `；另有 ${selectionValidationErrors.length - 4} 项` : ""}</span></div>}
-      {compileReport && <section className="execution-plan-report" aria-label="服务端执行计划">
-        <header><div><strong>原生分段执行计划</strong><small>{compileReport.execution_strategy} · 浏览器不接收可执行工作流或提示词</small></div><button type="button" className="icon-button" aria-label="关闭执行计划" onClick={onCloseCompile}>×</button></header>
-        <div className="execution-plan-report__summary"><span>{compileReport.plans.length} 个分段计划</span><span>{compileReport.model_families.map((family) => family.toUpperCase()).join(" + ")}</span><span>图来源：{compileReport.node_policy.graph_source === "server" ? "服务端" : "未知"}</span><span>客户端工作流：{compileReport.node_policy.accepts_client_workflow ? "允许" : "禁止"}</span></div>
-        <div className="execution-plan-report__plans">{compileReport.plans.map((plan) => {
-          const targetIndex = state.project.segments.findIndex((segment) => segment.id === plan.segment_id);
-          const targetLabel = targetIndex >= 0
-            ? `${targetIndex + 1} · ${state.project.segments[targetIndex].title}`
-            : plan.segment_id;
-          const predecessorIndex = plan.predecessor_segment_id === null
-            ? -1
-            : state.project.segments.findIndex((segment) => segment.id === plan.predecessor_segment_id);
-          const predecessorLabel = predecessorIndex >= 0
-            ? `${predecessorIndex + 1} · ${state.project.segments[predecessorIndex].title}`
-            : plan.predecessor_segment_id;
-          return <article key={plan.segment_id} aria-label={`执行计划 ${targetLabel}`}>
-            <header><strong title={targetLabel}>{targetLabel} · {TIMELINE_MODE_META[plan.mode].shortLabel} · 派生配方：{RECIPE_META[plan.recipe].label}</strong><em>{plan.backend === "raylight" ? "RayLight" : "标准"}</em></header>
-            <span>{plan.visible_frame_count}f 可见 / {plan.sample_frame_count}f 采样 · seed {plan.seed}{plan.seed_mode === "random" ? "（随机）" : "（固定）"}</span>
-            <small>{predecessorLabel
-              ? `${plan.continuity_source === "historical_take" ? "来源：复用前驱成片" : "来源：同次运行"} · 前驱 ${predecessorLabel} · 接续上下文 ${plan.continuity_context_frames}f · 对齐尾帧 ${plan.alignment_tail_frame_count}f${plan.historical_take_id ? ` · take ${plan.historical_take_id.slice(0, 8)}` : ""}`
-              : `来源：无接续 · ${plan.anchor_reset ? "锚点重置" : "无接续前驱"} · 对齐尾帧 ${plan.alignment_tail_frame_count}f`}</small>
-            <small>{plan.conditioning_node}</small>
-            <details><summary>{plan.node_classes.length} 类节点</summary><code>{plan.node_classes.join(" → ")}</code></details>
-          </article>;
-        })}</div>
-        <footer><span>允许节点 {compileReport.node_policy.allowed_nodes.length}</span><span>自定义节点 {compileReport.node_policy.custom_nodes.length}</span>{compileReport.node_policy.custom_nodes.length > 0 && <code>{compileReport.node_policy.custom_nodes.join("、")}</code>}</footer>
-      </section>}
+      <PreflightResultPanel
+        report={compileReport}
+        failure={compileFailure}
+        segments={state.project.segments}
+        onClose={onCloseCompile}
+        onOpenGlobalSettings={onOpenPreflightSettings}
+      />
       <section className={`director-monitors ${showLiveMonitor ? "is-live-open" : ""}`}>
         <article className="monitor monitor--program">
           <header><strong>时间线主预览</strong><em>{comparisonActive ? `原视频对比 · ${timelinePosition ? TIMELINE_MODE_META[timelinePosition.segment.mode].shortLabel : "无片段"}` : segmentCandidate ? `最新生成候选 · ${segmentCandidate.job_id.slice(0, 8)}` : showingTimeline ? timelineSource ? "源视频 · 无生成候选" : "片段占位画面 · 无生成候选" : "显式素材预览"} · {projectWidth}×{projectHeight}</em><button type="button" className="monitor__aux-toggle" aria-label="实时执行" aria-controls="live-execution-monitor" aria-expanded={showLiveMonitor} onClick={() => setShowLiveMonitor((open) => !open)}><span>实时执行</span>{activeTask && <i className="monitor__aux-toggle-status" aria-hidden="true" />}</button></header>

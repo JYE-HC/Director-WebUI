@@ -80,7 +80,7 @@ async def test_after_intent_crash_has_no_post_and_recovery_never_recompiles(
 
     monkeypatch.setattr(
         director_app_module,
-        "compile_v5_execution_plan",
+        "compile_project_execution_plan",
         forbidden_compile,
     )
     monkeypatch.setattr(
@@ -173,7 +173,7 @@ async def test_restart_recovery_claims_persisted_user_cancel_before_stage_transi
 
     monkeypatch.setattr(
         director_app_module,
-        "compile_v5_execution_plan",
+        "compile_project_execution_plan",
         forbidden_compile,
     )
     monkeypatch.setattr(

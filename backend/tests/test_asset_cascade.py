@@ -13,6 +13,10 @@ from directordeck.schemas import (
     default_settings,
     default_timeline_draft,
 )
+from directordeck.workflow.effective_features import (
+    migrate_timeline_feature_authority_to_v5,
+)
+from directordeck.workflow.v6_projection import project_v5_authority_to_v6
 
 from .conftest import (
     asset,
@@ -620,7 +624,11 @@ def test_atomic_validate_and_put_cannot_resurrect_asset_after_cascade_delete(
                 )
                 current_revision = database.get_timeline_authority()[1]
                 database.validate_and_put_timeline_authority(
-                    migrate_timeline_v4_to_v5(value, default_settings()),
+                    project_v5_authority_to_v6(
+                        migrate_timeline_feature_authority_to_v5(
+                            migrate_timeline_v4_to_v5(value, default_settings())
+                        )
+                    ).draft,
                     expected_revision=current_revision,
                 )
             else:

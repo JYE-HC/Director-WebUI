@@ -19,13 +19,14 @@ from .contracts import (
     Backend,
     canonical_sha256,
     ContractModel,
+    DirectorAdapterContractEvidence,
     EdgeRef,
     FeatureResolution,
     GraphAuditSpec,
+    GraphNodeContractEvidence,
     Identifier,
     ListRef,
     ModelFamily,
-    NodeContractEvidence,
     NodeContractRegistry,
     NodeId,
     ObjectInfoInputContract,
@@ -34,6 +35,7 @@ from .contracts import (
     PublishedValueRef,
     RecordRef,
     TerminalRef,
+    director_adapter_contract_digest,
 )
 
 
@@ -355,14 +357,27 @@ def _validate_node_contracts(
             raise GraphAuditError(
                 f"node {node_id!r} contract version does not match registry"
             )
-        if evidence.python_module not in contract.allowed_python_modules:
-            raise GraphAuditError(
-                f"node {node_id!r} compiler module differs from its graph contract"
-            )
-        if evidence.runtime_fingerprint not in contract.supported_runtime_fingerprints:
-            raise GraphAuditError(
-                f"node {node_id!r} compiler adapter identity differs from its graph contract"
-            )
+        if isinstance(evidence, DirectorAdapterContractEvidence):
+            if evidence.adapter_contract_digest != director_adapter_contract_digest(
+                contract
+            ):
+                raise GraphAuditError(
+                    f"node {node_id!r} Director adapter contract digest differs "
+                    "from its graph contract"
+                )
+        else:
+            if evidence.python_module not in contract.allowed_python_modules:
+                raise GraphAuditError(
+                    f"node {node_id!r} compiler module differs from its graph contract"
+                )
+            if (
+                evidence.runtime_fingerprint
+                not in contract.supported_runtime_fingerprints
+            ):
+                raise GraphAuditError(
+                    f"node {node_id!r} compiler adapter identity differs from "
+                    "its graph contract"
+                )
         if evidence.execution_terminal_role != contract.execution_terminal_role:
             raise GraphAuditError(
                 f"node {node_id!r} execution terminal role differs from registry"
@@ -442,6 +457,9 @@ def _validate_node_contracts(
             # semantic.  CURRENT explicitly supports the bundle-5 enum and
             # its interpreter/topology guard, including TORCH_FLASH.
             and "DirectorStrictModelAttentionBackend" not in registry.contracts
+            # Bundle 6 owns the selected attention through execution_strategy;
+            # CK off intentionally compiles the bundled TORCH_FLASH baseline.
+            and "ModelAttentionBackend" not in registry.contracts
         ):
             raise GraphAuditError(
                 "RayLight segment graphs require COMFY_KITCHEN_INT8 attention; "
@@ -534,7 +552,10 @@ def _validate_feature_traces(
                 raise GraphAuditError(
                     f"feature {trace.feature_id!r} resolution and provenance disagree"
                 )
-            if evidence.runtime_fingerprint != implementation.runtime_fingerprint:
+            if (
+                not isinstance(evidence, DirectorAdapterContractEvidence)
+                and evidence.runtime_fingerprint != implementation.runtime_fingerprint
+            ):
                 raise GraphAuditError(
                     f"feature {trace.feature_id!r} resolution fingerprint and "
                     "emission evidence disagree"
@@ -1091,7 +1112,7 @@ def build_graph_audit_spec(
     *,
     prompt: Mapping[str, Any],
     node_contract_registry: NodeContractRegistry,
-    node_contract_snapshot: Mapping[str, NodeContractEvidence],
+    node_contract_snapshot: Mapping[str, GraphNodeContractEvidence],
     public_writes: Sequence[PublicResourceWrite],
     public_reads: Sequence[PublicResourceRead],
     feature_traces: Sequence[FeatureAuditTrace],

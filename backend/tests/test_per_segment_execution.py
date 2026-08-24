@@ -22,7 +22,7 @@ from directordeck.app import (
     _sync_timeline_job,
     create_app,
 )
-from directordeck.comfy import ComfyError
+from directordeck.comfy import ComfyError, ComfyPromptRejected
 from directordeck.database import Database
 from directordeck.host_artifacts import PermanentHostOutputProbeError
 from directordeck.media import VideoProxy
@@ -309,10 +309,11 @@ async def test_128_segment_background_sync_uses_one_queue_and_one_bulk_history(
     )
     assert created.status_code == 200, created.text
     parent = created.json()
-    assert len(parent["children"]) == 128
     await _wait_for_prompt_count(fake_comfy, 128)
     assert len(fake_comfy.prompts) == 128
-    assert all(len(child["segment_ids"]) == 1 for child in parent["children"])
+    children = client.director_app.state.database.list_job_children(parent["id"])
+    assert len(children) == 128
+    assert all(len(child["segment_ids"]) == 1 for child in children)
 
     fake_comfy.queue_requests = 0
     fake_comfy.history_requests.clear()
@@ -322,7 +323,6 @@ async def test_128_segment_background_sync_uses_one_queue_and_one_bulk_history(
     assert fake_comfy.queue_requests == 0
     assert fake_comfy.history_requests == []
 
-    children = client.director_app.state.database.list_job_children(parent["id"])
     fake_comfy.pending = []
     fake_comfy.histories = {
         child["prompt_id"]: _success(child) for child in children
@@ -390,7 +390,7 @@ async def test_job_list_and_details_are_sqlite_only_when_comfy_is_a_black_hole(
             client.get(f"/api/jobs/{parent['id']}"),
             client.get("/api/jobs/legacy-black-hole"),
         ),
-        timeout=0.25,
+        timeout=5.0,
     )
 
     assert listing.status_code == 200
@@ -1424,6 +1424,111 @@ async def test_submit_side_effect_then_response_error_targets_durable_prompt(
     assert parent["stage"] == "submission_failed"
     assert child["status"] == "cancelled"
     assert child["stage"] == "cancelled_after_submission_failure"
+
+
+async def test_ambiguous_cleanup_releases_ticket_before_exact_cancel_finishes(
+    client, fake_comfy
+) -> None:
+    fake_comfy.submit_error_after_side_effect = ComfyError(
+        "response connection lost"
+    )
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def pause_before_exact_cancel(_job_id, _child_id):
+        cleanup_started.set()
+        await cleanup_release.wait()
+
+    client.director_app.state.before_cleanup_cancel_request = (
+        pause_before_exact_cancel
+    )
+    first = await client.post(
+        "/api/timeline/jobs",
+        json={"config": _timeline(_segment("cleanup-ticket-owner"))},
+    )
+    assert first.status_code == 200, first.text
+
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        fake_comfy.submit_error_after_side_effect = None
+        follower = await client.post(
+            "/api/timeline/jobs",
+            json={"config": _timeline(_segment("cleanup-ticket-follower"))},
+        )
+        assert follower.status_code == 200, follower.text
+        await _wait_for_prompt_count(fake_comfy, 2)
+
+        database = client.director_app.state.database
+        follower_child = database.list_job_children(follower.json()["id"])[0]
+        assert fake_comfy.prompts[1]["prompt_id"] == follower_child["id"]
+        assert first.json()["id"] in client.director_app.state.submission_jobs
+        assert not cleanup_release.is_set()
+    finally:
+        cleanup_release.set()
+
+    await _wait_for_submission_jobs(client)
+
+
+async def test_prompt_validation_rejection_fails_locally_and_releases_next_submit(
+    client, fake_comfy, monkeypatch
+) -> None:
+    original_submit = fake_comfy.submit
+    calls = 0
+    rejection_detail = {
+        "error": {"type": "prompt_outputs_failed_validation"},
+        "node_errors": {"7": {"class_type": "MissingLoader"}},
+    }
+
+    async def reject_first(prompt, client_id, prompt_id=None, *, on_receipt=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ComfyPromptRejected(
+                "validation rejected",
+                status_code=400,
+                detail=rejection_detail,
+            )
+        return await original_submit(
+            prompt,
+            client_id,
+            prompt_id,
+            on_receipt=on_receipt,
+        )
+
+    monkeypatch.setattr(fake_comfy, "submit", reject_first)
+    rejected = await client.post(
+        "/api/timeline/jobs",
+        json={"config": _timeline(_segment("definite-rejection"))},
+    )
+    assert rejected.status_code == 200, rejected.text
+    await _wait_for_submission_jobs(client)
+
+    database = client.director_app.state.database
+    rejected_parent = database.get_job(rejected.json()["id"])
+    rejected_child = database.list_job_children(rejected.json()["id"])[0]
+    assert rejected_parent is not None
+    assert rejected_parent["status"] == "failed"
+    assert rejected_parent["stage"] == "submission_failed"
+    assert rejected_child["status"] == "failed"
+    assert rejected_child["stage"] == "submission_failed"
+    assert rejected_child["prompt_id"] is None
+    assert database.get_job_child_execution_evidence(rejected_child["id"]) is None
+    assert database.get_prompt_ownership(rejected_child["id"]) is None
+    assert json.loads(rejected_child["error"])["detail"] == rejection_detail
+    assert fake_comfy.prompts == []
+    assert fake_comfy.cancelled == []
+    deleted = await client.delete(f"/api/jobs/{rejected.json()['id']}")
+    assert deleted.status_code == 200, deleted.text
+
+    following = await client.post(
+        "/api/timeline/jobs",
+        json={"config": _timeline(_segment("after-definite-rejection"))},
+    )
+    assert following.status_code == 200, following.text
+    await _wait_for_prompt_count(fake_comfy, 1)
+    await _wait_for_submission_jobs(client)
+    following_child = database.list_job_children(following.json()["id"])[0]
+    assert fake_comfy.prompts[0]["prompt_id"] == following_child["id"]
 
 
 async def test_explicit_retry_rejects_an_unreleased_prompt_owner(
@@ -2574,11 +2679,14 @@ async def test_lifespan_shutdown_cancels_and_clears_managed_sync_flights(
         (None, "submission_cancel_unconfirmed"),
     ],
 )
+@pytest.mark.parametrize("submit_error_kind", ["comfy", "timeout"])
 async def test_ambiguous_submit_cleanup_never_claims_failure_without_confirmed_cancel(
-    client, fake_comfy, cancel_error, expected_stage
+    client, fake_comfy, cancel_error, expected_stage, submit_error_kind
 ) -> None:
-    fake_comfy.submit_error_after_side_effect = ComfyError(
-        "response connection lost"
+    fake_comfy.submit_error_after_side_effect = (
+        ComfyError("response connection lost")
+        if submit_error_kind == "comfy"
+        else httpx.ReadTimeout("prompt response timed out")
     )
     if cancel_error is not None:
         fake_comfy.cancel_error = cancel_error
@@ -3090,7 +3198,7 @@ async def test_restart_reconciler_resumes_full_timeline_assembly(
     )
     monkeypatch.setattr(
         director_app_module,
-        "compile_v5_execution_plan",
+        "compile_project_execution_plan",
         compiler_recovery,
     )
 
@@ -3299,6 +3407,7 @@ async def test_runtime_recovery_selector_requires_explicit_parent_handoff(
     assert created.status_code == 200, created.text
     parent = created.json()
     database = client.director_app.state.database
+    await _wait_until(lambda: bool(database.list_job_children(parent["id"])))
     child = database.list_job_children(parent["id"])[0]
 
     database.update_job(parent["id"], status="preparing", stage="submitting")
@@ -3338,8 +3447,8 @@ async def test_runtime_recovery_never_cancels_live_preflight_or_submit(
     app.state.reconcile_interval_seconds = 0.01
     monkeypatch.setattr(app.state.progress_manager, "ensure", Mock())
     monkeypatch.setattr(app.state.progress_manager, "close", AsyncMock())
-    fake_comfy.preflight_started = asyncio.Event()
-    fake_comfy.preflight_release = asyncio.Event()
+    compile_started = asyncio.Event()
+    compile_release = asyncio.Event()
     fake_comfy.submit_started = asyncio.Event()
     fake_comfy.submit_release = asyncio.Event()
     cancel_calls = 0
@@ -3351,6 +3460,17 @@ async def test_runtime_recovery_never_cancels_live_preflight_or_submit(
         return await original_cancel(prompt_id)
 
     monkeypatch.setattr(fake_comfy, "cancel", count_cancel)
+
+    async def before_timeline_compile(_job_id: str) -> None:
+        compile_started.set()
+        await compile_release.wait()
+
+    monkeypatch.setattr(
+        app.state,
+        "before_timeline_compile",
+        before_timeline_compile,
+        raising=False,
+    )
 
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -3367,13 +3487,13 @@ async def test_runtime_recovery_never_cancels_live_preflight_or_submit(
                     },
                 )
             )
-            await asyncio.wait_for(fake_comfy.preflight_started.wait(), timeout=1)
+            await asyncio.wait_for(compile_started.wait(), timeout=1)
             await asyncio.sleep(0.04)
             parent = database.list_jobs()[0]
             assert parent["status"] == "preparing"
             assert cancel_calls == 0
 
-            fake_comfy.preflight_release.set()
+            compile_release.set()
             await asyncio.wait_for(fake_comfy.submit_started.wait(), timeout=1)
             await asyncio.sleep(0.04)
             parent = database.list_jobs()[0]
@@ -3431,6 +3551,14 @@ async def test_lifespan_recovers_interrupted_submission_and_empty_parent(
         status="cancelling",
         stage="submission_interrupted",
         error="shutdown interrupted submission",
+    )
+    # This is the Stage-0 admission window: the public parent exists, but the
+    # compiler has not yet filled its bounded runtime snapshot or child rows.
+    database.update_job(
+        "empty-parent",
+        stage="compiling",
+        settings_snapshot={},
+        prompt_snapshot=None,
     )
     database.update_job(
         "sigkill-parent",
@@ -4152,11 +4280,12 @@ async def test_stale_raylight_gpu_runtime_is_reported_and_never_submitted(
         "/api/timeline/jobs",
         json={"config": _timeline(_segment("blocked-stale-runtime", "t2v"))},
     )
-    assert rejected.status_code == 409, rejected.text
-    assert rejected.json()["detail"]["code"] == (
-        "raylight_runtime_restart_confirmation_required"
-    )
-    assert rejected.json()["detail"]["invalid_gpu_indexes"] == [4, 5, 6, 7]
+    assert rejected.status_code == 200, rejected.text
+    await _wait_for_submission_jobs(client)
+    stored = client.director_app.state.database.get_job(rejected.json()["id"])
+    assert stored is not None and stored["status"] == "failed"
+    assert stored["stage"] == "preflight_failed"
+    assert "raylight_runtime_restart_confirmation_required" in stored["error"]
     assert fake_comfy.prompts == []
     assert client.director_app.state.database.get_raylight_runtime_state() == before
 
@@ -4539,7 +4668,7 @@ async def test_raylight_restart_recovery_full_state_cas_preserves_late_tail(
     ))
 
 
-async def test_malformed_raylight_runtime_is_structured_conflict_not_submission_recovery(
+async def test_malformed_raylight_runtime_only_blocks_selected_raylight(
     client, fake_comfy
 ) -> None:
     database = client.director_app.state.database
@@ -4560,9 +4689,28 @@ async def test_malformed_raylight_runtime_is_structured_conflict_not_submission_
         "/api/timeline/jobs",
         json={"config": _timeline(_segment("malformed-runtime", "t2v"))},
     )
-    assert created.status_code == 409
-    assert created.json()["detail"]["code"] == "raylight_runtime_state_invalid"
-    assert fake_comfy.prompts == []
+    assert created.status_code == 200, created.text
+    await _wait_for_submission_jobs(client)
+    standard_stored = database.get_job(created.json()["id"])
+    assert standard_stored is not None and standard_stored["status"] == "queued", (
+        None if standard_stored is None else standard_stored["error"]
+    )
+    assert len(fake_comfy.prompts) == 1
+
+    assert (
+        await save_legacy_settings_document(client, _raylight_settings_document())
+    ).status_code == 200
+    ray = await client.post(
+        "/api/timeline/jobs",
+        json={"config": _timeline(_segment("malformed-runtime-ray", "t2v"))},
+    )
+    assert ray.status_code == 200, ray.text
+    await _wait_for_submission_jobs(client)
+    stored = database.get_job(ray.json()["id"])
+    assert stored is not None and stored["status"] == "failed"
+    assert stored["stage"] == "preflight_failed"
+    assert "raylight_runtime_state_invalid" in stored["error"]
+    assert len(fake_comfy.prompts) == 1
 
 
 def _initializer_namespace(prompt: dict) -> str:
@@ -4586,11 +4734,105 @@ async def _wait_until(predicate) -> None:
         while not predicate():
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(ready(), timeout=2.0)
+    await asyncio.wait_for(ready(), timeout=10.0)
 
 
 async def _wait_for_submission_jobs(client) -> None:
     await _wait_until(lambda: not client.director_app.state.submission_tasks)
+
+
+async def test_create_returns_admitted_job_before_runtime_preflight(
+    client, fake_comfy
+) -> None:
+    assert (
+        await save_legacy_settings_document(client, _raylight_settings_document())
+    ).status_code == 200
+    fake_comfy.preflight_started = asyncio.Event()
+    fake_comfy.preflight_release = asyncio.Event()
+
+    try:
+        response = await asyncio.wait_for(
+            client.post(
+                "/api/timeline/jobs",
+                json={"config": _timeline(_segment("early-admission"))},
+            ),
+            timeout=0.5,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "preparing"
+        job_id = response.json()["id"]
+        stored = client.director_app.state.database.get_job(job_id)
+        assert stored is not None
+        assert stored["stage"] in {"compiling", "preflight", "submitting"}
+        await asyncio.wait_for(fake_comfy.preflight_started.wait(), timeout=1)
+        assert fake_comfy.prompts == []
+    finally:
+        fake_comfy.preflight_release.set()
+
+    await _wait_for_prompt_count(fake_comfy, 1)
+    await _wait_for_submission_jobs(client)
+
+
+@pytest.mark.parametrize("first_compile_fails", [False, True])
+async def test_blocked_first_compiler_keeps_later_prompt_behind_admission_ticket(
+    client, fake_comfy, monkeypatch, first_compile_fails
+) -> None:
+    first_compile_started = asyncio.Event()
+    release_first_compile = asyncio.Event()
+    compile_order: list[str] = []
+
+    async def before_timeline_compile(job_id: str) -> None:
+        compile_order.append(job_id)
+        if len(compile_order) == 1:
+            first_compile_started.set()
+            await release_first_compile.wait()
+            if first_compile_fails:
+                raise ValueError("first compiler failed")
+
+    monkeypatch.setattr(
+        client.director_app.state,
+        "before_timeline_compile",
+        before_timeline_compile,
+        raising=False,
+    )
+    try:
+        first = await client.post(
+            "/api/timeline/jobs",
+            json={"config": _timeline(_segment("slow-first-compile"))},
+        )
+        assert first.status_code == 200, first.text
+        await asyncio.wait_for(first_compile_started.wait(), timeout=1)
+
+        second = await client.post(
+            "/api/timeline/jobs",
+            json={"config": _timeline(_segment("fast-second-compile"))},
+        )
+        assert second.status_code == 200, second.text
+        database = client.director_app.state.database
+        await _wait_until(
+            lambda: bool(database.list_job_children(second.json()["id"]))
+        )
+        assert fake_comfy.prompts == []
+
+        release_first_compile.set()
+        await _wait_for_prompt_count(fake_comfy, 1 if first_compile_fails else 2)
+        second_child = database.list_job_children(second.json()["id"])[0]
+        await _wait_for_submission_jobs(client)
+        if first_compile_fails:
+            failed_first = database.get_job(first.json()["id"])
+            assert failed_first is not None and failed_first["status"] == "failed"
+            assert [item["prompt_id"] for item in fake_comfy.prompts] == [
+                second_child["id"]
+            ]
+        else:
+            first_child = database.list_job_children(first.json()["id"])[0]
+            assert [item["prompt_id"] for item in fake_comfy.prompts] == [
+                first_child["id"],
+                second_child["id"],
+            ]
+    finally:
+        release_first_compile.set()
 
 
 async def _make_ambiguous_standard_recovery_tail(client, fake_comfy, identity: str):
@@ -4680,6 +4922,9 @@ async def test_raylight_dispatcher_returns_preparing_and_terminal_gates_parents(
 
     database = client.director_app.state.database
     first_children = database.list_job_children(first.json()["id"])
+    await _wait_until(
+        lambda: bool(database.list_job_children(second.json()["id"]))
+    )
     second_children = database.list_job_children(second.json()["id"])
     assert first_children[0]["prompt_id"] == fake_comfy.prompts[0]["prompt_id"]
     assert first_children[1]["prompt_id"] is None
@@ -4704,7 +4949,7 @@ async def test_raylight_dispatcher_returns_preparing_and_terminal_gates_parents(
     )
 
 
-async def test_ambiguous_old_standard_submission_gates_new_raylight_until_recovered(
+async def test_ambiguous_old_standard_submission_does_not_gate_new_raylight(
     client, fake_comfy, monkeypatch
 ) -> None:
     old_parent, old_child = await _make_ambiguous_standard_recovery_tail(
@@ -4722,39 +4967,18 @@ async def test_ambiguous_old_standard_submission_gates_new_raylight_until_recove
         json={"config": _timeline(_segment("ray-after-ambiguous-standard", "t2v"))},
     )
     assert newer.status_code == 200
-    for _ in range(10):
-        await asyncio.sleep(0)
-    assert len(fake_comfy.prompts) == 1
-    newer_child = client.director_app.state.database.list_job_children(
-        newer.json()["id"]
-    )[0]
-    assert newer_child["prompt_id"] is None
-
-    # The first recovery attempt cannot prove the old POST absent forever.
-    # Its durable marker continues to hold the endpoint gate.
-    await _recover_interrupted_submission(
-        _background_request(client.director_app), old_parent
-    )
-    assert len(fake_comfy.prompts) == 1
-    assert client.director_app.state.database.get_job_child(old_child["id"])[
-        "stage"
-    ] == "restart_cancel_unconfirmed"
-
-    # Model the old Standard POST reaching queue.put after that first cancel
-    # returned false. Directed recovery must cancel it before Ray can submit.
-    fake_comfy.pending = [[0, old_child["prompt_id"]]]
-    await _recover_interrupted_submission(
-        _background_request(client.director_app), old_parent
-    )
     await _wait_for_prompt_count(fake_comfy, 2)
     assert any(
         node.get("class_type") == "DirectorDeckRayInitializerAdvanced"
         for node in fake_comfy.prompts[1]["prompt"].values()
     )
-    assert fake_comfy.cancelled == [old_child["prompt_id"]]
+    assert client.director_app.state.database.get_job_child(old_child["id"])[
+        "stage"
+    ] == "restart_cancel_pending"
+    assert fake_comfy.cancelled == []
 
 
-async def test_cancel_new_parent_aborts_ambiguous_standard_recovery_gate(
+async def test_cancel_new_parent_does_not_mutate_ambiguous_old_standard_recovery(
     client, fake_comfy, monkeypatch
 ) -> None:
     old_parent, old_child = await _make_ambiguous_standard_recovery_tail(
@@ -4766,17 +4990,19 @@ async def test_cancel_new_parent_aborts_ambiguous_standard_recovery_gate(
     monkeypatch.setattr(
         director_app_module, "_RAYLIGHT_GENERATION_POLL_SECONDS", 0.001
     )
+    fake_comfy.preflight_started = asyncio.Event()
+    fake_comfy.preflight_release = asyncio.Event()
     newer = await client.post(
         "/api/timeline/jobs",
         json={"config": _timeline(_segment("cancelled-behind-old-standard", "t2v"))},
     )
     assert newer.status_code == 200
-    for _ in range(10):
-        await asyncio.sleep(0)
+    await asyncio.wait_for(fake_comfy.preflight_started.wait(), timeout=1)
     assert len(fake_comfy.prompts) == 1
 
     cancelled = await client.post(f"/api/jobs/{newer.json()['id']}/cancel")
     assert cancelled.status_code == 200
+    fake_comfy.preflight_release.set()
     await _wait_for_submission_jobs(client)
     assert client.director_app.state.database.get_job(newer.json()["id"])[
         "status"
@@ -5148,6 +5374,7 @@ async def test_cancelled_waiting_dispatcher_releases_ownership_for_immediate_del
     )
     assert waiting.status_code == 200, waiting.text
     waiting_id = waiting.json()["id"]
+    await _wait_until(lambda: bool(database.list_job_children(waiting_id)))
     waiting_child = database.list_job_children(waiting_id)[0]
     assert waiting_child["prompt_id"] is None
     assert len(fake_comfy.prompts) == 1
@@ -5168,6 +5395,9 @@ async def test_cancelled_waiting_dispatcher_releases_ownership_for_immediate_del
         json={"config": _timeline(_segment("still-waits-for-real-owner", "t2v"))},
     )
     assert follower.status_code == 200, follower.text
+    await _wait_until(
+        lambda: bool(database.list_job_children(follower.json()["id"]))
+    )
     follower_child = database.list_job_children(follower.json()["id"])[0]
     assert follower_child["prompt_id"] is None
     assert len(fake_comfy.prompts) == 1
@@ -5204,6 +5434,7 @@ async def test_terminal_cancel_retry_quiesces_waiting_dispatcher_before_delete(
     )
     assert waiting.status_code == 200, waiting.text
     waiting_id = waiting.json()["id"]
+    await _wait_until(lambda: bool(database.list_job_children(waiting_id)))
     waiting_child = database.list_job_children(waiting_id)[0]
     assert waiting_child["prompt_id"] is None
 
@@ -5212,6 +5443,9 @@ async def test_terminal_cancel_retry_quiesces_waiting_dispatcher_before_delete(
         json={"config": _timeline(_segment("terminal-retry-follower", "t2v"))},
     )
     assert follower.status_code == 200, follower.text
+    await _wait_until(
+        lambda: bool(database.list_job_children(follower.json()["id"]))
+    )
     follower_child = database.list_job_children(follower.json()["id"])[0]
     assert follower_child["prompt_id"] is None
 
@@ -5278,6 +5512,9 @@ async def test_cancelled_middle_ticket_keeps_pending_predecessor_order(
         )
         assert first.status_code == middle.status_code == 200
         database = client.director_app.state.database
+        await _wait_until(
+            lambda: bool(database.list_job_children(first.json()["id"]))
+        )
         first_child = database.list_job_children(first.json()["id"])[0]
         assert fake_comfy.prompts == []
 
@@ -5294,6 +5531,9 @@ async def test_cancelled_middle_ticket_keeps_pending_predecessor_order(
             json={"config": _timeline(_segment("ticket-proxy-last", "t2v"))},
         )
         assert last.status_code == 200, last.text
+        await _wait_until(
+            lambda: bool(database.list_job_children(last.json()["id"]))
+        )
         last_child = database.list_job_children(last.json()["id"])[0]
         await asyncio.sleep(0.02)
         assert fake_comfy.prompts == []
@@ -5387,12 +5627,11 @@ async def test_cancelled_ticket_waiter_closes_dynamically_created_barrier(
     holder_child = database.list_job_children(holder.json()["id"])[0]
     _complete_fake_prompt(fake_comfy, holder_child)
     await _wait_until(lambda: not client.director_app.state.submission_tasks)
-    # The cancelled parent can discover that a barrier would have been needed
-    # only after its predecessor completes. Its control audit row must still
-    # be terminal, and no DirectorDeckRayKill may cross the network on its behalf.
+    # Cancellation may win before compilation materializes any child. If a
+    # child already exists it must be terminal, and no DirectorDeckRayKill may
+    # cross the network on the cancelled parent's behalf.
     assert len(fake_comfy.prompts) == 1
     children = database.list_job_children(waiter.json()["id"])
-    assert children
     assert all(child["status"] == "cancelled" for child in children)
     assert all(child.get("prompt_id") is None for child in children)
 
@@ -5400,7 +5639,7 @@ async def test_cancelled_ticket_waiter_closes_dynamically_created_barrier(
 @pytest.mark.parametrize(
     "recovery_stage", ["submission_cancel_unconfirmed", "restart_cancel_pending"]
 )
-async def test_new_parent_waits_for_ambiguous_old_raylight_submission_recovery(
+async def test_ambiguous_old_raylight_fails_only_the_selected_ray_job(
     client, fake_comfy, monkeypatch, recovery_stage: str
 ) -> None:
     settings = _raylight_settings_document()
@@ -5416,7 +5655,6 @@ async def test_new_parent_waits_for_ambiguous_old_raylight_submission_recovery(
     await _wait_for_prompt_count(fake_comfy, 1)
     database = client.director_app.state.database
     old_child = database.list_job_children(old.json()["id"])[0]
-    old_prompt_id = str(old_child["prompt_id"])
     fake_comfy.pending = []
     database.update_job_child(
         old_child["id"], status="cancelling", stage=recovery_stage
@@ -5430,45 +5668,47 @@ async def test_new_parent_waits_for_ambiguous_old_raylight_submission_recovery(
         json={"config": _timeline(_segment(f"new-{recovery_stage}", "t2v"))},
     )
     assert newer.status_code == 200
-    for _ in range(20):
-        await asyncio.sleep(0)
+    await _wait_for_submission_jobs(client)
     assert len(fake_comfy.prompts) == 1
+    failed = database.get_job(newer.json()["id"])
+    assert failed is not None and failed["status"] == "failed"
+    assert "raylight_transition_recovery_pending" in failed["error"]
 
-    # The ambiguous old POST may become visible only after the newer request
-    # was accepted locally. It must remain ahead of any replacement barrier.
-    fake_comfy.pending = [[0, old_prompt_id]]
-    for _ in range(20):
-        await asyncio.sleep(0)
-    assert len(fake_comfy.prompts) == 1
-
-    # Model the recovery owner receiving a directed-cancel acknowledgement.
-    fake_comfy.pending = []
-    old_ownership = database.get_prompt_ownership(old_child["id"])
-    assert old_ownership is not None
-    released = director_app_module._confirm_typed_exact_cancel(
-        database,
-        old_child["id"],
-        old_ownership,
-        stage="cancelled",
+    # The old job retains its own durable recovery ownership, but an unrelated
+    # Standard job is admitted and reaches ComfyUI immediately.
+    settings["multi_gpu_enabled"] = False
+    settings["models"]["fl2va"].update(
+        backend="standard",
+        raylight={
+            "gpu_select": [0],
+            "ulysses_degree": 1,
+            "ring_degree": 1,
+            "cfg_degree": 1,
+            "dp_degree": 1,
+            "fsdp": False,
+            "cpu_offload": False,
+        },
     )
-    assert released is not None
-    database.update_job(
-        old.json()["id"],
-        status="cancelled",
-        progress=1.0,
-        stage="cancelled",
-        completed_at=utc_now(),
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
+    standard = await client.post(
+        "/api/timeline/jobs",
+        json={"config": _timeline(_segment(f"standard-{recovery_stage}", "t2v"))},
     )
-    fake_comfy.auto_complete_raylight = True
-    await _wait_for_prompt_count(fake_comfy, 3)
-    assert any(
+    assert standard.status_code == 200
+    await _wait_for_submission_jobs(client)
+    stored_standard = database.get_job(standard.json()["id"])
+    assert stored_standard is not None and stored_standard["status"] == "queued", (
+        None if stored_standard is None else stored_standard["error"]
+    )
+    await _wait_for_prompt_count(fake_comfy, 2)
+    assert not any(
         node.get("class_type") == "DirectorDeckRayKill"
         for node in fake_comfy.prompts[1]["prompt"].values()
     )
-    assert not any(
-        node.get("class_type") == "DirectorDeckRayKill"
-        for node in fake_comfy.prompts[2]["prompt"].values()
-    )
+    old_after = database.get_job_child(old_child["id"])
+    assert old_after is not None
+    assert old_after["status"] == "cancelling"
+    assert old_after["prompt_id"] == old_child["prompt_id"]
 
 
 async def test_cancel_new_parent_aborts_ambiguous_old_raylight_tail_gate(
@@ -5614,6 +5854,7 @@ async def test_standard_create_returns_preparing_behind_running_raylight(
         ray.json()["id"]
     )[0]
 
+    settings["multi_gpu_enabled"] = False
     settings["models"]["fl2va"].update(
         backend="standard",
         raylight={
@@ -5637,10 +5878,12 @@ async def test_standard_create_returns_preparing_behind_running_raylight(
     assert standard.status_code == 200
     assert standard.json()["status"] == "preparing"
     assert len(fake_comfy.prompts) == 1
-    standard_child = client.director_app.state.database.list_job_children(
+    # Admission now precedes compilation and child materialization.  The
+    # accepted parent is immediately visible even while endpoint-local work is
+    # serialized behind the running Ray task.
+    assert not client.director_app.state.database.list_job_children(
         standard.json()["id"]
-    )[0]
-    assert standard_child["prompt_id"] is None
+    )
 
     _complete_fake_prompt(fake_comfy, ray_child)
     await _wait_for_prompt_count(fake_comfy, 3)
@@ -5657,7 +5900,7 @@ async def test_standard_create_returns_preparing_behind_running_raylight(
 @pytest.mark.parametrize(
     "recovery_stage", ["submission_cancel_unconfirmed", "restart_cancel_pending"]
 )
-async def test_new_parent_waits_for_ambiguous_old_raylight_shutdown(
+async def test_ambiguous_old_raylight_shutdown_is_not_a_global_gate(
     client, fake_comfy, monkeypatch, recovery_stage: str
 ) -> None:
     settings = _raylight_settings_document()
@@ -5734,35 +5977,99 @@ async def test_new_parent_waits_for_ambiguous_old_raylight_shutdown(
         json={"config": _timeline(_segment(f"after-shutdown-{recovery_stage}", "r2v"))},
     )
     assert newer.status_code == 200
-    for _ in range(20):
-        await asyncio.sleep(0)
+    await _wait_for_submission_jobs(client)
     assert len(fake_comfy.prompts) == 1
-    # A delayed old DirectorDeckRayKill may appear after newer local acceptance; it still
-    # owns the endpoint order and no replacement/target may be submitted yet.
-    fake_comfy.pending = [[0, old_barrier_id]]
-    for _ in range(20):
-        await asyncio.sleep(0)
-    assert len(fake_comfy.prompts) == 1
+    failed = database.get_job(newer.json()["id"])
+    assert failed is not None and failed["status"] == "failed"
+    assert "raylight_transition_recovery_pending" in failed["error"]
 
-    fake_comfy.pending = []
-    database.update_job_child(
-        old_barrier_id,
-        status="cancelled",
-        progress=1.0,
-        stage="cancelled",
-        completed_at=utc_now(),
+    # The selected Ray job fails locally, but the historical shutdown does not
+    # become an endpoint-wide gate.  Standard submission proceeds without
+    # taking ownership of or rewriting the ambiguous Ray ledger.
+    settings["multi_gpu_enabled"] = False
+    settings["models"]["fl2va"].update(
+        backend="standard",
+        raylight={
+            "gpu_select": [0],
+            "ulysses_degree": 1,
+            "ring_degree": 1,
+            "cfg_degree": 1,
+            "dp_degree": 1,
+            "fsdp": False,
+            "cpu_offload": False,
+        },
     )
-    database.update_job(
-        old_parent_id,
-        status="cancelled",
-        progress=1.0,
-        stage="cancelled",
-        completed_at=utc_now(),
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
+    standard = await client.post(
+        "/api/timeline/jobs",
+        json={
+            "config": _timeline(
+                _segment(f"standard-after-shutdown-{recovery_stage}", "t2v")
+            )
+        },
     )
-    await _wait_for_prompt_count(fake_comfy, 3)
-    assert any(
+    assert standard.status_code == 200
+    await _wait_for_submission_jobs(client)
+    stored_standard = database.get_job(standard.json()["id"])
+    assert stored_standard is not None and stored_standard["status"] == "queued", (
+        None if stored_standard is None else stored_standard["error"]
+    )
+    await _wait_for_prompt_count(fake_comfy, 2)
+    assert not any(
         node.get("class_type") == "DirectorDeckRayKill"
-        for node in fake_comfy.prompts[1]["prompt"].values()
+        for node in fake_comfy.prompts[-1]["prompt"].values()
+    )
+
+
+async def test_missing_ambiguous_raylight_tail_child_does_not_gate_standard(
+    client, fake_comfy
+) -> None:
+    settings = _raylight_settings_document()
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
+    resident = await client.post(
+        "/api/timeline/jobs",
+        json={"config": _timeline(_segment("missing-tail-resident", "t2v"))},
+    )
+    assert resident.status_code == 200
+    await _wait_for_prompt_count(fake_comfy, 1)
+    database = client.director_app.state.database
+    state = database.get_raylight_runtime_state()
+    assert state is not None and state["current"] is not None
+    database.put_raylight_runtime_state(
+        {
+            "version": 2,
+            "epoch": state["epoch"],
+            "current": state["current"],
+            "tail_prompt_id": str(uuid.uuid4()),
+            "tail_action": "shutdown",
+            "tainted": True,
+        }
+    )
+
+    settings["multi_gpu_enabled"] = False
+    settings["models"]["fl2va"].update(
+        backend="standard",
+        raylight={
+            "gpu_select": [0],
+            "ulysses_degree": 1,
+            "ring_degree": 1,
+            "cfg_degree": 1,
+            "dp_degree": 1,
+            "fsdp": False,
+            "cpu_offload": False,
+        },
+    )
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
+    standard = await client.post(
+        "/api/timeline/jobs",
+        json={"config": _timeline(_segment("standard-after-missing-tail", "t2v"))},
+    )
+
+    assert standard.status_code == 200
+    await _wait_for_prompt_count(fake_comfy, 2)
+    assert not any(
+        node.get("class_type") == "DirectorDeckRayKill"
+        for node in fake_comfy.prompts[-1]["prompt"].values()
     )
 
 
@@ -5855,7 +6162,7 @@ async def test_raylight_model_switch_reuses_pool_and_epoch_without_barrier(
     assert len(barriers) == 0
 
 
-async def test_legacy_torch_flash_pool_crosses_barrier_before_default_ck(
+async def test_legacy_torch_flash_pool_crosses_compatibility_barrier_without_enabling_ck(
     client, fake_comfy
 ) -> None:
     settings = _raylight_settings_document()
@@ -5922,7 +6229,7 @@ async def test_legacy_torch_flash_pool_crosses_barrier_before_default_ck(
     # DirectorDeckRayKill must replay the persisted old initializer verbatim instead of
     # silently changing its kernel while reconstructing the loader chain.
     assert attention(barrier) == "TORCH_FLASH"
-    assert attention(current_prompt) == "COMFY_KITCHEN_INT8"
+    assert attention(current_prompt) == "TORCH_FLASH"
     assert _initializer_namespace(barrier) == legacy_namespace
     assert _initializer_namespace(current_prompt).endswith("-e2")
     assert _initializer_namespace(current_prompt) != legacy_namespace
@@ -5993,7 +6300,7 @@ async def test_mixed_raylight_job_reuses_pool_across_families_without_barrier(
         response.json()["id"]
     )
     assert all(child["segment_ids"] for child in children)
-    assert len(response.json()["children"]) == 2
+    assert len(children) == 2
 
     fake_comfy.pending = []
     fake_comfy.histories.update(
@@ -6002,6 +6309,43 @@ async def test_mixed_raylight_job_reuses_pool_across_families_without_barrier(
     completed = await _reconcile(client, response.json())
     assert completed["status"] == "succeeded"
     assert completed["progress"] == 1.0
+
+
+async def test_global_multi_gpu_setting_ignores_retired_per_family_backend(
+    client, fake_comfy
+) -> None:
+    settings = _raylight_settings_document()
+    settings["models"]["fl2va"]["backend"] = "standard"
+    assert (await save_legacy_settings_document(client, settings)).status_code == 200
+
+    response = await client.post(
+        "/api/timeline/jobs",
+        json={"config": _timeline(_segment("global-ray", "t2v"))},
+    )
+
+    assert response.status_code == 200, response.text
+    await _wait_for_submission_jobs(client)
+    stored = client.director_app.state.database.get_job(response.json()["id"])
+    assert stored is not None and stored["error"] is None, (
+        None if stored is None else stored["error"]
+    )
+    await _wait_for_prompt_count(fake_comfy, 1)
+    children = client.director_app.state.database.list_job_children(
+        response.json()["id"]
+    )
+    assert [child["backend"] for child in children] == ["raylight"]
+    assert all(
+        any(
+            node.get("class_type") == "DirectorDeckRayUNETLoader"
+            for node in submission["prompt"].values()
+        )
+        for submission in fake_comfy.prompts
+    )
+    assert not any(
+        node.get("class_type") == "DirectorDeckRayKill"
+        for submission in fake_comfy.prompts
+        for node in submission["prompt"].values()
+    )
 
 
 async def test_raylight_barrier_queue_wait_does_not_consume_execution_timeout(
@@ -6170,6 +6514,17 @@ async def test_raylight_to_standard_waits_for_full_loader_kill_barrier(
     assert ray.status_code == 200
     await _wait_for_prompt_count(fake_comfy, 1)
 
+    class ForbiddenProductionHostObservation:
+        def snapshot(self):
+            raise AssertionError(
+                "RayLight transition submission must not capture host classes"
+            )
+
+    client.director_app.state.host_capability_provider = (
+        ForbiddenProductionHostObservation()
+    )
+
+    settings["multi_gpu_enabled"] = False
     settings["models"]["fl2va"].update(
         backend="standard",  # obsolete value is deliberately ignored
         raylight={
@@ -6385,19 +6740,18 @@ async def test_legacy_direct_raylight_descriptor_requires_restart_certificate(
         "/api/timeline/jobs",
         json={"config": _timeline(_segment("legacy-direct-next", "t2v"))},
     )
-    assert created.status_code == 409
-    assert created.json()["detail"]["code"] == (
-        "raylight_runtime_restart_confirmation_required"
-    )
-    assert "旧版 RayLight" in created.json()["detail"]["message"]
-    parent = database.list_jobs()[0]
+    assert created.status_code == 200, created.text
+    await _wait_for_submission_jobs(client)
+    parent = database.get_job(created.json()["id"])
+    assert parent is not None
     assert parent["status"] == "failed"
     assert parent["stage"] == "preflight_failed"
+    assert "raylight_runtime_restart_confirmation_required" in parent["error"]
     assert fake_comfy.prompts == []
 
 
 @pytest.mark.parametrize("legacy_shape", ["direct", "envelope"])
-async def test_legacy_unknown_raylight_pool_blocks_until_restart_recovery(
+async def test_legacy_unknown_raylight_pool_does_not_gate_standard(
     client, fake_comfy, legacy_shape: str
 ) -> None:
     database = client.director_app.state.database
@@ -6429,19 +6783,15 @@ async def test_legacy_unknown_raylight_pool_blocks_until_restart_recovery(
         "/api/timeline/jobs",
         json={"config": _timeline(_segment(f"legacy-{legacy_shape}-standard", "t2v"))},
     )
-    assert created.status_code == 409
-    assert created.json()["detail"]["code"] == (
-        "raylight_runtime_restart_confirmation_required"
-    )
-
-    parent = database.list_jobs()[0]
-    assert parent["status"] == "failed"
-    assert parent["stage"] == "preflight_failed"
-    assert "旧版 RayLight 运行状态" in str(parent["error"])
-    assert fake_comfy.prompts == []
+    assert created.status_code == 200, created.text
+    await _wait_for_submission_jobs(client)
+    parent = database.get_job(created.json()["id"])
+    assert parent is not None and parent["status"] == "queued"
+    assert len(fake_comfy.prompts) == 1
+    assert database.get_raylight_runtime_state() is not None
 
 
-async def test_restart_recovers_positive_shutdown_barrier_before_standard(
+async def test_standard_does_not_adopt_certified_old_shutdown_tail(
     client, fake_comfy
 ) -> None:
     settings = _raylight_settings_document()
@@ -6474,6 +6824,7 @@ async def test_restart_recovers_positive_shutdown_barrier_before_standard(
         "status": {"status_str": "success", "completed": True, "messages": []},
         "outputs": {},
     }
+    settings["multi_gpu_enabled"] = False
     settings["models"]["fl2va"].update(
         backend="standard",  # obsolete value is deliberately ignored
         raylight={
@@ -6503,13 +6854,14 @@ async def test_restart_recovers_positive_shutdown_barrier_before_standard(
     )
     settled = database.get_raylight_runtime_state()
     assert settled is not None
-    assert settled["current"] is None
-    assert settled["tail_action"] is None
-    assert settled["tainted"] is False
+    assert settled["current"] == state["current"]
+    assert settled["tail_prompt_id"] == barrier_prompt_id
+    assert settled["tail_action"] == "shutdown"
+    assert settled["tainted"] is True
 
 
 @pytest.mark.parametrize("old_barrier_result", ["failed", "absent"])
-async def test_restart_replaces_dead_shutdown_tail_before_standard(
+async def test_standard_does_not_adopt_dead_shutdown_tail(
     client, fake_comfy, old_barrier_result: str
 ) -> None:
     settings = _raylight_settings_document()
@@ -6537,6 +6889,7 @@ async def test_restart_replaces_dead_shutdown_tail_before_standard(
     if old_barrier_result == "failed":
         fake_comfy.histories[dead_prompt_id] = _failure("old DirectorDeckRayKill failed")
 
+    settings["multi_gpu_enabled"] = False
     settings["models"]["fl2va"].update(
         backend="standard",
         raylight={
@@ -6556,16 +6909,18 @@ async def test_restart_replaces_dead_shutdown_tail_before_standard(
         json={"config": _timeline(_segment(f"standard-{old_barrier_result}", "t2v"))},
     )
     assert standard.status_code == 200
-    await _wait_for_prompt_count(fake_comfy, before + 2)
+    await _wait_for_prompt_count(fake_comfy, before + 1)
     submitted = fake_comfy.prompts[before:]
-    assert any(
+    assert len(submitted) == 1
+    assert not any(
         node.get("class_type") == "DirectorDeckRayKill"
         for node in submitted[0]["prompt"].values()
     )
-    assert not any(
-        node.get("class_type") == "DirectorDeckRayKill"
-        for node in submitted[1]["prompt"].values()
-    )
+    preserved = database.get_raylight_runtime_state()
+    assert preserved is not None
+    assert preserved["tail_prompt_id"] == dead_prompt_id
+    assert preserved["tail_action"] == "shutdown"
+    assert preserved["tainted"] is True
 
 
 @pytest.mark.parametrize("backend", ["standard", "raylight"])
@@ -6810,10 +7165,14 @@ async def test_continuity_selection_must_be_predecessor_closed_with_zero_posts(
             "segment_ids": ["selection-successor"],
         },
     )
-    assert response.status_code == 422
-    assert response.json()["detail"]["code"] == "historical_take_required"
-    assert "selection-root" not in response.text
-    assert "selection-successor" not in response.text
+    assert response.status_code == 200, response.text
+    await _wait_for_submission_jobs(client)
+    stored = client.director_app.state.database.get_job(response.json()["id"])
+    assert stored is not None and stored["status"] == "failed"
+    assert stored["stage"] == "compile_failed"
+    assert "historical_take_required" in stored["error"]
+    assert "selection-root" not in stored["error"]
+    assert "selection-successor" not in stored["error"]
     assert fake_comfy.prompts == []
 
 

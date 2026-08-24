@@ -285,7 +285,7 @@ async def test_standard_native_events_publish_explicit_pre_sampling_stages(
     sampling_started = database.get_job_child(child["id"])
     assert sampling_started is not None
     assert sampling_started["progress"] == pytest.approx(0.01)
-    assert sampling_started["stage"] == "采样中"
+    assert sampling_started["stage"] == "正在加载模型并准备采样"
 
     await sink(
         "http://comfy.test:8188",
@@ -367,7 +367,10 @@ async def test_immediate_raylight_execution_before_submit_response_is_preserved(
     database = client.director_app.state.database
 
     async def child_is_running() -> None:
-        while database.list_job_children(parent["id"])[0]["status"] != "running":
+        while True:
+            children = database.list_job_children(parent["id"])
+            if children and children[0]["status"] == "running":
+                return
             await asyncio.sleep(0)
 
     await asyncio.wait_for(child_is_running(), timeout=1.0)

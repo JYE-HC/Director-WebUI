@@ -11,6 +11,10 @@ import directordeck.database as database_module
 from directordeck.database import Database
 from directordeck.migrations.timeline_v4_v5 import migrate_timeline_v4_to_v5
 from directordeck.schemas import default_settings, default_timeline_draft
+from directordeck.workflow.effective_features import (
+    migrate_timeline_feature_authority_to_v5,
+)
+from directordeck.workflow.v6_projection import project_v5_authority_to_v6
 
 from .conftest import asset, runnable_draft, save_timeline_document
 
@@ -315,10 +319,14 @@ def test_multi_asset_cascade_validation_failure_rolls_back_batch_and_documents(
     raw = timeline_with_anchors()
     current_revision = database.get_timeline_authority()[1]
     database.validate_and_put_timeline_authority(
-        migrate_timeline_v4_to_v5(
-            document.model_validate(raw),
-            default_settings(),
-        ),
+        project_v5_authority_to_v6(
+            migrate_timeline_feature_authority_to_v5(
+                migrate_timeline_v4_to_v5(
+                    document.model_validate(raw),
+                    default_settings(),
+                )
+            )
+        ).draft,
         expected_revision=current_revision,
     )
     before, before_revision = database.get_timeline_authority()

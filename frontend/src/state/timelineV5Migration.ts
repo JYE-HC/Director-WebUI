@@ -1,9 +1,9 @@
 import {
   migrateLegacyTimelineProjectToV5,
-  migrateTimelineFeatureBundle4To5,
   normalizeFeatureSelection,
   normalizeLegacyTimelineProject,
   normalizeTimelineProject,
+  projectTimelineFeatureBundle,
   type FeatureSelection,
   type LegacyTimelineProjectV4,
   type ModelStack,
@@ -13,7 +13,10 @@ import {
   type TimelineWalDatabaseIdentity,
 } from "../domain/timelineProject";
 
-export { migrateTimelineFeatureBundle4To5 } from "../domain/timelineProject";
+export {
+  migrateTimelineFeatureBundle4To5,
+  migrateTimelineFeatureBundle5To6,
+} from "../domain/timelineProject";
 import {
   applyTimelinePatches,
   createTimelinePatchPair,
@@ -315,7 +318,7 @@ function sameDigest(left: DocumentDigest | null, right: DocumentDigest): boolean
 
 type ReceiptDestinationAuthority = {
   revision: number;
-  featureBundleVersion: 4 | 5;
+  featureBundleVersion: 4 | 5 | 6;
 };
 
 function receiptDestinationAuthority(
@@ -337,18 +340,24 @@ function receiptDestinationAuthority(
       featureBundleVersion: 4,
     };
   }
-  const upgraded = migrateTimelineFeatureBundle4To5(receiptDestination);
-  const upgradedRevision = receipt.new_revision + 1;
-  if (
-    upgraded &&
-    Number.isSafeInteger(upgradedRevision) &&
-    serverRevision === upgradedRevision &&
-    timelineValuesEqual(serverProject, upgraded)
-  ) {
-    return {
-      revision: upgradedRevision,
-      featureBundleVersion: 5,
-    };
+  for (const targetBundleVersion of [5, 6] as const) {
+    const projected = projectTimelineFeatureBundle(
+      receiptDestination,
+      targetBundleVersion,
+    );
+    const projectedRevision = receipt.new_revision + (projected?.revision_steps ?? 0);
+    if (
+      projected &&
+      projected.revision_steps > 0 &&
+      Number.isSafeInteger(projectedRevision) &&
+      serverRevision === projectedRevision &&
+      timelineValuesEqual(serverProject, projected.document)
+    ) {
+      return {
+        revision: projectedRevision,
+        featureBundleVersion: targetBundleVersion,
+      };
+    }
   }
   return null;
 }
@@ -415,9 +424,12 @@ export function resolveLegacyTimelineWalWithReceipt(
     receipt.legacy_creative_binding_context,
   );
   if (!migratedPending) return conflict("receipt-mismatch");
-  const project = destinationAuthority.featureBundleVersion === 5
-    ? migrateTimelineFeatureBundle4To5(migratedPending)
-    : migratedPending;
+  const project = destinationAuthority.featureBundleVersion === 4
+    ? migratedPending
+    : projectTimelineFeatureBundle(
+        migratedPending,
+        destinationAuthority.featureBundleVersion,
+      )?.document ?? null;
   return project
     ? {
         status: "replay",

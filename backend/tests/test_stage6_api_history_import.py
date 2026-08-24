@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import uuid
 
 import pytest
@@ -23,11 +24,13 @@ from directordeck.schemas import (
     RuntimeSettingsV1,
     UnifiedTimelineDraftV4,
     UnifiedTimelineDraftV5,
+    default_model_stack,
     default_settings,
     default_timeline_draft,
+    default_timeline_draft_v5,
 )
 
-from .conftest import runnable_draft
+from .conftest import runnable_draft, wait_for_submission_tasks
 
 
 def _test_migrate(
@@ -71,6 +74,14 @@ def _test_migrate(
         },
     )
     return UnifiedTimelineDraftV5.model_validate(document)
+
+
+def _complete_frozen_v5_document(prompt: str) -> dict:
+    document = default_timeline_draft_v5(
+        default_model_stack()
+    ).model_dump(mode="json")
+    document["segments"][0]["prompt"] = prompt
+    return document
 
 
 @pytest.mark.parametrize("mode", ("t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v"))
@@ -479,13 +490,18 @@ async def test_new_project_can_be_incomplete_but_compile_fails_closed(client) ->
         binding["filename"] is None
         for binding in timeline["model_stack"].values()
     )
+    timeline["segments"][0]["prompt"] = "Incomplete model binding test"
 
     compile_response = await client.post(
         f"/api/projects/{project_id}/compile",
         json={"config": timeline},
     )
     assert compile_response.status_code == 422, compile_response.text
-    assert compile_response.json()["detail"]["code"] == "model_binding_required"
+    detail = compile_response.json()["detail"]
+    assert detail["code"] == "model_binding_required"
+    assert detail["reasons"][0]["safe_details"] == {
+        "bindings": ["clip", "video_vae", "audio_vae", "fl2va"]
+    }
 
 
 async def test_v5_job_request_is_required_and_never_falls_back_to_project(
@@ -521,13 +537,7 @@ async def test_v5_submit_captures_one_runtime_snapshot_and_no_project_document(
     client, monkeypatch
 ) -> None:
     database = client.director_app.state.database
-    document = (await client.get("/api/timeline")).json()
-    document["segments"][0]["prompt"] = "A submitted v5 snapshot"
-    legacy_models = default_settings().models
-    for role in ("fl2va", "ref2va", "clip", "video_vae", "audio_vae"):
-        document["model_stack"][role]["filename"] = getattr(
-            legacy_models, role
-        ).filename
+    document = _complete_frozen_v5_document("A submitted v5 snapshot")
 
     settings_reads = 0
     original_get_settings = database.get_settings
@@ -552,6 +562,7 @@ async def test_v5_submit_captures_one_runtime_snapshot_and_no_project_document(
     )
 
     assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
     persisted = database.get_job(response.json()["id"])
     assert persisted is not None
     assert persisted["config_snapshot"]["timeline"] == document
@@ -568,16 +579,12 @@ async def test_v5_submit_projects_plan_invariants_as_safe_structured_errors(
     client, fake_comfy, monkeypatch
 ) -> None:
     database = client.director_app.state.database
-    document = (await client.get("/api/timeline")).json()
-    document["segments"][0]["prompt"] = "A safe invariant response boundary"
-    legacy_models = default_settings().models
-    for role in ("fl2va", "ref2va", "clip", "video_vae", "audio_vae"):
-        document["model_stack"][role]["filename"] = getattr(
-            legacy_models, role
-        ).filename
+    document = _complete_frozen_v5_document(
+        "A safe invariant response boundary"
+    )
 
     unsafe_internal_detail = "/" + "home/private/director/token-secret"
-    original_compile = director_app_module.compile_v5_execution_plan
+    original_compile = director_app_module.compile_project_execution_plan
 
     class InvalidManifestPlan:
         def __init__(self, plan) -> None:
@@ -597,7 +604,7 @@ async def test_v5_submit_projects_plan_invariants_as_safe_structured_errors(
 
     monkeypatch.setattr(
         director_app_module,
-        "compile_v5_execution_plan",
+        "compile_project_execution_plan",
         compile_with_invalid_manifest,
     )
     jobs_before = database.list_jobs()
@@ -606,13 +613,17 @@ async def test_v5_submit_projects_plan_invariants_as_safe_structured_errors(
         json={"config": document},
     )
 
-    assert response.status_code == 500, response.text
-    assert response.json()["detail"] == {
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    persisted = database.get_job(response.json()["id"])
+    assert persisted is not None
+    assert persisted["status"] == "failed"
+    assert json.loads(persisted["error"]) == {
         "code": "execution_plan_invariant_failed",
         "message": "The compiled execution evidence is internally inconsistent.",
     }
-    assert unsafe_internal_detail not in response.text
-    assert database.list_jobs() == jobs_before
+    assert unsafe_internal_detail not in persisted["error"]
+    assert len(database.list_jobs()) == len(jobs_before) + 1
     assert fake_comfy.prompts == []
 
 

@@ -19,6 +19,7 @@ import {
   legacyTimelineHistoryEnvelopeHash,
   migrateLegacyTimelineHistoryEnvelope,
   migrateTimelineFeatureBundle4To5,
+  migrateTimelineFeatureBundle5To6,
   parseLegacyTimelineWalRaw,
   resolveLegacyTimelineWalWithReceipt,
   type LegacyCreativeBindingContext,
@@ -136,6 +137,17 @@ describe("Stage 6 receipt-aware timeline recovery", () => {
     });
     expect(JSON.stringify(baseReceipt)).toBe(frozenReceiptBytes);
 
+    const currentBase = migrateTimelineFeatureBundle5To6(upgradedBase);
+    if (!currentBase) throw new Error("bundle 5 receipt destination did not upgrade");
+    expect(resolveLegacyTimelineWalWithReceipt(wal, baseReceipt, {
+      document: currentBase,
+      revision: baseReceipt.new_revision + 2,
+    })).toMatchObject({
+      status: "replay",
+      expected_server_revision: baseReceipt.new_revision + 2,
+      project: { features: { template_bundle_version: 6 } },
+    });
+
     const unrelatedEdit = structuredClone(upgradedBase);
     unrelatedEdit.title = "unrelated post-receipt authority edit";
     expect(resolveLegacyTimelineWalWithReceipt(wal, baseReceipt, {
@@ -165,6 +177,16 @@ describe("Stage 6 receipt-aware timeline recovery", () => {
       status: "acknowledged",
       server_revision: acknowledgedReceipt.new_revision + 1,
       project: { features: { template_bundle_version: 5 } },
+    });
+    const currentPending = migrateTimelineFeatureBundle5To6(upgradedPending);
+    if (!currentPending) throw new Error("lost-ACK destination did not reach bundle 6");
+    expect(resolveLegacyTimelineWalWithReceipt(wal, acknowledgedReceipt, {
+      document: currentPending,
+      revision: acknowledgedReceipt.new_revision + 2,
+    })).toMatchObject({
+      status: "acknowledged",
+      server_revision: acknowledgedReceipt.new_revision + 2,
+      project: { features: { template_bundle_version: 6 } },
     });
 
     expect(resolveLegacyTimelineWalWithReceipt(wal, baseReceipt, {

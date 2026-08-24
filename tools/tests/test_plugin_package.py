@@ -184,6 +184,23 @@ def test_manifest_requires_exact_dependency_equivalence(tmp_path: Path) -> None:
         gate._validate_manifest(package, source_root=source)
 
 
+def test_product_config_gate_rejects_runtime_salvage_only_config(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "backend/directordeck/config/directordeck.json"
+    config_path.parent.mkdir(parents=True)
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "backend/directordeck/config/directordeck.json"
+    )
+    document = json.loads(source.read_text(encoding="utf-8"))
+    document["lora"]["loader_policies"][0]["lora_filename"] = "["
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(PackageError, match="product configuration"):
+        gate._validate_product_config(tmp_path)
+
+
 def test_docs_reject_legacy_route_and_accept_release_policy(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text(
         "Open `/directordeck/`; DB: `user/directordeck/database/directordeck.sqlite3`.",

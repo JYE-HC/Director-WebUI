@@ -8,10 +8,12 @@ import pytest
 from directordeck.app import _UPLOAD_LIMITS, _media_response, _read_upload_limited
 from directordeck.database import Database
 from directordeck.schemas import (
+    UnifiedTimelineDraftV5,
     default_settings,
     mode_draft_to_timeline,
     validate_mode_draft,
 )
+from directordeck.workflow.v6_projection import project_v5_authority_to_v6
 
 from .conftest import (
     runnable_draft,
@@ -25,10 +27,13 @@ async def _v5_mode_document(client, mode: str) -> dict:
     legacy = mode_draft_to_timeline(
         validate_mode_draft(mode, runnable_draft(mode))
     )
-    return await v5_timeline_document(
+    bundle5 = await v5_timeline_document(
         client,
         legacy.model_dump(mode="json"),
     )
+    return project_v5_authority_to_v6(
+        UnifiedTimelineDraftV5.model_validate(bundle5)
+    ).draft.model_dump(mode="json")
 
 
 async def _raw_save_v5(client, document: dict):

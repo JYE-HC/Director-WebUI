@@ -31,7 +31,7 @@ from .effective_features import (
     feature_parameter_model,
 )
 from .interpreters import V4BuiltinInterpreter, builtin_interpreter_map
-from .node_contracts import require_current_node_contract
+from .node_contracts import require_v5_node_contract
 from .registry import FeatureInterpreterRegistry, ValidatedFeatureTemplate
 from .templates import V5_TEMPLATE_BUNDLE
 
@@ -40,11 +40,11 @@ _STRICT_ATTENTION_CLASS = "DirectorStrictModelAttentionBackend"
 _STRICT_H3_LOW_VRAM_CLASS = "DirectorStrictH3LowVramSagePatch"
 
 
-def _current_node_identity(
+def _v5_node_identity(
     feature_id: str,
     class_type: str,
 ) -> ResolvedImplementationIdentity:
-    contract = require_current_node_contract(class_type)
+    contract = require_v5_node_contract(class_type)
     return ResolvedImplementationIdentity(
         role="node",
         class_type=class_type,
@@ -96,7 +96,7 @@ class _AttentionBackendInterpreter:
         return FeatureResolution(
             state="active",
             implementations=(
-                _current_node_identity(self.id, _STRICT_ATTENTION_CLASS),
+                _v5_node_identity(self.id, _STRICT_ATTENTION_CLASS),
             ),
             resolution_details={
                 "source": "bundle5_strict_attention_backend",
@@ -212,7 +212,7 @@ class _H3LowVramAttentionInterpreter:
         return FeatureResolution(
             state="active",
             implementations=(
-                _current_node_identity(self.id, _STRICT_H3_LOW_VRAM_CLASS),
+                _v5_node_identity(self.id, _STRICT_H3_LOW_VRAM_CLASS),
             ),
             resolution_details={
                 "source": "bundle5_strict_h3_low_vram_attention",

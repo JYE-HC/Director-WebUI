@@ -38,6 +38,7 @@ from directordeck.workflow.execution import (
     legacy_fnv1a32_document_digest,
     sha256_document_digest,
 )
+from directordeck.workflow.v6_projection import project_v5_authority_to_v6
 
 
 _CLIENT_FIXTURES = (
@@ -186,12 +187,15 @@ def test_database_migration_receipt_matches_cross_runtime_golden(
 
     migrated, revision = database.get_timeline_authority()
     receipt = database.get_latest_project_migration_receipt("default")
-    expected_current = json.loads(json.dumps(expected_v5_raw))
-    expected_current["features"]["template_bundle_version"] = 5
+    expected_bundle5 = json.loads(json.dumps(expected_v5_raw))
+    expected_bundle5["features"]["template_bundle_version"] = 5
+    expected_current = project_v5_authority_to_v6(
+        UnifiedTimelineDraftV5.model_validate(expected_bundle5)
+    ).draft.model_dump(mode="json")
     assert migrated.model_dump(mode="json") == expected_current
     # The frozen schema receipt lands at revision 5/bundle 4. The independent
-    # feature-authority migration then advances exactly once to bundle 5.
-    assert revision == 6
+    # feature-authority migrations then advance once each to bundles 5 and 6.
+    assert revision == 7
     assert receipt is not None
     assert receipt.old_client_digest.value == "fnv1a-93bba5c8"
     assert receipt.new_client_digest.value == "fnv1a-0189db3f"
@@ -618,8 +622,8 @@ def test_timeline_v4_stale_write_reports_the_exact_migration_receipt(
     assert caught.value.migration_id == receipt.migration_id
     current, revision = database.get_timeline_authority()
     assert current.version == 5
-    assert current.features.template_bundle_version == 5
-    assert revision == receipt.new_revision + 1
+    assert current.features.template_bundle_version == 6
+    assert revision == receipt.new_revision + 2
 
 
 def test_receipt_exists_but_authority_digest_changed_at_migration_revision_fails(

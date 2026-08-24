@@ -234,6 +234,13 @@ export interface CapabilityReport {
   }>;
 }
 
+export interface ComfyKitchenAttentionCapability {
+  context_revision: string;
+  backend: ResolvedExecutionBackend | null;
+  state: "available" | "unavailable" | "unknown";
+  reasons: Array<{ code: string; message: string }>;
+}
+
 /** Bounded, server-redacted JSON carried by capability diagnostics and UI hints. */
 export type CapabilityJsonValue =
   | null
@@ -323,7 +330,7 @@ export interface DirectorDeckConfig {
     fallback_policy: {
       loader_ids: LoraLoaderAdapterId[];
       default_loader_id: LoraLoaderAdapterId;
-    };
+    } | null;
     loader_policies: Array<{
       /** Regular expression searched against the complete relative LoRA path. */
       lora_filename: string;
@@ -331,6 +338,10 @@ export interface DirectorDeckConfig {
       default_loader_id: LoraLoaderAdapterId;
     }>;
   };
+  diagnostics: Array<{
+    code: string;
+    message: string;
+  }>;
 }
 
 export type FeatureCatalogFetchResult =
@@ -557,12 +568,16 @@ export interface TimelineCompileReport {
       adapter_fingerprint: string;
       capability: FeatureCapabilityEvaluation;
     }>;
+    /** Bundle-6 compiler evidence is preserved as bounded opaque JSON. */
+    uses?: CapabilityJsonValue[];
     notices: Array<{
       segment_id: string;
       unit_id: string;
       feature_id: string;
       message: string;
     }>;
+    /** Non-authorizing Bundle-6 host compatibility diagnostics. */
+    advisories?: CapabilityReason[];
   };
   effective_execution_digest: {
     algorithm: "sha256-canonical-json-v1";

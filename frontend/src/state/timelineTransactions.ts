@@ -86,7 +86,13 @@ export function timelineTransactionPolicy(
     case "project/update-model":
       return documentPolicy("修改创作模型");
     case "feature/set-project":
-      return documentPolicy(action.featureId === "lora" ? "修改 LoRA" : "修改项目扩展配置");
+      return documentPolicy(
+        action.featureId === "lora"
+          ? "修改 LoRA"
+          : action.featureId === "comfy_kitchen_attention"
+            ? "修改 CK Attention"
+            : "修改项目扩展配置",
+      );
     case "feature/set-segment":
       return documentPolicy("修改片段扩展配置");
     case "feature/clear-segment":

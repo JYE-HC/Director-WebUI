@@ -16,6 +16,7 @@ import type {
 import { downloadHistoricalProjectConfig } from "../domain/historicalProjectExport";
 import { MODE_META } from "../domain/modes";
 import { taskLivePresentation } from "../domain/taskProgress";
+import { localizeProblem, useTranslator } from "../i18n";
 import {
   loadTimelineWorkspacePreferences,
   updateTimelineWorkspacePreferences,
@@ -494,6 +495,8 @@ function TaskDetails({
   queuedAhead: number | null;
   estimatedWaitSeconds: number | null;
 }) {
+  const translator = useTranslator();
+  const failure = task.error ? localizeProblem(task.error, translator) : null;
   return (
     <section
       className="task-row__details"
@@ -545,7 +548,12 @@ function TaskDetails({
           ))}
         </div>
       )}
-      {task.error && <pre>{task.error}</pre>}
+      {failure && (
+        <div className="task-row__failure">
+          <strong>{failure.message}</strong>
+          <small>{failure.remediation}</small>
+        </div>
+      )}
     </section>
   );
 }
@@ -810,19 +818,29 @@ function ErrorDialog({
   onClose: () => void;
   restoreFocus?: HTMLElement | null;
 }) {
+  const translator = useTranslator();
+  const failure = task.error ? localizeProblem(task.error, translator) : null;
   const dialogRef = useModalLifecycle(onClose, restoreFocus);
   return createPortal(
     <div className="task-error-dialog" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose();
     }}>
-      <section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="任务错误详情">
+      <section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label={translator.t("task.failure.details")}>
         <header>
-          <strong>任务错误详情</strong>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="关闭错误详情">×</button>
+          <strong>{translator.t("task.failure.details")}</strong>
+          <button type="button" className="icon-button" onClick={onClose} aria-label={translator.t("task.failure.closeLabel")}>×</button>
         </header>
-        <pre>{task.error || "没有可显示的错误详情。"}</pre>
+        {failure && <div className="task-error-dialog__summary" role="alert">
+          <strong>{failure.message}</strong>
+          <p>{failure.remediation}</p>
+          <code>{translator.t("common.errorCode", { code: failure.code })}</code>
+        </div>}
+        <details open={!failure}>
+          <summary>{translator.t("task.failure.technicalDetails")}</summary>
+          <pre>{task.error || translator.t("task.failure.noDetails")}</pre>
+        </details>
         <footer>
-          <button type="button" onClick={() => void copyText(task.error || "")}>复制错误详情</button>
+          <button type="button" onClick={() => void copyText(task.error || "")}>{translator.t("task.failure.copyDetails")}</button>
         </footer>
       </section>
     </div>,

@@ -7,8 +7,6 @@ import {
   type ConnectionTestResult,
   type DeviceTarget,
   type DirectorDeckConfig,
-  type FeatureCatalog,
-  type FeatureCapabilityEvaluation,
   type GPUResource,
   type LoraLoaderAdapterId,
   type LoraLoaderOverrideRecord,
@@ -88,7 +86,6 @@ interface LoraLoaderChoice {
   class_type: string;
   is_default: boolean;
   configuration_options: DirectorDeckConfig["lora"]["loaders"][number]["options"];
-  capability: FeatureCapabilityEvaluation | null;
 }
 
 const EMPTY_LORA_LOADER_MAPPING_DRAFT: LoraLoaderMappingDraft = {
@@ -201,12 +198,10 @@ export function validateRuntimeSettingsForm(settings: RuntimeSettings): string[]
   return errors;
 }
 
-export function SettingsPage({ settings, confirmedSettings = settings, resourcesReady = false, capabilities, featureCatalog = null, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, overlay = false, onDraftChange = () => undefined, onSaved, onSaveLoraLoaderOverride, onConnectionTestSucceeded = () => undefined, onHostCapabilitiesChanged = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
+export function SettingsPage({ settings, confirmedSettings = settings, resourcesReady = false, capabilities, gpus, models, rayLightRuntimeStatus = null, rayLightRecoveryPending = false, rayLightRecoveryDisabled = false, rayLightRecoveryBlockedReason = null, loadingModels, syncError = null, runtimeEditingDisabled = false, overlay = false, onDraftChange = () => undefined, onSaved, onSaveLoraLoaderOverride, onConnectionTestSucceeded = () => undefined, onHostCapabilitiesChanged = () => undefined, onConfirmRayLightRuntimeRecovery = async () => undefined, onRequestClose }: {
   settings: RuntimeSettings; confirmedSettings?: RuntimeSettings; capabilities: CapabilityReport; gpus: GPUResource[];
   /** True once App has confirmed the four runtime resources against the host. */
   resourcesReady?: boolean;
-  /** Last host-revision-verified feature catalog; null means adapter editing is unavailable. */
-  featureCatalog?: FeatureCatalog | null;
   models: ModelInventory;
   rayLightRuntimeStatus?: RayLightRuntimeStatus | null;
   rayLightRecoveryPending?: boolean;
@@ -226,8 +221,8 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   onSaveLoraLoaderOverride: (edit: LoraLoaderOverrideEdit) => Promise<RuntimeSettings>;
   /** App re-reads capabilities/GPU/models after a successful host probe. */
   onConnectionTestSucceeded?: () => void;
-  /** A completed install changed the live host snapshot and catalog identity. */
-  onHostCapabilitiesChanged?: () => void;
+  /** A completed install changed the live host resource snapshot. */
+  onHostCapabilitiesChanged?: (scope: "raylight" | "media") => void;
   /** App-owned explicit restart certificate followed by authoritative refresh. */
   onConfirmRayLightRuntimeRecovery?: () => Promise<void>;
 }) {
@@ -278,31 +273,15 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     .map((role) => role === "fl2va" ? "FL2VA" : "Ref2VA");
   const mappingAuthorityBlocked = effectiveRuntimeEditingDisabled || mappingBusy ||
     !sameSettings(working, confirmedRef.current);
-  const observedLoraAdapters = featureCatalog?.entries.find((entry) =>
-    entry.id === "lora")?.adapter_options ?? [];
   const allStandardLoraAdapterOptions = useMemo<LoraLoaderChoice[]>(() => {
-    if (productConfig) {
-      return productConfig.lora.loaders.map((loader) => ({
-        adapter_id: loader.id,
-        display_name: loader.display_name,
-        class_type: loader.class_type,
-        is_default: loader.id === productConfig.lora.fallback_policy.default_loader_id,
-        configuration_options: loader.options,
-        capability: observedLoraAdapters.find((option) =>
-          option.adapter_id === loader.id)?.capability ?? null,
-      }));
-    }
-    return observedLoraAdapters
-      .filter((option) => option.backend === "standard")
-      .map((option) => ({
-        adapter_id: option.adapter_id,
-        display_name: option.display_name,
-        class_type: option.class_type,
-        is_default: option.is_default,
-        configuration_options: option.configuration_options,
-        capability: option.capability,
-      }));
-  }, [observedLoraAdapters, productConfig]);
+    return productConfig?.lora.loaders.map((loader) => ({
+      adapter_id: loader.id,
+      display_name: loader.display_name,
+      class_type: loader.class_type,
+      is_default: loader.id === productConfig.lora.fallback_policy?.default_loader_id,
+      configuration_options: loader.options,
+    })) ?? [];
+  }, [productConfig]);
   const compiledLoraLoaderPolicies = useMemo(() => (
     productConfig?.lora.loader_policies.map((policy) => ({
       policy,
@@ -324,7 +303,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
   const defaultLoraAdapterFor = useCallback((loraFilename: string) => {
     const policy = loraLoaderPolicyFor(loraFilename);
     const defaultId = policy?.default_loader_id ??
-      productConfig?.lora.fallback_policy.default_loader_id;
+      productConfig?.lora.fallback_policy?.default_loader_id;
     return allStandardLoraAdapterOptions.find((option) =>
       option.adapter_id === defaultId) ??
       allStandardLoraAdapterOptions.find((option) => option.is_default);
@@ -338,6 +317,10 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     )?.adapter_id);
   const selectedLoraAdapterOption = allStandardLoraAdapterOptions.find((option) =>
     option.adapter_id === mappingDraft.adapter_id);
+  const selectedLoraAdapterAvailable = resourcesReady &&
+    capabilities.connection === "online" && selectedLoraAdapterOption
+    ? capabilities.available_nodes.includes(selectedLoraAdapterOption.class_type)
+    : null;
   const selectedLoraPolicy = loraLoaderPolicyFor(mappingDraft.lora_filename);
   const selectedLoraAdapterAllowed = !mappingDraft.adapter_id ||
     selectedLoraPolicy === null ||
@@ -397,7 +380,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     setRayLightSetup(status);
     if (wasRunning && (
       status.install.state === "needs_restart" || status.dependencies_installed
-    )) onHostCapabilitiesChangedRef.current();
+    )) onHostCapabilitiesChangedRef.current("raylight");
   }, []);
 
   const acceptMediaSetup = useCallback((status: MediaToolsStatus) => {
@@ -406,7 +389,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
     setMediaSetup(status);
     if (
       wasRunning && status.install.state === "ready" && status.ready
-    ) onHostCapabilitiesChangedRef.current();
+    ) onHostCapabilitiesChangedRef.current("media");
   }, []);
 
   const requestClose = useCallback((restoreFocus = true) => {
@@ -447,7 +430,7 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
       .then((config) => {
         if (!controller.signal.aborted) {
           setProductConfig(config);
-          setProductConfigError(null);
+          setProductConfigError(config.diagnostics[0]?.message ?? null);
         }
       })
       .catch((reason: unknown) => {
@@ -1238,20 +1221,20 @@ export function SettingsPage({ settings, confirmedSettings = settings, resources
                     </div>
                     : <p className="muted">此加载器没有额外配置项。</p>}
                   {selectedLoraAdapterOption && <div
-                    className={`lora-loader-adapter-evidence${selectedLoraAdapterOption.capability?.available === false ? " lora-loader-adapter-evidence--unavailable" : ""}`}
+                    className={`lora-loader-adapter-evidence${selectedLoraAdapterAvailable === false ? " lora-loader-adapter-evidence--unavailable" : ""}`}
                     role="status"
                     aria-label="LoRA 映射节点检测"
                   >
-                    <strong>{selectedLoraAdapterOption.capability === null
+                    <strong>{selectedLoraAdapterAvailable === null
                       ? "节点状态尚未读取"
-                      : selectedLoraAdapterOption.capability.available
+                      : selectedLoraAdapterAvailable
                         ? "当前已检测到节点"
                         : "当前未检测到节点"}</strong>
-                    <p>{selectedLoraAdapterOption.capability === null
+                    <p>{selectedLoraAdapterAvailable === null
                       ? "加载器清单仍可选择和保存；节点状态由宿主能力检查更新。"
-                      : selectedLoraAdapterOption.capability.available
-                      ? "这里只表示宿主当前存在同名节点，不认证其来源或实现。"
-                      : "仍可保存配置；实际使用时若节点缺失，任务会返回明确错误。"}</p>
+                      : selectedLoraAdapterAvailable
+                        ? "这里只表示宿主当前存在同名节点，不认证其来源或实现。"
+                        : "仍可保存配置；实际使用时若节点缺失，任务会返回明确错误。"}</p>
                   </div>}
                   <div className="lora-loader-mapping-actions">
                     <button

@@ -4,6 +4,7 @@ from directordeck.schemas import UnifiedTimelineDraftV5
 
 from .test_stage7_job_runtime_snapshot import (
     _active_mapped_lora_draft,
+    _install_retained_v5_authority,
     _seed_readable_job,
     _settings_with_overrides,
     _user_mapping_record,
@@ -23,11 +24,7 @@ async def test_current_snapshot_uses_current_active_execution_projection(client)
         expected_authority_token=settings_token,
         schema_version=3,
     )
-    _, revision = database.get_timeline_authority()
-    database.validate_and_put_timeline_authority(
-        draft,
-        expected_revision=revision,
-    )
+    _install_retained_v5_authority(database, draft)
     job_id = _seed_readable_job(database, draft, settings)
 
     baseline = await client.get(f"/api/jobs/{job_id}")
@@ -86,11 +83,7 @@ async def test_current_snapshot_fails_when_captured_segment_is_removed(client) -
         expected_authority_token=settings_token,
         schema_version=3,
     )
-    _, revision = database.get_timeline_authority()
-    database.validate_and_put_timeline_authority(
-        draft,
-        expected_revision=revision,
-    )
+    _install_retained_v5_authority(database, draft)
     job_id = _seed_readable_job(database, draft, settings)
 
     removed = draft.model_dump(mode="json")

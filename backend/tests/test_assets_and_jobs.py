@@ -655,7 +655,7 @@ async def test_retired_lora_loader_field_does_not_override_configured_fallback(
     assert lora["inputs"]["lora_name"] == "style.safetensors"
 
 
-async def test_job_requires_the_configured_dedicated_lora_adapter_node(
+async def test_unobserved_configured_dedicated_lora_adapter_is_still_submitted(
     client, fake_comfy
 ) -> None:
     settings = await legacy_settings_document(client)
@@ -673,9 +673,15 @@ async def test_job_requires_the_configured_dedicated_lora_adapter_node(
 
     response = await submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
 
-    assert response.status_code == 422
-    assert response.json()["detail"]["code"] == "node_unavailable"
-    assert fake_comfy.prompts == []
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    lora = next(
+        node
+        for submission in fake_comfy.prompts
+        for node in submission["prompt"].values()
+        if node["class_type"] == "MiniMaxH3TurboLoRA"
+    )
+    assert lora["inputs"]["lora_name"] == binding["lora_name"]
 
 
 async def test_auto_lora_uses_configured_model_only_fallback(client, fake_comfy) -> None:
@@ -791,24 +797,39 @@ async def test_explicit_cancel_wins_when_completion_arrives_during_cancel_dispat
     assert fake_comfy.cancelled == []
 
 
-async def test_cancel_during_preflight_prevents_upstream_submission(client, fake_comfy) -> None:
-    fake_comfy.preflight_started = asyncio.Event()
-    fake_comfy.preflight_release = asyncio.Event()
+async def test_cancel_during_compile_prevents_upstream_submission(
+    client, fake_comfy, monkeypatch
+) -> None:
+    compile_started = asyncio.Event()
+    compile_release = asyncio.Event()
+
+    async def before_timeline_compile(_job_id: str) -> None:
+        compile_started.set()
+        await compile_release.wait()
+
+    monkeypatch.setattr(
+        client.director_app.state,
+        "before_timeline_compile",
+        before_timeline_compile,
+        raising=False,
+    )
     create_request = asyncio.create_task(
         submit_legacy_mode_job(client, "t2v", runnable_draft("t2v"))
     )
-    await asyncio.wait_for(fake_comfy.preflight_started.wait(), timeout=1)
+    await asyncio.wait_for(compile_started.wait(), timeout=1)
+    created = await asyncio.wait_for(create_request, timeout=1)
+    assert created.status_code == 200
     jobs = (await client.get("/api/jobs")).json()["jobs"]
     assert len(jobs) == 1
     assert jobs[0]["status"] == "preparing"
     cancelled = await client.post(f"/api/jobs/{jobs[0]['id']}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
-    fake_comfy.preflight_release.set()
-    created = await asyncio.wait_for(create_request, timeout=1)
+    compile_release.set()
+    await wait_for_submission_tasks(client)
+    stored = (await client.get(f"/api/jobs/{jobs[0]['id']}")).json()
 
-    assert created.status_code == 200
-    assert created.json()["status"] == "cancelled"
+    assert stored["status"] == "cancelled"
     assert fake_comfy.prompts == []
 
 
@@ -1138,7 +1159,12 @@ async def test_incomplete_v5_model_stack_does_not_submit(client, fake_comfy) -> 
     draft["segments"][0]["prompt"] = "A cinematic camera move"
     draft["model_stack"]["fl2va"]["filename"] = None
     response = await client.post("/api/jobs", json={"config": draft})
-    assert response.status_code == 422
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    stored = (await client.get(f"/api/jobs/{response.json()['id']}")).json()
+    assert stored["status"] == "failed"
+    assert stored["stage"] == "compile_failed"
+    assert "model_binding_required" in stored["error"]
     assert not fake_comfy.prompts
 
 

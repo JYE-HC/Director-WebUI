@@ -54,12 +54,9 @@ from .execution import (
     effective_execution_digest,
     sha256_document_digest,
 )
-from .templates import V4_TEMPLATE_BUNDLE
-from .node_contracts import (
-    CURRENT_NODE_CONTRACT_REGISTRY,
-    V4_NODE_CONTRACT_REGISTRY,
-)
 from .lora_factory import ResolvedLoraAdapter
+from .node_contracts import node_contract_registry_for_bundle
+from .templates import V4_TEMPLATE_BUNDLE
 from .v4_compiler import compile_v4_timeline
 
 
@@ -687,10 +684,8 @@ def adapt_v4_compile_result(
         # of retaining a second workflow representation for preflight.
         validate_native_workflow_runtime_effects(
             unit,
-            node_contract_registry=(
-                CURRENT_NODE_CONTRACT_REGISTRY
-                if template_bundle.version >= 5
-                else V4_NODE_CONTRACT_REGISTRY
+            node_contract_registry=node_contract_registry_for_bundle(
+                template_bundle.version
             ),
         )
         if len(unit.segment_ids) != 1 or unit.segment_ids[0] not in segments:

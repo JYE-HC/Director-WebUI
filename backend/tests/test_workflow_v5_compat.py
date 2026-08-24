@@ -192,6 +192,42 @@ def test_v5_default_graph_is_v4_compatible_but_uses_current_bundle_identity() ->
     )
 
 
+def test_v5_strict_feature_does_not_read_the_moving_current_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import directordeck.workflow.node_contracts as node_contracts
+
+    v4, settings_v1 = _v4_pair()
+    v5, settings_v3 = _v5_pair(v4, settings_v1)
+    document = v5.model_dump(mode="json")
+    document["features"]["template_bundle_version"] = 5
+    document["features"]["project"]["attention_backend_override"] = {
+        "enabled": True,
+        "params": {"mode": "pytorch"},
+    }
+
+    # Simulate a later default-bundle cutover. Bundle-5 compilation must still
+    # resolve its strict node from the frozen V5 registry.
+    monkeypatch.setattr(
+        node_contracts,
+        "CURRENT_NODE_CONTRACT_REGISTRY",
+        node_contracts.V4_NODE_CONTRACT_REGISTRY,
+    )
+    plan = compile_v5_execution_plan(
+        UnifiedTimelineDraftV5.model_validate(document),
+        settings_v3,
+        "frozen-v5-registry",
+    )
+
+    strict_nodes = [
+        node
+        for node in plan.segment_units[0].prompt_base.values()
+        if node["class_type"] == "DirectorStrictModelAttentionBackend"
+    ]
+    assert len(strict_nodes) == 1
+    assert strict_nodes[0]["inputs"]["mode"] == "pytorch"
+
+
 def test_v5_adapter_never_falls_back_when_explicit_execution_specs_are_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -177,12 +177,62 @@ describe("Director REST 契约", () => {
           default_loader_id: "minimax_h3_turbo",
         }],
       },
+      diagnostics: [],
     };
     fetchMock.mockResolvedValueOnce(jsonResponse(config));
 
     await expect(directorApi.getDirectorDeckConfig()).resolves.toEqual(config);
     expect(fetchMock.mock.calls[0][0]).toBe("/directordeck/api/config");
     expect(JSON.stringify(config)).not.toContain("directordeck.node");
+  });
+
+  it("接受带安全诊断的空 LoRA 配置子集", async () => {
+    const unavailable = {
+      schema_version: 1,
+      lora: {
+        loaders: [],
+        fallback_policy: null,
+        loader_policies: [],
+      },
+      diagnostics: [{
+        code: "lora_product_config_unavailable",
+        message: "DirectorDeck's LoRA loader configuration is unavailable.",
+      }],
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse(unavailable));
+
+    await expect(directorApi.getDirectorDeckConfig()).resolves.toEqual(unavailable);
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      ...unavailable,
+      diagnostics: [],
+    }));
+    await expect(directorApi.getDirectorDeckConfig()).rejects.toThrow(
+      "DirectorDeck LoRA 空配置子集无效",
+    );
+  });
+
+  it("主动读取独立 CK Attention 能力提示且不携带运行权威 token", async () => {
+    const capability = {
+      context_revision: "ctx:standard",
+      backend: "standard",
+      state: "unavailable",
+      reasons: [{
+        code: "target_device_not_cuda",
+        message: "The Standard diffusion target is not CUDA.",
+      }],
+    } as const;
+    fetchMock.mockResolvedValueOnce(jsonResponse(capability));
+
+    await expect(directorApi.getComfyKitchenAttentionCapability([
+      "fl2va",
+      "ref2va",
+    ])).resolves.toEqual(capability);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/directordeck/api/capabilities/comfy-kitchen-attention?family=fl2va&family=ref2va",
+    );
+    expect(new Headers(fetchMock.mock.calls[0][1]?.headers).has("X-Director-Runtime-Authority"))
+      .toBe(false);
   });
 
   it("功能目录严格解析强 ETag，并可用 If-None-Match 取得 304", async () => {
@@ -585,7 +635,7 @@ describe("Director REST 契约", () => {
     expect(fetchMock.mock.calls[1][1]?.signal).toBe(controller.signal);
   });
 
-  it("只保留可重试 RayLight 恢复冲突的安全错误码", async () => {
+  it("保留有界错误码作为翻译 key，并剔除 RayLight 内部诊断", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({
         detail: {
@@ -628,8 +678,16 @@ describe("Director REST 契约", () => {
       () => { throw new Error("预期普通恢复冲突请求失败"); },
       (reason): ApiError => reason as ApiError,
     );
-    expect(definitive.code).toBeUndefined();
-    expect(JSON.stringify(definitive.details)).not.toContain("unknown_internal_conflict");
+    expect(definitive).toMatchObject({
+      status: 409,
+      code: "unknown_internal_conflict",
+      details: {
+        detail: {
+          code: "unknown_internal_conflict",
+          message: "another conflict",
+        },
+      },
+    });
     expect(JSON.stringify(definitive.details)).not.toContain("secret-owner");
   });
 
@@ -1668,6 +1726,75 @@ describe("Director REST 契约", () => {
     expect(error.message).not.toContain("MustNotBeShown");
   });
 
+  it("模型绑定错误保留有界逻辑角色并丢弃路径等诊断", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      detail: {
+        code: "model_binding_required",
+        message: "The selected project workflow configuration is invalid.",
+        reasons: [{
+          code: "model_binding_required",
+          safe_details: {
+            bindings: ["clip", "video_vae", "audio_vae", "clip", "not-a-role"],
+            source_path: "C:\\private\\models",
+          },
+        }],
+      },
+    }, 422));
+
+    const error = await directorApi.compileProjectTimeline(
+      "project-1",
+      { config: createTimelineProject() },
+    ).then(
+      () => { throw new Error("预期模型绑定预检失败"); },
+      (reason): ApiError => reason as ApiError,
+    );
+
+    expect(error).toMatchObject({
+      status: 422,
+      code: "model_binding_required",
+      details: {
+        detail: {
+          code: "model_binding_required",
+          bindings: ["clip", "video_vae", "audio_vae"],
+        },
+      },
+    });
+    expect(JSON.stringify(error.details)).not.toContain("private");
+    expect(JSON.stringify(error.details)).not.toContain("not-a-role");
+  });
+
+  it("保留稳定预检错误码和有界帧数供文本目录翻译", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      detail: {
+        code: "segment_frame_limit_exceeded",
+        message: "A selected segment exceeds the native frame limit.",
+        reasons: [{
+          code: "segment_frame_limit_exceeded",
+          safe_details: { max_frames: 768, source_path: "C:\\private" },
+        }],
+      },
+    }, 422));
+
+    const error = await directorApi.compileProjectTimeline(
+      "project-1",
+      { config: createTimelineProject() },
+    ).then(
+      () => { throw new Error("预期帧数预检失败"); },
+      (reason): ApiError => reason as ApiError,
+    );
+
+    expect(error).toMatchObject({
+      code: "segment_frame_limit_exceeded",
+      details: {
+        detail: {
+          code: "segment_frame_limit_exceeded",
+          max_frames: 768,
+        },
+      },
+    });
+    expect(JSON.stringify(error.details)).not.toContain("private");
+  });
+
   it("节点不可用诊断非法时回退通用消息，其他错误不得借 reasons 暴露节点", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({
@@ -1717,7 +1844,7 @@ describe("Director REST 契约", () => {
     );
     expect(other).toMatchObject({
       status: 422,
-      code: undefined,
+      code: "creative_configuration_invalid",
       message: "The selected timeline is not runnable.",
     });
     expect(JSON.stringify(other.details)).not.toContain("HiddenNode");
@@ -2029,6 +2156,11 @@ describe("Director REST 契约", () => {
 
   it("编译端点只接收服务端脱敏计划并拒绝 workflow/prompt 泄漏", async () => {
     const project = createTimelineProject();
+    project.features = {
+      template_bundle_version: 5,
+      project: { lora: project.features.project.lora },
+      by_segment: {},
+    };
     const compiledLoraCapability = {
       available: true,
       reasons: [],
@@ -2470,6 +2602,65 @@ describe("Director REST 契约", () => {
     await expect(directorApi.compileTimeline({ config: project })).rejects.toThrow(
       "执行计划分段结构无效",
     );
+
+    const bundle6Project = createTimelineProject();
+    const bundle6Use = {
+      segment_id: report.plans[0].segment_id,
+      unit_id: `segment:${report.plans[0].segment_id}`,
+      feature_id: "comfy_kitchen_attention",
+      version: 1,
+      backend: "standard",
+      family: "fl2va",
+      template_id: "h3_standard_segment",
+      state: "inactive",
+      config_source: "project",
+      reason_code: "disabled",
+      implementation: null,
+      execution_identity: null,
+      runtime_pool_identity: null,
+      node_emissions: [],
+    };
+    const advisory = {
+      code: "host_node_unavailable",
+      feature_id: "comfy_kitchen_attention",
+      segment_id: null,
+      unit_id: null,
+      backend: "standard",
+      rule: "host_compatibility",
+      message: "The optional host node is unavailable.",
+      remediation: "Install it to use this optional feature.",
+      safe_details: {},
+    };
+    const bundle6Report = {
+      ...report,
+      template_bundle_version: 6,
+      features: {
+        requested: bundle6Project.features,
+        effective_by_segment: {},
+        resolutions: [],
+        uses: [bundle6Use],
+        notices: [],
+        advisories: [advisory],
+      },
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse(bundle6Report));
+    const parsedBundle6 = await directorApi.compileTimeline({ config: bundle6Project });
+    expect(parsedBundle6.features.uses).toEqual([bundle6Use]);
+    expect(parsedBundle6.features.advisories).toEqual([advisory]);
+    expect(JSON.stringify(parsedBundle6.features.uses)).not.toContain(
+      "runtime_fingerprint",
+    );
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      ...bundle6Report,
+      features: {
+        ...bundle6Report.features,
+        effective_by_segment: report.features.effective_by_segment,
+      },
+    }));
+    await expect(directorApi.compileTimeline({ config: bundle6Project })).rejects.toThrow(
+      "执行计划功能证据模式无效",
+    );
   });
 
   it("单删和批清使用 DELETE，并严格校验输出保留响应", async () => {
@@ -2548,7 +2739,7 @@ describe("Director REST 契约", () => {
     await expect(directorApi.listProjects()).resolves.toEqual({
       projects: [summary],
     });
-    await expect(directorApi.createProject("第二部影片")).resolves.toEqual(summary);
+    await expect(directorApi.createProject("第二部影片", project.model_stack)).resolves.toEqual(summary);
     await expect(directorApi.deleteProject("project-1")).resolves.toEqual({
       deleted_project_id: "project-1",
       outputs_preserved: true,
@@ -2564,6 +2755,10 @@ describe("Director REST 契约", () => {
       ["/directordeck/api/projects/project-1/timeline", "GET"],
       ["/directordeck/api/projects/project-1/timeline", "PUT"],
     ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      title: "第二部影片",
+      initial_model_stack: project.model_stack,
+    });
   });
 
   it("项目列表拒绝多余的 envelope 字段", async () => {
@@ -2574,6 +2769,31 @@ describe("Director REST 契约", () => {
       }));
 
     await expect(directorApi.listProjects()).rejects.toThrow("项目列表响应结构无效");
+  });
+
+  it("项目列表保留不可读项目的零片段摘要，并解析局部读取错误", async () => {
+    const damaged = {
+      id: "damaged-project",
+      title: "损坏项目",
+      created_at: "2026-08-12T00:00:00Z",
+      updated_at: "2026-08-12T00:00:00Z",
+      segment_count: 0,
+    };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ projects: [damaged] }))
+      .mockResolvedValueOnce(jsonResponse({
+        detail: {
+          code: "project_document_unreadable",
+          message: "The stored project document is unreadable.",
+          project_id: damaged.id,
+        },
+      }, 409));
+
+    await expect(directorApi.listProjects()).resolves.toEqual({ projects: [damaged] });
+    await expect(directorApi.getProjectTimelineAuthority(damaged.id)).rejects.toMatchObject({
+      status: 409,
+      code: "project_document_unreadable",
+    });
   });
 
   it("导入项目必须先 preflight，再用 exact digest/token commit", async () => {

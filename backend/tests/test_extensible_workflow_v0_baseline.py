@@ -142,10 +142,11 @@ def test_current_v4_database_fixture_is_immutable_input_and_migrates_idempotentl
 
     timeline, revision = database.get_timeline_authority()
     assert timeline.version == 5
-    assert timeline.features.template_bundle_version == 5
+    assert timeline.features.template_bundle_version == 6
+    assert timeline.features.project["comfy_kitchen_attention"].enabled is False
     # Schema 4 -> 5 keeps its frozen receipt at revision 2; the independent
-    # feature-bundle 4 -> 5 authority migration advances CAS once more.
-    assert revision == 3
+    # feature-bundle 4 -> 5 and 5 -> 6 migrations each advance CAS once more.
+    assert revision == 4
     receipt = database.get_latest_project_migration_receipt("default")
     assert receipt is not None
     assert receipt.old_revision == 1

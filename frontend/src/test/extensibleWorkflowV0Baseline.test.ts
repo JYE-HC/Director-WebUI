@@ -20,6 +20,7 @@ import {
   legacyClientDocumentDigest,
   migrateLegacyTimelineHistoryEnvelope,
   migrateTimelineFeatureBundle4To5,
+  migrateTimelineFeatureBundle5To6,
   parseLegacyTimelineWalRaw,
   resolveLegacyTimelineWalWithReceipt,
   type LegacyCreativeBindingContext,
@@ -279,6 +280,23 @@ describe("extensible workflow phase-0 frozen migration baselines", () => {
       .toBe(5);
     expect(JSON.stringify(receipt)).toBe(receiptBytes);
     expect(await hasLegacyV4TimelineHistoryJournalEvidence(scope)).toBe(true);
+
+    const currentV6 = migrateTimelineFeatureBundle5To6(current)!;
+    const restoredV6 = await loadTimelineHistoryJournal(scope, {
+      document: currentV6,
+      revision: receipt.new_revision + 2,
+    }, receipt);
+    expect(restoredV6).toMatchObject({
+      status: "restored",
+      confirmedRevision: receipt.new_revision + 2,
+      project: {
+        title: "阶段 0 · 历史编辑 19",
+        features: { template_bundle_version: 6 },
+      },
+    });
+    if (restoredV6.status !== "restored") throw new Error("bundle 6 journal did not restore");
+    expect(redoTimelineHistory(restoredV6.history)?.snapshot.project.features)
+      .toMatchObject({ template_bundle_version: 6 });
 
     const unrelated = structuredClone(current);
     unrelated.title = "unrelated authority edit";

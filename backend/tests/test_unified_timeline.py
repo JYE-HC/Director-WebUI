@@ -19,11 +19,13 @@ from directordeck.native_templates import NativeTemplateError, compile_native_ti
 from directordeck.schemas import (
     MINIMAX_H3_PROMPT_MAX_CHARACTERS,
     UnifiedTimelineDraft,
+    UnifiedTimelineDraftV5,
     default_settings,
     default_timeline_draft,
     iter_timeline_assets,
     timeline_segment_recipe,
 )
+from directordeck.workflow.v6_projection import project_v5_authority_to_v6
 
 from .conftest import (
     adapt_legacy_workflow_requests,
@@ -903,7 +905,10 @@ def test_initialize_does_not_invent_order_for_multiple_legacy_drafts(tmp_path) -
         default_settings().model_dump(mode="json"),
     )
     expected["features"]["template_bundle_version"] = 5
-    assert database.get_timeline().model_dump(mode="json") == expected
+    expected_v6 = project_v5_authority_to_v6(
+        UnifiedTimelineDraftV5.model_validate(expected)
+    ).draft.model_dump(mode="json")
+    assert database.get_timeline().model_dump(mode="json") == expected_v6
     with sqlite3.connect(path) as connection:
         notice = connection.execute(
             "SELECT message FROM migration_notices WHERE id = 'multiple-legacy-mode-drafts'"
@@ -1147,21 +1152,16 @@ async def test_selected_compile_does_not_validate_unselected_stale_asset(client)
     assert "not-registered" not in blocked.text
 
 
-async def test_timeline_submission_requires_every_selected_native_node(
+async def test_timeline_submission_does_not_gate_on_advertised_node_inventory(
     client, fake_comfy
 ) -> None:
     fake_comfy.available_nodes.remove("BasicGuider")
     response = await client.post(
         "/api/timeline/jobs", json={"config": timeline(segment("t2v", "ready"))}
     )
-    assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert detail["code"] == "node_unavailable"
-    assert any(
-        reason["safe_details"] == {"class_type": "BasicGuider"}
-        for reason in detail["reasons"]
-    )
-    assert fake_comfy.prompts == []
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    assert fake_comfy.prompts
 
 
 async def test_timeline_submission_does_not_pin_host_owned_node_provenance(
@@ -1177,7 +1177,7 @@ async def test_timeline_submission_does_not_pin_host_owned_node_provenance(
 
 
 @pytest.mark.parametrize("raylight", [False, True])
-async def test_timeline_preflight_rejects_unavailable_logical_gpu(
+async def test_timeline_submission_does_not_gate_on_advisory_gpu_inventory(
     client, fake_comfy, raylight: bool
 ) -> None:
     authority = (await client.get("/api/settings/authority")).json()
@@ -1212,20 +1212,9 @@ async def test_timeline_preflight_rejects_unavailable_logical_gpu(
         "/api/timeline/jobs", json={"config": timeline(segment("t2v", "ready"))}
     )
 
-    assert response.status_code == 422
-    if raylight:
-        detail = response.json()["detail"]
-        assert detail["code"] == "invalid_runtime_gpu_indices"
-        assert detail["reasons"][0]["safe_details"] == {
-            "invalid_indices": [2]
-        }
-    else:
-        detail = response.json()["detail"]
-        assert detail["code"] == "runtime_placement_unavailable"
-        assert detail["reasons"][0]["safe_details"] == {
-            "devices": ["gpu:3"]
-        }
-    assert fake_comfy.prompts == []
+    assert response.status_code == 200, response.text
+    await wait_for_submission_tasks(client)
+    assert fake_comfy.prompts
 
 
 async def test_asset_library_refuses_referenced_delete(

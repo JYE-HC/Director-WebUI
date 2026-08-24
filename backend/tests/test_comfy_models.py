@@ -339,3 +339,22 @@ async def test_both_diffusion_slots_receive_the_complete_comfy_inventory() -> No
         ("GET", "/models/vae"),
         ("GET", "/models/loras"),
     ]
+
+
+async def test_object_info_returns_only_requested_ck_carriers() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/object_info/ModelAttentionBackend"
+        return httpx.Response(200, json={
+            "ModelAttentionBackend": {"input": {"required": {}}},
+            "UnrelatedUserNode": {"python_module": "custom_nodes.user"},
+        })
+
+    client = ComfyClient(
+        "http://comfy.test",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.object_info(("ModelAttentionBackend",))
+
+    assert set(result) == {"ModelAttentionBackend"}
+    assert "UnrelatedUserNode" not in result
