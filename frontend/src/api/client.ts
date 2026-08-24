@@ -9,6 +9,7 @@ import {
   normalizeFeatureConfiguration,
   normalizeFeatureSelection,
   normalizeTimelineProject,
+  type ModelStack,
   type TimelineGenerationMode,
   type TimelineProject,
 } from "../domain/timelineProject";
@@ -19,6 +20,7 @@ import { parseProjectMigrationReceipt, type ProjectMigrationReceipt } from "../s
 import { parseLegacyRuntimeSettingsV1, parseRuntimeSettingsV3 } from "./types";
 import type {
   CapabilityReport,
+  ComfyKitchenAttentionCapability,
   AssetCascadeDeleteResponse,
   AssetDeleteResponse,
   AssetListResponse,
@@ -91,9 +93,11 @@ export function taskEventsUrl(): string {
   return `${API_BASE}/tasks/events`;
 }
 
-export type ApiErrorCode =
+type KnownApiErrorCode =
   | "raylight_recovery_in_flight"
   | "node_unavailable"
+  | "model_binding_required"
+  | "project_document_unreadable"
   | "timeline_revision_conflict"
   | "timeline_schema_migrated"
   | "runtime_settings_schema_migrated"
@@ -102,6 +106,11 @@ export type ApiErrorCode =
   | "assets_in_use"
   | "asset_trash_restore_conflict"
   | "asset_trash_purge_conflict";
+
+// Backend capability/configuration errors use the same bounded identifier
+// contract. Preserve unfamiliar stable codes so the text catalog can add a
+// translation without another transport-parser change.
+export type ApiErrorCode = KnownApiErrorCode | (string & {});
 
 export class ApiError extends Error {
   constructor(
@@ -266,6 +275,44 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
   const expected = [...keys].sort();
   return actual.length === expected.length &&
     actual.every((key, index) => key === expected[index]);
+}
+
+function parseComfyKitchenAttentionCapability(
+  value: unknown,
+): ComfyKitchenAttentionCapability {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["context_revision", "backend", "state", "reasons"]) ||
+    typeof value.context_revision !== "string" ||
+    value.context_revision.length < 1 ||
+    value.context_revision.length > 128 ||
+    ![null, "standard", "raylight"].includes(value.backend as null | string) ||
+    !["available", "unavailable", "unknown"].includes(String(value.state)) ||
+    !Array.isArray(value.reasons) ||
+    value.reasons.length > 16
+  ) throw new ApiError("CK Attention 能力响应结构无效", 502, value);
+  const reasons = value.reasons.map((reason) => {
+    if (
+      !isRecord(reason) ||
+      !hasExactKeys(reason, ["code", "message"]) ||
+      typeof reason.code !== "string" ||
+      reason.code.length < 1 ||
+      reason.code.length > 128 ||
+      typeof reason.message !== "string" ||
+      reason.message.length < 1 ||
+      reason.message.length > 1_024
+    ) throw new ApiError("CK Attention 能力原因结构无效", 502, reason);
+    return { code: reason.code, message: reason.message };
+  });
+  if ((value.state === "available") !== (reasons.length === 0)) {
+    throw new ApiError("CK Attention 能力摘要无效", 502, value);
+  }
+  return {
+    context_revision: value.context_revision,
+    backend: value.backend as ComfyKitchenAttentionCapability["backend"],
+    state: value.state as ComfyKitchenAttentionCapability["state"],
+    reasons,
+  };
 }
 
 function parseRuntimeSettingsAuthority(value: unknown): RuntimeSettingsAuthority {
@@ -749,19 +796,9 @@ function parseHttpError(
   if (!isRecord(detail)) {
     return { message: fallback };
   }
-  const candidateCode: ApiErrorCode | undefined =
-    detail.code === "raylight_recovery_in_flight" ||
-    detail.code === "node_unavailable" ||
-    detail.code === "timeline_revision_conflict" ||
-    detail.code === "timeline_schema_migrated" ||
-    detail.code === "runtime_settings_schema_migrated" ||
-    detail.code === "runtime_settings_authority_conflict" ||
-    detail.code === "project_import_preflight_required" ||
-    detail.code === "assets_in_use" ||
-    detail.code === "asset_trash_restore_conflict" ||
-    detail.code === "asset_trash_purge_conflict"
-      ? detail.code
-      : undefined;
+  const candidateCode: ApiErrorCode | undefined = isCapabilityIdentifier(detail.code)
+    ? detail.code
+    : undefined;
   const assetCode = candidateCode === "assets_in_use" ||
     candidateCode === "asset_trash_restore_conflict" ||
     candidateCode === "asset_trash_purge_conflict";
@@ -801,6 +838,51 @@ function parseHttpError(
       missingNodeClassTypes.push(classType);
     }
   }
+  const missingModelBindings: string[] = [];
+  if (
+    (code === "model_binding_required" || code === "model_binding_unavailable") &&
+    Array.isArray(detail.reasons)
+  ) {
+    const allowed = new Set([
+      "fl2va",
+      "ref2va",
+      "clip",
+      "video_vae",
+      "audio_vae",
+      "loras:fl2va",
+      "loras:ref2va",
+    ]);
+    const seen = new Set<string>();
+    for (const reason of detail.reasons.slice(0, 32)) {
+      if (
+        !isRecord(reason) ||
+        reason.code !== code ||
+        !isRecord(reason.safe_details) ||
+        !Array.isArray(reason.safe_details.bindings)
+      ) continue;
+      for (const binding of reason.safe_details.bindings.slice(0, 5)) {
+        if (typeof binding !== "string" || !allowed.has(binding) || seen.has(binding)) continue;
+        seen.add(binding);
+        missingModelBindings.push(binding);
+      }
+    }
+  }
+  let maxFrames: number | null = null;
+  if (code === "segment_frame_limit_exceeded" && Array.isArray(detail.reasons)) {
+    for (const reason of detail.reasons.slice(0, 32)) {
+      if (
+        !isRecord(reason) ||
+        reason.code !== code ||
+        !isRecord(reason.safe_details) ||
+        typeof reason.safe_details.max_frames !== "number" ||
+        !Number.isSafeInteger(reason.safe_details.max_frames) ||
+        reason.safe_details.max_frames < 1 ||
+        reason.safe_details.max_frames > 1_000_000
+      ) continue;
+      maxFrames = reason.safe_details.max_frames;
+      break;
+    }
+  }
   const usages = code === "node_unavailable"
     ? []
     : isStringArray(detail.usages) ? [...detail.usages] : [];
@@ -812,6 +894,8 @@ function parseHttpError(
     ...(code ? { code } : {}),
     message: detail.message,
     ...(missingNodeClassTypes.length ? { missing_node_class_types: missingNodeClassTypes } : {}),
+    ...(missingModelBindings.length ? { bindings: missingModelBindings } : {}),
+    ...(maxFrames !== null ? { max_frames: maxFrames } : {}),
     ...(usages.length ? { usages } : {}),
     ...(timelineConflict && typeof detail.project_id === "string" && detail.project_id
       ? { project_id: detail.project_id }
@@ -1081,17 +1165,27 @@ function parseFeatureCatalog(value: unknown): FeatureCatalog {
 function parseDirectorDeckConfig(value: unknown): DirectorDeckConfig {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ["schema_version", "lora"]) ||
+    !hasExactKeys(value, ["schema_version", "lora", "diagnostics"]) ||
     value.schema_version !== 1 ||
     !isRecord(value.lora) ||
     !hasExactKeys(value.lora, [
       "loaders", "fallback_policy", "loader_policies",
     ]) ||
     !Array.isArray(value.lora.loaders) ||
-    value.lora.loaders.length === 0 ||
-    !isRecord(value.lora.fallback_policy) ||
-    !Array.isArray(value.lora.loader_policies)
+    !Array.isArray(value.lora.loader_policies) ||
+    !Array.isArray(value.diagnostics) ||
+    value.diagnostics.length > 16
   ) throw new ApiError("DirectorDeck 配置响应结构无效", 502, value);
+  const diagnostics = value.diagnostics.map((diagnostic) => {
+    if (
+      !isRecord(diagnostic) ||
+      !hasExactKeys(diagnostic, ["code", "message"]) ||
+      !isCapabilityIdentifier(diagnostic.code) ||
+      !isBoundedNonemptyString(diagnostic.message, 1_024) ||
+      !diagnostic.message.trim()
+    ) throw new ApiError("DirectorDeck 配置诊断结构无效", 502, diagnostic);
+    return { code: diagnostic.code, message: diagnostic.message };
+  });
   const loaders = value.lora.loaders.map((loader) => {
     if (
       !isRecord(loader) ||
@@ -1148,17 +1242,38 @@ function parseDirectorDeckConfig(value: unknown): DirectorDeckConfig {
     loaderIds.size !== loaders.length
   ) throw new ApiError("DirectorDeck LoRA 加载器清单无效", 502, value);
   const fallbackPolicy = value.lora.fallback_policy;
-  if (
-    !hasExactKeys(fallbackPolicy, ["loader_ids", "default_loader_id"]) ||
-    !Array.isArray(fallbackPolicy.loader_ids) ||
-    fallbackPolicy.loader_ids.length === 0 ||
-    fallbackPolicy.loader_ids.some((id) =>
-      typeof id !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(id) ||
-      !loaderIds.has(id)) ||
-    new Set(fallbackPolicy.loader_ids).size !== fallbackPolicy.loader_ids.length ||
-    typeof fallbackPolicy.default_loader_id !== "string" ||
-    !fallbackPolicy.loader_ids.includes(fallbackPolicy.default_loader_id)
-  ) throw new ApiError("DirectorDeck LoRA 回退策略无效", 502, fallbackPolicy);
+  let parsedFallbackPolicy: NonNullable<
+    DirectorDeckConfig["lora"]["fallback_policy"]
+  > | null;
+  if (fallbackPolicy === null) {
+    if (
+      loaders.length > 0 ||
+      value.lora.loader_policies.length > 0 ||
+      diagnostics.length === 0
+    ) throw new ApiError("DirectorDeck LoRA 空配置子集无效", 502, value);
+    parsedFallbackPolicy = null;
+  } else {
+    if (
+      !isRecord(fallbackPolicy) ||
+      !hasExactKeys(fallbackPolicy, ["loader_ids", "default_loader_id"]) ||
+      !Array.isArray(fallbackPolicy.loader_ids) ||
+      fallbackPolicy.loader_ids.length === 0 ||
+      fallbackPolicy.loader_ids.some((id) =>
+        typeof id !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(id) ||
+        !loaderIds.has(id)) ||
+      new Set(fallbackPolicy.loader_ids).size !== fallbackPolicy.loader_ids.length ||
+      typeof fallbackPolicy.default_loader_id !== "string" ||
+      !fallbackPolicy.loader_ids.includes(fallbackPolicy.default_loader_id)
+    ) throw new ApiError("DirectorDeck LoRA 回退策略无效", 502, fallbackPolicy);
+    parsedFallbackPolicy = {
+      loader_ids: [...fallbackPolicy.loader_ids] as NonNullable<
+        DirectorDeckConfig["lora"]["fallback_policy"]
+      >["loader_ids"],
+      default_loader_id: fallbackPolicy.default_loader_id as NonNullable<
+        DirectorDeckConfig["lora"]["fallback_policy"]
+      >["default_loader_id"],
+    };
+  }
   const policyPatterns = new Set<string>();
   const loaderPolicies = value.lora.loader_policies.map((policy) => {
     if (
@@ -1193,12 +1308,10 @@ function parseDirectorDeckConfig(value: unknown): DirectorDeckConfig {
     schema_version: 1,
     lora: {
       loaders,
-      fallback_policy: {
-        loader_ids: [...fallbackPolicy.loader_ids] as DirectorDeckConfig["lora"]["fallback_policy"]["loader_ids"],
-        default_loader_id: fallbackPolicy.default_loader_id as DirectorDeckConfig["lora"]["fallback_policy"]["default_loader_id"],
-      },
+      fallback_policy: parsedFallbackPolicy,
       loader_policies: loaderPolicies,
     },
+    diagnostics,
   };
 }
 
@@ -1540,21 +1653,39 @@ function parseTimelineCompileReport(value: unknown): TimelineCompileReport {
   }
 
   const features = value.features;
+  if (!isRecord(features)) {
+    throw new ApiError("执行计划功能证据结构无效", 502, value);
+  }
+  const hasLegacyFeatureWire = hasExactKeys(features, [
+    "requested",
+    "effective_by_segment",
+    "resolutions",
+    "notices",
+  ]);
+  const hasExtendedFeatureWire = hasExactKeys(features, [
+    "requested",
+    "effective_by_segment",
+    "resolutions",
+    "uses",
+    "notices",
+    "advisories",
+  ]);
+  const rawUses = hasExtendedFeatureWire ? features.uses : [];
+  const rawAdvisories = hasExtendedFeatureWire ? features.advisories : [];
   if (
-    !isRecord(features) ||
-    !hasExactKeys(features, [
-      "requested",
-      "effective_by_segment",
-      "resolutions",
-      "notices",
-    ]) ||
+    (!hasLegacyFeatureWire && !hasExtendedFeatureWire) ||
     !isRecord(features.requested) ||
     !isRecord(features.requested.by_segment) ||
     !isRecord(features.effective_by_segment) ||
     !Array.isArray(features.resolutions) ||
     features.resolutions.length > 8_192 ||
+    !Array.isArray(rawUses) ||
+    rawUses.length > 8_192 ||
+    !rawUses.every((use) => isRecord(use) && isCapabilityJsonValue(use)) ||
     !Array.isArray(features.notices) ||
     features.notices.length > 256 ||
+    !Array.isArray(rawAdvisories) ||
+    rawAdvisories.length > 256 ||
     !isRecord(value.effective_execution_digest) ||
     !hasExactKeys(value.effective_execution_digest, ["algorithm", "value"]) ||
     value.effective_execution_digest.algorithm !== "sha256-canonical-json-v1" ||
@@ -1573,6 +1704,18 @@ function parseTimelineCompileReport(value: unknown): TimelineCompileReport {
       Object.keys(features.requested.by_segment).length
   ) throw new ApiError("执行计划请求功能结构无效", 502, features.requested);
 
+  const bundle6 = value.template_bundle_version === 6;
+  if (
+    (bundle6 && (
+      Object.keys(features.effective_by_segment).length > 0 ||
+      features.resolutions.length > 0 ||
+      rawUses.length === 0
+    )) ||
+    (!bundle6 && (rawUses.length > 0 || rawAdvisories.length > 0))
+  ) throw new ApiError("执行计划功能证据模式无效", 502, features);
+  const uses = rawUses.map((use) => structuredClone(use) as CapabilityJsonValue);
+  const advisories = parseCapabilityReasons(rawAdvisories);
+
   const effectiveBySegment: TimelineCompileReport["features"]["effective_by_segment"] = {};
   for (const [segmentId, rawResolution] of Object.entries(features.effective_by_segment)) {
     if (!isBoundedOpaqueId(segmentId, 128)) {
@@ -1581,14 +1724,14 @@ function parseTimelineCompileReport(value: unknown): TimelineCompileReport {
     effectiveBySegment[segmentId] = parseEffectiveSegmentResolution(rawResolution);
   }
   const planIds = plans.map((plan) => plan.segment_id);
-  if (
+  if (!bundle6 && (
     Object.keys(effectiveBySegment).length !== planIds.length ||
     planIds.some((segmentId) => !(segmentId in effectiveBySegment)) ||
     plans.some((plan) => {
       const effective = effectiveBySegment[plan.segment_id];
       return effective.backend !== plan.backend || effective.family !== plan.model_family;
     })
-  ) throw new ApiError("执行计划有效功能范围与分段不一致", 502, features.effective_by_segment);
+  )) throw new ApiError("执行计划有效功能范围与分段不一致", 502, features.effective_by_segment);
 
   const resolutions: TimelineCompileReport["features"]["resolutions"] = [];
   for (const rawResolution of features.resolutions) {
@@ -1636,32 +1779,34 @@ function parseTimelineCompileReport(value: unknown): TimelineCompileReport {
   if (new Set(actualResolutionKeys).size !== actualResolutionKeys.length) {
     throw new ApiError("执行计划功能解析证据包含重复身份", 502, features.resolutions);
   }
-  for (const plan of plans) {
-    const effective = effectiveBySegment[plan.segment_id];
-    const actual = resolutions.filter((item) => item.segment_id === plan.segment_id);
-    if (
-      actual.length === 0 ||
-      actual.length !== effective.features.length ||
-      actual.some((item, index) => {
-        const feature = effective.features[index];
-        return item.unit_id !== effective.unit_id ||
-          item.backend !== effective.backend ||
-          item.family !== effective.family ||
-          item.template_id !== effective.template_id ||
-          item.feature_id !== feature.id ||
-          item.version !== feature.version ||
-          item.resolution.state !== feature.state ||
-          item.adapter_fingerprint !== feature.adapter_fingerprint ||
-          JSON.stringify(item.capability) !== JSON.stringify(feature.capability);
-      })
-    ) throw new ApiError(
-      "执行计划功能解析证据与有效功能不一致",
-      502,
-      features.resolutions,
-    );
-  }
-  if (resolutions.some((item) => !plansById.has(item.segment_id))) {
-    throw new ApiError("执行计划功能解析证据引用未编译分段", 502, features.resolutions);
+  if (!bundle6) {
+    for (const plan of plans) {
+      const effective = effectiveBySegment[plan.segment_id];
+      const actual = resolutions.filter((item) => item.segment_id === plan.segment_id);
+      if (
+        actual.length === 0 ||
+        actual.length !== effective.features.length ||
+        actual.some((item, index) => {
+          const feature = effective.features[index];
+          return item.unit_id !== effective.unit_id ||
+            item.backend !== effective.backend ||
+            item.family !== effective.family ||
+            item.template_id !== effective.template_id ||
+            item.feature_id !== feature.id ||
+            item.version !== feature.version ||
+            item.resolution.state !== feature.state ||
+            item.adapter_fingerprint !== feature.adapter_fingerprint ||
+            JSON.stringify(item.capability) !== JSON.stringify(feature.capability);
+        })
+      ) throw new ApiError(
+        "执行计划功能解析证据与有效功能不一致",
+        502,
+        features.resolutions,
+      );
+    }
+    if (resolutions.some((item) => !plansById.has(item.segment_id))) {
+      throw new ApiError("执行计划功能解析证据引用未编译分段", 502, features.resolutions);
+    }
   }
 
   const notices: TimelineCompileReport["features"]["notices"] = [];
@@ -1676,9 +1821,9 @@ function parseTimelineCompileReport(value: unknown): TimelineCompileReport {
       !isCapabilityIdentifier(rawNotice.feature_id) ||
       !isBoundedNonemptyString(rawNotice.message, 4_096) ||
       !rawNotice.message.trim() ||
-      !resolutionNoticeKeys.has(
+      (!bundle6 && !resolutionNoticeKeys.has(
         `${rawNotice.segment_id}\u0000${rawNotice.unit_id}\u0000${rawNotice.feature_id}`,
-      )
+      ))
     ) throw new ApiError("执行计划功能提示结构无效", 502, rawNotice);
     notices.push({
       segment_id: rawNotice.segment_id,
@@ -1686,6 +1831,17 @@ function parseTimelineCompileReport(value: unknown): TimelineCompileReport {
       feature_id: rawNotice.feature_id,
       message: rawNotice.message,
     });
+  }
+
+  const parsedFeatures: TimelineCompileReport["features"] = {
+    requested,
+    effective_by_segment: effectiveBySegment,
+    resolutions,
+    notices,
+  };
+  if (hasExtendedFeatureWire) {
+    parsedFeatures.uses = uses;
+    parsedFeatures.advisories = advisories;
   }
 
   return {
@@ -1701,12 +1857,7 @@ function parseTimelineCompileReport(value: unknown): TimelineCompileReport {
       custom_nodes: [...policy.custom_nodes],
       provenance: { ...policy.provenance } as TimelineCompileReport["node_policy"]["provenance"],
     },
-    features: {
-      requested,
-      effective_by_segment: effectiveBySegment,
-      resolutions,
-      notices,
-    },
+    features: parsedFeatures,
     effective_execution_digest: {
       algorithm: "sha256-canonical-json-v1",
       value: value.effective_execution_digest.value,
@@ -1985,7 +2136,7 @@ function parseProjectSummary(value: unknown): ProjectSummary {
     typeof value.title !== "string" ||
     typeof value.created_at !== "string" ||
     typeof value.updated_at !== "string" ||
-    !isNonNegativeInteger(value.segment_count) || value.segment_count < 1
+    !isNonNegativeInteger(value.segment_count)
   ) throw new ApiError("项目摘要响应结构无效", 502, value);
   return {
     id: value.id,
@@ -2698,6 +2849,16 @@ export const directorApi = {
       signal,
       headers: runtimeAuthorityHeaders(authorityToken),
     }).then(parseCapabilities),
+  getComfyKitchenAttentionCapability: (
+    families: readonly TimelineGenerationMode[],
+    signal?: AbortSignal,
+  ) =>
+    request<unknown>(
+      `/capabilities/comfy-kitchen-attention?${families
+        .map((family) => `family=${encodeURIComponent(family)}`).join("&")}`,
+      { signal },
+    )
+      .then(parseComfyKitchenAttentionCapability),
   getGpus: (signal: AbortSignal | undefined, authorityToken: string) =>
     request<{ gpus: GPUResource[] }>("/gpus", {
       signal,
@@ -2809,10 +2970,13 @@ export const directorApi = {
 
   listProjects: (signal?: AbortSignal) =>
     request<unknown>("/projects", { signal }).then(parseProjectList),
-  createProject: (title?: string) =>
+  createProject: (title?: string, initialModelStack?: ModelStack) =>
     request<unknown>("/projects", {
       method: "POST",
-      body: JSON.stringify({ title: title ?? "" }),
+      body: JSON.stringify({
+        title: title ?? "",
+        initial_model_stack: initialModelStack ?? null,
+      }),
     }).then(parseProjectSummary),
   preflightProjectImport: (payload: ProjectImportPreflightRequest) =>
     request<unknown>("/projects/import/preflight", {

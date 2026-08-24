@@ -5,8 +5,6 @@ import {
   EMPTY_MODELS,
   sanitizeRuntimeSettings,
   type CapabilityReport,
-  type FeatureCatalog,
-  type FeaturePreflightResponse,
   type GenerationTask,
   type GPUResource,
   type ModelInventory,
@@ -32,6 +30,7 @@ import { TimelineGlobalSettings } from "./components/TimelineGlobalSettings";
 import { ProjectImportDialog } from "./components/ProjectImportDialog";
 import { WorkspaceAssetSidebar } from "./components/WorkspaceAssetSidebar";
 import { Spinner } from "./components/ui";
+import { localizeProblem, useTranslator, type LocalizedProblem } from "./i18n";
 import {
   classifyDroppedFiles,
   describeUploadProgress,
@@ -143,6 +142,7 @@ import {
   saveLoraLoaderOverrideWithCas,
   type LoraLoaderOverrideEdit,
 } from "./state/loraLoaderOverrides";
+import { useComfyKitchenAttentionCapability } from "./hooks/useComfyKitchenAttentionCapability";
 import {
   clearLegacyTimelineWalCandidate,
   legacyTimelineWalCandidates,
@@ -843,36 +843,8 @@ function submitTimelineForProject(
     : directorApi.createProjectTask(projectId, payload);
 }
 
-export class FeatureCatalogDriftError extends Error {
-  constructor() {
-    super("功能目录或宿主能力在预检期间发生变化；已重新核对，请重试");
-    this.name = "FeatureCatalogDriftError";
-  }
-}
-
-export function requireSuccessfulFeaturePreflight(
-  result: FeaturePreflightResponse,
-  config: TimelineProject,
-  catalog: FeatureCatalog | null,
-): void {
-  if (
-    catalog === null ||
-    config.features.template_bundle_version !== catalog.template_bundle_version ||
-    result.template_bundle_version !== catalog.template_bundle_version ||
-    result.host_capability_revision !== catalog.host_capability_revision
-  ) throw new FeatureCatalogDriftError();
-  if (result.valid) return;
-  const failure = result.errors[0];
-  if (failure) {
-    throw new Error(`${failure.message}；${failure.remediation}`);
-  }
-  const readiness = result.operational_readiness.blocking_reason_codes;
-  throw new Error(readiness.length
-    ? `当前运行环境未就绪：${readiness.join("、")}`
-    : "当前功能配置未通过服务端能力预检");
-}
-
 export default function App() {
+  const translator = useTranslator();
   const [state, dispatch] = useReducer(directorReducer, undefined, loadDirectorState);
   const [timeline, rawTimelineDispatch] = useReducer(
     timelineEditorReducer,
@@ -894,11 +866,6 @@ export default function App() {
   const [rayLightRecoveryPending, setRayLightRecoveryPending] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
   const [runtimeResourcesReady, setRuntimeResourcesReady] = useState(false);
-  const [featureCatalogStatus, setFeatureCatalogStatus] = useState<{
-    ready: boolean;
-    error: string | null;
-  }>({ ready: false, error: null });
-  const [featureCatalog, setFeatureCatalog] = useState<FeatureCatalog | null>(null);
   const [runtimeSettingsOperationOwner, setRuntimeSettingsOperationOwner] = useState<RuntimeSettingsOperationOwner | null>(null);
   const [runtimeSettingsSyncRequired, setRuntimeSettingsSyncRequired] = useState(false);
   const [runtimeSettingsDraft, setRuntimeSettingsDraft] = useState<RuntimeSettings>(() => state.settings);
@@ -919,6 +886,7 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false);
   const [compiling, setCompiling] = useState(false);
   const [compileReport, setCompileReport] = useState<TimelineCompileReport | null>(null);
+  const [compileFailure, setCompileFailure] = useState<LocalizedProblem | null>(null);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [assetsDeleting, setAssetsDeleting] = useState(false);
   const [assetsUploading, setAssetsUploading] = useState(false);
@@ -930,6 +898,17 @@ export default function App() {
   const [sidebarViewportWidth, setSidebarViewportWidth] = useState(() => window.innerWidth);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false);
+  const {
+    capability: comfyKitchenAttentionCapability,
+    refreshHostCapability: refreshComfyKitchenAttentionHost,
+  } = useComfyKitchenAttentionCapability({
+    active: globalSettingsOpen && state.view === "workspace" &&
+      timeline.project.features.template_bundle_version >= 6,
+    familyModes: timeline.project.segments.map((segment) => segment.mode),
+    connection: capabilities.connection,
+    confirmedSettings: state.settings,
+    draftSettings: runtimeSettingsDraft,
+  });
   const [timelineHistoryPanelOpen, setTimelineHistoryPanelOpen] = useState(false);
   const [assetTrashPanelOpen, setAssetTrashPanelOpen] = useState(false);
   const [assetTrashBatches, setAssetTrashBatches] = useState<AssetTrashBatch[]>([]);
@@ -971,10 +950,6 @@ export default function App() {
   const externalRuntimeAuthorityRetryTimer = useRef<number | null>(null);
   const runtimeResourcesReadyRef = useRef(false);
   const runtimeResourcesAuthorityTokenRef = useRef<string | null>(null);
-  const featureCatalogRef = useRef<FeatureCatalog | null>(null);
-  const featureCatalogEtagRef = useRef<string | null>(null);
-  const featureCatalogReadyRef = useRef(false);
-  const featureCatalogErrorRef = useRef<string | null>(null);
   const rayLightRuntimeStatusRef = useRef<RayLightRuntimeStatus | null>(null);
   const rayLightRecoveryOperationRef = useRef<Promise<void> | null>(null);
   const rayLightRecoveryControllerRef = useRef<AbortController | null>(null);
@@ -1300,6 +1275,7 @@ export default function App() {
     setTimelineDirty(false);
     setTimelinePausedError(null);
     setCompileReport(null);
+    setCompileFailure(null);
     clearTimelineHistory();
     setTimelineHydrationStatus("loading");
     setTimelineHydrationEpoch((current) => current + 1);
@@ -1418,12 +1394,14 @@ export default function App() {
       setTimelinePausedError(null);
       setTimelineDirty(true);
       setCompileReport(null);
+      setCompileFailure(null);
       taskListRequest.current += 1;
       dispatch({ type: "tasks/invalidate-current-snapshots" });
     }
     if (transaction.runnableSelectionChanged) {
       segmentSelectionGeneration.current += 1;
       setCompileReport(null);
+      setCompileFailure(null);
     }
     const activeDatabase = activeDatabaseRef.current;
     const selectionPreferenceScope = activeDatabase
@@ -2088,15 +2066,11 @@ export default function App() {
       initialAuthority = null;
     }
     const unavailable = () => Promise.reject(new Error("运行设置权威 token 不可用"));
-    const cachedCatalogEtag = featureCatalogRef.current
-      ? featureCatalogEtagRef.current ?? undefined
-      : undefined;
     const [
       capabilityResult,
       gpuResult,
       modelResult,
       rayLightRuntimeResult,
-      featureCatalogResult,
     ] = await Promise.allSettled([
       initialAuthority
         ? directorApi.getCapabilities(signal, initialAuthority.token)
@@ -2110,7 +2084,6 @@ export default function App() {
       initialAuthority
         ? directorApi.getRayLightRuntimeStatus(signal, initialAuthority.token)
         : unavailable(),
-      directorApi.getFeatureCatalog(cachedCatalogEtag, signal),
     ]);
     // Read the authority again after all resources. The server also checks the
     // same token before and after every upstream call, so A -> B -> A cannot
@@ -2162,48 +2135,9 @@ export default function App() {
       clearTimelineHistory();
       setRuntimeAuthorityRequired(true);
       setCompileReport(null);
+      setCompileFailure(null);
       window.queueMicrotask(() => externalRuntimeAuthorityRefreshRef.current());
       return false;
-    }
-
-    const featureCatalogSnapshot = featureCatalogResult.status === "fulfilled"
-      ? featureCatalogResult.value.status === "fresh"
-        ? {
-            catalog: featureCatalogResult.value.catalog,
-            etag: featureCatalogResult.value.etag,
-          }
-        : featureCatalogRef.current &&
-            featureCatalogEtagRef.current === featureCatalogResult.value.etag
-          ? {
-              catalog: featureCatalogRef.current,
-              etag: featureCatalogResult.value.etag,
-            }
-          : null
-      : null;
-    if (featureCatalogSnapshot) {
-      featureCatalogRef.current = featureCatalogSnapshot.catalog;
-      featureCatalogEtagRef.current = featureCatalogSnapshot.etag;
-      featureCatalogReadyRef.current = true;
-      featureCatalogErrorRef.current = null;
-      setFeatureCatalog(featureCatalogSnapshot.catalog);
-      setFeatureCatalogStatus({ ready: true, error: null });
-    } else {
-      const reason = featureCatalogResult.status === "rejected" &&
-        featureCatalogResult.reason instanceof Error
-        ? featureCatalogResult.reason.message
-        : "服务器未返回可复用的功能目录";
-      const message = `功能目录与宿主能力不可用：${reason}`;
-      featureCatalogReadyRef.current = false;
-      featureCatalogErrorRef.current = message;
-      setFeatureCatalog(null);
-      setFeatureCatalogStatus({ ready: false, error: message });
-      // A stale cached catalog remains available solely for a future 304
-      // revalidation. It must never keep execution unlocked after a provider
-      // or catalog request failure.
-      runtimeResourcesReadyRef.current = false;
-      runtimeResourcesAuthorityTokenRef.current = null;
-      setRuntimeResourcesReady(false);
-      setCompileReport(null);
     }
 
     const visibleGpuSnapshot = gpuResult.status === "fulfilled"
@@ -2222,7 +2156,6 @@ export default function App() {
       gpuResult.status === "fulfilled" &&
       modelResult.status === "fulfilled" &&
       rayLightRuntimeResult.status === "fulfilled" &&
-      featureCatalogSnapshot !== null &&
       gpuSnapshotMatchesRuntime;
     if (complete) {
       setCapabilities(capabilityResult.value);
@@ -2266,14 +2199,17 @@ export default function App() {
   runtimeResourceRefreshRef.current = (preserveExisting) =>
     refreshRuntimeResources(preserveExisting);
 
-  const refreshAuthoritativeRuntimeResources = useCallback(() => {
+  const refreshAuthoritativeRuntimeResources = useCallback((refreshCkCapability = true) => {
     // A successful probe or in-process host-tool install changes the single
-    // embedded host. App refreshes runtime inventories and the catalog in one
-    // latest-wins generation. A resource-only failure must not masquerade as
-    // a settings-authority change or duplicate the server evaluator gate.
+    // embedded host. App refreshes its authoritative runtime inventories. A
+    // resource-only failure must not masquerade as a settings-authority change.
     setCompileReport(null);
-    void refreshRuntimeResources(runtimeResourcesReadyRef.current);
-  }, [refreshRuntimeResources]);
+    setCompileFailure(null);
+    void refreshRuntimeResources(runtimeResourcesReadyRef.current)
+      .finally(() => {
+        if (refreshCkCapability) refreshComfyKitchenAttentionHost();
+      });
+  }, [refreshComfyKitchenAttentionHost, refreshRuntimeResources]);
 
   const refreshRuntime = useCallback(async (
     signal?: AbortSignal,
@@ -2405,6 +2341,7 @@ export default function App() {
     setRuntimeSettingsOperationOwner(owner);
     setRuntimeAuthorityRequired(true);
     setCompileReport(null);
+    setCompileFailure(null);
     const invalidateAssetAuthority = () => {
       assetAuthorityRequired.current = true;
       assetListRequest.current += 1;
@@ -2608,6 +2545,7 @@ export default function App() {
     setRuntimeSettingsDraftValid(true);
     setRuntimeAuthorityRequired(true);
     setCompileReport(null);
+    setCompileFailure(null);
     taskListRequest.current += 1;
     dispatch({ type: "tasks/invalidate-current-snapshots" });
     const activeDatabase = activeDatabaseRef.current;
@@ -2772,6 +2710,7 @@ export default function App() {
     setRuntimeSettingsOperationOwner("resync");
     setRuntimeAuthorityRequired(true);
     setCompileReport(null);
+    setCompileFailure(null);
     let recoveryResult: Awaited<ReturnType<typeof recoverRuntimeSettingsV2WalCandidate>> | null =
       null;
     const operation = (async (): Promise<RuntimeSettings> => {
@@ -2858,6 +2797,7 @@ export default function App() {
     setRuntimeSettingsOperationOwner("lora-mapping");
     setRuntimeAuthorityRequired(true);
     setCompileReport(null);
+    setCompileFailure(null);
     const operation = (async () => {
       const committed = await saveLoraLoaderOverrideWithCas(
         edit,
@@ -3312,17 +3252,24 @@ export default function App() {
           authority = await fetchTimelineForProject(hydratingProjectId, controller.signal);
         } catch (reason) {
           if (!ownsHydration()) return;
-          if (!(
+          const missingPersistedProject =
             reason instanceof ApiError &&
             reason.status === 404 &&
-            hydratingProjectId !== DEFAULT_PROJECT_ID
-          )) throw reason;
+            hydratingProjectId !== DEFAULT_PROJECT_ID;
+          const unreadablePersistedProject =
+            reason instanceof ApiError &&
+            reason.code === "project_document_unreadable" &&
+            hydratingProjectId !== DEFAULT_PROJECT_ID;
+          if (!missingPersistedProject && !unreadablePersistedProject) throw reason;
 
           // A create-like endpoint already acknowledged this project in the
           // current page. Its timeline GET/list membership may still lag that
           // commit, so retry hydration instead of treating the stale 404 as
           // proof that the project was deleted.
-          if (locallyCommittedProjectsRef.current.has(hydratingProjectId)) {
+          if (
+            missingPersistedProject &&
+            locallyCommittedProjectsRef.current.has(hydratingProjectId)
+          ) {
             throw reason;
           }
 
@@ -3337,12 +3284,18 @@ export default function App() {
           if (
             verification.active_database_path !== candidateDatabase.active_database_path
           ) throw new DatabaseIdentityChangedDuringHydrationError();
-          if (list.projects.some((project) => project.id === hydratingProjectId)) {
+          if (
+            missingPersistedProject &&
+            list.projects.some((project) => project.id === hydratingProjectId)
+          ) {
             // GET and list disagreed inside one stable database. Retry instead
             // of guessing whether creation/deletion won the inter-request race.
             throw reason;
           }
           setProjects(reconcileServerProjectList(list.projects));
+          if (unreadablePersistedProject) {
+            setToast("上次打开的项目配置已损坏；已切换到默认项目，可通过项目导出接口保留原始数据或删除该项目");
+          }
           restartTimelineHydrationForProject(DEFAULT_PROJECT_ID);
           return;
         }
@@ -4424,10 +4377,6 @@ export default function App() {
 
   const submitTimeline = async (segmentIds: string[]) => {
     if (submitting) return;
-    if (!featureCatalogReadyRef.current) {
-      setToast(featureCatalogErrorRef.current ?? "功能目录与宿主能力尚未完成核对；暂不能生成");
-      return;
-    }
     if (!segmentIds.length) {
       setToast("请至少勾选一个要生成的片段");
       return;
@@ -4486,11 +4435,9 @@ export default function App() {
         runtimeSettingsGeneration.current !== executionGeneration ||
         !sameRuntimeSettings(authoritativeSettingsRef.current, executionSettings)
       ) throw new Error("运行设置权威状态已变化，请重新生成");
-      // Submission is the only authoritative execution gate and recaptures
-      // current host/model/runtime facts before creating any upstream side
-      // effect. Do not synchronously run the advisory preflight immediately
-      // beforehand; it duplicates the expensive host scan and makes every
-      // click wait twice for the same observation.
+      // Submission compiles the clicked project/settings snapshot and hands it
+      // directly to ComfyUI. Advisory preflight is neither repeated here nor
+      // used to authorize execution.
       const task = await submitTimelineForProject(clickedProjectId, {
         config: structuredClone(config),
         segment_ids: clickedSegmentIds,
@@ -4504,13 +4451,6 @@ export default function App() {
       dispatch({ type: "tasks/panel", open: true });
       setToast(`已提交 ${clickedSegmentIds.length} 个原生分段子图`);
     } catch (reason) {
-      if (reason instanceof FeatureCatalogDriftError) {
-        featureCatalogReadyRef.current = false;
-        featureCatalogErrorRef.current = reason.message;
-        setFeatureCatalog(null);
-        setFeatureCatalogStatus({ ready: false, error: reason.message });
-        void refreshRuntimeResources(runtimeResourcesReadyRef.current);
-      }
       setToast(reason instanceof Error ? reason.message : "时间线任务提交失败");
     } finally {
       setSubmitting(false);
@@ -4565,10 +4505,6 @@ export default function App() {
 
   const inspectTimelineExecution = async (segmentIds: string[]) => {
     if (compiling) return;
-    if (!featureCatalogReadyRef.current) {
-      setToast(featureCatalogErrorRef.current ?? "功能目录与宿主能力尚未完成核对；暂不能预检");
-      return;
-    }
     if (!segmentIds.length) {
       setToast("请至少勾选一个要预检的片段");
       return;
@@ -4592,6 +4528,15 @@ export default function App() {
     if (validationErrors.length) { setToast(validationErrors[0]); return; }
     const executionGeneration = runtimeSettingsGeneration.current;
     const executionSettings = structuredClone(authoritativeSettingsRef.current);
+    const clickedTimelineRevision = timelineRevision.current;
+    const requestStillCurrent = () =>
+      activeProjectIdRef.current === clickedProjectId &&
+      timelineRevision.current === clickedTimelineRevision &&
+      segmentSelectionGeneration.current === clickedSegmentSelectionGeneration &&
+      runtimeSettingsGeneration.current === executionGeneration &&
+      sameRuntimeSettings(authoritativeSettingsRef.current, executionSettings) &&
+      runtimeSettingsDesired.current === null &&
+      !runtimeSettingsSyncRequiredRef.current;
     // A pending project GET must not land while preflight owns this project.
     projectSwitchGeneration.current += 1;
     runtimeExecutionIntent.current += 1;
@@ -4600,58 +4545,23 @@ export default function App() {
       // Preflight is strictly read-only: make random seeds concrete on this
       // detached draft without dispatch, history, WAL, autosave or timeline PUT.
       config = materializeRandomSeeds(config, clickedSegmentIds).project;
-      const clickedTimelineRevision = timelineRevision.current;
       validationErrors = [
         ...validateTimelineProject(config, clickedSegmentIds),
       ];
       if (validationErrors.length) { setToast(validationErrors[0]); return; }
-      const capabilityPreflight = await directorApi.preflightFeatures({
-        config: structuredClone(config),
-        segment_ids: clickedSegmentIds,
-        project_id: clickedProjectId,
-      });
-      if (
-        activeProjectIdRef.current !== clickedProjectId ||
-        timelineRevision.current !== clickedTimelineRevision ||
-        segmentSelectionGeneration.current !== clickedSegmentSelectionGeneration ||
-        runtimeSettingsGeneration.current !== executionGeneration ||
-        !sameRuntimeSettings(authoritativeSettingsRef.current, executionSettings) ||
-        runtimeSettingsDesired.current !== null ||
-        runtimeSettingsSyncRequiredRef.current
-      ) {
-        setToast("项目、时间线、分段选择或运行设置已变化，请重新预检");
-        return;
-      }
-      requireSuccessfulFeaturePreflight(
-        capabilityPreflight,
-        config,
-        featureCatalogRef.current,
-      );
       const report = await compileTimelineForProject(clickedProjectId, { config: structuredClone(config), segment_ids: clickedSegmentIds });
-      if (
-        activeProjectIdRef.current !== clickedProjectId ||
-        timelineRevision.current !== clickedTimelineRevision ||
-        segmentSelectionGeneration.current !== clickedSegmentSelectionGeneration ||
-        runtimeSettingsGeneration.current !== executionGeneration ||
-        !sameRuntimeSettings(authoritativeSettingsRef.current, executionSettings) ||
-        runtimeSettingsDesired.current !== null ||
-        runtimeSettingsSyncRequiredRef.current
-      ) {
+      if (!requestStillCurrent()) {
         setToast("项目、时间线、分段选择或运行设置已变化，请重新预检");
         return;
       }
       setCompileReport(report);
+      setCompileFailure(null);
       setToast(`已预检 ${report.plans.length} 个服务端原生执行计划`);
     } catch (reason) {
-      if (reason instanceof FeatureCatalogDriftError) {
-        featureCatalogReadyRef.current = false;
-        featureCatalogErrorRef.current = reason.message;
-        setFeatureCatalog(null);
-        setFeatureCatalogStatus({ ready: false, error: reason.message });
-        void refreshRuntimeResources(runtimeResourcesReadyRef.current);
-      }
+      if (!requestStillCurrent()) return;
       setCompileReport(null);
-      setToast(reason instanceof Error ? reason.message : "执行计划预检失败");
+      setCompileFailure(localizeProblem(reason, translator));
+      setToast(translator.t("preflight.failure.title"));
     } finally {
       setCompiling(false);
       runtimeExecutionIntent.current = Math.max(0, runtimeExecutionIntent.current - 1);
@@ -4724,6 +4634,7 @@ export default function App() {
       setRayLightRecoveryPending(true);
       setRuntimeAuthorityRequired(true);
       setCompileReport(null);
+      setCompileFailure(null);
       let mutationMayHaveCommitted = false;
       let attempt = 0;
       try {
@@ -5407,7 +5318,7 @@ export default function App() {
   }
   const runtimeResourcesConfirmed = capabilities.connection === "online" &&
     runtimeResourcesReady && rayLightRuntimeStatus !== null;
-  const runtimeReady = runtimeResourcesConfirmed && featureCatalogStatus.ready;
+  const runtimeReady = runtimeResourcesConfirmed;
   const rayLightRecoveryRequired = runtimeReady &&
     rayLightRuntimeStatus?.recovery_required === true;
   const runtimeAuthorityPending = runtimeSettingsOperationOwner !== null || runtimeSettingsSyncRequired;
@@ -5419,11 +5330,7 @@ export default function App() {
         ...capabilities,
         connection: "checking",
         message: !runtimeReady
-          ? featureCatalogStatus.error ?? (
-              !featureCatalogStatus.ready
-                ? "功能目录与宿主能力等待权威核对"
-                : "ComfyUI 运行资源等待权威核对"
-            )
+          ? "ComfyUI 运行资源等待权威核对"
           : rayLightRecoveryRequired
           ? "旧 RayLight 运行状态等待重启确认"
           : rayLightRecoveryPending
@@ -5463,9 +5370,6 @@ export default function App() {
   const selectionTimelineErrors = [
     ...(!timelineHydrated ? [databaseIdentityStale ? "本页数据库身份已过期，请刷新整个页面" : "正在从服务器恢复时间线"] : []),
     ...(runtimeAuthorityPending ? ["运行设置尚未完成服务器权威回读"] : []),
-    ...(!featureCatalogStatus.ready
-      ? [featureCatalogStatus.error ?? "功能目录与宿主能力尚未完成权威核对"]
-      : []),
     ...(creativeAuthorityWritePending ? ["项目创作配置正在等待服务器 CAS 确认"] : []),
     ...(timelineSyncRequired ? ["素材级联已提交，但服务器时间线尚未完成权威回读"] : []),
     ...(timelineRevisionConflict ? ["服务器时间线存在修订冲突，请先选择采用服务器版本或保留本地版本"] : []),
@@ -5478,8 +5382,8 @@ export default function App() {
       ? [`当前 ComfyUI 素材库不包含所选片段的引用素材：${[...new Set(inactiveSelectionAssetReferences)].join("、")}`]
       : []),
   ];
-  const timelineRunActionsReady = featureCatalogStatus.ready &&
-    selectionTimelineErrors.length === 0 && selectedEnabledIds.length > 0;
+  const timelineRunActionsReady = selectionTimelineErrors.length === 0 &&
+    selectedEnabledIds.length > 0;
   const timelineHistoryBlocked = state.view !== "workspace" ||
     !timelineHydrated || databaseIdentityStale ||
     timelineSyncRequired || Boolean(timelineRevisionConflict) || assetsDeleting ||
@@ -5745,6 +5649,7 @@ export default function App() {
     setTimelineHydrationStatus("ready");
     setTimelineDirty(targetHasPending);
     setCompileReport(null);
+    setCompileFailure(null);
     setTimelinePausedError(null);
     setTimelineRevisionConflict(targetConflict);
     if (targetWal && targetWalResolution?.status === "acknowledged" && !targetConflict) {
@@ -5792,7 +5697,10 @@ export default function App() {
       }
     }
     try {
-      const created = await directorApi.createProject(title);
+      const created = await directorApi.createProject(
+        title,
+        structuredClone(timelineRef.current.project.model_stack),
+      );
       publishLocallyCommittedProject(created);
       await switchProject(created.id);
     } catch (reason) {
@@ -5834,6 +5742,20 @@ export default function App() {
         setProjectDeletingId(null);
       }
     }
+  };
+
+  const openPreflightSettings = () => {
+    setTimelineHistoryPanelOpen(false);
+    setAssetTrashPanelOpen(false);
+    dispatch({ type: "tasks/panel", open: false });
+    setGlobalSettingsOpen(true);
+    window.requestAnimationFrame(() => {
+      const target = document.getElementById(`${GLOBAL_SETTINGS_ID}-codec-models`);
+      target?.focus({ preventScroll: true });
+      if (typeof target?.scrollIntoView === "function") {
+        target.scrollIntoView({ block: "nearest" });
+      }
+    });
   };
 
   return (
@@ -6325,6 +6247,7 @@ export default function App() {
               project={timeline.project}
               models={models}
               runtimeReady={runtimeSettingsDraftValid && runtimeResourcesReady && capabilities.connection === "online" && !rayLightRecoveryRequired}
+              comfyKitchenAttentionCapability={comfyKitchenAttentionCapability}
               onClose={() => { setGlobalSettingsOpen(false); window.requestAnimationFrame(() => globalSettingsToggleRef.current?.focus()); }}
               onProjectPatch={(patch) => dispatchTimeline({ type: "project/patch", patch })}
               onSamplingChange={(family, patch) => dispatchTimeline({
@@ -6334,14 +6257,23 @@ export default function App() {
               })}
               onModelChange={(role, filename) => {
                 setCompileReport(null);
+                setCompileFailure(null);
                 dispatchTimeline({ type: "project/update-model", role, filename });
               }}
               onLoraChange={(family, patch) => {
                 setCompileReport(null);
+                setCompileFailure(null);
                 dispatchTimeline({
                   type: "feature/set-project",
                   featureId: "lora",
                   selection: updateLoraFeatureFamily(timeline.project.features, family, patch),
+                });
+              }}
+              onComfyKitchenAttentionChange={(enabled) => {
+                dispatchTimeline({
+                  type: "feature/set-project",
+                  featureId: "comfy_kitchen_attention",
+                  selection: { enabled, params: {} },
                 });
               }}
             />
@@ -6376,16 +6308,21 @@ export default function App() {
                 }
               }}
             />
-            {!workspaceRuntimeReady && <div className="timeline-runtime-notice">{!runtimeSettingsDraftValid ? "系统设置有无效输入，请打开并修正；有效后自动应用。" : runtimeSettingsPausedError ? `服务器拒绝当前系统设置：${runtimeSettingsPausedError}。请打开并修改；有效修改后自动应用。` : featureCatalogStatus.error ? `${featureCatalogStatus.error}；生成与预检保持锁定。` : rayLightRecoveryRequired ? "旧 RayLight 运行状态引用了当前不可见 GPU；服务器预检会按最新状态给出阻断原因，也可在系统设置确认重启恢复。" : runtimeSettingsSyncRequired ? "运行设置或素材库正在后台自动核对；恢复权威状态前，生成与素材操作保持锁定。" : runtimeSettingsOperationOwner !== null ? "运行设置正在同步并从服务器权威回读；完成前不能生成或操作素材。" : creativeAuthorityWritePending ? "项目创作配置正在提交 CAS；确认前不能生成或操作素材。" : timelineRevisionConflict ? "服务器时间线存在修订冲突；本地草稿已保留，请在页面顶部选择处理方式。" : timelineSyncRequired ? "素材操作结果正在自动核对；恢复权威时间线前，编辑与生成保持锁定。" : assetsDeleting ? "正在原子解除素材引用；时间线编辑与生成暂时锁定。" : assetsUploading ? assetUploadProgress ? `${describeUploadProgress(assetUploadProgress)}；完成前暂时锁定同步、预检和生成。` : "正在上传并绑定本地素材；完成前暂时锁定同步、预检和生成。" : capabilities.connection === "offline" ? "ComfyUI 当前离线；编辑内容会继续保留，恢复后由服务器实时核对执行能力。" : !featureCatalogStatus.ready ? "正在读取功能目录与宿主能力…" : "正在检查设置页所需的 ComfyUI 资源；执行能力由服务器实时预检。"}</div>}
+            {!workspaceRuntimeReady && <div className="timeline-runtime-notice">{!runtimeSettingsDraftValid ? "系统设置有无效输入，请打开并修正；有效后自动应用。" : runtimeSettingsPausedError ? `服务器拒绝当前系统设置：${runtimeSettingsPausedError}。请打开并修改；有效修改后自动应用。` : rayLightRecoveryRequired ? "旧 RayLight 运行状态引用了当前不可见 GPU；服务器预检会按最新状态给出阻断原因，也可在系统设置确认重启恢复。" : runtimeSettingsSyncRequired ? "运行设置或素材库正在后台自动核对；恢复权威状态前，生成与素材操作保持锁定。" : runtimeSettingsOperationOwner !== null ? "运行设置正在同步并从服务器权威回读；完成前不能生成或操作素材。" : creativeAuthorityWritePending ? "项目创作配置正在提交 CAS；确认前不能生成或操作素材。" : timelineRevisionConflict ? "服务器时间线存在修订冲突；本地草稿已保留，请在页面顶部选择处理方式。" : timelineSyncRequired ? "素材操作结果正在自动核对；恢复权威时间线前，编辑与生成保持锁定。" : assetsDeleting ? "正在原子解除素材引用；时间线编辑与生成暂时锁定。" : assetsUploading ? assetUploadProgress ? `${describeUploadProgress(assetUploadProgress)}；完成前暂时锁定同步、预检和生成。` : "正在上传并绑定本地素材；完成前暂时锁定同步、预检和生成。" : capabilities.connection === "offline" ? "ComfyUI 当前离线；编辑内容会继续保留，恢复后由服务器实时核对执行能力。" : "正在检查设置页所需的 ComfyUI 资源；执行能力由服务器实时预检。"}</div>}
             <LongFormTimelineWorkspace
               state={timeline}
               capabilities={workspaceCapabilities}
               activeTask={activeTask}
               segmentCandidates={segmentCandidates}
               compileReport={compileReport}
+              compileFailure={compileFailure}
               selectionValidationErrors={selectionTimelineErrors}
               onDispatch={dispatchTimeline}
-              onCloseCompile={() => setCompileReport(null)}
+              onCloseCompile={() => {
+                setCompileReport(null);
+                setCompileFailure(null);
+              }}
+              onOpenPreflightSettings={openPreflightSettings}
               onCancelTask={(id) => void cancel(id)}
               onUploadFiles={uploadWorkspaceFiles}
             />
@@ -6398,7 +6335,6 @@ export default function App() {
             confirmedSettings={state.settings}
             resourcesReady={runtimeResourcesReady}
             capabilities={capabilities}
-            featureCatalog={featureCatalogStatus.ready ? featureCatalog : null}
             gpus={gpus}
             models={models}
             rayLightRuntimeStatus={rayLightRuntimeStatus}
@@ -6420,7 +6356,8 @@ export default function App() {
             onSaved={(next) => queueRuntimeSettings("settings-page", next)}
             onSaveLoraLoaderOverride={saveLoraLoaderOverride}
             onConnectionTestSucceeded={refreshAuthoritativeRuntimeResources}
-            onHostCapabilitiesChanged={refreshAuthoritativeRuntimeResources}
+            onHostCapabilitiesChanged={(scope) =>
+              refreshAuthoritativeRuntimeResources(scope === "raylight")}
             onConfirmRayLightRuntimeRecovery={confirmRayLightRuntimeRecovery}
             onRequestClose={(restoreFocus = true) => {
               dispatch({ type: "navigate/workspace" });

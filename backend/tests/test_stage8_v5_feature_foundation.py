@@ -37,7 +37,7 @@ from directordeck.workflow.templates import (
     V4_TEMPLATE_BUNDLE,
     V5_TEMPLATE_BUNDLE,
 )
-from directordeck.workflow.node_contracts import CURRENT_NODE_CONTRACT_REGISTRY
+from directordeck.workflow.node_contracts import V5_NODE_CONTRACT_REGISTRY
 from directordeck.workflow.v5_compat import (
     compile_v5_execution_plan,
     project_v5_compile_authority,
@@ -110,7 +110,7 @@ def _current_snapshot(*, strict_runtime: bool = False) -> HostCapabilitySnapshot
     node_registry: dict[str, str] = {}
     object_info: dict[str, object] = {}
     module_fingerprints: dict[str, str] = {}
-    for contract in CURRENT_NODE_CONTRACT_REGISTRY.contracts.values():
+    for contract in V5_NODE_CONTRACT_REGISTRY.contracts.values():
         module = contract.allowed_python_modules[0]
         node_registry[contract.class_type] = module
         object_info[contract.class_type] = contract.object_info_contract
@@ -488,7 +488,7 @@ def test_catalog_preflight_and_compile_share_bundle5_resolution() -> None:
         host_capability_snapshot=snapshot,
         operational_readiness=readiness,
         capability_evaluator=CapabilityEvaluator(
-            CURRENT_NODE_CONTRACT_REGISTRY
+            V5_NODE_CONTRACT_REGISTRY
         ),
     )
 
@@ -538,7 +538,7 @@ def test_raylight_attention_preflight_and_compile_share_effective_route_mode() -
         endpoint_online=True,
         available_logical_gpu_count=4,
     )
-    evaluator = CapabilityEvaluator(CURRENT_NODE_CONTRACT_REGISTRY)
+    evaluator = CapabilityEvaluator(V5_NODE_CONTRACT_REGISTRY)
 
     flash_v5, settings_v3 = _raylight_ring_pair("torch_flash")
     flash_projection = project_v5_compile_authority(flash_v5, settings_v3)
@@ -685,7 +685,7 @@ def test_active_attention_mode_emits_exact_current_node_and_changes_identity() -
             available_logical_gpu_count=4,
         ),
         capability_evaluator=CapabilityEvaluator(
-            CURRENT_NODE_CONTRACT_REGISTRY
+            V5_NODE_CONTRACT_REGISTRY
         ),
     )
     snapshot = _current_snapshot(strict_runtime=True)
@@ -693,7 +693,7 @@ def test_active_attention_mode_emits_exact_current_node_and_changes_identity() -
         endpoint_online=True,
         available_logical_gpu_count=4,
     )
-    evaluator = CapabilityEvaluator(CURRENT_NODE_CONTRACT_REGISTRY)
+    evaluator = CapabilityEvaluator(V5_NODE_CONTRACT_REGISTRY)
     pytorch = compile_v5_execution_plan(
         UnifiedTimelineDraftV5.model_validate(raw),
         settings_v3,
@@ -751,7 +751,7 @@ def test_active_h3_low_vram_emits_exact_current_model_replacement() -> None:
             available_logical_gpu_count=4,
         ),
         capability_evaluator=CapabilityEvaluator(
-            CURRENT_NODE_CONTRACT_REGISTRY
+            V5_NODE_CONTRACT_REGISTRY
         ),
     )
     prompt = plan.segment_units[0].prompt_base

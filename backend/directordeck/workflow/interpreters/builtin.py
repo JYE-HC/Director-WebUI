@@ -35,9 +35,10 @@ from ..contracts import (
     ScopedGraphBuilderProtocol,
     TerminalRef,
 )
+from ..execution_hints import build_feature_execution_hints
 from ..node_contracts import (
-    require_current_node_contract,
     require_native_node_contract,
+    require_v5_node_contract,
 )
 from ..lora_factory import (
     LoraAdapterResolutionSource,
@@ -131,8 +132,8 @@ _STATIC_IMPLEMENTATION_CLASSES: dict[str, tuple[str, ...]] = {
 # Bundle-5 progress is declared by the feature which owns each private node.
 # These stage-only hints deliberately carry no numeric weight: ComfyUI exposes
 # an exact current node but no byte/frame total while loading models, reading
-# references or building conditioning. Keeping the labels here prevents typed
-# workflows from falling back to class-name guesses in the progress consumer.
+# references or building conditioning. The shared hint builder owns labels so
+# Bundle 5 and Bundle 6 cannot silently drift.
 _PRE_SAMPLING_STAGE_FEATURES = frozenset(
     {
         "shared_models",
@@ -149,38 +150,9 @@ _PRE_SAMPLING_STAGE_FEATURES = frozenset(
         "raylight_sampling",
     }
 )
-_PRE_SAMPLING_STAGE_LABELS: dict[str, str] = {
-    "CLIPLoader": "加载文本编码器",
-    "SelectCLIPDevice": "分配文本编码器设备",
-    "VAELoader": "加载 VAE",
-    "SelectVAEDevice": "分配 VAE 设备",
-    "UNETLoader": "加载生成模型",
-    "SelectModelDevice": "分配生成模型设备",
-    "LoraLoaderModelOnly": "加载 LoRA",
-    "LoraLoaderBypassModelOnly": "加载 LoRA",
-    "MiniMaxH3TurboLoRA": "加载 H3 Turbo LoRA",
-    "MiniMaxH3SigmaShift": "配置生成模型",
-    "DirectorDeckRayInitializerAdvanced": "初始化 RayLight 多卡",
-    "DirectorDeckRayLoraLoader": "加载 RayLight LoRA",
-    "DirectorDeckRayUNETLoader": "加载 RayLight 生成模型",
-    "DirectorDeckRayMiniMaxH3SigmaShift": "配置 RayLight 生成模型",
-    "LoadImage": "读取参考图",
-    "LoadVideo": "读取参考视频",
-    "Video Slice": "裁剪参考视频",
-    "GetVideoComponents": "解析参考视频",
-    "LoadAudio": "读取参考音频",
-    "TrimAudioDuration": "裁剪参考音频",
-    "ImageFromBatch": "处理参考图",
-    "MiniMaxH3ImageToVideo": "构建画面条件",
-    "MiniMaxH3ReferenceToVideo": "构建多模态条件",
-    "MiniMaxH3AddGuide": "构建接续条件",
-    "BasicGuider": "准备采样引导",
-    "DirectorDeckRayBasicGuider": "准备 RayLight 采样引导",
-    "BasicScheduler": "生成采样计划",
-    "DirectorDeckRayBasicScheduler": "生成 RayLight 采样计划",
-    "KSamplerSelect": "选择采样器",
-    "RandomNoise": "生成初始噪声",
-}
+_SAMPLING_STAGE_FEATURES = frozenset(
+    {"standard_sampling", "raylight_sampling"}
+)
 
 
 def _require_context(ctx: Any) -> V4BuiltinContext:
@@ -420,7 +392,7 @@ def builtin_required_capability_ids(
         try:
             return require_native_node_contract(class_type)
         except KeyError:
-            return require_current_node_contract(class_type)
+            return require_v5_node_contract(class_type)
 
     raylight_classes = tuple(
         class_type
@@ -471,92 +443,13 @@ def _execution_hints(
 
     if context.template_bundle_version < 5:
         return (), ()
-
-    phase: dict[str, BoundedJsonValue] | None = None
-    preview: tuple[BoundedJsonValue, ...] = ()
-    if feature_id in {"standard_sampling", "raylight_sampling"}:
-        samples = outputs.get("samples")
-        if not isinstance(samples, EdgeRef):
-            raise AssertionError("sampling feature must publish a samples edge")
-        phase = {
-            "id": "sampling",
-            "label": "采样中",
-            "node_id": samples.node_id,
-            "kind": "fractional",
-            "weight": 0.70,
-        }
-        preview = (
-            {
-                "node_id": samples.node_id,
-                "phase_id": "sampling",
-                "publish": True,
-                "priority": 100,
-            },
-        )
-    elif feature_id == "decode_video":
-        emitted = builder.emitted_node_ids
-        if not emitted:
-            raise AssertionError("decode feature must emit a video decode node")
-        # VAEDecode is always the first node in this scope. A following
-        # ImageFromBatch is continuity trimming, not completion of decoding.
-        phase = {
-            "id": "decode_video",
-            "label": "解码视频画面",
-            "node_id": emitted[0],
-            "kind": "milestone",
-            "weight": 0.15,
-        }
-    elif feature_id == "audio_output":
-        video = outputs.get("video")
-        if not isinstance(video, EdgeRef):
-            raise AssertionError("audio output feature must publish a video edge")
-        phase = {
-            "id": "assemble_media",
-            "label": "封装音视频",
-            "node_id": video.node_id,
-            "kind": "milestone",
-            "weight": 0.10,
-        }
-    elif feature_id == "save_take":
-        take = outputs.get("take_output")
-        if not isinstance(take, TerminalRef):
-            raise AssertionError("save feature must publish a take terminal")
-        phase = {
-            "id": "persist_take",
-            "label": "写入视频文件",
-            "node_id": take.node_id,
-            "kind": "milestone",
-            "weight": 0.05,
-        }
-    elif feature_id not in _PRE_SAMPLING_STAGE_FEATURES:
-        return (), ()
-
-    primary_node_id = str(phase["node_id"]) if phase is not None else None
-    stage_hints: list[BoundedJsonValue] = []
-    if feature_id in _PRE_SAMPLING_STAGE_FEATURES:
-        for node_id, node in builder.prompt_fragment.items():
-            if node_id == primary_node_id:
-                continue
-            class_type = node.get("class_type")
-            label = (
-                _PRE_SAMPLING_STAGE_LABELS.get(class_type)
-                if isinstance(class_type, str)
-                else None
-            )
-            if label is None:
-                continue
-            stage_hints.append(
-                {
-                    "id": f"{feature_id}_{node_id}_stage",
-                    "label": label,
-                    "node_id": node_id,
-                    "kind": "stage",
-                    "weight": 0.0,
-                }
-            )
-    if phase is not None:
-        stage_hints.append(phase)
-    return tuple(stage_hints), preview
+    return build_feature_execution_hints(
+        feature_id=feature_id,
+        outputs=outputs,
+        builder=builder,
+        pre_sampling_features=_PRE_SAMPLING_STAGE_FEATURES,
+        sampling_features=_SAMPLING_STAGE_FEATURES,
+    )
 
 
 def _emit_shared_models_entry(

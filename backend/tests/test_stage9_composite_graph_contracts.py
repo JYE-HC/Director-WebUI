@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import sqlite3
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from pydantic import BaseModel
@@ -54,6 +54,7 @@ from directordeck.workflow.contracts import (
     ObjectInfoOutputContract,
     PublicResourceRead,
     PublicResourceWrite,
+    ResolvedFeatureImplementation,
     Resource,
     ResourcePool,
     ResourceReadDeclaration,
@@ -66,6 +67,7 @@ from directordeck.workflow.contracts import (
 from directordeck.workflow.execution import (
     CompiledExecutionPlan,
     EndpointIdentity,
+    ExpectedOutputGeometry,
     ExpectedOutputSpec,
     PreparedSegmentUnit,
     RuntimeRequirements,
@@ -73,20 +75,48 @@ from directordeck.workflow.execution import (
     derive_feature_execution_specs,
     sha256_document_digest,
 )
-from directordeck.workflow.registry import FeatureInterpreterRegistry
-from directordeck.workflow.v4_compiler import (
-    _commit_emission,
-    _node_contract_snapshot,
-    _read_resources,
-    _scope_public_reads,
-    _scope_public_writes,
-    _scope_trace_parts,
+from directordeck.workflow.compile_report import (
+    CompiledFeatureUseV3,
+    NodeEmissionEvidenceV3,
 )
+from directordeck.workflow.registry import FeatureInterpreterRegistry
+from directordeck.workflow.feature_compiler_support import (
+    commit_emission,
+    node_contract_snapshot,
+    public_reads as collect_public_reads,
+    public_writes as collect_public_writes,
+    read_resources,
+)
+from directordeck.workflow.v4_compiler import _scope_trace_parts
 
 
 _FINGERPRINT = "sha256:" + "9" * 64
 _MODULE = "directordeck.tests.synthetic_stage9_nodes"
 _SEGMENT_ID = "stage9-segment"
+_SAMPLING_FEATURE_ID = "sampling_pipeline"
+_CASCADE_IMPLEMENTATION_ID = "synthetic_cascaded_sampling"
+
+
+class _ResolvedSamplingPlan(BaseModel):
+    implementation_id: Literal["synthetic_cascaded_sampling"]
+    model_bindings: tuple[str, str]
+    stages: tuple[str, ...]
+    final_geometry: ExpectedOutputGeometry
+
+
+def _resolved_sampling_plan() -> _ResolvedSamplingPlan:
+    return _ResolvedSamplingPlan(
+        implementation_id=_CASCADE_IMPLEMENTATION_ID,
+        model_bindings=("model-a", "model-b"),
+        stages=("sample_a", "upscale", "sample_b"),
+        final_geometry=ExpectedOutputGeometry(
+            width=736,
+            height=416,
+            fps=24.0,
+            visible_frame_count=121,
+            expected_audio_mode="none",
+        ),
+    )
 
 
 class _NoParams(BaseModel):
@@ -183,8 +213,13 @@ def _node_registry() -> NodeContractRegistry:
     for contract in (
         _node_contract("SyntheticLatentSource", outputs=("LATENT",)),
         _node_contract(
+            "SyntheticModelLoader",
+            required={"model_name": "STRING"},
+            outputs=("MODEL",),
+        ),
+        _node_contract(
             "SyntheticSampler",
-            required={"latent": "LATENT"},
+            required={"model": "MODEL", "latent": "LATENT"},
             outputs=("LATENT",),
         ),
         _node_contract(
@@ -243,7 +278,8 @@ class _SyntheticInterpreter:
         self.validate_params(params, ctx)
         classes = {
             "synthetic_source": ("SyntheticLatentSource",),
-            "synthetic_composite": (
+            _SAMPLING_FEATURE_ID: (
+                "SyntheticModelLoader",
                 "SyntheticSampler",
                 "SyntheticDecode",
                 "SyntheticTransform",
@@ -296,11 +332,15 @@ class _SyntheticInterpreter:
             source = builder.add_node("SyntheticLatentSource", {})
             return FeatureEmission(outputs={"latent": builder.edge(source, 0)})
 
-        if self.id == "synthetic_composite":
+        if self.id == _SAMPLING_FEATURE_ID:
             source = inputs["latent"].value
             assert isinstance(source, EdgeRef)
+            model_a = builder.add_node(
+                "SyntheticModelLoader", {"model_name": "model-a"}
+            )
             sampler_a = builder.add_node(
-                "SyntheticSampler", {"latent": source}
+                "SyntheticSampler",
+                {"model": builder.edge(model_a, 0), "latent": source},
             )
             intermediate_decode = builder.add_node(
                 "SyntheticDecode",
@@ -314,9 +354,15 @@ class _SyntheticInterpreter:
                 "SyntheticEncode",
                 {"images": builder.edge(transform, 0)},
             )
+            model_b = builder.add_node(
+                "SyntheticModelLoader", {"model_name": "model-b"}
+            )
             sampler_b = builder.add_node(
                 "SyntheticSampler",
-                {"latent": builder.edge(encode, 0)},
+                {
+                    "model": builder.edge(model_b, 0),
+                    "latent": builder.edge(encode, 0),
+                },
             )
             return FeatureEmission(
                 outputs={"samples": builder.edge(sampler_b, 0)},
@@ -329,7 +375,7 @@ class _SyntheticInterpreter:
                         "milestone",
                         0.05,
                     ),
-                    _phase("transform", "中间变换", transform, "milestone", 0.05),
+                    _phase("upscale", "超分放大", transform, "milestone", 0.05),
                     _phase("sample_b", "第二次采样", sampler_b, "fractional", 0.40),
                 ),
                 preview_hints=(
@@ -341,7 +387,7 @@ class _SyntheticInterpreter:
                     ),
                     _preview(
                         transform,
-                        "transform",
+                        "upscale",
                         publish=False,
                         priority=15,
                     ),
@@ -442,7 +488,7 @@ def _synthetic_template() -> SegmentTemplate:
                 ),
             ),
             _entry(
-                "synthetic_composite",
+                _SAMPLING_FEATURE_ID,
                 "sampling",
                 reads=(ResourceReadDeclaration(name="latent", type="LATENT"),),
                 writes=(
@@ -461,7 +507,7 @@ def _synthetic_template() -> SegmentTemplate:
                         name="frames", type="IMAGE", operation="define"
                     ),
                 ),
-                requires=("synthetic_composite",),
+                requires=(_SAMPLING_FEATURE_ID,),
             ),
             _entry(
                 "synthetic_assemble",
@@ -489,6 +535,48 @@ def _synthetic_template() -> SegmentTemplate:
     )
 
 
+def _v6_sampling_use(
+    prompt: Mapping[str, Any],
+    node_ids: tuple[str, ...],
+) -> CompiledFeatureUseV3:
+    implementation = ResolvedFeatureImplementation(
+        implementation_id=_CASCADE_IMPLEMENTATION_ID,
+        implementation_version=1,
+        carrier_kind="private_subgraph",
+        responsibility="director",
+        class_types=tuple(
+            dict.fromkeys(prompt[node_id]["class_type"] for node_id in node_ids)
+        ),
+        binding_key=f"{_SAMPLING_FEATURE_ID}.{_CASCADE_IMPLEMENTATION_ID}",
+    )
+    return CompiledFeatureUseV3(
+        segment_id=_SEGMENT_ID,
+        unit_id="stage9-synthetic-unit",
+        feature_id=_SAMPLING_FEATURE_ID,
+        version=1,
+        backend="standard",
+        family="fl2va",
+        template_id="h3_standard_segment",
+        state="applicable",
+        config_source="context",
+        implementation=implementation,
+        execution_identity={
+            "resolved_sampling_plan": _resolved_sampling_plan().model_dump(
+                mode="json"
+            )
+        },
+        node_emissions=tuple(
+            NodeEmissionEvidenceV3(
+                node_id=node_id,
+                class_type=prompt[node_id]["class_type"],
+                feature_id=_SAMPLING_FEATURE_ID,
+                implementation_id=_CASCADE_IMPLEMENTATION_ID,
+            )
+            for node_id in node_ids
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class _CompiledSyntheticGraph:
     prompt: dict[str, Any]
@@ -497,6 +585,7 @@ class _CompiledSyntheticGraph:
     public_writes: tuple[PublicResourceWrite, ...]
     public_reads: tuple[PublicResourceRead, ...]
     feature_traces: tuple[FeatureAuditTrace, ...]
+    sampling_feature_use: CompiledFeatureUseV3
     scoped_emissions: tuple[tuple[tuple[str, ...], FeatureEmission], ...]
     take_node_id: str
 
@@ -544,24 +633,25 @@ def _compile_synthetic_graph(
     for entry in template.entries:
         interpreter = validated.interpreter_for(entry)
         resolution = interpreter.resolve(params, context)
-        inputs = _read_resources(pool, entry)
+        inputs = read_resources(pool, entry)
         before = pool
         with graph.begin_scope(entry.id) as scope:
             emission = interpreter.emit(
                 scope, inputs, params, context, resolution
             )
-            pool = _commit_emission(
+            pool = commit_emission(
                 pool=pool,
-                entry=entry,
+                owner_id=entry.id,
+                use=entry,
                 emission=emission,
                 scope=scope,
             )
-        public_reads.extend(_scope_public_reads(inputs=inputs, scope=scope))
+        public_reads.extend(collect_public_reads(inputs, scope))
         public_writes.extend(
-            _scope_public_writes(
+            collect_public_writes(
                 before=before,
                 after=pool,
-                entry=entry,
+                use=entry,
                 emission=emission,
             )
         )
@@ -591,14 +681,20 @@ def _compile_synthetic_graph(
         )
         for feature_id, resolution, emitted_nodes in trace_parts
     )
+    sampling_node_ids = tuple(
+        node_id
+        for node_id in prompt
+        if graph.node_feature_ids[node_id] == _SAMPLING_FEATURE_ID
+    )
     node_registry = _node_registry()
     return _CompiledSyntheticGraph(
         prompt=prompt,
         registry=node_registry,
-        node_contract_snapshot=_node_contract_snapshot(prompt, node_registry),
+        node_contract_snapshot=node_contract_snapshot(prompt, node_registry),
         public_writes=tuple(public_writes),
         public_reads=tuple(public_reads),
         feature_traces=traces,
+        sampling_feature_use=_v6_sampling_use(prompt, sampling_node_ids),
         scoped_emissions=tuple(scoped_emissions),
         take_node_id=take.node_id,
     )
@@ -620,8 +716,15 @@ def _unit_and_prepared() -> tuple[NativeWorkflowUnit, PreparedSegmentUnit, _Comp
         output_nodes={_SEGMENT_ID: compiled.take_node_id},
         graph_audit_spec=audit,
         graph_audit_traces=compiled.feature_traces,
+        compile_feature_uses=(compiled.sampling_feature_use,),
         progress_spec=progress,
         preview_spec=preview,
+    )
+    geometry = _resolved_sampling_plan().final_geometry
+    expected_output = ExpectedOutputSpec(
+        segment_id=_SEGMENT_ID,
+        node_id=compiled.take_node_id,
+        **geometry.model_dump(mode="python"),
     )
     prepared = PreparedSegmentUnit(
         id=unit.id,
@@ -632,15 +735,7 @@ def _unit_and_prepared() -> tuple[NativeWorkflowUnit, PreparedSegmentUnit, _Comp
         template_revision=9001,
         prompt_base=unit.prompt,
         graph_audit_spec=audit,
-        expected_output_spec=ExpectedOutputSpec(
-            segment_id=_SEGMENT_ID,
-            node_id=compiled.take_node_id,
-            width=736,
-            height=416,
-            fps=24.0,
-            visible_frame_count=121,
-            expected_audio_mode="none",
-        ),
+        expected_output_spec=expected_output,
         progress_spec=progress,
         preview_spec=preview,
         continuity_dependency=None,
@@ -652,7 +747,17 @@ def _unit_and_prepared() -> tuple[NativeWorkflowUnit, PreparedSegmentUnit, _Comp
         ),
         runtime_pool_identity=None,
         effective_execution_digest=sha256_document_digest(
-            {"stage": 9, "unit": unit.id, "prompt": unit.prompt}
+            {
+                "stage": 9,
+                "unit": unit.id,
+                "prompt": unit.prompt,
+                "sampling_feature_use": compiled.sampling_feature_use.model_dump(
+                    mode="json"
+                ),
+                "expected_output_geometry": expected_output.geometry.model_dump(
+                    mode="json"
+                ),
+            }
         ),
     )
     return unit, prepared, compiled
@@ -744,15 +849,26 @@ def _persisted_child(unit: NativeWorkflowUnit) -> dict[str, Any]:
 def test_composite_interpreter_is_one_segment_take_with_private_nodes_in_its_cone() -> None:
     unit, prepared, compiled = _unit_and_prepared()
     prompt = unit.prompt
+    model_ids = _node_ids(prompt, "SyntheticModelLoader")
     sampler_ids = _node_ids(prompt, "SyntheticSampler")
     decode_ids = _node_ids(prompt, "SyntheticDecode")
     transform_id = _node_ids(prompt, "SyntheticTransform")[0]
     encode_id = _node_ids(prompt, "SyntheticEncode")[0]
     cone = _take_cone(prompt, compiled.take_node_id)
 
-    assert len(sampler_ids) == 2
+    assert len(model_ids) == len(sampler_ids) == 2
+    assert [prompt[node_id]["inputs"]["model_name"] for node_id in model_ids] == [
+        "model-a",
+        "model-b",
+    ]
+    assert [prompt[node_id]["inputs"]["model"] for node_id in sampler_ids] == [
+        [model_ids[0], 0],
+        [model_ids[1], 0],
+    ]
     assert len(decode_ids) == 2
-    assert set((*sampler_ids, *decode_ids, transform_id, encode_id)) <= cone
+    assert set(
+        (*model_ids, *sampler_ids, *decode_ids, transform_id, encode_id)
+    ) <= cone
     assert cone == frozenset(prompt)
     assert prepared.owner_segment_id == _SEGMENT_ID
     assert prepared.expected_output_spec.node_id == compiled.take_node_id
@@ -764,16 +880,34 @@ def test_composite_interpreter_is_one_segment_take_with_private_nodes_in_its_con
         if evidence.persistent_artifact_role is not None
     ] == [compiled.take_node_id]
 
-    composite_write = next(
+    sampling_write = next(
         write
         for write in compiled.public_writes
-        if write.resource.source_feature_id == "synthetic_composite"
+        if write.resource.source_feature_id == _SAMPLING_FEATURE_ID
     )
-    assert composite_write.resource.name == "samples"
-    assert composite_write.resource.producer_node_ids == (sampler_ids[1],)
+    assert sampling_write.resource.name == "samples"
+    assert sampling_write.resource.type == "LATENT"
+    assert sampling_write.resource.producer_node_ids == (sampler_ids[1],)
     assert set((sampler_ids[0], decode_ids[0], transform_id, encode_id)).isdisjoint(
-        composite_write.resource.producer_node_ids
+        sampling_write.resource.producer_node_ids
     )
+    sampling_nodes = {
+        *model_ids,
+        *sampler_ids,
+        decode_ids[0],
+        transform_id,
+        encode_id,
+    }
+    assert {
+        read.resource_name
+        for read in compiled.public_reads
+        if read.consumer_node_id in sampling_nodes
+    } == {"latent"}
+    assert [
+        write.resource.name
+        for write in compiled.public_writes
+        if write.resource.source_feature_id == _SAMPLING_FEATURE_ID
+    ] == ["samples"]
     assert tuple(write.resource.name for write in compiled.public_writes) == (
         "latent",
         "samples",
@@ -781,6 +915,33 @@ def test_composite_interpreter_is_one_segment_take_with_private_nodes_in_its_con
         "video",
         "take_output",
     )
+
+    feature_use = compiled.sampling_feature_use
+    assert (feature_use.feature_id, feature_use.version) == (
+        _SAMPLING_FEATURE_ID,
+        1,
+    )
+    assert feature_use.implementation is not None
+    assert feature_use.implementation.implementation_id == (
+        _CASCADE_IMPLEMENTATION_ID
+    )
+    assert feature_use.implementation.carrier_kind == "private_subgraph"
+    assert set(feature_use.implementation.class_types) == {
+        prompt[node_id]["class_type"] for node_id in sampling_nodes
+    }
+    assert {evidence.node_id for evidence in feature_use.node_emissions} == (
+        sampling_nodes
+    )
+    assert {evidence.feature_id for evidence in feature_use.node_emissions} == {
+        _SAMPLING_FEATURE_ID
+    }
+    assert {
+        evidence.implementation_id for evidence in feature_use.node_emissions
+    } == {_CASCADE_IMPLEMENTATION_ID}
+    assert feature_use.execution_identity["resolved_sampling_plan"][
+        "final_geometry"
+    ] == prepared.expected_output_spec.geometry.model_dump(mode="json")
+    assert unit.compile_feature_uses == (feature_use,)
 
     assert unit.progress_spec is prepared.progress_spec
     assert unit.preview_spec is prepared.preview_spec
@@ -804,13 +965,21 @@ def test_composite_specs_survive_lock_exact_snapshot_and_sqlite_round_trip(
 
     unit, prepared, compiled = _unit_and_prepared()
     plan = _compiled_plan(prepared)
-    # Synthetic contracts stay test-local.  Patch only the two validation
-    # boundaries which ordinarily consume the production bundle-5 registry.
+    # Synthetic contracts stay test-local. Patch only the two validation
+    # boundaries which ordinarily resolve a production bundle registry.
+    def synthetic_registry(bundle: int) -> NodeContractRegistry:
+        assert bundle == 5
+        return compiled.registry
+
     monkeypatch.setattr(
-        submission_module, "CURRENT_NODE_CONTRACT_REGISTRY", compiled.registry
+        submission_module,
+        "node_contract_registry_for_bundle",
+        synthetic_registry,
     )
     monkeypatch.setattr(
-        database_module, "CURRENT_NODE_CONTRACT_REGISTRY", compiled.registry
+        database_module,
+        "node_contract_registry_for_bundle",
+        synthetic_registry,
     )
     endpoint = EndpointIdentity(
         endpoint_key="synthetic-host",
@@ -822,6 +991,7 @@ def test_composite_specs_survive_lock_exact_snapshot_and_sqlite_round_trip(
         source_unit_ordinal=0,
         segment_child_id="stage9-child",
     )
+    assert len(plan.segment_units) == len(locked.units) == 1
     locked_unit = locked.units[0]
     exact = planner.exact_snapshot(locked, locked_unit)
 
@@ -914,6 +1084,17 @@ def test_composite_progress_is_monotonic_and_intermediate_decode_does_not_jump()
             ComfyProgressEvent(
                 prompt_id="stage9-prompt",
                 node_id=phases["sample_a"].node_id,
+                value=50.0,
+                maximum=100.0,
+            ),
+        )
+    )
+    record(
+        child_progress_snapshot(
+            child,
+            ComfyProgressEvent(
+                prompt_id="stage9-prompt",
+                node_id=phases["sample_a"].node_id,
                 value=100.0,
                 maximum=100.0,
             ),
@@ -935,7 +1116,7 @@ def test_composite_progress_is_monotonic_and_intermediate_decode_does_not_jump()
             child,
             ComfyExecutionEvent(
                 prompt_id="stage9-prompt",
-                node_id=phases["transform"].node_id,
+                node_id=phases["upscale"].node_id,
             ),
         )
     )
@@ -974,7 +1155,7 @@ def test_composite_progress_is_monotonic_and_intermediate_decode_does_not_jump()
 
     assert observations == sorted(observations)
     assert observations == pytest.approx(
-        [0.20, 0.25, 0.30, 0.50, 0.70, 0.85, 0.95, 1.0]
+        [0.10, 0.20, 0.25, 0.30, 0.50, 0.70, 0.85, 0.95, 1.0]
     )
 
 
@@ -988,7 +1169,7 @@ def test_composite_preview_policy_hides_transform_and_rejects_late_sampler_a() -
 
     assert isinstance(early, ResolvedPreviewSource)
     assert early.priority == 10
-    assert preview_source_for_node(child, sources["transform"].node_id) is None
+    assert preview_source_for_node(child, sources["upscale"].node_id) is None
     assert isinstance(late, ResolvedPreviewSource)
     assert late.priority == 20
     assert late.supersedes == (sources["sample_a"].node_id,)
@@ -1012,7 +1193,7 @@ def test_composite_preview_policy_hides_transform_and_rejects_late_sampler_a() -
     )
     transform_started = ComfyExecutionEvent(
         prompt_id="stage9-prompt",
-        node_id=sources["transform"].node_id,
+        node_id=sources["upscale"].node_id,
     )
     transform_phase_index = preview_phase_index_for_event(
         child, transform_started

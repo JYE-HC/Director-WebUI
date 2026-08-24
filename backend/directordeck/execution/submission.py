@@ -38,10 +38,7 @@ from ..workflow.execution import (
     compiled_execution_plan_digest,
     sha256_document_digest,
 )
-from ..workflow.node_contracts import (
-    CURRENT_NODE_CONTRACT_REGISTRY,
-    V4_NODE_CONTRACT_REGISTRY,
-)
+from ..workflow.node_contracts import node_contract_registry_for_bundle
 from ..workflow.templates import V4_TEMPLATE_BUNDLE
 
 
@@ -631,14 +628,14 @@ class LockedSubmissionPlanner:
             late_binding_evidence=tuple(typed_evidence),
             late_bound_values=expected_values,
         )
-        if template_bundle_version == V4_TEMPLATE_BUNDLE.version:
-            node_contract_registry = V4_NODE_CONTRACT_REGISTRY
-        elif template_bundle_version == 5:
-            node_contract_registry = CURRENT_NODE_CONTRACT_REGISTRY
-        else:
+        try:
+            node_contract_registry = node_contract_registry_for_bundle(
+                template_bundle_version
+            )
+        except KeyError as exc:
             raise SubmissionPlanningError(
                 "prepared segment uses an unsupported template bundle"
-            )
+            ) from exc
         segment.validate_materialized_prompt(
             node_contract_registry=node_contract_registry
         )

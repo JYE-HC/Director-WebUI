@@ -110,7 +110,16 @@ def test_v3_override_order_uses_ecmascript_utf16_tuple_order() -> None:
 def test_v3_override_paths_are_unique_and_bounded() -> None:
     duplicate = _record("loras/style.safetensors")
     with pytest.raises(ValidationError, match="override paths must be unique"):
-        _v3([duplicate, {**duplicate, "adapter_id": "minimax_h3_turbo", "options": {"low_vram": False}}])
+        _v3(
+            [
+                duplicate,
+                {
+                    **duplicate,
+                    "adapter_id": "minimax_h3_turbo",
+                    "options": {"low_vram": False},
+                },
+            ]
+        )
 
     with pytest.raises(ValidationError):
         _v3(
@@ -123,15 +132,38 @@ def test_v3_override_paths_are_unique_and_bounded() -> None:
         )
     with pytest.raises(ValidationError):
         _v3([_record("m" * 1025)])
-    with pytest.raises(ValidationError):
-        _v3(
-            [
-                _record(
-                    "loras/style.safetensors",
-                    adapter_id="ray_lora",
-                )
-            ]
-        )
+
+
+def test_v3_override_schema_keeps_retired_or_unknown_loader_records_readable() -> None:
+    settings = _v3(
+        [
+            _record(
+                "loras/retired.safetensors",
+                adapter_id="future_uninstalled_adapter",
+                options={"retired_mode": True},
+            ),
+            _record(
+                "loras/ray.safetensors",
+                adapter_id="ray_lora",
+            ),
+        ]
+    )
+
+    assert [
+        record.model_dump(mode="json")
+        for record in settings.lora_loader_overrides
+    ] == [
+        {
+            "lora_filename": "loras/ray.safetensors",
+            "adapter_id": "ray_lora",
+            "options": {},
+        },
+        {
+            "lora_filename": "loras/retired.safetensors",
+            "adapter_id": "future_uninstalled_adapter",
+            "options": {"retired_mode": True},
+        },
+    ]
 
 
 def test_v2_to_v3_migration_is_atomic_exact_and_idempotent(tmp_path) -> None:
@@ -177,7 +209,9 @@ def test_v2_to_v3_migration_is_atomic_exact_and_idempotent(tmp_path) -> None:
         {
             "lora_filename": "LoRAs/H3/Style.safetensors",
             "adapter_id": "minimax_h3_turbo",
-            "options": {"low_vram": False},
+            # Historical data stays structural; the current product default is
+            # applied only if this mapping becomes active or is changed.
+            "options": {},
         },
         {
             "lora_filename": "loras/ref2va/style.safetensors",
@@ -389,16 +423,79 @@ async def test_settings_api_rejects_a_new_mapping_outside_the_effective_policy(
     ]
 
 
+async def test_settings_api_rejects_invalid_options_on_a_new_mapping(client) -> None:
+    authority = (await client.get("/api/settings/authority")).json()
+    document = authority["settings"]
+    document["lora_loader_overrides"] = [{
+        "lora_filename": "loras/minimax_h3_turbo_v4.safetensors",
+        "adapter_id": "minimax_h3_turbo",
+        "options": {"removed_option": True},
+    }]
+
+    rejected = await client.put(
+        "/api/settings/authority",
+        json={
+            "schema_version": 3,
+            "document": document,
+            "expected_authority_token": authority["authority_token"],
+        },
+    )
+
+    assert rejected.status_code == 422, rejected.text
+    assert rejected.json()["detail"] == {
+        "code": "lora_loader_options_invalid",
+        "message": "The selected LoRA loader configuration is invalid.",
+        "lora_filename": "loras/minimax_h3_turbo_v4.safetensors",
+        "adapter_id": "minimax_h3_turbo",
+    }
+
+
+async def test_settings_api_reports_config_failure_only_for_a_new_mapping(
+    client,
+    monkeypatch,
+) -> None:
+    authority = (await client.get("/api/settings/authority")).json()
+    document = authority["settings"]
+    document["lora_loader_overrides"] = [{
+        "lora_filename": "loras/style.safetensors",
+        "adapter_id": "model_only",
+        "options": {},
+    }]
+
+    def unavailable():
+        raise RuntimeError("private product configuration failure")
+
+    monkeypatch.setattr(
+        "directordeck.app.get_directordeck_config",
+        unavailable,
+    )
+    rejected = await client.put(
+        "/api/settings/authority",
+        json={
+            "schema_version": 3,
+            "document": document,
+            "expected_authority_token": authority["authority_token"],
+        },
+    )
+
+    assert rejected.status_code == 503, rejected.text
+    assert rejected.json()["detail"]["code"] == (
+        "lora_product_config_unavailable"
+    )
+    assert "private product configuration failure" not in rejected.text
+
+
 async def test_settings_api_preserves_and_allows_removing_an_old_invalid_mapping(
     client,
+    monkeypatch,
 ) -> None:
     database = client.director_app.state.database
     settings, authority = database.get_settings_authority()
     raw = settings.model_dump(mode="json")
     raw["lora_loader_overrides"] = [{
         "lora_filename": "loras/style.safetensors",
-        "adapter_id": "minimax_h3_turbo",
-        "options": {"low_vram": False},
+        "adapter_id": "retired_loader",
+        "options": {"retired_mode": True},
     }]
     historical = RuntimeSettingsV3.model_validate(raw)
     database.put_settings_v3_authority(
@@ -407,6 +504,18 @@ async def test_settings_api_preserves_and_allows_removing_an_old_invalid_mapping
         schema_version=3,
     )
     current = (await client.get("/api/settings/authority")).json()
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("product configuration unavailable")
+
+    monkeypatch.setattr(
+        "directordeck.app.get_directordeck_config",
+        unavailable,
+    )
+    monkeypatch.setattr(
+        "directordeck.app.get_lora_loader_policy",
+        unavailable,
+    )
 
     preserved_document = current["settings"]
     preserved_document["client_id"] = "preserve-historical-invalid-mapping"

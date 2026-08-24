@@ -26,7 +26,7 @@ from directordeck.workflow.contracts import (
     ResolvedImplementationIdentity,
     RuntimeProbeEvidence,
 )
-from directordeck.workflow.node_contracts import CURRENT_NODE_CONTRACT_REGISTRY
+from directordeck.workflow.node_contracts import V5_NODE_CONTRACT_REGISTRY
 
 from .test_plugin_lifecycle import loaded_plugin
 
@@ -44,7 +44,7 @@ def _snapshot(
     *,
     schema_version: int = 2,
 ) -> HostCapabilitySnapshot:
-    contract = CURRENT_NODE_CONTRACT_REGISTRY.require(
+    contract = V5_NODE_CONTRACT_REGISTRY.require(
         "DirectorStrictModelAttentionBackend"
     )
     module = contract.allowed_python_modules[0]
@@ -65,7 +65,7 @@ def _snapshot(
 
 
 def _resolution() -> FeatureResolution:
-    contract = CURRENT_NODE_CONTRACT_REGISTRY.require(
+    contract = V5_NODE_CONTRACT_REGISTRY.require(
         "DirectorStrictModelAttentionBackend"
     )
     return FeatureResolution(
@@ -88,7 +88,7 @@ def _evaluate(
     runtime_id: str,
 ):
     class_type = "DirectorStrictModelAttentionBackend"
-    return CapabilityEvaluator(CURRENT_NODE_CONTRACT_REGISTRY).evaluate(
+    return CapabilityEvaluator(V5_NODE_CONTRACT_REGISTRY).evaluate(
         feature_id="attention_backend_override",
         ctx=_Context(binding=SimpleNamespace(device="gpu:0")),
         resolution=_resolution(),

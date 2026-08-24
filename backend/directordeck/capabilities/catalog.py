@@ -33,8 +33,8 @@ from ..workflow.interpreters import (
 from ..config_manager import get_directordeck_config
 from ..workflow.lora_factory import standard_lora_adapters
 from ..workflow.node_contracts import (
-    CURRENT_NODE_CONTRACT_REGISTRY,
     V4_NODE_CONTRACT_REGISTRY,
+    V5_NODE_CONTRACT_REGISTRY,
 )
 from ..workflow.templates import V4_TEMPLATE_BUNDLE
 from .evaluator import (
@@ -409,7 +409,7 @@ def build_feature_catalog(
 
     entries: list[FeatureCatalogEntry] = []
     node_contract_registry = (
-        CURRENT_NODE_CONTRACT_REGISTRY
+        V5_NODE_CONTRACT_REGISTRY
         if template_bundle.version >= 5
         else V4_NODE_CONTRACT_REGISTRY
     )

@@ -33,16 +33,17 @@ from .canonical import (
     javascript_json_stringify,
     utf16_sort_key,
 )
-from .compile_report import CompiledExecutionReportV2
+from .compile_report import CompiledExecutionReportV2, CompiledExecutionReportV3
 from .contracts import (
     Backend,
     ContractModel,
     FeatureEmission,
     GraphAuditSpec,
+    GraphNodeContractEvidence,
     JsonObject,
     ModelFamily,
-    NodeContractEvidence,
     NodeContractRegistry,
+    ResolvedFeatureImplementation,
     ResolvedImplementationIdentity,
 )
 
@@ -671,7 +672,11 @@ class FeatureExecutionIdentity(FrozenContractModel):
     feature: Annotated[str, Field(min_length=3, max_length=256)]
     effective_cache_params: JsonObject
     resolved_implementations: Annotated[
-        tuple[ResolvedImplementationIdentity, ...], Field(min_length=1)
+        tuple[
+            ResolvedImplementationIdentity | ResolvedFeatureImplementation,
+            ...,
+        ],
+        Field(min_length=1),
     ]
 
     @field_validator("feature")
@@ -753,7 +758,7 @@ def effective_execution_digest(
     *,
     template_id: str,
     template_revision: int,
-    resolved_node_contract_identities: Sequence[NodeContractEvidence],
+    resolved_node_contract_identities: Sequence[GraphNodeContractEvidence],
 ) -> DocumentDigest:
     if not template_id or template_revision < 1:
         raise ValueError("template id must be non-empty and revision must be positive")
@@ -930,13 +935,22 @@ class PreparedControlUnit(FrozenContractModel):
 
 
 def _coerce_compiled_execution_report(value: Any) -> Any:
-    if isinstance(value, CompiledExecutionReportV2):
+    if isinstance(value, (CompiledExecutionReportV2, CompiledExecutionReportV3)):
         return value
     if (
         isinstance(value, dict)
         and value.get("source") == "v4_native_compile_adapter_v2"
     ):
         return CompiledExecutionReportV2.model_validate_json(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        )
+    if isinstance(value, dict) and value.get("source") == "bundle6_native_compile_v3":
+        return CompiledExecutionReportV3.model_validate_json(
             json.dumps(
                 value,
                 ensure_ascii=False,
@@ -955,7 +969,7 @@ class CompiledExecutionPlan(FrozenContractModel):
     # contain more than the generic JsonObject container limit of 256 feature
     # resolution records. JsonObject remains only for frozen historical V1.
     compile_report: Annotated[
-        CompiledExecutionReportV2 | JsonObject,
+        CompiledExecutionReportV2 | CompiledExecutionReportV3 | JsonObject,
         BeforeValidator(_coerce_compiled_execution_report),
     ]
     node_policy: JsonObject
@@ -981,13 +995,23 @@ class CompiledExecutionPlan(FrozenContractModel):
             raise ValueError("compiled plan digest must use canonical SHA-256")
         if self.version == 1:
             # Frozen historical Stage-4 plans predate typed compile evidence.
-            if isinstance(self.compile_report, CompiledExecutionReportV2):
+            if isinstance(
+                self.compile_report,
+                (CompiledExecutionReportV2, CompiledExecutionReportV3),
+            ):
                 raise ValueError("historical plan cannot carry a v2 compile report")
             return self
-        if self.version != 2:
+        if self.version not in {2, 3}:
             raise ValueError("compiled execution plan version is unsupported")
-        if not isinstance(self.compile_report, CompiledExecutionReportV2):
-            raise ValueError("v2 plan requires a typed compile report")
+        report_type = (
+            CompiledExecutionReportV2
+            if self.version == 2
+            else CompiledExecutionReportV3
+        )
+        if not isinstance(self.compile_report, report_type):
+            raise ValueError(f"v{self.version} plan requires its typed compile report")
+        if self.version == 3 and self.template_bundle_version != 6:
+            raise ValueError("v3 plan requires Bundle 6")
         report = self.compile_report
         units_by_id = {unit.id: unit for unit in self.segment_units}
         digest_unit_ids = tuple(

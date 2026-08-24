@@ -27,11 +27,13 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import websockets
 
 from .workflow.execution import PreviewSpec, ProgressSpec
+from .workflow.execution_hints import COMMON_NODE_STAGE_LABELS
 
 
+_STANDARD_SAMPLER_CLASS = "SamplerCustomAdvanced"
 _SAMPLER_CLASSES = frozenset(
     {
-        "SamplerCustomAdvanced",
+        _STANDARD_SAMPLER_CLASS,
         "DirectorDeckRayXFuserSamplerCustomAdvanced",
         # Historical task display only; new submissions use the Director alias.
         "XFuserSamplerCustomAdvanced",
@@ -43,41 +45,17 @@ _SAMPLER_CLASSES = frozenset(
 # to the server-owned native templates: this is deliberately not a generic
 # workflow/node-name renderer.
 _EXECUTION_STAGES: dict[str, str] = {
-    "CLIPLoader": "加载文本编码器",
-    "SelectCLIPDevice": "分配文本编码器设备",
-    "VAELoader": "加载 VAE",
-    "SelectVAEDevice": "分配 VAE 设备",
-    "UNETLoader": "加载生成模型",
-    "SelectModelDevice": "分配生成模型设备",
-    "LoraLoaderModelOnly": "加载 LoRA",
-    "LoraLoaderBypassModelOnly": "加载 LoRA",
-    "MiniMaxH3TurboLoRA": "加载 H3 Turbo LoRA",
-    "MiniMaxH3SigmaShift": "配置生成模型",
+    **COMMON_NODE_STAGE_LABELS,
+    # Historical task aliases only. New prompts use DirectorDeck-prefixed IDs.
     "RayInitializerAdvanced": "初始化 RayLight 多卡",
-    "DirectorDeckRayInitializerAdvanced": "初始化 RayLight 多卡",
     "RayLoraLoader": "加载 RayLight LoRA",
-    "DirectorDeckRayLoraLoader": "加载 RayLight LoRA",
     "RayUNETLoader": "加载 RayLight 生成模型",
-    "DirectorDeckRayUNETLoader": "加载 RayLight 生成模型",
     "RayMiniMaxH3SigmaShift": "配置 RayLight 生成模型",
-    "DirectorDeckRayMiniMaxH3SigmaShift": "配置 RayLight 生成模型",
-    "LoadImage": "读取参考图",
-    "LoadVideo": "读取参考视频",
-    "Video Slice": "裁剪参考视频",
-    "GetVideoComponents": "解析参考视频",
-    "LoadAudio": "读取参考音频",
-    "ImageFromBatch": "处理参考图",
-    "MiniMaxH3ImageToVideo": "构建画面条件",
-    "MiniMaxH3ReferenceToVideo": "构建多模态条件",
-    "BasicGuider": "准备采样引导",
     "RayBasicGuider": "准备 RayLight 采样引导",
-    "DirectorDeckRayBasicGuider": "准备 RayLight 采样引导",
-    "BasicScheduler": "生成采样计划",
     "RayBasicScheduler": "生成 RayLight 采样计划",
-    "DirectorDeckRayBasicScheduler": "生成 RayLight 采样计划",
-    "KSamplerSelect": "选择采样器",
-    "RandomNoise": "生成初始噪声",
-    "SamplerCustomAdvanced": "采样中",
+    # Historical fallback owns sampler and post-processing labels; typed
+    # Bundle-5/6 rows read these phases from their persisted ProgressSpec.
+    _STANDARD_SAMPLER_CLASS: "正在加载模型并准备采样",
     "XFuserSamplerCustomAdvanced": "RayLight 采样中",
     "DirectorDeckRayXFuserSamplerCustomAdvanced": "RayLight 采样中",
     "VAEDecode": "解码视频画面",
@@ -782,9 +760,23 @@ def _persisted_execution_snapshot(
             mapped = current_progress
         else:
             return None
+    stage = phase.label
+    _, snapshot = _child_exact_prompt_snapshot(child)
+    exact_prompt = _snapshot_field(snapshot, "exact_prompt")
+    node = (
+        exact_prompt.get(event.node_id)
+        if isinstance(exact_prompt, Mapping)
+        else None
+    )
+    if (
+        phase.kind == "fractional"
+        and isinstance(node, Mapping)
+        and node.get("class_type") == _STANDARD_SAMPLER_CLASS
+    ):
+        stage = "正在加载模型并准备采样"
     return ChildProgress(
         progress=max(0.0, min(1.0, mapped)),
-        stage=phase.label,
+        stage=stage,
     )
 
 

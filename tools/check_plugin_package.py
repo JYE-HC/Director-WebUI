@@ -10,6 +10,7 @@ addition to the provenance-covered generated payload.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -49,6 +50,7 @@ PUBLISHER_WHEEL_SHA256 = (
 REQUIRED_PATHS = {
     "__init__.py",
     "backend/directordeck/__init__.py",
+    "backend/directordeck/config/directordeck.json",
     "dist/index.html",
     "LICENSE",
     "pyproject.toml",
@@ -203,6 +205,30 @@ def _validate_docs(package_root: Path) -> None:
         raise PackageError("LICENSE is not the expected GPL v3 text")
     if "RayLight" not in notices:
         raise PackageError("THIRD_PARTY_NOTICES.md is missing the bundled RayLight notice")
+
+
+def _validate_product_config(package_root: Path) -> None:
+    backend_root = package_root / "backend"
+    sys.path.insert(0, str(backend_root))
+    previous_bytecode_setting = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        from directordeck.config_manager import DirectorDeckConfig
+
+        raw = json.loads(
+            (backend_root / "directordeck/config/directordeck.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        DirectorDeckConfig.model_validate(raw)
+    except Exception as exc:
+        raise PackageError("DirectorDeck product configuration is invalid") from exc
+    finally:
+        sys.dont_write_bytecode = previous_bytecode_setting
+        try:
+            sys.path.remove(str(backend_root))
+        except ValueError:  # pragma: no cover - defensive path hygiene.
+            pass
 
 
 def _validate_privacy_and_paths(package_root: Path) -> None:
@@ -454,6 +480,7 @@ def check_package(
         _validate_final_repository_policy(package_root)
     version = _validate_manifest(package_root, source_root=source_root)
     _validate_docs(package_root)
+    _validate_product_config(package_root)
     return _validate_provenance(
         package_root,
         source_root=source_root,

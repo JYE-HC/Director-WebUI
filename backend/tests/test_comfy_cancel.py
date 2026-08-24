@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from directordeck.comfy import ComfyClient, ComfyError
+from directordeck.comfy import ComfyClient, ComfyError, ComfyPromptRejected
 
 
 async def test_comfy_submit_requests_only_server_owned_metadata_previews() -> None:
@@ -46,6 +46,64 @@ async def test_comfy_submit_requests_only_server_owned_metadata_previews() -> No
         ("receipt", "fixed-id", "fixed-id"),
         ("returned", "fixed-id"),
     ]
+
+
+async def test_comfy_submit_exposes_definite_4xx_rejection() -> None:
+    detail = {
+        "error": {"type": "prompt_outputs_failed_validation"},
+        "node_errors": {"7": {"class_type": "MissingLoader"}},
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json=detail)
+
+    client = ComfyClient(
+        "http://comfy.test", transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(ComfyPromptRejected) as caught:
+        await client.submit({}, "director-client", "rejected-id")
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail == detail
+
+
+async def test_comfy_submit_keeps_5xx_in_the_ambiguous_error_path() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "host failed after receipt boundary"})
+
+    client = ComfyClient(
+        "http://comfy.test", transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(ComfyError) as caught:
+        await client.submit({}, "director-client", "ambiguous-id")
+
+    assert not isinstance(caught.value, ComfyPromptRejected)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "detail"),
+    [
+        (429, {"error": {"type": "rate_limited"}, "node_errors": {}}),
+        (400, {"error": "proxy rejected the request"}),
+    ],
+)
+async def test_comfy_submit_keeps_unproven_4xx_in_the_ambiguous_error_path(
+    status_code: int,
+    detail: dict,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json=detail)
+
+    client = ComfyClient(
+        "http://comfy.test", transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(ComfyError) as caught:
+        await client.submit({}, "director-client", "ambiguous-id")
+
+    assert not isinstance(caught.value, ComfyPromptRejected)
 
 
 async def test_comfy_submit_prompt_id_mismatch_atomically_cancels_actual_id() -> None:

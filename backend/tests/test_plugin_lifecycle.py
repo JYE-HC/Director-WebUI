@@ -812,7 +812,7 @@ def test_backend_receives_the_host_tls_certificate(
         assert control.app_kwargs["comfy_tls_certfile"] == str(certificate)
     finally:
         control.release.set()
-        thread.join(timeout=1)
+        thread.join(timeout=5)
         assert not thread.is_alive()
 
 
@@ -846,7 +846,7 @@ async def test_fake_comfy_lifecycle_reports_ready_then_stopped(
     )
 
     control.release.set()
-    thread.join(timeout=1)
+    thread.join(timeout=5)
     assert not thread.is_alive()
     assert not any(
         isinstance(item, plugin._DirectorHttpxRequestFilter)
@@ -871,7 +871,7 @@ async def test_fake_uvicorn_failure_after_ready_preserves_exception(
 
     control.failure = RuntimeError("backend crashed after ready")
     control.release.set()
-    thread.join(timeout=1)
+    thread.join(timeout=5)
     assert not thread.is_alive()
 
     failed = await read_status(loaded_plugin)

@@ -6,9 +6,8 @@ import {
   DEFAULT_SETTINGS,
   EMPTY_CAPABILITIES,
   EMPTY_MODELS,
+  type CapabilityReport,
   type DirectorDeckConfig,
-  type FeatureCatalog,
-  type FeatureCapabilityEvaluation,
   type GPUResource,
   type LoraLoaderOverrideRecord,
   type MediaToolInstallPhase,
@@ -28,73 +27,30 @@ const GPUS: GPUResource[] = [
   { index: 0, name: "GPU 0", vram_total: 24_000, vram_free: 20_000, visible: true },
   { index: 1, name: "GPU 1", vram_total: 24_000, vram_free: 18_000, visible: true },
 ];
-const AVAILABLE_ADAPTER_CAPABILITY: FeatureCapabilityEvaluation = {
-  available: true,
-  reasons: [],
-  verified_contracts: ["directordeck.node.test-lora"],
-  runtime_fingerprints: [`sha256:${"c".repeat(64)}`],
-};
-const LORA_FEATURE_CATALOG: FeatureCatalog = {
-  template_bundle_version: 5,
-  host_capability_revision: `sha256:${"a".repeat(64)}`,
-  entries: [{
-    id: "lora",
-    version: 1,
-    title: "LoRA",
-    description: "Apply the selected fail-closed LoRA adapter.",
-    mode: "switch",
-    layer: "graph",
-    scopes: ["project"],
-    params_schema: {},
-    defaults: {},
-    backends: ["standard", "raylight"],
-    availability: { state: "conditional", reasons: [] },
-    adapter_options: [
-      {
-        adapter_id: "model_only",
-        display_name: "LoRA加载器（仅模型）",
-        class_type: "LoraLoaderModelOnly",
-        is_default: true,
-        backend: "standard",
-        supported_families: ["fl2va", "ref2va"],
-        configuration_options: [],
-        adapter_fingerprint: `sha256:${"1".repeat(64)}`,
-        capability: AVAILABLE_ADAPTER_CAPABILITY,
-      },
-      {
-        adapter_id: "minimax_h3_turbo",
-        display_name: "MiniMax-H3 Turbo LoRA",
-        class_type: "MiniMaxH3TurboLoRA",
-        is_default: false,
-        backend: "standard",
-        supported_families: ["fl2va", "ref2va"],
-        configuration_options: [{
-          id: "low_vram",
-          type: "boolean",
-          label: "low_vram",
-          description: "启用低显存模式",
-          default: false,
-        }],
-        adapter_fingerprint: `sha256:${"2".repeat(64)}`,
-        capability: AVAILABLE_ADAPTER_CAPABILITY,
-      },
-    ],
-    ui: { visibility: "internal_v4" },
-  }],
-};
 const DIRECTORDECK_CONFIG: DirectorDeckConfig = {
   schema_version: 1,
   lora: {
-    loaders: LORA_FEATURE_CATALOG.entries[0].adapter_options.map((option) => ({
-      id: option.adapter_id,
-      display_name: option.display_name,
-      class_type: option.class_type,
-      input_contract: option.adapter_id === "minimax_h3_turbo"
-        ? "dedicated_model"
-        : "model_only",
-      supported_families: option.supported_families,
-      options: option.configuration_options,
-    })),
+    loaders: [{
+      id: "model_only",
+      display_name: "LoRA加载器（仅模型）",
+      class_type: "LoraLoaderModelOnly",
+      input_contract: "model_only",
+      supported_families: ["fl2va", "ref2va"],
+      options: [],
+    }, {
+      id: "minimax_h3_turbo",
+      display_name: "MiniMax-H3 Turbo LoRA",
+      class_type: "MiniMaxH3TurboLoRA",
+      input_contract: "dedicated_model",
+      supported_families: ["fl2va", "ref2va"],
+      options: [{
+        id: "low_vram",
+        type: "boolean",
+        label: "low_vram",
+        description: "启用低显存模式",
+        default: false,
+      }],
+    }],
     fallback_policy: {
       loader_ids: ["model_only"],
       default_loader_id: "model_only",
@@ -105,6 +61,7 @@ const DIRECTORDECK_CONFIG: DirectorDeckConfig = {
       default_loader_id: "minimax_h3_turbo",
     }],
   },
+  diagnostics: [],
 };
 
 function runningMediaSetup(
@@ -174,7 +131,7 @@ function runtimeSettings(): RuntimeSettings {
 function renderSettings(options: {
   settings?: RuntimeSettings;
   resourcesReady?: boolean;
-  featureCatalog?: FeatureCatalog | null;
+  capabilities?: CapabilityReport;
   gpus?: GPUResource[];
   models?: ModelInventory;
   runtimeEditingDisabled?: boolean;
@@ -192,10 +149,7 @@ function renderSettings(options: {
       settings={settings}
       confirmedSettings={settings}
       resourcesReady={options.resourcesReady ?? true}
-      capabilities={ONLINE_CAPABILITIES}
-      featureCatalog={options.featureCatalog === undefined
-        ? LORA_FEATURE_CATALOG
-        : options.featureCatalog}
+      capabilities={options.capabilities ?? ONLINE_CAPABILITIES}
       gpus={options.gpus ?? GPUS}
       models={options.models ?? EMPTY_MODELS}
       loadingModels={false}
@@ -262,7 +216,6 @@ describe("RuntimeSettingsV3 system settings", () => {
 
   it("loads the fallback loader list independently of the host feature catalog", async () => {
     renderSettings({
-      featureCatalog: null,
       models: { ...EMPTY_MODELS, loras: ["LoRA/H3/Style.Exact"] },
     });
 
@@ -276,11 +229,34 @@ describe("RuntimeSettingsV3 system settings", () => {
     expect(screen.queryByLabelText("LoRA 加载器映射迁移提示")).not.toBeInTheDocument();
   });
 
+  it("shows the safe product diagnostic when the loader subset is unavailable", async () => {
+    vi.mocked(directorApi.getDirectorDeckConfig).mockResolvedValueOnce({
+      schema_version: 1,
+      lora: {
+        loaders: [],
+        fallback_policy: null,
+        loader_policies: [],
+      },
+      diagnostics: [{
+        code: "lora_product_config_unavailable",
+        message: "LoRA loader configuration is unavailable.",
+      }],
+    });
+    renderSettings({
+      models: { ...EMPTY_MODELS, loras: ["LoRA/style.safetensors"] },
+    });
+
+    const loaderList = await screen.findByRole("listbox", { name: "加载器列表" });
+    expect(await within(loaderList).findByText(
+      "LoRA loader configuration is unavailable.",
+    )).toBeInTheDocument();
+    expect(within(loaderList).queryByRole("option")).not.toBeInTheDocument();
+  });
+
   it("applies the first matching filename regex policy and exposes the full path tooltip", async () => {
     const filename = "nested/minimax_h3_turbo_v4_step600_ema.safetensors";
     const styleFilename = "nested/style_detail.safetensors";
     renderSettings({
-      featureCatalog: null,
       models: { ...EMPTY_MODELS, loras: [filename, styleFilename] },
     });
 
@@ -315,7 +291,6 @@ describe("RuntimeSettingsV3 system settings", () => {
     }];
     renderSettings({
       settings,
-      featureCatalog: null,
       models: { ...EMPTY_MODELS, loras: [filename] },
     });
 
@@ -347,9 +322,9 @@ describe("RuntimeSettingsV3 system settings", () => {
     };
     const view = renderSettings({ models, onSaveLoraLoaderOverride: onMapping });
 
-    await user.click(within(screen.getByRole("listbox", {
+    await user.click(await within(screen.getByRole("listbox", {
       name: "加载器列表",
-    })).getByRole("option", { name: /MiniMax-H3 Turbo LoRA/ }));
+    })).findByRole("option", { name: /MiniMax-H3 Turbo LoRA/ }));
     await user.click(screen.getByLabelText("LoRA 加载器配置 low_vram"));
     await user.click(screen.getByRole("button", { name: "保存映射" }));
 
@@ -366,7 +341,6 @@ describe("RuntimeSettingsV3 system settings", () => {
       confirmedSettings={saved}
       resourcesReady
       capabilities={ONLINE_CAPABILITIES}
-      featureCatalog={LORA_FEATURE_CATALOG}
       gpus={GPUS}
       models={models}
       loadingModels={false}
@@ -394,7 +368,7 @@ describe("RuntimeSettingsV3 system settings", () => {
       onSaveLoraLoaderOverride: onMapping,
     });
     const loaderList = screen.getByRole("listbox", { name: "加载器列表" });
-    await user.click(within(loaderList).getByRole("option", {
+    await user.click(await within(loaderList).findByRole("option", {
       name: /MiniMax-H3 Turbo LoRA/,
     }));
     await user.click(screen.getByLabelText("LoRA 加载器配置 low_vram"));
@@ -407,33 +381,12 @@ describe("RuntimeSettingsV3 system settings", () => {
     expect(screen.getByLabelText("LoRA 加载器配置 low_vram")).toBeChecked();
   });
 
-  it("shows node observation without treating fingerprint as execution authority", async () => {
+  it("keeps loader mapping usable without host catalog observation", async () => {
     const user = userEvent.setup();
-    const featureCatalog = structuredClone(LORA_FEATURE_CATALOG);
-    const option = featureCatalog.entries[0].adapter_options.find((item) =>
-      item.adapter_id === "minimax_h3_turbo");
-    expect(option).toBeDefined();
-    if (!option) return;
-    option.capability = {
-      available: false,
-      reasons: [{
-        code: "node_unavailable",
-        feature_id: "lora",
-        segment_id: null,
-        unit_id: null,
-        backend: "standard",
-        rule: "host_node_registry",
-        message: "A required ComfyUI node is unavailable.",
-        remediation: "Install the supported node implementation and restart ComfyUI.",
-        safe_details: { class_type: "LoraLoaderModelOnly" },
-      }],
-      verified_contracts: [],
-      runtime_fingerprints: [],
-    };
     const onMapping = vi.fn(async (edit: LoraLoaderOverrideEdit) =>
       applyLoraLoaderOverrideEdit(edit.base_settings, edit));
     renderSettings({
-      featureCatalog,
+      resourcesReady: false,
       models: {
         ...EMPTY_MODELS,
         loras: ["LoRA/H3/minimax_h3_turbo_Style.Exact.safetensors"],
@@ -441,15 +394,13 @@ describe("RuntimeSettingsV3 system settings", () => {
       onSaveLoraLoaderOverride: onMapping,
     });
 
-    await user.click(within(screen.getByRole("listbox", {
+    await user.click(await within(screen.getByRole("listbox", {
       name: "加载器列表",
-    })).getByRole("option", { name: /MiniMax-H3 Turbo LoRA/ }));
+    })).findByRole("option", { name: /MiniMax-H3 Turbo LoRA/ }));
 
     const evidence = screen.getByRole("status", { name: "LoRA 映射节点检测" });
-    expect(evidence).toHaveTextContent("当前未检测到节点");
-    expect(evidence).toHaveTextContent("仍可保存配置");
-    expect(evidence).not.toHaveTextContent(option.adapter_fingerprint);
-    expect(evidence).not.toHaveTextContent("node_unavailable");
+    expect(evidence).toHaveTextContent("节点状态尚未读取");
+    expect(evidence).toHaveTextContent("加载器清单仍可选择和保存");
     expect(screen.getByRole("button", { name: "保存映射" })).toBeEnabled();
 
     await user.click(screen.getByRole("button", { name: "保存映射" }));
@@ -457,6 +408,30 @@ describe("RuntimeSettingsV3 system settings", () => {
     expect(onMapping.mock.calls[0][0].next).toMatchObject({
       adapter_id: "minimax_h3_turbo",
     });
+  });
+
+  it.each([
+    { availableNodes: ["MiniMaxH3TurboLoRA"], expected: "当前已检测到节点" },
+    { availableNodes: [], expected: "当前未检测到节点" },
+  ])("shows advisory loader observation without gating save", async ({
+    availableNodes,
+    expected,
+  }) => {
+    const user = userEvent.setup();
+    renderSettings({
+      capabilities: { ...ONLINE_CAPABILITIES, available_nodes: availableNodes },
+      models: {
+        ...EMPTY_MODELS,
+        loras: ["LoRA/H3/minimax_h3_turbo_Style.Exact.safetensors"],
+      },
+    });
+
+    await user.click(await within(screen.getByRole("listbox", {
+      name: "加载器列表",
+    })).findByRole("option", { name: /MiniMax-H3 Turbo LoRA/ }));
+    expect(screen.getByRole("status", { name: "LoRA 映射节点检测" }))
+      .toHaveTextContent(expected);
+    expect(screen.getByRole("button", { name: "保存映射" })).toBeEnabled();
   });
 
   it("writes a complete v3 runtime document when placement changes", async () => {

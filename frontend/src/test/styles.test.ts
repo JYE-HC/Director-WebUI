@@ -50,6 +50,9 @@ describe("长视频全局设置", () => {
     expect(styles).toMatch(
       /@container \(max-width:460px\)\{\.timeline-family-settings__models,\.timeline-sampling-fields\{grid-template-columns:1fr\}\}/,
     );
+    expect(styles).toMatch(
+      /\.timeline-family-settings--codec>header\{padding-bottom:0;border-bottom:0\}/,
+    );
   });
 
   it("让六项采样参数在宽屏保持为一行", () => {

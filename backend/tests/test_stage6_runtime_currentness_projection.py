@@ -12,6 +12,9 @@ from directordeck.schemas import (
 )
 from directordeck.execution.submission import LockedSubmissionPlanner
 from directordeck.workflow.execution import OutputDescriptor
+from directordeck.workflow.effective_features import (
+    migrate_timeline_feature_authority_to_v5,
+)
 from directordeck.workflow.v5_compat import (
     compile_v5_execution_plan,
     project_v5_runtime_currentness,
@@ -91,6 +94,18 @@ def _runtime_copy(
     document = settings.model_dump(mode="json")
     mutate(document)
     return RuntimeSettingsV3.model_validate(document)
+
+
+def _install_frozen_v5_authority(database, draft: UnifiedTimelineDraftV5) -> None:
+    """Install historical authority bytes without weakening downgrade guards."""
+
+    current = migrate_timeline_feature_authority_to_v5(draft)
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE unified_timeline SET document = ?, revision = revision + 1 "
+            "WHERE singleton = 1",
+            (current.model_dump_json(),),
+        )
 
 
 def test_runtime_currentness_ignores_unselected_family_and_unused_runtime_fields() -> None:
@@ -408,11 +423,7 @@ def _seed_readable_v5_job(database, draft, settings: RuntimeSettingsV3) -> str:
 async def test_job_currentness_uses_relevant_v5_runtime_projection(client) -> None:
     database = client.director_app.state.database
     draft = _complete_v5_draft()
-    _, revision = database.get_timeline_authority()
-    database.validate_and_put_timeline_authority(
-        draft,
-        expected_revision=revision,
-    )
+    _install_frozen_v5_authority(database, draft)
     captured = database.get_settings()
     job_id = _seed_readable_v5_job(database, draft, captured)
 
@@ -477,11 +488,7 @@ async def test_job_currentness_uses_relevant_v5_runtime_projection(client) -> No
 async def test_historical_v4_job_currentness_remains_fail_closed(client) -> None:
     database = client.director_app.state.database
     draft = _complete_v5_draft()
-    _, revision = database.get_timeline_authority()
-    database.validate_and_put_timeline_authority(
-        draft,
-        expected_revision=revision,
-    )
+    _install_frozen_v5_authority(database, draft)
     job_id = _seed_readable_v5_job(database, draft, database.get_settings())
 
     legacy_document = draft.model_dump(

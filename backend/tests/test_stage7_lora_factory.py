@@ -4,11 +4,22 @@ from dataclasses import dataclass
 
 import pytest
 
+from directordeck.schemas import (
+    RuntimeSettingsV3,
+    UnifiedTimelineDraftV5,
+    default_model_stack,
+    default_runtime_settings_v3,
+    default_timeline_draft_v5,
+)
 from directordeck.workflow.lora_factory import (
     LoraAdapterResolutionError,
     LoraLoaderBindingKey,
     resolve_raylight_lora_adapter,
     resolve_standard_lora_adapter,
+)
+from directordeck.workflow.v5_compat import (
+    V5CreativeAuthorityError,
+    resolve_v5_lora_adapters,
 )
 
 
@@ -186,6 +197,85 @@ def test_duplicate_exact_user_records_fail_closed_even_for_corrupt_callers() -> 
         resolve_standard_lora_adapter(binding, (override, override))
 
     assert caught.value.code == "lora_loader_mapping_conflict"
+
+
+def test_active_standard_lora_reports_unavailable_product_config_locally(
+    monkeypatch,
+) -> None:
+    def unavailable():
+        raise RuntimeError("private parser failure")
+
+    monkeypatch.setattr(
+        "directordeck.workflow.lora_factory.get_directordeck_config",
+        unavailable,
+    )
+
+    with pytest.raises(LoraAdapterResolutionError) as caught:
+        resolve_standard_lora_adapter(_binding(), ())
+
+    assert caught.value.code == "lora_product_config_unavailable"
+    assert "private parser failure" not in str(caught.value)
+
+
+def test_project_without_active_lora_does_not_read_product_config(
+    monkeypatch,
+) -> None:
+    def unexpected():
+        raise AssertionError("no-LoRA resolution read product configuration")
+
+    monkeypatch.setattr(
+        "directordeck.workflow.lora_factory.get_directordeck_config",
+        unexpected,
+    )
+    draft = default_timeline_draft_v5(default_model_stack())
+
+    assert resolve_v5_lora_adapters(
+        draft,
+        default_runtime_settings_v3(),
+        None,
+    ) == ()
+
+
+def test_active_standard_lora_projects_config_failure_as_current_feature_error(
+    monkeypatch,
+) -> None:
+    def unavailable():
+        raise RuntimeError("private parser failure")
+
+    monkeypatch.setattr(
+        "directordeck.workflow.lora_factory.get_directordeck_config",
+        unavailable,
+    )
+    document = default_timeline_draft_v5(
+        default_model_stack()
+    ).model_dump(mode="json")
+    document["features"]["project"]["lora"] = {
+        "enabled": True,
+        "params": {
+            "by_family": {
+                "fl2va": {
+                    "enabled": True,
+                    "filename": "loras/style.safetensors",
+                    "strength": 1.0,
+                },
+                "ref2va": {
+                    "enabled": False,
+                    "filename": None,
+                    "strength": 1.0,
+                },
+            }
+        },
+    }
+    draft = UnifiedTimelineDraftV5.model_validate(document)
+    settings = RuntimeSettingsV3.model_validate(
+        default_runtime_settings_v3().model_dump(mode="json")
+    )
+
+    with pytest.raises(V5CreativeAuthorityError) as caught:
+        resolve_v5_lora_adapters(draft, settings, None)
+
+    assert caught.value.code == "lora_product_config_unavailable"
+    assert caught.value.feature_id == "lora"
 
 
 @pytest.mark.parametrize("family", ("fl2va", "ref2va"))

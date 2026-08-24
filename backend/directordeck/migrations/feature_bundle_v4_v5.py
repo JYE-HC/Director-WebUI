@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Atomic persisted-authority upgrade from feature bundle 4 to bundle 5.
+"""Authority-local upgrade from feature bundle 4 to bundle 5.
 
 This migration is deliberately separate from the frozen timeline schema-4 to
 schema-5 receipt migration.  The latter preserves its historical destination
@@ -72,25 +72,45 @@ def migrate_feature_bundle_v4_authorities_to_v5(
     *,
     created_at: str,
 ) -> tuple[str, ...]:
-    """Upgrade all schema-v5 bundle-4 authorities in one transaction.
+    """Upgrade each schema-v5 bundle-4 authority in its own transaction.
 
     Bundle-5 authorities are still validated against the current resolver but
-    remain byte/revision untouched.  Any invalid authority rolls back every
-    bundle change, leaving a deterministic retry path on the next initialize.
+    remain byte/revision untouched. An invalid authority keeps its exact bytes
+    without preventing another project from migrating.
     """
 
     migrated: list[str] = []
-    try:
-        db.execute("BEGIN IMMEDIATE")
-        for kind, project_id, raw_document, revision in _authorities(db):
+    for kind, project_id, raw_document, revision in _authorities(db):
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            decoded: Any = None
             try:
                 decoded = json.loads(raw_document)
                 document = UnifiedTimelineDraftV5.model_validate(decoded)
             except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+                source_hint = (
+                    ((decoded.get("features") or {}).get("template_bundle_version"))
+                    if isinstance(decoded, dict)
+                    else None
+                )
+                if source_hint != 4:
+                    # Bundle-5/6 corruption belongs to the later project-local
+                    # migration and must not reopen this frozen global bridge.
+                    db.rollback()
+                    continue
                 raise FeatureBundleMigrationConflict(
                     "the authority is not a valid timeline schema 5 document",
                     project_id=project_id,
                 ) from exc
+            source_bundle = document.features.template_bundle_version
+            # Bundle 6 is a separate current authority.  This frozen bridge
+            # must neither reinterpret nor reject it on subsequent startups.
+            if source_bundle == 6:
+                db.rollback()
+                continue
+            if source_bundle == V5_TEMPLATE_BUNDLE.version:
+                db.rollback()
+                continue
             try:
                 current = migrate_timeline_feature_authority_to_v5(document)
             except V5FeatureConfigurationError as exc:
@@ -103,9 +123,6 @@ def migrate_feature_bundle_v4_authorities_to_v5(
                         **exc.safe_details,
                     },
                 ) from exc
-            source_bundle = document.features.template_bundle_version
-            if source_bundle == V5_TEMPLATE_BUNDLE.version:
-                continue
             if source_bundle != 4:  # pragma: no cover - guarded by resolver.
                 raise FeatureBundleMigrationConflict(
                     "the feature bundle version is unsupported",
@@ -141,12 +158,15 @@ def migrate_feature_bundle_v4_authorities_to_v5(
                     "the authority CAS update did not affect exactly one row",
                     project_id=project_id,
                 )
-            migrated.append(project_id)
-        db.commit()
-        return tuple(migrated)
-    except BaseException:
-        db.rollback()
-        raise
+            db.commit()
+        except FeatureBundleMigrationConflict:
+            db.rollback()
+            continue
+        except BaseException:
+            db.rollback()
+            raise
+        migrated.append(project_id)
+    return tuple(migrated)
 
 
 __all__ = [

@@ -1,8 +1,8 @@
 import {
   migrateLegacyTimelineProjectToV5,
-  migrateTimelineFeatureBundle4To5,
   normalizeLegacyTimelineProject,
   normalizeTimelineProject,
+  projectTimelineFeatureBundle,
   type LegacyTimelineProjectV4,
   type TimelineProject,
 } from "../domain/timelineProject";
@@ -684,34 +684,62 @@ async function decodeJournal(
     history,
     project: structuredClone(history.head),
   };
-  const upgradedConfirmed = migrateTimelineFeatureBundle4To5(decoded.confirmedDocument);
-  const upgradedHead = migrateTimelineFeatureBundle4To5(decoded.project);
-  if (!upgradedConfirmed || !upgradedHead) return decoded;
-  const confirmedProjectionMatches =
-    authority.revision === decoded.confirmedRevision + 1 &&
-    timelineProjectsEqual(authority.document, upgradedConfirmed);
-  const acknowledgedProjectionMatches =
-    authority.revision === decoded.confirmedRevision + 2 &&
-    timelineProjectsEqual(authority.document, upgradedHead);
-  if (!confirmedProjectionMatches && !acknowledgedProjectionMatches) return decoded;
+  for (const targetBundleVersion of [5, 6] as const) {
+    const confirmed = projectTimelineFeatureBundle(
+      decoded.confirmedDocument, targetBundleVersion,
+    );
+    const head = projectTimelineFeatureBundle(decoded.project, targetBundleVersion);
+    if (!confirmed || !head || confirmed.revision_steps === 0 ||
+        confirmed.revision_steps !== head.revision_steps) continue;
+    const confirmedProjectionMatches =
+      authority.revision === decoded.confirmedRevision + confirmed.revision_steps &&
+      timelineProjectsEqual(authority.document, confirmed.document);
+    const acknowledgedProjectionMatches =
+      authority.revision === decoded.confirmedRevision + head.revision_steps + 1 &&
+      timelineProjectsEqual(authority.document, head.document);
+    if (!confirmedProjectionMatches && !acknowledgedProjectionMatches) continue;
+    try {
+      const upgradedHistory = projectTimelineHistoryFeatureBundle(
+        history,
+        targetBundleVersion,
+        head.revision_steps,
+      );
+      if (!upgradedHistory?.head) return null;
+      return {
+        confirmedRevision: authority.revision,
+        confirmedDocument: structuredClone(authority.document),
+        history: upgradedHistory,
+        project: structuredClone(upgradedHistory.head),
+      };
+    } catch {
+      return null;
+    }
+  }
+  return decoded;
+}
 
+function projectTimelineHistoryFeatureBundle(
+  history: TimelineHistoryState,
+  targetBundleVersion: 5 | 6,
+  revisionSteps: number,
+): TimelineHistoryState | null {
+  const head = projectTimelineFeatureBundle(history.head, targetBundleVersion);
+  if (!head || head.revision_steps !== revisionSteps) return null;
   try {
-    const upgradedHistory = deserializeTimelineHistory(serializeTimelineHistory({
+    return deserializeTimelineHistory(serializeTimelineHistory({
       ...history,
       checkpoints: history.checkpoints.map((checkpoint) => {
-        const project = migrateTimelineFeatureBundle4To5(checkpoint.project);
-        if (!project) throw new TypeError("Timeline checkpoint is not bundle 4.");
-        return { ...checkpoint, project };
+        const projected = projectTimelineFeatureBundle(
+          checkpoint.project,
+          targetBundleVersion,
+        );
+        if (!projected || projected.revision_steps !== revisionSteps) {
+          throw new TypeError("Timeline checkpoint feature bundle cannot be projected.");
+        }
+        return { ...checkpoint, project: projected.document };
       }),
-      head: upgradedHead,
+      head: head.document,
     }));
-    if (!upgradedHistory?.head) return null;
-    return {
-      confirmedRevision: authority.revision,
-      confirmedDocument: structuredClone(authority.document),
-      history: upgradedHistory,
-      project: structuredClone(upgradedHistory.head),
-    };
   } catch {
     return null;
   }
@@ -757,27 +785,43 @@ async function decodeLegacyV4Journal(
     legacyClientDocumentDigest(receiptDestination)?.value !==
       receipt.new_client_digest.value
   ) return null;
-  const upgradedReceiptDestination = migrateTimelineFeatureBundle4To5(
+  const upgradedReceiptDestination = projectTimelineFeatureBundle(
     receiptDestination,
+    5,
+  );
+  const currentReceiptDestination = projectTimelineFeatureBundle(
+    receiptDestination,
+    6,
   );
   const directAuthority =
     authority.revision === receipt.new_revision &&
     timelineProjectsEqual(authority.document, receiptDestination);
   const upgradedRevision = receipt.new_revision + 1;
+  const currentRevision = receipt.new_revision + 2;
   const upgradedAuthority =
     upgradedReceiptDestination !== null &&
     Number.isSafeInteger(upgradedRevision) &&
     authority.revision === upgradedRevision &&
-    timelineProjectsEqual(authority.document, upgradedReceiptDestination);
+    timelineProjectsEqual(authority.document, upgradedReceiptDestination.document);
+  const currentAuthority =
+    currentReceiptDestination !== null &&
+    Number.isSafeInteger(currentRevision) &&
+    authority.revision === currentRevision &&
+    timelineProjectsEqual(authority.document, currentReceiptDestination.document);
   // An authority at the post-receipt revision is represented in current bundle
   // form even when it contains an unrelated edit. Classification below keeps
   // that valid local branch as conflict evidence instead of calling it corrupt.
-  const targetBundleVersion = upgradedAuthority || authority.revision >= upgradedRevision
-    ? 5
-    : 4;
+  const targetBundleVersion: 4 | 5 | 6 =
+    currentReceiptDestination && (currentAuthority || authority.revision >= currentRevision)
+      ? 6
+      : upgradedReceiptDestination && (
+          upgradedAuthority || authority.revision >= upgradedRevision
+        )
+        ? 5
+        : 4;
   const migrationContext = {
     ...receipt.legacy_creative_binding_context,
-    template_bundle_version: targetBundleVersion,
+    template_bundle_version: targetBundleVersion === 6 ? 5 : targetBundleVersion,
   };
   const migratedConfirmed = migrateLegacyTimelineProjectToV5(
     record.confirmedDocument,
@@ -788,14 +832,23 @@ async function decodeLegacyV4Journal(
     migrationContext,
   );
   if (!migratedConfirmed || !migratedHistory?.history.head) return null;
+  const projectedConfirmed = targetBundleVersion === 6
+    ? projectTimelineFeatureBundle(migratedConfirmed, 6)?.document ?? null
+    : migratedConfirmed;
+  const projectedHistory = targetBundleVersion === 6
+    ? projectTimelineHistoryFeatureBundle(migratedHistory.history, 6, 1)
+    : migratedHistory.history;
+  if (!projectedConfirmed || !projectedHistory?.head) return null;
   return {
-    confirmedRevision: targetBundleVersion === 5
-      ? upgradedRevision
-      : receipt.new_revision,
-    confirmedDocument: migratedConfirmed,
-    history: migratedHistory.history,
-    project: structuredClone(migratedHistory.history.head),
-    receiptAuthorityMatched: directAuthority || upgradedAuthority,
+    confirmedRevision: targetBundleVersion === 6
+      ? currentRevision
+      : targetBundleVersion === 5
+        ? upgradedRevision
+        : receipt.new_revision,
+    confirmedDocument: projectedConfirmed,
+    history: projectedHistory,
+    project: structuredClone(projectedHistory.head),
+    receiptAuthorityMatched: directAuthority || upgradedAuthority || currentAuthority,
   };
 }
 

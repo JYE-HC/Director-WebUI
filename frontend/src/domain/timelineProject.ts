@@ -44,7 +44,12 @@ export const DEFAULT_PROJECT_ID = "default";
 export type TimelineGenerationMode = (typeof TIMELINE_MODE_ORDER)[number];
 export type DerivedGenerationRecipe = LegacyGenerationMode;
 
-export type TimelineOutputAspect = "16:9" | "9:16";
+/** Official MiniMax H3 output aspects; 3:4 / 9:16 are the portrait forms of 4:3 / 16:9. */
+export type TimelineOutputAspect = "16:9" | "9:16" | "4:3" | "3:4" | "1:1" | "21:9";
+
+export const TIMELINE_OUTPUT_ASPECTS: readonly TimelineOutputAspect[] = [
+  "16:9", "9:16", "4:3", "3:4", "1:1", "21:9",
+];
 
 /** Exact multiple-of-32 output tiers exposed by the native Director node. */
 export const H3_OUTPUT_RESOLUTIONS_16_9 = [
@@ -69,14 +74,56 @@ export interface TimelineOutputResolution {
   height: number;
 }
 
+/**
+ * Area-anchored tiers for the other official aspects: each tier keeps the
+ * 16:9 ladder's pixel area and snaps both axes to the 32-pixel grid, so one
+ * tier costs the same regardless of aspect. Aspect labels are approximate (the
+ * 16:9 ladder itself is not exact either); adjacent source tiers that snap to
+ * identical dimensions collapse into one.
+ */
+function areaMatchedTiers(aspectRatio: number): TimelineOutputResolution[] {
+  const snap = (value: number) => Math.max(32, Math.round(value / 32) * 32);
+  const tiers: TimelineOutputResolution[] = [];
+  for (const [landscapeWidth, landscapeHeight] of H3_OUTPUT_RESOLUTIONS_16_9) {
+    const area = landscapeWidth * landscapeHeight;
+    const candidate = {
+      width: snap(Math.sqrt(area * aspectRatio)),
+      height: snap(Math.sqrt(area / aspectRatio)),
+    };
+    if (tiers.some(
+      (tier) => tier.width === candidate.width && tier.height === candidate.height,
+    )) continue;
+    tiers.push(candidate);
+  }
+  return tiers;
+}
+
+function transposed(
+  tiers: readonly TimelineOutputResolution[],
+): TimelineOutputResolution[] {
+  return tiers.map(({ width, height }) => ({ width: height, height: width }));
+}
+
+const H3_OUTPUT_RESOLUTIONS_16_9_OBJECTS: TimelineOutputResolution[] =
+  H3_OUTPUT_RESOLUTIONS_16_9.map(([width, height]) => ({ width, height }));
+const H3_OUTPUT_RESOLUTIONS_4_3 = areaMatchedTiers(4 / 3);
+
+const H3_OUTPUT_RESOLUTIONS_BY_ASPECT: Record<
+  TimelineOutputAspect,
+  TimelineOutputResolution[]
+> = {
+  "16:9": H3_OUTPUT_RESOLUTIONS_16_9_OBJECTS,
+  "9:16": transposed(H3_OUTPUT_RESOLUTIONS_16_9_OBJECTS),
+  "4:3": H3_OUTPUT_RESOLUTIONS_4_3,
+  "3:4": transposed(H3_OUTPUT_RESOLUTIONS_4_3),
+  "1:1": areaMatchedTiers(1),
+  "21:9": areaMatchedTiers(21 / 9),
+};
+
 export function timelineOutputResolutions(
   aspect: TimelineOutputAspect,
 ): TimelineOutputResolution[] {
-  return H3_OUTPUT_RESOLUTIONS_16_9.map(([landscapeWidth, landscapeHeight]) =>
-    aspect === "16:9"
-      ? { width: landscapeWidth, height: landscapeHeight }
-      : { width: landscapeHeight, height: landscapeWidth },
-  );
+  return H3_OUTPUT_RESOLUTIONS_BY_ASPECT[aspect];
 }
 
 /**
@@ -89,14 +136,17 @@ export function inferTimelineOutputAspect(
 ): TimelineOutputAspect | null {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0)
     return null;
-  if (H3_OUTPUT_RESOLUTIONS_16_9.some(
-    ([landscapeWidth, landscapeHeight]) =>
-      landscapeWidth === width && landscapeHeight === height,
-  ) || width * 9 === height * 16) return "16:9";
-  if (H3_OUTPUT_RESOLUTIONS_16_9.some(
-    ([landscapeWidth, landscapeHeight]) =>
-      landscapeHeight === width && landscapeWidth === height,
-  ) || width * 16 === height * 9) return "9:16";
+  for (const aspect of TIMELINE_OUTPUT_ASPECTS) {
+    if (H3_OUTPUT_RESOLUTIONS_BY_ASPECT[aspect].some(
+      (resolution) => resolution.width === width && resolution.height === height,
+    )) return aspect;
+  }
+  if (width * 9 === height * 16) return "16:9";
+  if (width * 16 === height * 9) return "9:16";
+  if (width * 3 === height * 4) return "4:3";
+  if (width * 4 === height * 3) return "3:4";
+  if (width * 9 === height * 21) return "21:9";
+  if (width === height) return "1:1";
   return null;
 }
 
@@ -276,11 +326,19 @@ export const DEFAULT_LORA_FEATURE_SELECTION: FeatureSelection = {
   },
 };
 
-export const CURRENT_TEMPLATE_BUNDLE_VERSION = 5;
+export const DEFAULT_CK_ATTENTION_FEATURE_SELECTION: FeatureSelection = {
+  enabled: false,
+  params: {},
+};
+
+export const CURRENT_TEMPLATE_BUNDLE_VERSION = 6;
 
 export const DEFAULT_FEATURE_CONFIGURATION: FeatureConfiguration = {
   template_bundle_version: CURRENT_TEMPLATE_BUNDLE_VERSION,
-  project: { lora: DEFAULT_LORA_FEATURE_SELECTION },
+  project: {
+    lora: DEFAULT_LORA_FEATURE_SELECTION,
+    comfy_kitchen_attention: DEFAULT_CK_ATTENTION_FEATURE_SELECTION,
+  },
   by_segment: {},
 };
 
@@ -344,6 +402,15 @@ export function updateLoraFeatureFamily(
     enabled: byFamily.fl2va.enabled || byFamily.ref2va.enabled,
     params: { by_family: byFamily },
   };
+}
+
+export function comfyKitchenAttentionFeatureSelection(
+  features: FeatureConfiguration,
+): FeatureSelection {
+  const selection = features.project.comfy_kitchen_attention;
+  return selection && Object.keys(selection.params).length === 0
+    ? structuredClone(selection)
+    : structuredClone(DEFAULT_CK_ATTENTION_FEATURE_SELECTION);
 }
 
 export interface TimelineProject {
@@ -4311,6 +4378,128 @@ export function migrateTimelineFeatureBundle4To5(value: unknown): TimelineProjec
   return normalizeExactTimelineProject(candidate);
 }
 
+const BUNDLE5_MIGRATION_FEATURES = new Set([
+  "lora",
+  "attention_backend_override",
+  "h3_low_vram_attention",
+  "raylight_pool_intent",
+]);
+
+function effectiveFeatureSelection(
+  project: TimelineProject,
+  segmentId: string,
+  featureId: string,
+): [FeatureSelection | null, boolean] {
+  const segment = project.features.by_segment[segmentId];
+  if (segment && featureId in segment) return [segment[featureId], true];
+  if (featureId in project.features.project) {
+    return [project.features.project[featureId], true];
+  }
+  return [null, false];
+}
+
+function bundle5StandardCk(selection: FeatureSelection | null): boolean | null {
+  if (!selection?.enabled) return false;
+  return Object.keys(selection.params).length === 1 && selection.params.mode === "ck_int8"
+    ? true
+    : null;
+}
+
+function bundle5RayCk(
+  selection: FeatureSelection | null,
+  explicit: boolean,
+): boolean | null | undefined {
+  if (!explicit) return undefined;
+  if (!selection?.enabled) return false;
+  if (Object.keys(selection.params).length !== 1) return null;
+  if (selection.params.attention === "ck_int8") return true;
+  if (selection.params.attention === "torch_flash") return false;
+  return null;
+}
+
+/** Pure, capability-free Bundle 5 -> 6 projection shared by WAL branches. */
+export function migrateTimelineFeatureBundle5To6(value: unknown): TimelineProject | null {
+  const source = normalizeExactTimelineProject(value);
+  if (!source) return null;
+  if (source.features.template_bundle_version === 6) {
+    const keys = Object.keys(source.features.project);
+    const ck = source.features.project.comfy_kitchen_attention;
+    return keys.every((key) => key === "lora" || key === "comfy_kitchen_attention") &&
+      Object.keys(source.features.by_segment).length === 0 &&
+      Boolean(ck) && Object.keys(ck.params).length === 0
+      ? structuredClone(source)
+      : null;
+  }
+  if (
+    source.features.template_bundle_version !== 5 ||
+    Object.keys(source.features.project).some((key) => !BUNDLE5_MIGRATION_FEATURES.has(key)) ||
+    Object.values(source.features.by_segment).some((scope) =>
+      Object.keys(scope).some((key) => !BUNDLE5_MIGRATION_FEATURES.has(key))) ||
+    Object.values(source.features.by_segment).some((scope) => "lora" in scope)
+  ) return null;
+
+  const normalized: boolean[] = [];
+  for (const segment of source.segments) {
+    const [lowVram] = effectiveFeatureSelection(
+      source, segment.id, "h3_low_vram_attention",
+    );
+    if (lowVram?.enabled) return null;
+    const [standard] = effectiveFeatureSelection(
+      source, segment.id, "attention_backend_override",
+    );
+    const standardCk = bundle5StandardCk(standard);
+    if (standardCk === null) return null;
+    const [ray, rayExplicit] = effectiveFeatureSelection(
+      source, segment.id, "raylight_pool_intent",
+    );
+    const rayCk = bundle5RayCk(ray, rayExplicit);
+    if (rayCk === null || (standardCk && rayCk === false) || (!standardCk && rayCk === true)) {
+      return null;
+    }
+    normalized.push(standardCk);
+  }
+  if (new Set(normalized).size !== 1) return null;
+  const candidate = structuredClone(source);
+  candidate.features = {
+    template_bundle_version: 6,
+    project: {
+      ...(source.features.project.lora
+        ? { lora: structuredClone(source.features.project.lora) }
+        : {}),
+      comfy_kitchen_attention: { enabled: normalized[0], params: {} },
+    },
+    by_segment: {},
+  };
+  return normalizeExactTimelineProject(candidate);
+}
+
+export interface TimelineFeatureBundleProjection {
+  document: TimelineProject;
+  revision_steps: number;
+}
+
+/** Apply only the frozen, deterministic marker migrations up to one target bundle. */
+export function projectTimelineFeatureBundle(
+  value: unknown,
+  targetBundleVersion: 5 | 6 = CURRENT_TEMPLATE_BUNDLE_VERSION,
+): TimelineFeatureBundleProjection | null {
+  const source = normalizeExactTimelineProject(value);
+  if (!source || source.features.template_bundle_version > targetBundleVersion) return null;
+  let document: TimelineProject = source;
+  let revisionSteps = 0;
+  while (document.features.template_bundle_version !== targetBundleVersion) {
+    const next: TimelineProject | null = document.features.template_bundle_version === 4
+      ? migrateTimelineFeatureBundle4To5(document)
+      : document.features.template_bundle_version === 5
+        ? migrateTimelineFeatureBundle5To6(document)
+        : null;
+    if (!next) return null;
+    document = next;
+    revisionSteps += 1;
+  }
+  return { document, revision_steps: revisionSteps };
+}
+
 function timelineProjectDocumentsEqual(left: TimelineProject, right: TimelineProject): boolean {
   const leftJson = canonicalTimelineJson(left);
   return leftJson !== null && leftJson === canonicalTimelineJson(right);
@@ -4647,29 +4836,31 @@ export function resolveLocalTimelineWal(
   ) throw new TypeError("Invalid timeline WAL resolution input.");
 
   const serverHash = timelineProjectDocumentHash(serverProject);
-  const upgradedBase = migrateTimelineFeatureBundle4To5(parsedWal.base_project);
-  const upgradedPending = migrateTimelineFeatureBundle4To5(parsedWal.pending_project);
-  if (
-    upgradedBase && upgradedPending &&
-    authority.revision === parsedWal.base_server_revision + 1 &&
-    timelineProjectDocumentsEqual(serverProject, upgradedBase)
-  ) {
-    return {
-      status: "replay",
-      project: upgradedPending,
-      expected_server_revision: authority.revision,
-    };
-  }
-  if (
-    upgradedPending &&
-    authority.revision === parsedWal.base_server_revision + 2 &&
-    timelineProjectDocumentsEqual(serverProject, upgradedPending)
-  ) {
-    return {
-      status: "acknowledged",
-      project: structuredClone(serverProject),
-      server_revision: authority.revision,
-    };
+  for (const targetBundleVersion of [5, 6] as const) {
+    const base = projectTimelineFeatureBundle(parsedWal.base_project, targetBundleVersion);
+    const pending = projectTimelineFeatureBundle(parsedWal.pending_project, targetBundleVersion);
+    if (!base || !pending || base.revision_steps === 0 ||
+        base.revision_steps !== pending.revision_steps) continue;
+    if (
+      authority.revision === parsedWal.base_server_revision + base.revision_steps &&
+      timelineProjectDocumentsEqual(serverProject, base.document)
+    ) {
+      return {
+        status: "replay",
+        project: pending.document,
+        expected_server_revision: authority.revision,
+      };
+    }
+    if (
+      authority.revision === parsedWal.base_server_revision + pending.revision_steps + 1 &&
+      timelineProjectDocumentsEqual(serverProject, pending.document)
+    ) {
+      return {
+        status: "acknowledged",
+        project: structuredClone(serverProject),
+        server_revision: authority.revision,
+      };
+    }
   }
   if (
     authority.revision > parsedWal.base_server_revision &&

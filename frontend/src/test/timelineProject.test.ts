@@ -57,6 +57,7 @@ import {
   timelineSegmentAt,
   timelineEditorReducer,
   timelineOutputResolutions,
+  TIMELINE_OUTPUT_ASPECTS,
   timelineProjectDocumentHash,
   TIMELINE_WAL_FORMAT,
   TIMELINE_WAL_VERSION,
@@ -2062,10 +2063,57 @@ describe("统一 timeline domain", () => {
     expect(isTimelineOutputResolution(480, 864)).toBe(true);
     expect(isTimelineOutputResolution(1024, 576)).toBe(false);
     expect(inferTimelineOutputAspect(1024, 576)).toBe("16:9");
-    expect(inferTimelineOutputAspect(800, 600)).toBeNull();
+    expect(inferTimelineOutputAspect(800, 500)).toBeNull();
     expect(closestTimelineOutputResolution(1920, 1088, "9:16")).toEqual({
       width: 1088,
       height: 1920,
+    });
+  });
+
+  it("官方新增画幅按 16:9 面积阶梯分桶，32 取整且去重", () => {
+    expect(TIMELINE_OUTPUT_ASPECTS).toEqual(
+      ["16:9", "9:16", "4:3", "3:4", "1:1", "21:9"],
+    );
+    expect(timelineOutputResolutions("4:3")).toEqual([
+      { width: 544, height: 416 }, { width: 640, height: 480 },
+      { width: 736, height: 544 }, { width: 832, height: 640 },
+      { width: 928, height: 704 }, { width: 992, height: 736 },
+      { width: 1056, height: 768 }, { width: 1120, height: 832 },
+      { width: 1184, height: 864 }, { width: 1184, height: 896 },
+      { width: 1280, height: 960 }, { width: 1440, height: 1088 },
+      { width: 1568, height: 1184 }, { width: 1664, height: 1248 },
+    ]);
+    expect(timelineOutputResolutions("3:4")).toEqual(
+      timelineOutputResolutions("4:3").map(({ width, height }) => ({
+        width: height,
+        height: width,
+      })),
+    );
+    const square = timelineOutputResolutions("1:1");
+    expect(square).toHaveLength(13);
+    expect(square.every(({ width, height }) => width === height)).toBe(true);
+    expect(square.map(({ width }) => width)).toEqual([
+      448, 544, 640, 736, 800, 864, 896, 960, 1024, 1120, 1248, 1376, 1440,
+    ]);
+    expect(timelineOutputResolutions("21:9")).toContainEqual({
+      width: 1536,
+      height: 672,
+    });
+    for (const aspect of TIMELINE_OUTPUT_ASPECTS) {
+      for (const { width, height } of timelineOutputResolutions(aspect)) {
+        expect(width % 32).toBe(0);
+        expect(height % 32).toBe(0);
+      }
+    }
+    expect(inferTimelineOutputAspect(1184, 864)).toBe("4:3");
+    expect(inferTimelineOutputAspect(1024, 768)).toBe("4:3");
+    expect(isTimelineOutputResolution(1024, 768)).toBe(false);
+    expect(inferTimelineOutputAspect(768, 1024)).toBe("3:4");
+    expect(inferTimelineOutputAspect(768, 768)).toBe("1:1");
+    expect(inferTimelineOutputAspect(1536, 672)).toBe("21:9");
+    expect(closestTimelineOutputResolution(1344, 768, "4:3")).toEqual({
+      width: 1184,
+      height: 864,
     });
   });
 

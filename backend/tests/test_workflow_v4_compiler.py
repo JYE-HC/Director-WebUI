@@ -230,6 +230,30 @@ def test_production_public_read_adapter_owns_one_composite_resource() -> None:
     consumer.rollback()
 
 
+def test_shared_public_read_adapter_rejects_duplicate_edge_evidence() -> None:
+    graph = PromptGraphBuilder()
+    producer = graph.begin_scope("producer")
+    source = producer.add_node("LoadImage", {"image": "one.png"})
+    value = producer.edge(source)
+    pool = producer.commit(
+        public_outputs={"image": value},
+        resource_transaction=ResourcePool().begin().define(
+            name="image",
+            type="IMAGE",
+            value=value,
+            source_feature_id="producer",
+            producer_node_ids=(source,),
+        ),
+    )
+    consumer = graph.begin_scope("consumer")
+    consumer.add_node("ImageConsumer", {"image": value})
+    consumer._input_edge_evidence.append(consumer.input_edge_evidence[0])
+
+    with pytest.raises(AssertionError, match="duplicate input-edge evidence"):
+        _scope_public_reads(inputs={"image": pool.resources["image"]}, scope=consumer)
+    consumer.rollback()
+
+
 class _SingleReadResolution(Mapping[str, ResolvedLoraAdapter]):
     def __init__(self, resolution: ResolvedLoraAdapter) -> None:
         self.resolution = resolution

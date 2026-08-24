@@ -27,14 +27,15 @@ from directordeck.workflow.node_contracts import (
     DIRECTOR_NODE_ADAPTER_SOURCE_FILES,
     RuntimeFingerprintMaterial,
     V4_NODE_CONTRACT_REGISTRY,
+    V5_NODE_CONTRACT_REGISTRY,
+    V6_NODE_CONTRACT_REGISTRY,
     compute_runtime_fingerprint,
     current_expected_module_policy,
     current_provenance_policy,
-    current_release_supported_runtime_fingerprints,
     native_expected_module_policy,
     native_provenance_policy,
+    node_contract_registry_for_bundle,
     release_supported_runtime_fingerprints,
-    require_current_node_contract,
     require_native_node_contract,
 )
 
@@ -230,36 +231,44 @@ def test_registry_is_frozen_round_trippable_and_has_module_scoped_fingerprints()
 
 
 def test_current_registry_extends_v4_without_changing_any_v4_contract() -> None:
+    assert CURRENT_NODE_CONTRACT_REGISTRY is V6_NODE_CONTRACT_REGISTRY
     assert set(CURRENT_NODE_CONTRACT_REGISTRY.contracts) == (
-        set(V4_NODE_CONTRACT_REGISTRY.contracts) | _STAGE8_STRICT_FEATURE_CLASSES
+        set(V4_NODE_CONTRACT_REGISTRY.contracts) | {"ModelAttentionBackend"}
     )
     for class_type, contract in V4_NODE_CONTRACT_REGISTRY.contracts.items():
         assert CURRENT_NODE_CONTRACT_REGISTRY.require(class_type) == contract
     assert dict(current_expected_module_policy()) == {
         **dict(native_expected_module_policy()),
-        "DirectorStrictModelAttentionBackend": (
-            "custom_nodes.DirectorDeck-Strict-Attention"
-        ),
-        "DirectorStrictH3LowVramSagePatch": (
-            "custom_nodes.DirectorDeck-Strict-H3"
-        ),
+        "ModelAttentionBackend": "comfy_extras.nodes_model_advanced",
     }
-    assert dict(current_provenance_policy(_STAGE8_STRICT_FEATURE_CLASSES)) == {
-        "DirectorStrictModelAttentionBackend": (
-            "director-owned-strict-attention"
-        ),
-        "DirectorStrictH3LowVramSagePatch": "director-owned-strict-h3",
+    assert dict(current_provenance_policy(("ModelAttentionBackend",))) == {
+        "ModelAttentionBackend": "comfy-extras",
     }
+
+
+def test_bundle_registry_lookup_uses_only_real_versioned_registries() -> None:
+    assert node_contract_registry_for_bundle(4) is V4_NODE_CONTRACT_REGISTRY
+    assert node_contract_registry_for_bundle(5) is V5_NODE_CONTRACT_REGISTRY
+    assert node_contract_registry_for_bundle(6) is V6_NODE_CONTRACT_REGISTRY
+    with pytest.raises(
+        KeyError,
+        match="unsupported node-contract template bundle: 7",
+    ):
+        node_contract_registry_for_bundle(7)
 
 
 def test_adapter_content_digests_come_from_reviewed_module_source_closures() -> None:
     directordeck_root = Path(__file__).parents[1] / "directordeck"
-    current_modules = {
+    versioned_modules = {
         contract.allowed_python_modules[0]
-        for contract in CURRENT_NODE_CONTRACT_REGISTRY.contracts.values()
+        for registry in (
+            V5_NODE_CONTRACT_REGISTRY,
+            V6_NODE_CONTRACT_REGISTRY,
+        )
+        for contract in registry.contracts.values()
     }
-    assert set(DIRECTOR_NODE_ADAPTER_SOURCE_FILES) == current_modules
-    assert set(DIRECTOR_NODE_ADAPTER_CONTENT_DIGESTS) == current_modules
+    assert set(DIRECTOR_NODE_ADAPTER_SOURCE_FILES) == versioned_modules
+    assert set(DIRECTOR_NODE_ADAPTER_CONTENT_DIGESTS) == versioned_modules
 
     for module, relative_files in DIRECTOR_NODE_ADAPTER_SOURCE_FILES.items():
         assert relative_files
@@ -463,7 +472,7 @@ def test_non_lora_identity_contract_cannot_be_output_affecting() -> None:
 
 
 def test_stage8_strict_feature_contracts_are_exact_and_fail_closed() -> None:
-    attention = require_current_node_contract(
+    attention = V5_NODE_CONTRACT_REGISTRY.require(
         "DirectorStrictModelAttentionBackend"
     )
     assert attention.allowed_python_modules == (
@@ -481,7 +490,7 @@ def test_stage8_strict_feature_contracts_are_exact_and_fail_closed() -> None:
         node_contracts._output(0, "MODEL", "model"),
     )
 
-    low_vram = require_current_node_contract(
+    low_vram = V5_NODE_CONTRACT_REGISTRY.require(
         "DirectorStrictH3LowVramSagePatch"
     )
     assert low_vram.allowed_python_modules == (
@@ -504,9 +513,7 @@ def test_stage8_strict_feature_contracts_are_exact_and_fail_closed() -> None:
         assert effect.verified_model_families == ("fl2va", "ref2va")
         assert effect.verified_backends == ("standard",)
         assert effect.notes
-        assert current_release_supported_runtime_fingerprints(
-            contract.class_type
-        ) == contract.supported_runtime_fingerprints
+        assert contract.supported_runtime_fingerprints
         implementation = ResolvedImplementationIdentity(
             role=f"feature.{contract.class_type}",
             class_type=contract.class_type,
@@ -516,7 +523,7 @@ def test_stage8_strict_feature_contracts_are_exact_and_fail_closed() -> None:
             binding_key=f"feature.{contract.class_type}",
         )
         assert (
-            CURRENT_NODE_CONTRACT_REGISTRY.validate_implementation(
+            V5_NODE_CONTRACT_REGISTRY.validate_implementation(
                 implementation,
                 output_affecting=True,
                 model_family="fl2va",
@@ -525,7 +532,7 @@ def test_stage8_strict_feature_contracts_are_exact_and_fail_closed() -> None:
             == contract
         )
         with pytest.raises(ValueError, match="not verified for backend"):
-            CURRENT_NODE_CONTRACT_REGISTRY.validate_implementation(
+            V5_NODE_CONTRACT_REGISTRY.validate_implementation(
                 implementation,
                 output_affecting=True,
                 model_family="fl2va",

@@ -24,6 +24,7 @@ from .contracts import (
     SegmentTemplateSet,
     TemplateBundle,
 )
+from .templates_v6 import V6_TEMPLATE_BUNDLE
 
 
 _FAMILIES: tuple[ModelFamily, ...] = ("fl2va", "ref2va")
@@ -793,7 +794,7 @@ V5_TEMPLATE_BUNDLE = TemplateBundle(
     ),
 )
 
-CURRENT_TEMPLATE_BUNDLE = V5_TEMPLATE_BUNDLE
+CURRENT_TEMPLATE_BUNDLE = V6_TEMPLATE_BUNDLE
 
 
 __all__ = [

@@ -61,17 +61,24 @@ sys.path.insert(0, str(COMFY_ROOT))
 
 from directordeck.native_templates import (  # noqa: E402
     bind_native_workflow_predecessor_output,
+    bind_raylight_runtime_epoch,
     build_raylight_shutdown_unit,
-    compile_native_timeline,
+    compile_native_timeline as compile_legacy_native_timeline,
     raylight_runtime_descriptor,
-    validate_native_workflow_ready,
 )
+from directordeck.config_manager import initialize_directordeck_config  # noqa: E402
 from directordeck.h3_capabilities import H3_REFERENCE_LIMITS  # noqa: E402
 from directordeck.schemas import (  # noqa: E402
     RuntimeSettings,
+    RuntimeSettingsV3,
     UnifiedTimelineDraft,
+    UnifiedTimelineDraftV5,
     default_settings,
 )
+from directordeck.workflow.node_contracts import (  # noqa: E402
+    V6_NODE_CONTRACT_REGISTRY,
+)
+from directordeck.workflow.segment_compiler import compile_v6_timeline  # noqa: E402
 
 
 MODES = ("t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v")
@@ -281,13 +288,7 @@ def _raylight_lora_settings() -> RuntimeSettings:
 
 
 def _dedicated_lora_settings() -> RuntimeSettings:
-    value = _standard_settings().model_dump(mode="json")
-    value["models"]["fl2va"].update(
-        lora_name=TURBO_LORA,
-        lora_loader="dedicated",
-        lora_low_vram=False,
-    )
-    return RuntimeSettings.model_validate(value)
+    return _standard_lora_settings("dedicated")
 
 
 def _standard_lora_settings(loader: str) -> RuntimeSettings:
@@ -316,6 +317,81 @@ def _standard_settings() -> RuntimeSettings:
     value["models"]["video_vae"]["device"] = "gpu:0"
     value["models"]["audio_vae"]["device"] = "gpu:0"
     return RuntimeSettings.model_validate(value)
+
+
+def _compile_bundle6_timeline(
+    draft: UnifiedTimelineDraft,
+    settings: RuntimeSettings,
+    job_id: str,
+    *,
+    ck_enabled: bool = False,
+) -> Any:
+    """Project one model-free validator fixture into current Bundle 6."""
+
+    if any(
+        getattr(settings.models, family).lora_name is not None
+        for family in ("fl2va", "ref2va")
+    ):
+        raise ValueError("Bundle-6 core validator fixtures must not carry LoRA")
+    document = draft.model_dump(mode="json")
+    document.update(
+        version=5,
+        model_stack={
+            role: {"filename": getattr(settings.models, role).filename}
+            for role in ("fl2va", "ref2va", "clip", "video_vae", "audio_vae")
+        },
+        features={
+            "template_bundle_version": 6,
+            "project": {
+                "lora": {
+                    "enabled": False,
+                    "params": {
+                        "by_family": {
+                            family: {
+                                "enabled": False,
+                                "filename": None,
+                                "strength": 1.0,
+                            }
+                            for family in ("fl2va", "ref2va")
+                        }
+                    },
+                },
+                "comfy_kitchen_attention": {
+                    "enabled": ck_enabled,
+                    "params": {},
+                },
+            },
+            "by_segment": {},
+        },
+    )
+    runtime = RuntimeSettingsV3.model_validate(
+        {
+            "schema_version": 3,
+            "client_id": settings.client_id,
+            "memory_policy": settings.memory_policy,
+            "raylight_residency_policy": settings.raylight_residency_policy,
+            "multi_gpu_enabled": settings.multi_gpu_enabled,
+            "placement": {
+                "fl2va": {
+                    "device": settings.models.fl2va.device,
+                    "raylight": settings.models.fl2va.raylight.model_dump(mode="json"),
+                },
+                "ref2va": {
+                    "device": settings.models.ref2va.device,
+                    "raylight": settings.models.ref2va.raylight.model_dump(mode="json"),
+                },
+                "clip_device": settings.models.clip.device,
+                "video_vae_device": settings.models.video_vae.device,
+                "audio_vae_device": settings.models.audio_vae.device,
+            },
+            "lora_loader_overrides": [],
+        }
+    )
+    return compile_v6_timeline(
+        UnifiedTimelineDraftV5.model_validate(document),
+        runtime,
+        job_id,
+    )
 
 
 def _require_fixture(path: str) -> None:
@@ -451,8 +527,8 @@ def _validate_raylight_initializer_contract(nodes: Any) -> list[str]:
     prompt-only check could falsely pass against an older RayLight and then use
     its endpoint-global cleanup behavior or reject Director's attention choice.
     Inspect the live registered node schema as an additional compatibility
-    boundary. RayLight keeps TORCH_FLASH as its third-party workflow default;
-    Director selects COMFY_KITCHEN_INT8 explicitly in every generated prompt.
+    boundary. The bundled initializer keeps TORCH_FLASH as its CK-off baseline;
+    Bundle 6 selects COMFY_KITCHEN_INT8 only when the feature is enabled.
     """
 
     node_class = nodes.NODE_CLASS_MAPPINGS.get("DirectorDeckRayInitializerAdvanced")
@@ -493,7 +569,7 @@ def _validate_raylight_initializer_contract(nodes: Any) -> list[str]:
     if attention_metadata.get("default") != "TORCH_FLASH":
         return [
             "DirectorDeckRayInitializerAdvanced.XFuser_attention must retain "
-            "TORCH_FLASH as the third-party workflow default"
+            "TORCH_FLASH as the CK-off baseline"
         ]
     optional = input_types.get("optional")
     if not isinstance(optional, dict):
@@ -529,21 +605,64 @@ def _validate_raylight_initializer_contract(nodes: Any) -> list[str]:
         ]
     print(
         "PASS DirectorDeckRayInitializerAdvanced contract: attention offers "
-        "COMFY_KITCHEN_INT8/TORCH_FLASH with legacy default TORCH_FLASH; "
+        "COMFY_KITCHEN_INT8/TORCH_FLASH with CK-off baseline TORCH_FLASH; "
         "driver cleanup and RAM-cache inputs present"
     )
     return []
 
 
-def _validate_compiled_raylight_attention(results: list[Any]) -> list[str]:
-    """Require Director-owned RayLight prompts to select CK explicitly."""
+def _validate_compiled_attention_carriers(results: list[Any]) -> list[str]:
+    """Validate exact Bundle-6 CK off/on carriers on both runtime paths."""
 
     failures: list[str] = []
-    checked = 0
+    checked: set[tuple[str, bool]] = set()
     for result in results:
         for unit in result.workflows:
-            if unit.backend != "raylight":
+            feature_uses = [
+                use
+                for use in unit.compile_feature_uses
+                if use.feature_id == "comfy_kitchen_attention"
+            ]
+            if len(feature_uses) != 1:
+                failures.append(
+                    f"{unit.id}: expected one comfy_kitchen_attention feature use"
+                )
                 continue
+            ck_enabled = feature_uses[0].state == "applicable"
+            official = [
+                node
+                for node in unit.prompt.values()
+                if node.get("class_type") == "ModelAttentionBackend"
+            ]
+            strict = [
+                node
+                for node in unit.prompt.values()
+                if node.get("class_type") == "DirectorStrictModelAttentionBackend"
+            ]
+            if strict:
+                failures.append(f"{unit.id}: Bundle 6 emitted a legacy strict carrier")
+            if unit.backend == "standard":
+                checked.add(("standard", ck_enabled))
+                expected_count = 1 if ck_enabled else 0
+                if len(official) != expected_count:
+                    failures.append(
+                        f"{unit.id}: Standard CK {'on' if ck_enabled else 'off'} "
+                        f"requires {expected_count} ModelAttentionBackend node(s)"
+                    )
+                elif ck_enabled and official[0].get("inputs", {}).get("attention") != (
+                    "comfy kitchen attention"
+                ):
+                    failures.append(
+                        f"{unit.id}: Standard CK must select exact "
+                        "'comfy kitchen attention'"
+                    )
+                continue
+            if unit.backend != "raylight":
+                failures.append(f"{unit.id}: unsupported Bundle-6 backend {unit.backend!r}")
+                continue
+            checked.add(("raylight", ck_enabled))
+            if official:
+                failures.append(f"{unit.id}: RayLight must not emit ModelAttentionBackend")
             initializers = [
                 node
                 for node in unit.prompt.values()
@@ -554,18 +673,24 @@ def _validate_compiled_raylight_attention(results: list[Any]) -> list[str]:
                     f"{unit.id}: expected exactly one DirectorDeckRayInitializerAdvanced"
                 )
                 continue
-            checked += 1
             value = initializers[0].get("inputs", {}).get("XFuser_attention")
-            if value != "COMFY_KITCHEN_INT8":
+            expected = "COMFY_KITCHEN_INT8" if ck_enabled else "TORCH_FLASH"
+            if value != expected:
                 failures.append(
-                    f"{unit.id}: XFuser_attention must be explicitly "
-                    "COMFY_KITCHEN_INT8"
+                    f"{unit.id}: RayLight CK {'on' if ck_enabled else 'off'} "
+                    f"must explicitly select {expected}"
                 )
+    missing = {
+        (backend, ck_enabled)
+        for backend in ("standard", "raylight")
+        for ck_enabled in (False, True)
+    } - checked
+    failures.extend(
+        f"missing Bundle-6 {backend} CK {'on' if ck_enabled else 'off'} fixture"
+        for backend, ck_enabled in sorted(missing)
+    )
     if not failures:
-        print(
-            "PASS Director RayLight attention contract: "
-            f"{checked} prompts explicitly select COMFY_KITCHEN_INT8"
-        )
+        print("PASS Bundle-6 CK carriers: exact Standard/RayLight off/on fixtures")
     return failures
 
 
@@ -622,6 +747,7 @@ async def validate_all() -> int:
         raise SystemExit(f"validation LoRA is missing: {TURBO_LORA}")
     _require_fixture(VALIDATION_IMAGE)
     _require_fixture(VALIDATION_VIDEO)
+    initialize_directordeck_config()
     continuity_output = _continuity_output_descriptor()
 
     # This must happen before importing execution/nodes, which import CUDA
@@ -645,11 +771,13 @@ async def validate_all() -> int:
     settings = _standard_settings()
     failures: list[str] = []
     compiled_results: list[Any] = []
+    bundle6_results: list[Any] = []
     for mode in MODES:
-        result = compile_native_timeline(
+        result = _compile_bundle6_timeline(
             _draft(mode), settings, f"validate-standard-{mode}"
         )
         compiled_results.append(result)
+        bundle6_results.append(result)
         if not await _validate(
             execution,
             f"native-standard-{mode}",
@@ -657,12 +785,13 @@ async def validate_all() -> int:
         ):
             failures.append(f"standard-{mode}")
     for mode in ("t2v", "r2v"):
-        result = compile_native_timeline(
+        result = _compile_bundle6_timeline(
             _draft(mode, scheduler="beta"),
             settings,
             f"validate-standard-beta-{mode}",
         )
         compiled_results.append(result)
+        bundle6_results.append(result)
         if not await _validate(
             execution,
             f"native-standard-beta-{mode}",
@@ -670,12 +799,13 @@ async def validate_all() -> int:
         ):
             failures.append(f"standard-beta-{mode}")
     for mode in ("v2v", "rv2v"):
-        result = compile_native_timeline(
+        result = _compile_bundle6_timeline(
             _paired_source_audio_draft(mode),
             settings,
             f"validate-standard-{mode}-paired-source-audio",
         )
         compiled_results.append(result)
+        bundle6_results.append(result)
         if not await _validate(
             execution,
             f"native-standard-{mode}-paired-source-audio",
@@ -683,16 +813,18 @@ async def validate_all() -> int:
         ):
             failures.append(f"standard-{mode}-paired-source-audio")
 
-    standard_continuity = compile_native_timeline(
+    standard_continuity = _compile_bundle6_timeline(
         _continuity_draft("fl2v"),
         settings,
         "validate-standard-continuity",
     )
     compiled_results.append(standard_continuity)
+    bundle6_results.append(standard_continuity)
     bound_standard_continuity = bind_native_workflow_predecessor_output(
-        standard_continuity.workflows[1], continuity_output
+        standard_continuity.workflows[1],
+        continuity_output,
+        node_contract_registry=V6_NODE_CONTRACT_REGISTRY,
     )
-    validate_native_workflow_ready(bound_standard_continuity)
     if not await _validate(
         execution,
         "native-standard-continuity",
@@ -704,14 +836,32 @@ async def validate_all() -> int:
         ("r2v-max-references", _maximum_reference_draft(with_source_video=False)),
         ("rv2v-max-references", _maximum_reference_draft(with_source_video=True)),
     ):
-        result = compile_native_timeline(draft, settings, f"validate-standard-{label}")
+        result = _compile_bundle6_timeline(
+            draft, settings, f"validate-standard-{label}"
+        )
         compiled_results.append(result)
+        bundle6_results.append(result)
         if not await _validate(
             execution,
             f"native-standard-{label}",
             result.workflows[0].prompt,
         ):
             failures.append(f"standard-{label}")
+
+    standard_ck = _compile_bundle6_timeline(
+        _draft("t2v"),
+        settings,
+        "validate-standard-ck",
+        ck_enabled=True,
+    )
+    compiled_results.append(standard_ck)
+    bundle6_results.append(standard_ck)
+    if not await _validate(
+        execution,
+        "native-standard-ck",
+        standard_ck.workflows[0].prompt,
+    ):
+        failures.append("standard-ck")
 
     base_nodes = set(nodes.NODE_CLASS_MAPPINGS)
     raylight_loaded = await nodes.load_custom_node(
@@ -729,14 +879,11 @@ async def validate_all() -> int:
         raylight_settings = _raylight_settings()
         raylight_without_lora = None
         for mode in MODES:
-            family = "fl2va" if mode in {"t2v", "i2v", "fl2v"} else "ref2va"
-            value = raylight_settings.model_dump(mode="json")
-            value["models"][family]["backend"] = "raylight"
-            selected_settings = RuntimeSettings.model_validate(value)
-            result = compile_native_timeline(
-                _draft(mode), selected_settings, f"validate-raylight-u2-{mode}"
+            result = _compile_bundle6_timeline(
+                _draft(mode), raylight_settings, f"validate-raylight-u2-{mode}"
             )
             compiled_results.append(result)
+            bundle6_results.append(result)
             if raylight_without_lora is None:
                 raylight_without_lora = result.workflows[0]
             if not await _validate(
@@ -747,16 +894,13 @@ async def validate_all() -> int:
                 failures.append(f"raylight-u2-{mode}")
 
         for mode in ("t2v", "r2v"):
-            family = "fl2va" if mode == "t2v" else "ref2va"
-            value = raylight_settings.model_dump(mode="json")
-            value["models"][family]["backend"] = "raylight"
-            selected_settings = RuntimeSettings.model_validate(value)
-            result = compile_native_timeline(
+            result = _compile_bundle6_timeline(
                 _draft(mode, scheduler="beta"),
-                selected_settings,
+                raylight_settings,
                 f"validate-raylight-u2-beta-{mode}",
             )
             compiled_results.append(result)
+            bundle6_results.append(result)
             if not await _validate(
                 execution,
                 f"native-raylight-u2-beta-{mode}",
@@ -764,16 +908,23 @@ async def validate_all() -> int:
             ):
                 failures.append(f"raylight-u2-beta-{mode}")
 
-        raylight_continuity = compile_native_timeline(
+        raylight_continuity = _compile_bundle6_timeline(
             _continuity_draft("r2v"),
             raylight_settings,
             "validate-raylight-u2-continuity",
         )
         compiled_results.append(raylight_continuity)
+        bundle6_results.append(raylight_continuity)
         bound_raylight_continuity = bind_native_workflow_predecessor_output(
-            raylight_continuity.workflows[1], continuity_output
+            raylight_continuity.workflows[1],
+            continuity_output,
+            node_contract_registry=V6_NODE_CONTRACT_REGISTRY,
         )
-        validate_native_workflow_ready(bound_raylight_continuity)
+        bound_raylight_continuity = bind_raylight_runtime_epoch(
+            bound_raylight_continuity,
+            1,
+            node_contract_registry=V6_NODE_CONTRACT_REGISTRY,
+        )
         if not await _validate(
             execution,
             "native-raylight-u2-continuity",
@@ -781,7 +932,22 @@ async def validate_all() -> int:
         ):
             failures.append("raylight-u2-continuity")
 
-        ray_lora = compile_native_timeline(
+        raylight_ck = _compile_bundle6_timeline(
+            _draft("t2v"),
+            raylight_settings,
+            "validate-raylight-ck",
+            ck_enabled=True,
+        )
+        compiled_results.append(raylight_ck)
+        bundle6_results.append(raylight_ck)
+        if not await _validate(
+            execution,
+            "native-raylight-ck",
+            raylight_ck.workflows[0].prompt,
+        ):
+            failures.append("raylight-ck")
+
+        ray_lora = compile_legacy_native_timeline(
             _draft("t2v"), _raylight_lora_settings(), "validate-raylight-lora"
         )
         compiled_results.append(ray_lora)
@@ -819,7 +985,7 @@ async def validate_all() -> int:
         print("FAIL standard-dedicated-lora: Turbo LoRA node failed to register")
         failures.append("standard-dedicated-lora")
     else:
-        dedicated = compile_native_timeline(
+        dedicated = compile_legacy_native_timeline(
             _draft("t2v"), _dedicated_lora_settings(), "validate-dedicated-lora"
         )
         compiled_results.append(dedicated)
@@ -832,7 +998,7 @@ async def validate_all() -> int:
         ("model_only", "model-only"),
         ("bypass_model_only", "bypass-model-only"),
     ):
-        standard_lora = compile_native_timeline(
+        standard_lora = compile_legacy_native_timeline(
             _draft("t2v"),
             _standard_lora_settings(loader),
             f"validate-{label}-lora",
@@ -851,8 +1017,8 @@ async def validate_all() -> int:
     failures.extend(
         f"raylight-initializer:{item}" for item in initializer_contract_failures
     )
-    attention_failures = _validate_compiled_raylight_attention(compiled_results)
-    failures.extend(f"raylight-attention:{item}" for item in attention_failures)
+    attention_failures = _validate_compiled_attention_carriers(bundle6_results)
+    failures.extend(f"attention-carrier:{item}" for item in attention_failures)
     beta_scheduler_failures = _validate_beta_scheduler_contract(nodes)
     failures.extend(
         f"beta-scheduler:{item}" for item in beta_scheduler_failures

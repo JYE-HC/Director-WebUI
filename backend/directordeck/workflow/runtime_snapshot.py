@@ -13,9 +13,15 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 
 from ..schemas import LoraFeatureParams, RuntimeSettingsV3, UnifiedTimelineDraftV5
-from .compile_report import CompiledExecutionReportV2, CompiledFeatureResolution
-from .contracts import ContractModel, FrozenMap, JsonValue, ModelFamily
+from .compile_report import (
+    CompiledExecutionReportV2,
+    CompiledExecutionReportV3,
+    CompiledFeatureResolution,
+    CompiledFeatureUseV3,
+)
+from .contracts import ContractModel, FrozenMap, JsonValue, ModelFamily, canonical_sha256
 from .execution import CompiledExecutionPlan
+from .feature_config import LoraConfigV1
 from .lora_factory import LoraLoaderBindingKey, ResolvedLoraAdapter
 from .v5_compat import (
     V5RayLightRuntimeProjection,
@@ -279,6 +285,13 @@ def _compiled_report(plan: CompiledExecutionPlan) -> CompiledExecutionReportV2:
     return CompiledExecutionReportV2.model_validate(report)
 
 
+def _compiled_report_v3(plan: CompiledExecutionPlan) -> CompiledExecutionReportV3:
+    report = plan.compile_report
+    if isinstance(report, CompiledExecutionReportV3):
+        return report
+    return CompiledExecutionReportV3.model_validate(report)
+
+
 def _active_lora_resolutions(
     report: CompiledExecutionReportV2,
     family: ModelFamily,
@@ -367,12 +380,176 @@ def _snapshot_adapter(
     )
 
 
+def _v6_runtime_projection(
+    draft: UnifiedTimelineDraftV5,
+    segment_ids: list[str] | None,
+    settings: RuntimeSettingsV3,
+    plan: CompiledExecutionPlan,
+) -> JobRuntimeProjectionV1:
+    selected_ids = (
+        {segment.id for segment in draft.segments if segment.enabled}
+        if segment_ids is None
+        else set(segment_ids)
+    )
+    selected = tuple(
+        segment
+        for segment in draft.segments
+        if segment.enabled and segment.id in selected_ids
+    )
+    families: list[JobRuntimeFamilyProjectionV1] = []
+    for family in ("fl2va", "ref2va"):
+        units = tuple(unit for unit in plan.segment_units if unit.family == family)
+        if not units:
+            continue
+        backends = {unit.backend for unit in units}
+        if len(backends) != 1:
+            raise ValueError("one family cannot use multiple backends in one plan")
+        backend = next(iter(backends))
+        placement = getattr(settings.placement, family)
+        families.append(
+            JobRuntimeFamilyProjectionV1(
+                family=family,
+                backend=backend,
+                device=placement.device,
+                raylight_profile=(
+                    JobRayLightRuntimeProjectionV1(
+                        gpu_select=tuple(placement.raylight.gpu_select),
+                        ulysses_degree=placement.raylight.ulysses_degree,
+                        ring_degree=placement.raylight.ring_degree,
+                        cfg_degree=placement.raylight.cfg_degree,
+                        dp_degree=placement.raylight.dp_degree,
+                        fsdp=placement.raylight.fsdp,
+                        cpu_offload=placement.raylight.cpu_offload,
+                    )
+                    if backend == "raylight"
+                    else None
+                ),
+            )
+        )
+    uses_raylight = any(item.backend == "raylight" for item in families)
+    needs_audio_vae = any(
+        segment.mode == "ref2va" or segment.audio_mode == "generate"
+        for segment in selected
+    )
+    return JobRuntimeProjectionV1(
+        memory_policy=settings.memory_policy,
+        raylight_residency_policy=(
+            settings.raylight_residency_policy if uses_raylight else None
+        ),
+        multi_gpu_enabled=(settings.multi_gpu_enabled if uses_raylight else None),
+        families=tuple(families),
+        clip_device=settings.placement.clip_device,
+        video_vae_device=settings.placement.video_vae_device,
+        audio_vae_device=(
+            settings.placement.audio_vae_device if needs_audio_vae else None
+        ),
+    )
+
+
+def _v6_snapshot_adapter(
+    use: CompiledFeatureUseV3,
+) -> tuple[ResolvedJobLoraAdapterV1, LoraConfigV1]:
+    if use.state != "applicable" or use.implementation is None:
+        raise ValueError("Bundle-6 LoRA evidence is inactive")
+    details = use.execution_identity
+    raw_config = details.get("details", {}).get("config") if details else None
+    if isinstance(raw_config, FrozenMap):
+        raw_config = dict(raw_config)
+        if isinstance(raw_config.get("options"), FrozenMap):
+            raw_config["options"] = dict(raw_config["options"])
+    config = LoraConfigV1.model_validate(raw_config)
+    implementation = use.implementation
+    binding = (
+        LoraLoaderBindingKey(
+            family=config.family,
+            model_filename=config.model_filename,
+            lora_filename=config.lora_filename,
+        )
+        if config.backend == "standard"
+        else None
+    )
+    adapter = ResolvedJobLoraAdapterV1(
+        family=config.family,
+        backend=config.backend,
+        adapter_id=config.adapter_id,
+        binding=binding,
+        class_type=config.class_type,
+        node_contract_id=implementation.implementation_id,
+        semantic_version=str(implementation.implementation_version),
+        options=dict(config.options),
+        runtime_fingerprint=canonical_sha256(
+            implementation.model_dump(mode="json")
+        ),
+    )
+    return adapter, config
+
+
+def _build_v6_job_runtime_snapshot(
+    draft: UnifiedTimelineDraftV5,
+    segment_ids: list[str] | None,
+    settings: RuntimeSettingsV3,
+    plan: CompiledExecutionPlan,
+) -> JobRuntimeSnapshotV1:
+    report = _compiled_report_v3(plan)
+    selection = draft.features.project.get("lora")
+    params = (
+        LoraFeatureParams.model_validate(selection.params)
+        if selection is not None and selection.enabled
+        else None
+    )
+    adapters_by_family: dict[ModelFamily, ResolvedJobLoraAdapterV1] = {}
+    for use in report.feature_resolutions:
+        if use.feature_id != "lora" or use.state != "applicable":
+            continue
+        adapter, config = _v6_snapshot_adapter(use)
+        family_selection = (
+            params.by_family[config.family] if params is not None else None
+        )
+        model_filename = getattr(draft.model_stack, config.family).filename
+        if (
+            family_selection is None
+            or not family_selection.enabled
+            or family_selection.filename != config.lora_filename
+            or family_selection.strength != config.strength
+            or model_filename != config.model_filename
+        ):
+            raise ValueError(
+                "Bundle-6 LoRA evidence drifted from creative input"
+            )
+        current = adapters_by_family.setdefault(adapter.family, adapter)
+        if current != adapter:
+            raise ValueError("Bundle-6 family LoRA evidence is inconsistent")
+    snapshot = JobRuntimeSnapshotV1(
+        runtime_projection=_v6_runtime_projection(
+            draft, segment_ids, settings, plan
+        ),
+        resolved_lora_adapters=tuple(
+            adapters_by_family[family]
+            for family in ("fl2va", "ref2va")
+            if family in adapters_by_family
+        ),
+        control_evidence=JobControlEvidenceV1(
+            progress_client_id=settings.client_id,
+        ),
+    )
+    validate_job_runtime_snapshot_creative_binding(
+        snapshot, draft, segment_ids
+    )
+    return snapshot
+
+
 def build_job_runtime_snapshot(
     draft: UnifiedTimelineDraftV5,
     segment_ids: list[str] | None,
     settings: RuntimeSettingsV3,
     plan: CompiledExecutionPlan,
 ) -> JobRuntimeSnapshotV1:
+    if plan.template_bundle_version == 6:
+        return _build_v6_job_runtime_snapshot(
+            draft, segment_ids, settings, plan
+        )
+    if plan.template_bundle_version != 5:
+        raise ValueError("job runtime snapshot has no matching bundle reader")
     runtime = project_v5_runtime_currentness(draft, segment_ids, settings)
     expected = resolve_v5_lora_adapters(draft, settings, segment_ids)
     report = _compiled_report(plan)

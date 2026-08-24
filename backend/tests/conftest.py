@@ -48,7 +48,11 @@ from directordeck.workflow.contracts import (
     RayLightInstallation,
     canonical_sha256,
 )
+from directordeck.workflow.effective_features import (
+    migrate_timeline_feature_authority_to_v5,
+)
 from directordeck.workflow.node_contracts import V4_NODE_CONTRACT_REGISTRY
+from directordeck.workflow.v6_projection import project_v5_authority_to_v6
 
 
 VIDEO_METADATA: dict[str, Any] = {
@@ -753,16 +757,18 @@ async def v5_timeline_document(
     """Convert a frozen v1-v4 test document to the explicit v5 request shape."""
 
     if document.get("version") == 5:
-        return UnifiedTimelineDraftV5.model_validate(document).model_dump(
-            mode="json"
+        converted = UnifiedTimelineDraftV5.model_validate(document)
+    else:
+        settings = RuntimeSettingsV1.model_validate(
+            legacy_settings
+            if legacy_settings is not None
+            else await legacy_settings_document(client, project_id=project_id)
         )
-    settings = RuntimeSettingsV1.model_validate(
-        legacy_settings
-        if legacy_settings is not None
-        else await legacy_settings_document(client, project_id=project_id)
-    )
-    legacy = UnifiedTimelineDraftV4.model_validate(document)
-    return migrate_timeline_v4_to_v5(legacy, settings).model_dump(mode="json")
+        legacy = UnifiedTimelineDraftV4.model_validate(document)
+        converted = migrate_timeline_v4_to_v5(legacy, settings)
+    if converted.features.template_bundle_version == 4:
+        converted = migrate_timeline_feature_authority_to_v5(converted)
+    return converted.model_dump(mode="json")
 
 
 async def save_timeline_document(
@@ -772,7 +778,7 @@ async def save_timeline_document(
     project_id: str | None = None,
     legacy_settings: Mapping[str, Any] | None = None,
 ) -> httpx.Response:
-    """Save a legacy test timeline through the real v5 revision-CAS route."""
+    """Save a legacy test timeline through the current revision-CAS authority."""
 
     authority_path = (
         "/api/timeline/authority"
@@ -787,6 +793,16 @@ async def save_timeline_document(
         legacy_settings=legacy_settings,
         project_id=project_id,
     )
+    current_bundle = (
+        current.json()
+        .get("document", {})
+        .get("features", {})
+        .get("template_bundle_version")
+    )
+    if current_bundle == 6 and converted["features"]["template_bundle_version"] == 5:
+        converted = project_v5_authority_to_v6(
+            UnifiedTimelineDraftV5.model_validate(converted)
+        ).draft.model_dump(mode="json")
     saved = await client.put(
         authority_path,
         json={
@@ -944,6 +960,38 @@ def adapt_legacy_workflow_requests(client, monkeypatch) -> None:
 
     original_post = client.post
 
+    async def current_document(
+        document: Mapping[str, Any],
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        converted = await v5_timeline_document(
+            client,
+            document,
+            project_id=project_id,
+        )
+        authority_path = (
+            "/api/timeline/authority"
+            if project_id is None
+            else f"/api/projects/{project_id}/timeline/authority"
+        )
+        authority = await client.get(authority_path)
+        assert authority.status_code == 200, authority.text
+        current_bundle = (
+            authority.json()
+            .get("document", {})
+            .get("features", {})
+            .get("template_bundle_version")
+        )
+        if (
+            current_bundle == 6
+            and converted["features"]["template_bundle_version"] == 5
+        ):
+            return project_v5_authority_to_v6(
+                UnifiedTimelineDraftV5.model_validate(converted)
+            ).draft.model_dump(mode="json")
+        return converted
+
     async def v5_post(url: str, *args, **kwargs):
         body = kwargs.get("json")
         if not isinstance(body, Mapping):
@@ -967,19 +1015,24 @@ def adapt_legacy_workflow_requests(client, monkeypatch) -> None:
                 legacy_draft = validate_mode_draft(mode, config)
                 timeline = mode_draft_to_timeline(legacy_draft)
                 converted_body = {
-                    "config": await v5_timeline_document(
-                        client,
+                    "config": await current_document(
                         timeline.model_dump(mode="json"),
                     )
                 }
         else:
             config = body.get("config")
             if isinstance(config, Mapping) and config.get("version") != 5:
-                converted_body["config"] = await v5_timeline_document(
-                    client,
-                    config,
-                    project_id=project_id,
-                )
+                if url == "/api/features/preflight":
+                    converted_body["config"] = await v5_timeline_document(
+                        client,
+                        config,
+                        project_id=project_id,
+                    )
+                else:
+                    converted_body["config"] = await current_document(
+                        config,
+                        project_id=project_id,
+                    )
         rewritten = dict(kwargs)
         rewritten["json"] = converted_body
         return await original_post(url, *args, **rewritten)

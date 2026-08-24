@@ -629,21 +629,18 @@ def migrate_v4_authorities_to_v5(
             for _kind, project_id, revision, raw_document in authorities:
                 try:
                     document = json.loads(raw_document)
-                except (json.JSONDecodeError, TypeError) as exc:
-                    raise WorkflowMigrationConflict(
-                        "project document is malformed", project_id=project_id
-                    ) from exc
+                except (json.JSONDecodeError, TypeError):
+                    # Current settings prove the global v4 cut-over already
+                    # completed. A later-damaged project is isolated by the
+                    # per-authority Bundle-6 migration instead of reopening a
+                    # global startup gate.
+                    continue
                 if not isinstance(document, dict) or document.get("version") != 5:
-                    raise WorkflowMigrationConflict(
-                        "runtime settings migrated before every project",
-                        project_id=project_id,
-                    )
+                    continue
                 try:
                     validated = UnifiedTimelineDraftV5.model_validate(document)
-                except ValidationError as exc:
-                    raise WorkflowMigrationConflict(
-                        "project v5 document is invalid", project_id=project_id
-                    ) from exc
+                except ValidationError:
+                    continue
                 receipt = receipts.get(project_id)
                 if receipt is not None:
                     _verify_migrated_authority(

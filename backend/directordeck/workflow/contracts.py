@@ -12,6 +12,7 @@ import math
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime
+from functools import lru_cache
 from typing import (
     Annotated,
     Any,
@@ -795,6 +796,27 @@ class ResolvedImplementationIdentity(ContractModel):
     binding_key: Identifier
 
 
+class ResolvedFeatureImplementation(ContractModel):
+    """Bundle-6 adapter identity, independent from live host fingerprints."""
+
+    implementation_id: Identifier
+    implementation_version: PositiveVersion
+    carrier_kind: Literal[
+        "host_runtime",
+        "comfy_node",
+        "private_subgraph",
+        "director_runtime",
+    ]
+    responsibility: Literal["director", "host_user"]
+    class_types: tuple[ClassType, ...] = ()
+    binding_key: Identifier | None = None
+
+    @model_validator(mode="after")
+    def unique_classes(self) -> "ResolvedFeatureImplementation":
+        _require_unique(self.class_types, "implementation class types")
+        return self
+
+
 class FeatureResolution(ContractModel):
     state: Literal["active", "noop"]
     implementations: tuple[ResolvedImplementationIdentity, ...]
@@ -1150,6 +1172,53 @@ class NodeContractEvidence(ContractModel):
     persistent_artifact_role: PersistentArtifactRole | None = None
 
 
+class DirectorAdapterContractEvidence(ContractModel):
+    """Bundle-6 graph evidence for Director's adapter contract only.
+
+    This deliberately contains no host module, source, package, or runtime
+    fingerprint.  It identifies the immutable contract Director compiled
+    against; ComfyUI remains responsible for accepting the emitted class type.
+    """
+
+    evidence_kind: Literal["director_adapter"] = "director_adapter"
+    contract_id: Identifier
+    semantic_version: SemanticVersion
+    class_type: ClassType
+    adapter_contract_digest: Sha256Digest
+    execution_terminal_role: ExecutionTerminalRole | None = None
+    persistent_artifact_role: PersistentArtifactRole | None = None
+
+
+@lru_cache(maxsize=256)
+def _director_adapter_contract_digest(serialized: str) -> Sha256Digest:
+    contract = NodeContract.model_validate_json(serialized)
+    return canonical_sha256(
+        {
+            "contract_id": contract.contract_id,
+            "semantic_version": contract.semantic_version,
+            "class_type": contract.class_type,
+            "object_info_contract": contract.object_info_contract.model_dump(
+                mode="json"
+            ),
+            "output_contract": contract.output_contract.model_dump(mode="json"),
+            "execution_terminal_role": contract.execution_terminal_role,
+            "persistent_artifact_role": contract.persistent_artifact_role,
+            "runtime_effect_contract": contract.runtime_effect_contract.model_dump(
+                mode="json"
+            ),
+        }
+    )
+
+
+def director_adapter_contract_digest(contract: NodeContract) -> Sha256Digest:
+    """Hash immutable Director graph semantics once per distinct contract."""
+
+    return _director_adapter_contract_digest(contract.model_dump_json())
+
+
+GraphNodeContractEvidence = DirectorAdapterContractEvidence | NodeContractEvidence
+
+
 class PublicResourceWrite(ContractModel):
     operation: Literal["define", "replace"]
     resource: Resource
@@ -1209,7 +1278,7 @@ class GraphAuditSpec(ContractModel):
     unit_kind: Literal["segment", "control"]
     control_kind: Literal["ray_kill"] | None = None
     take_node_id: NodeId | None = None
-    node_contract_snapshot: FrozenMap[NodeId, NodeContractEvidence]
+    node_contract_snapshot: FrozenMap[NodeId, GraphNodeContractEvidence]
     public_writes: tuple[PublicResourceWrite, ...] = ()
     public_reads: tuple[PublicResourceRead, ...] = ()
     allowed_late_bound_inputs: tuple[AllowedLateBoundInput, ...] = ()

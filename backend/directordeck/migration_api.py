@@ -40,6 +40,10 @@ from .workflow.effective_features import (
     migrate_timeline_feature_authority_to_v5,
 )
 from .workflow.execution import DocumentDigest, sha256_document_digest
+from .workflow.v6_projection import (
+    V5V6ProjectionError,
+    project_v5_authority_to_v6,
+)
 
 
 _MAX_PENDING_IMPORTS = 256
@@ -193,11 +197,28 @@ def _document_version(document: Mapping[str, Any]) -> int:
 
 def _upgrade_current_features(
     document: UnifiedTimelineDraftV5,
+    *,
+    migrate_bundle5: bool = True,
 ) -> UnifiedTimelineDraftV5:
-    """Validate bundle 5 or deterministically upgrade a bundle-4 v5 file."""
+    """Validate Bundle 6 exactly and migrate only unambiguous older input."""
 
+    bundle = document.features.template_bundle_version
+    if bundle == 6:
+        try:
+            return project_v5_authority_to_v6(document).draft
+        except V5V6ProjectionError as exc:
+            details: dict[str, Any] = {"reason_code": exc.code}
+            if exc.feature_id is not None:
+                details["feature_id"] = exc.feature_id
+            if exc.segment_id is not None:
+                details["segment_id"] = exc.segment_id
+            raise ProjectImportError(
+                "project_import_feature_configuration_invalid",
+                "The imported Bundle 6 feature configuration is invalid.",
+                details=details,
+            ) from exc
     try:
-        return migrate_timeline_feature_authority_to_v5(document)
+        legacy = migrate_timeline_feature_authority_to_v5(document)
     except V5FeatureConfigurationError as exc:
         if exc.code == "template_bundle_version_unsupported":
             raise ProjectImportError(
@@ -226,6 +247,13 @@ def _upgrade_current_features(
             "The imported project feature configuration is invalid.",
             details=details,
         ) from exc
+    if not migrate_bundle5:
+        return legacy
+    try:
+        return project_v5_authority_to_v6(legacy).draft
+    except V5V6ProjectionError:
+        # A valid but ambiguous Bundle-5 project keeps its frozen compiler.
+        return legacy
 
 
 def _missing_model_bindings(document: UnifiedTimelineDraftV5) -> list[str]:
@@ -461,7 +489,7 @@ def resolve_historical_creative_input(
             "historical_creative_snapshot_invalid",
             "This historical task has invalid immutable creative evidence.",
         ) from exc
-    resolved = _upgrade_current_features(resolved)
+    resolved = _upgrade_current_features(resolved, migrate_bundle5=False)
     # Never return the coordinator's mutable instance to callers that may
     # retitle it for save-as.
     return resolved.model_copy(deep=True)

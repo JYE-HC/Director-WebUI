@@ -365,12 +365,12 @@ def test_initialize_adds_revision_columns_and_migrates_v5_exactly_once(
     project_document, project_revision = database.get_project_timeline_authority(
         "legacy-project"
     )
-    assert default_revision == 2
-    assert project_revision == 2
+    assert default_revision == 3
+    assert project_revision == 3
     assert default_document.version == 5
     assert project_document.version == 5
-    assert default_document.features.template_bundle_version == 5
-    assert project_document.features.template_bundle_version == 5
+    assert default_document.features.template_bundle_version == 6
+    assert project_document.features.template_bundle_version == 6
     with sqlite3.connect(path) as connection:
         timeline_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(unified_timeline)")
@@ -383,8 +383,8 @@ def test_initialize_adds_revision_columns_and_migrates_v5_exactly_once(
 
     # Repeated startup is idempotent when canonical storage did not change.
     database.initialize()
-    assert database.get_timeline_authority()[1] == 2
-    assert database.get_project_timeline_authority("legacy-project")[1] == 2
+    assert database.get_timeline_authority()[1] == 3
+    assert database.get_project_timeline_authority("legacy-project")[1] == 3
 
 
 def test_startup_canonicalization_advances_revision_once(tmp_path) -> None:
@@ -410,14 +410,14 @@ def test_startup_canonicalization_advances_revision_once(tmp_path) -> None:
 
     database.initialize()
     document, revision = database.get_timeline_authority()
-    assert revision == 10
+    assert revision == 11
     assert document.version == 5
-    assert document.features.template_bundle_version == 5
+    assert document.features.template_bundle_version == 6
     assert document.segments[0].ref_image_size == "max"
     assert document.segments[0].audio_mode == "mute"
 
     database.initialize()
-    assert database.get_timeline_authority()[1] == 10
+    assert database.get_timeline_authority()[1] == 11
 
 
 def test_two_concurrent_cas_writers_have_exactly_one_winner(tmp_path) -> None:

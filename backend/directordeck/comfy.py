@@ -22,6 +22,10 @@ class ComfyError(RuntimeError):
         self.detail = detail
 
 
+class ComfyPromptRejected(ComfyError):
+    """ComfyUI rejected ``POST /prompt`` before queue admission."""
+
+
 @dataclass
 class ComfyMediaStream:
     """One streaming ComfyUI `/view` response and its owning HTTP client."""
@@ -42,6 +46,7 @@ class ComfyMediaStream:
 
 class ComfyClientProtocol(Protocol):
     async def capabilities(self) -> dict[str, Any]: ...
+    async def object_info(self, class_types: tuple[str, ...]) -> dict[str, Any]: ...
     async def models(self) -> dict[str, list[str]]: ...
     async def system_stats(self) -> dict[str, Any]: ...
     async def upload(self, filename: str, content: bytes | Path, content_type: str, kind: AssetKind) -> dict[str, Any]: ...
@@ -350,6 +355,23 @@ class ComfyClient:
             },
         }
 
+    async def object_info(self, class_types: tuple[str, ...]) -> dict[str, Any]:
+        """Read only the requested node schemas from ComfyUI's exact routes."""
+
+        if not class_types or len(class_types) != len(set(class_types)):
+            raise ValueError("class_types must be non-empty and unique")
+        result: dict[str, Any] = {}
+        async with self._http(timeout=10) as client:
+            for class_type in class_types:
+                value = await self._json(
+                    await client.get(f"/object_info/{class_type}")
+                )
+                if not isinstance(value, dict):
+                    raise ComfyError("ComfyUI /object_info returned an invalid object")
+                if class_type in value:
+                    result[class_type] = value[class_type]
+        return result
+
     async def models(self) -> dict[str, list[str]]:
         async with self._http() as client:
             diffusion = await self._json(await client.get("/models/diffusion_models"))
@@ -450,9 +472,24 @@ class ComfyClient:
         if requested_prompt_id is not None:
             payload["prompt_id"] = requested_prompt_id
         async with self._http(timeout=60) as client:
-            value = await self._json(
-                await client.post("/prompt", json=payload)
-            )
+            response = await client.post("/prompt", json=payload)
+            if response.status_code == 400:
+                try:
+                    detail: Any = response.json()
+                except ValueError:
+                    detail = response.text[:1000]
+                error = detail.get("error") if isinstance(detail, dict) else None
+                if (
+                    isinstance(error, dict)
+                    and isinstance(error.get("type"), str)
+                    and isinstance(detail.get("node_errors"), dict)
+                ):
+                    raise ComfyPromptRejected(
+                        "ComfyUI rejected the prompt before queue admission",
+                        status_code=response.status_code,
+                        detail=detail,
+                    )
+            value = await self._json(response)
             if not isinstance(value, dict) or not value.get("prompt_id"):
                 raise ComfyError("ComfyUI accepted no prompt id", detail=value)
             actual_prompt_id = self._strict_submit_prompt_id(

@@ -25,8 +25,8 @@ from ..workflow.effective_features import (
     feature_parameter_model,
 )
 from ..workflow.node_contracts import (
-    CURRENT_NODE_CONTRACT_REGISTRY,
     V4_NODE_CONTRACT_REGISTRY,
+    V5_NODE_CONTRACT_REGISTRY,
 )
 from ..workflow.lora_factory import ResolvedLoraAdapter
 from ..workflow.templates import V4_TEMPLATE_BUNDLE
@@ -321,7 +321,7 @@ def preflight_projected_v5_timeline(
     if effective_features.template_bundle_version != V5_TEMPLATE_BUNDLE.version:
         raise TypeError("v5 preflight requires the current effective feature bundle")
     capability_evaluator = evaluator or CapabilityEvaluator(
-        CURRENT_NODE_CONTRACT_REGISTRY
+        V5_NODE_CONTRACT_REGISTRY
     )
     try:
         compile_input = CreativeCompileInputResolver.resolve_v4(

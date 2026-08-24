@@ -14,10 +14,12 @@ from directordeck.schemas import (
     UnifiedTimelineDraftV5,
     default_settings,
     default_model_stack,
+    default_runtime_settings_v3,
     default_runtime_settings_v2,
     default_timeline_draft_v5,
 )
-from directordeck.workflow.execution import OutputDescriptor
+from directordeck.workflow.execution import CompiledExecutionPlan, OutputDescriptor
+from directordeck.workflow.project_compiler import compile_project_execution_plan
 from directordeck.workflow.runtime_snapshot import (
     JobRuntimeSnapshotV1,
     build_job_runtime_snapshot,
@@ -26,6 +28,7 @@ from directordeck.workflow.v5_compat import (
     compile_v5_execution_plan,
     project_v5_runtime_currentness,
 )
+from directordeck.workflow.v6_projection import project_v5_authority_to_v6
 
 from .test_execution_evidence_database import _persist_observed_success
 from .test_workflow_execution_contracts import endpoint_identity
@@ -186,7 +189,7 @@ def _seed_readable_job(database, draft, settings: RuntimeSettingsV3) -> str:
     now = "2026-08-22T12:00:00+00:00"
     job_id = "stage7-runtime-snapshot-job"
     segment_id = "stage7-fl-segment"
-    plan = compile_v5_execution_plan(
+    plan = compile_project_execution_plan(
         draft,
         settings,
         job_id,
@@ -251,6 +254,17 @@ def _seed_readable_job(database, draft, settings: RuntimeSettingsV3) -> str:
         completed_at=now,
     )
     return job_id
+
+
+def _install_retained_v5_authority(database, draft: UnifiedTimelineDraftV5) -> None:
+    """Model one project intentionally retained on its frozen Bundle-5 path."""
+
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE unified_timeline SET document = ?, revision = revision + 1 "
+            "WHERE singleton = 1",
+            (draft.model_dump_json(),),
+        )
 
 
 def test_new_job_snapshot_contains_only_actual_adapter_not_mapping_table() -> None:
@@ -347,10 +361,12 @@ def _insert_active_job_with_settings_snapshot(
 async def test_lifespan_uses_captured_control_evidence_after_client_setting_changes(
     tmp_path,
     monkeypatch,
+    fake_comfy,
 ) -> None:
     app = create_app(
         comfy_url="http://comfy.test:8188",
         database_path=tmp_path / "stage7-control-evidence.sqlite3",
+        comfy_factory=lambda _url: fake_comfy,
     )
     database = app.state.database
     database.initialize()
@@ -486,11 +502,7 @@ async def test_currentness_ignores_unrelated_mapping_records_but_tracks_adapter(
 ) -> None:
     database = client.director_app.state.database
     draft = _active_mapped_lora_draft()
-    _, revision = database.get_timeline_authority()
-    database.validate_and_put_timeline_authority(
-        draft,
-        expected_revision=revision,
-    )
+    _install_retained_v5_authority(database, draft)
     captured = _settings_with_overrides(
         database.get_settings(),
         [_user_mapping_record("dedicated")],
@@ -615,17 +627,73 @@ async def test_currentness_ignores_unrelated_mapping_records_but_tracks_adapter(
     assert exported.json()["segment_ids"] == ["stage7-fl-segment"]
 
 
+async def test_bundle6_currentness_uses_v3_plan_and_ck_authority(client) -> None:
+    database = client.director_app.state.database
+    draft = project_v5_authority_to_v6(_active_mapped_lora_draft()).draft
+    _, revision = database.get_timeline_authority()
+    database.validate_and_put_timeline_authority(
+        draft,
+        expected_revision=revision,
+    )
+    settings = _settings_with_overrides(
+        database.get_settings(),
+        [_user_mapping_record("dedicated")],
+    )
+    _, token = database.get_settings_authority()
+    database.put_settings_v3_authority(
+        settings,
+        expected_authority_token=token,
+        schema_version=3,
+    )
+    job_id = _seed_readable_job(database, draft, settings)
+    stored_plan = database.get_job_execution_plan(job_id)
+    assert stored_plan is not None
+    assert stored_plan.version == 3
+
+    current = await client.get(f"/api/jobs/{job_id}")
+    assert current.status_code == 200, current.text
+    assert current.json()["segment_results"][0]["current_snapshot"] is True
+
+    document = draft.model_dump(mode="json")
+    document["features"]["project"]["comfy_kitchen_attention"]["enabled"] = True
+    changed = UnifiedTimelineDraftV5.model_validate(document)
+    _, revision = database.get_timeline_authority()
+    database.validate_and_put_timeline_authority(
+        changed,
+        expected_revision=revision,
+    )
+    stale = await client.get(f"/api/jobs/{job_id}")
+    assert stale.status_code == 200, stale.text
+    assert stale.json()["segment_results"][0]["current_snapshot"] is False
+
+
+def test_bundle6_runtime_snapshot_rejects_lora_strength_drift() -> None:
+    draft = project_v5_authority_to_v6(_active_mapped_lora_draft()).draft
+    settings = _settings_with_overrides(
+        default_runtime_settings_v3(),
+        [_user_mapping_record("dedicated")],
+    )
+    plan = compile_project_execution_plan(draft, settings, "v6-strength-drift")
+    document = plan.model_dump(mode="json")
+    lora_use = next(
+        use
+        for use in document["compile_report"]["feature_resolutions"]
+        if use["feature_id"] == "lora" and use["state"] == "applicable"
+    )
+    lora_use["execution_identity"]["details"]["config"]["strength"] = 0.25
+    drifted = CompiledExecutionPlan.model_validate_json(json.dumps(document))
+
+    with pytest.raises(ValueError, match="LoRA evidence drifted"):
+        build_job_runtime_snapshot(draft, None, settings, drifted)
+
+
 async def test_active_raylight_currentness_never_reads_standard_mapping(
     client,
     monkeypatch,
 ) -> None:
     database = client.director_app.state.database
     draft = _active_mapped_lora_draft()
-    _, revision = database.get_timeline_authority()
-    database.validate_and_put_timeline_authority(
-        draft,
-        expected_revision=revision,
-    )
+    _install_retained_v5_authority(database, draft)
     settings = _raylight_settings(
         _settings_with_overrides(
             database.get_settings(),
@@ -666,11 +734,7 @@ async def test_historical_v5_runtime_v2_snapshot_remains_viewable_and_exportable
 ) -> None:
     database = client.director_app.state.database
     draft = _active_mapped_lora_draft()
-    _, revision = database.get_timeline_authority()
-    database.validate_and_put_timeline_authority(
-        draft,
-        expected_revision=revision,
-    )
+    _install_retained_v5_authority(database, draft)
     mapped_settings = _settings_with_overrides(
         database.get_settings(),
         [_user_mapping_record("dedicated")],

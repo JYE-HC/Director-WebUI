@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
-from directordeck.config_manager import DirectorDeckConfigManager
+from directordeck.app import create_app
+from directordeck.config_manager import DirectorDeckConfig, DirectorDeckConfigManager
 
 
 def _document() -> dict[str, object]:
@@ -88,7 +91,7 @@ def test_config_manager_rejects_a_second_source(tmp_path) -> None:
         manager.initialize(second_source)
 
 
-def test_config_manager_rejects_an_invalid_policy_regex(tmp_path) -> None:
+def test_config_manager_isolates_an_invalid_policy_regex(tmp_path) -> None:
     document = _document()
     lora = document["lora"]
     assert isinstance(lora, dict)
@@ -98,8 +101,41 @@ def test_config_manager_rejects_an_invalid_policy_regex(tmp_path) -> None:
     source = tmp_path / "invalid-regex.json"
     source.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="regular expression"):
-        DirectorDeckConfigManager().initialize(source)
+    manager = DirectorDeckConfigManager()
+    snapshot = manager.initialize(source)
+
+    assert [loader.id for loader in snapshot.loaders] == [
+        "model_only",
+        "minimax_h3_turbo",
+    ]
+    assert snapshot.lora.loader_policies == ()
+    assert [item.code for item in manager.diagnostics()] == [
+        "lora_loader_policy_invalid"
+    ]
+    with pytest.raises(ValueError, match="regular expression"):
+        DirectorDeckConfig.model_validate(document)
+
+
+def test_config_manager_isolates_an_invalid_unused_loader(tmp_path) -> None:
+    document = _document()
+    lora = document["lora"]
+    assert isinstance(lora, dict)
+    loaders = lora["loaders"]
+    assert isinstance(loaders, list)
+    loaders.append({"id": "broken loader"})
+    source = tmp_path / "invalid-unused-loader.json"
+    source.write_text(json.dumps(document), encoding="utf-8")
+
+    manager = DirectorDeckConfigManager()
+    snapshot = manager.initialize(source)
+
+    assert [loader.id for loader in snapshot.loaders] == [
+        "model_only",
+        "minimax_h3_turbo",
+    ]
+    assert [item.code for item in manager.diagnostics()] == [
+        "lora_loader_entry_invalid"
+    ]
 
 
 def test_config_manager_rejects_an_unknown_fallback_loader(tmp_path) -> None:
@@ -113,7 +149,7 @@ def test_config_manager_rejects_an_unknown_fallback_loader(tmp_path) -> None:
     source = tmp_path / "invalid-fallback.json"
     source.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="unknown loaders"):
+    with pytest.raises(RuntimeError, match="unavailable loader"):
         DirectorDeckConfigManager().initialize(source)
 
 
@@ -165,6 +201,7 @@ async def test_product_config_api_exposes_loaders_without_claiming_node_ownershi
 
     assert response.status_code == 200, response.text
     document = response.json()
+    assert document["diagnostics"] == []
     assert document["lora"]["fallback_policy"] == {
         "loader_ids": ["model_only"],
         "default_loader_id": "model_only",
@@ -186,3 +223,54 @@ async def test_product_config_api_exposes_loaders_without_claiming_node_ownershi
         "semantic_version" not in loader
         for loader in document["lora"]["loaders"]
     )
+
+
+async def test_invalid_product_config_does_not_block_database_startup(
+    tmp_path,
+    fake_comfy,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "config-failure.sqlite3"
+
+    def fail_initialization():
+        raise RuntimeError("sensitive config parser detail")
+
+    monkeypatch.setattr(
+        "directordeck.app.initialize_directordeck_config",
+        fail_initialization,
+    )
+    app = create_app(
+        database_path=database_path,
+        comfy_url="http://comfy.test:8188",
+        comfy_factory=lambda _url: fake_comfy,
+    )
+    monkeypatch.setattr(app.state.progress_manager, "ensure", Mock())
+    monkeypatch.setattr(app.state.progress_manager, "close", AsyncMock())
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app,
+                raise_app_exceptions=True,
+            ),
+            base_url="http://testserver",
+        ) as test_client:
+            settings = await test_client.get("/api/settings")
+            product_config = await test_client.get("/api/config")
+
+    assert database_path.exists()
+    assert settings.status_code == 200, settings.text
+    assert product_config.status_code == 200, product_config.text
+    assert product_config.json() == {
+        "schema_version": 1,
+        "lora": {
+            "loaders": [],
+            "fallback_policy": None,
+            "loader_policies": [],
+        },
+        "diagnostics": [{
+            "code": "lora_product_config_unavailable",
+            "message": "DirectorDeck's LoRA loader configuration is unavailable.",
+        }],
+    }
+    assert "sensitive config parser detail" not in product_config.text
