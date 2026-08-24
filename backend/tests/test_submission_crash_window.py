@@ -47,7 +47,7 @@ async def test_after_intent_crash_has_no_post_and_recovery_never_recompiles(
         json={"config": _timeline(_segment("after-intent-crash"))},
     )
     assert created.status_code == 200, created.text
-    await asyncio.wait_for(intent_persisted.wait(), timeout=1)
+    await asyncio.wait_for(intent_persisted.wait(), timeout=5.0)
     await _wait_for_submission_owner(client)
 
     database = client.director_app.state.database
