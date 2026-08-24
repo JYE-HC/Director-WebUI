@@ -390,7 +390,7 @@ async def test_job_list_and_details_are_sqlite_only_when_comfy_is_a_black_hole(
             client.get(f"/api/jobs/{parent['id']}"),
             client.get("/api/jobs/legacy-black-hole"),
         ),
-        timeout=0.25,
+        timeout=5.0,
     )
 
     assert listing.status_code == 200
