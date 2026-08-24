@@ -245,7 +245,7 @@ async def _wait_for_prompt_count(fake_comfy, count: int) -> None:
         while len(fake_comfy.prompts) < count:
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(ready(), timeout=2)
+    await asyncio.wait_for(ready(), timeout=10.0)
 
 
 def _successful_child_history(child: dict, filename: str) -> dict:

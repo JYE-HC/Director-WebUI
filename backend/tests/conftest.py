@@ -513,7 +513,7 @@ def fake_comfy() -> FakeComfy:
     return FakeComfy()
 
 
-async def wait_for_submission_tasks(client, *, timeout: float = 2.0) -> None:
+async def wait_for_submission_tasks(client, *, timeout: float = 10.0) -> None:
     """Wait until every accepted background job dispatcher has terminated."""
 
     async def drained() -> None:

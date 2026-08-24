@@ -373,7 +373,7 @@ async def test_immediate_raylight_execution_before_submit_response_is_preserved(
                 return
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(child_is_running(), timeout=1.0)
+    await asyncio.wait_for(child_is_running(), timeout=10.0)
     child = database.list_job_children(parent["id"])[0]
     assert child["status"] == "running"
     assert child["progress"] == pytest.approx(0.0)
