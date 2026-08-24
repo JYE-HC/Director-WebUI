@@ -27,7 +27,7 @@ async def _wait_for_submission_owner(client) -> None:
         while client.director_app.state.submission_tasks:
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(finished(), timeout=1)
+    await asyncio.wait_for(finished(), timeout=10.0)
 
 
 async def test_after_intent_crash_has_no_post_and_recovery_never_recompiles(

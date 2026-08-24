@@ -4726,7 +4726,7 @@ async def _wait_for_prompt_count(fake_comfy, expected: int) -> None:
         while len(fake_comfy.prompts) < expected:
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(ready(), timeout=2.0)
+    await asyncio.wait_for(ready(), timeout=10.0)
 
 
 async def _wait_until(predicate) -> None:

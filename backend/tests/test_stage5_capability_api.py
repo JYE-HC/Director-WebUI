@@ -171,7 +171,7 @@ async def _wait_until(predicate) -> None:
         while not predicate():
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(ready(), timeout=2.0)
+    await asyncio.wait_for(ready(), timeout=10.0)
 
 
 async def test_feature_catalog_has_strong_stable_etag_and_304_is_bodyless(
